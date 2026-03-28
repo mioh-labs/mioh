@@ -3,6 +3,7 @@
 
 from dataclasses import dataclass
 from fractions import Fraction
+from typing import TypeAlias
 
 import numpy as np
 import torch
@@ -11,39 +12,39 @@ import torch
 A bounding box of a detected object defined by two points, the top/left and bottom/right pixel.
 Represented as X/Y coordinate tuple: top-left (Y), top-left (X), bottom-right (Y), bottom-right (X)
 """
-type Box = tuple[int, int, int, int]
+Box: TypeAlias = tuple[int, int, int, int]
 
 """
 A segmentation mask of a detected object. Pixel values of 0 indicate that the pixel is not part of the object.
 Shape: (H, W, 1), dtype: np.uint8, range: 0-255
 """
-type Mask = np.ndarray[np.uint8]
+Mask: TypeAlias = np.ndarray[np.uint8]
 
 """
 A segmentation mask of a detected object. Pixel values of 0 indicate that the pixel is not part of the object.
 Shape: (H, W, 1), dtype: torch.uint8, range: 0-255
 """
-type MaskTensor = torch.Tensor
+MaskTensor: TypeAlias = torch.Tensor
 
 """
 Color Image
 Shape: (H, W, C=3), dtype: np.uint8, range: 0-255
 H, W, C stand for image height, width and color channels respectively. C is in BGR instead of RGB order
 """
-type Image = np.ndarray[np.uint8]
+Image: TypeAlias = np.ndarray[np.uint8]
 
 """
 Color Image
 Shape: (H, W, C=3), dtype: torch.uint8, range: 0-255
 H, W, C stand for image height, width and color channels respectively. C is in BGR instead of RGB order
 """
-type ImageTensor = torch.Tensor
+ImageTensor: TypeAlias = torch.Tensor
 
 """
 Padding of an Image or Mask represented as tuple padding values (number of black pixels) added to each image edge:
 (padding-top, padding-bottom, padding-left, padding-right)
 """
-type Pad = tuple[int, int, int, int]
+Pad: TypeAlias = tuple[int, int, int, int]
 
 """
 Metadata about a video file

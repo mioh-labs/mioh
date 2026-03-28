@@ -34,11 +34,13 @@ import math
 import signal
 import sys
 import atexit
+import multiprocessing as mp
 from multiprocessing import resource_tracker
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import threading
 import psutil
+from dataclasses import dataclass
 
 from lada.utils.mps_utils import (
     configure_mps_runtime,
@@ -48,7 +50,199 @@ from lada.utils.mps_utils import (
 
 os.environ['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] = 'YES'
 
-warnings.filterwarnings('ignore', category=UserWarning, module='multiprocessing.resource_tracker')
+def suppress_resource_tracker_warnings():
+    warnings.filterwarnings('ignore', category=UserWarning, module='multiprocessing.resource_tracker')
+    warnings.filterwarnings(
+        'ignore',
+        message=r"resource_tracker: There appear to be .* leaked semaphore objects to clean up at shutdown",
+        category=UserWarning,
+    )
+
+
+suppress_resource_tracker_warnings()
+
+
+@dataclass(frozen=True)
+class WorkerRuntimeConfig:
+    device: str
+    fp16: bool
+    mps_memory_fraction: float | None
+    log_mps_memory: bool
+    encoding_preset: str | None
+    encoder: str | None
+    encoder_options: str | None
+    optimal_encoder_options: str | None
+    mp4_fast_start: bool
+    mosaic_restoration_model: str
+    max_clip_length: int
+    mosaic_detection_model: str
+    detect_face_mosaics: bool
+    lada_temp_dir: str | None
+    overwrite: bool
+
+
+def build_worker_env(config: WorkerRuntimeConfig) -> dict[str, str]:
+    env = os.environ.copy()
+    if config.device == 'mps':
+        env['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = '0.0'
+        env['PYTORCH_MPS_LOW_WATERMARK_RATIO'] = '0.0'
+        env['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+        env['PYTORCH_MPS_ALLOCATOR_POLICY'] = 'garbage_collection'
+        if config.mps_memory_fraction is not None:
+            env['LADA_MPS_MEMORY_FRACTION'] = str(config.mps_memory_fraction)
+            if config.log_mps_memory:
+                env['LADA_LOG_MPS_MEMORY'] = '1'
+
+    env['OMP_NUM_THREADS'] = '2'
+    env['MKL_NUM_THREADS'] = '2'
+    env['OPENBLAS_NUM_THREADS'] = '1'
+    env['NUMEXPR_NUM_THREADS'] = '2'
+    env['PYTHONMALLOC'] = 'malloc'
+    env['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] = 'YES'
+    env['PYTHONWARNINGS'] = ",".join(filter(None, [
+        env.get('PYTHONWARNINGS'),
+        "ignore::UserWarning:multiprocessing.resource_tracker",
+    ]))
+    return env
+
+
+def build_lada_cli_command(config: WorkerRuntimeConfig, input_video: Path, output_video: Path) -> list[str]:
+    cmd = [
+        'lada-cli',
+        '--input', str(input_video),
+        '--output', str(output_video),
+        '--device', config.device,
+    ]
+
+    cmd.append('--fp16' if config.fp16 else '--no-fp16')
+
+    if config.device == 'mps' and config.mps_memory_fraction is not None:
+        cmd.extend(['--mps-memory-fraction', str(config.mps_memory_fraction)])
+
+    if config.encoding_preset:
+        cmd.extend(['--encoding-preset', config.encoding_preset])
+    elif config.encoder:
+        cmd.extend(['--encoder', config.encoder])
+        if config.optimal_encoder_options:
+            cmd.extend(['--encoder-options', str(config.optimal_encoder_options)])
+        elif config.encoder_options:
+            cmd.extend(['--encoder-options', str(config.encoder_options)])
+    elif config.optimal_encoder_options and config.device == 'mps':
+        cmd.extend(['--encoder', 'hevc_videotoolbox'])
+        cmd.extend(['--encoder-options', str(config.optimal_encoder_options)])
+    elif config.encoder_options:
+        cmd.extend(['--encoder', 'hevc_videotoolbox' if config.device == 'mps' else 'libx264'])
+        cmd.extend(['--encoder-options', str(config.encoder_options)])
+
+    if config.mp4_fast_start:
+        cmd.append('--mp4-fast-start')
+
+    cmd.extend(['--mosaic-restoration-model', config.mosaic_restoration_model])
+    cmd.extend(['--max-clip-length', str(config.max_clip_length)])
+    cmd.extend(['--mosaic-detection-model', config.mosaic_detection_model])
+    cmd.append('--detect-face-mosaics' if config.detect_face_mosaics else '--no-detect-face-mosaics')
+
+    if config.lada_temp_dir:
+        cmd.extend(['--temporary-directory', str(config.lada_temp_dir)])
+
+    return cmd
+
+
+def aggressive_memory_cleanup_for_device(device: str):
+    try:
+        import torch
+
+        if device == 'mps' and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        elif 'cuda' in device and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+    gc.collect()
+    time.sleep(0.05)
+
+
+def process_segment_worker(segment_info, config: WorkerRuntimeConfig):
+    idx, input_path, output_path = segment_info
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+
+    if output_path.exists() and not config.overwrite:
+        return {
+            'idx': idx,
+            'output_path': str(output_path),
+            'status': 'skipped',
+            'elapsed': 0.0,
+            'error': None,
+        }
+
+    start_time = time.time()
+    worker_name = f"PID:{os.getpid()}"
+    print(f"[並列処理] セグメント #{idx} 開始 (ワーカー: {worker_name})", flush=True)
+
+    cmd = build_lada_cli_command(config, input_path, output_path)
+    env = build_worker_env(config)
+
+    try:
+        if os.environ.get('DEBUG_LADA_CMD'):
+            print(f"[DEBUG] 実行コマンド: {' '.join(cmd)}", flush=True)
+
+        process = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+
+        assert process.stdout is not None
+        for line in process.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            if 'Processing video:' in line:
+                print(f"\r  {line}", end='', flush=True)
+            elif 'error' in line.lower() or 'warning' in line.lower():
+                print(f"\n  {line}", flush=True)
+
+        return_code = process.wait()
+        if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, cmd)
+
+        print()
+        elapsed = time.time() - start_time
+        print(f"[並列処理] セグメント #{idx} 完了 ({elapsed:.1f}秒)", flush=True)
+        return {
+            'idx': idx,
+            'output_path': str(output_path),
+            'status': 'success',
+            'elapsed': elapsed,
+            'error': None,
+        }
+    except subprocess.CalledProcessError as e:
+        print(f"\n[ERROR] lada-cli実行エラー:", flush=True)
+        print(f"  コマンド: {' '.join(cmd)}", flush=True)
+        print(f"  終了コード: {e.returncode}", flush=True)
+        return {
+            'idx': idx,
+            'output_path': None,
+            'status': 'error',
+            'elapsed': time.time() - start_time,
+            'error': f"Command '{' '.join(cmd)}' returned non-zero exit status {e.returncode}.",
+        }
+    except Exception as e:
+        print(f"\n[ERROR] 予期しないエラー: {e}", flush=True)
+        return {
+            'idx': idx,
+            'output_path': None,
+            'status': 'error',
+            'elapsed': time.time() - start_time,
+            'error': str(e),
+        }
+    finally:
+        aggressive_memory_cleanup_for_device(config.device)
 
 # ===== グローバルクリーンアップ (MPS v0.11.0最適化版) =====
 def cleanup_resources():
@@ -91,12 +285,6 @@ def cleanup_resources():
     # Pythonのガベージコレクション
     gc.collect()
     
-    # リソーストラッカーのクリーンアップ
-    try:
-        resource_tracker._resource_tracker._stop()
-    except:
-        pass
-
 
 def get_effective_mps_memory_fraction(args) -> float | None:
     """Resolve process-level MPS memory fraction."""
@@ -132,31 +320,62 @@ def format_mps_memory_stats() -> str | None:
 # グローバル停止フラグ
 _shutdown_requested = False
 _force_shutdown = False
+_active_executor = None
+_active_executor_lock = threading.Lock()
+
+
+def _set_active_executor(executor):
+    global _active_executor
+    with _active_executor_lock:
+        _active_executor = executor
+
+
+def _shutdown_active_executor():
+    with _active_executor_lock:
+        executor = _active_executor
+    if executor is None:
+        return
+    _shutdown_executor(executor, wait=False, cancel_futures=True)
+
+
+def _shutdown_executor(executor, *, wait: bool, cancel_futures: bool = False):
+    if executor is None:
+        return
+    try:
+        executor.shutdown(wait=wait, cancel_futures=cancel_futures)
+    except RuntimeError:
+        pass
+    except Exception:
+        pass
+
+
+def _terminate_descendant_processes():
+    try:
+        current = psutil.Process(os.getpid())
+        for child in current.children(recursive=True):
+            try:
+                child.terminate()
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 def signal_handler(signum, frame):
-    """Ctrl+CまたはGUI停止時のハンドリング（改善版）"""
+    """Ctrl+CまたはGUI停止時のハンドリング"""
     global _shutdown_requested, _force_shutdown
     
     signal_name = "SIGINT" if signum == signal.SIGINT else "SIGTERM"
-    
-    if _force_shutdown:
-        # 2回目のCtrl+C → 即座に終了
+
+    if _shutdown_requested or _force_shutdown:
         print(f"\n\n⚠️  強制終了します...")
-        sys.exit(1)
-    
-    if _shutdown_requested:
-        # 既に停止処理中 → 次回は強制終了
-        print(f"\n\n⏳ 停止処理中です。もう一度 Ctrl+C を押すと強制終了します...")
-        _force_shutdown = True
-        return
-    
-    # 初回のCtrl+C
-    print(f"\n\n🛑 {signal_name}を受信しました。処理を停止中...")
-    print(f"💡 完全に停止するまでお待ちください。すぐに終了したい場合はもう一度 Ctrl+C を押してください。")
+    else:
+        print(f"\n\n🛑 {signal_name}を受信しました。即座に停止します...")
+
     _shutdown_requested = True
-    
-    # KeyboardInterruptを発生させてfinallyブロックを実行
-    raise KeyboardInterrupt(f"{signal_name}による中断")
+    _force_shutdown = True
+    _shutdown_active_executor()
+    _terminate_descendant_processes()
+    os._exit(130)
 
 atexit.register(cleanup_resources)
 signal.signal(signal.SIGINT, signal_handler)
@@ -723,6 +942,25 @@ class ParallelVideoProcessor:
                 self.stats[key].extend(value)
             else:
                 self.stats[key] += value
+
+    def _build_worker_runtime_config(self) -> WorkerRuntimeConfig:
+        return WorkerRuntimeConfig(
+            device=self.args.device,
+            fp16=self.args.fp16,
+            mps_memory_fraction=get_effective_mps_memory_fraction(self.args),
+            log_mps_memory=self.args.log_mps_memory,
+            encoding_preset=self.args.encoding_preset,
+            encoder=self.args.encoder,
+            encoder_options=self.args.encoder_options,
+            optimal_encoder_options=self.optimal_encoder_options,
+            mp4_fast_start=self.args.mp4_fast_start,
+            mosaic_restoration_model=self.args.mosaic_restoration_model,
+            max_clip_length=self.args.max_clip_length,
+            mosaic_detection_model=self.args.mosaic_detection_model,
+            detect_face_mosaics=self.args.detect_face_mosaics,
+            lada_temp_dir=str(self.args.lada_temp_dir) if getattr(self.args, 'lada_temp_dir', None) else None,
+            overwrite=self.args.overwrite,
+        )
     
     def process_segment(self, segment_info):
         """
@@ -1094,11 +1332,18 @@ class ParallelVideoProcessor:
             
             # 未処理のセグメントのみを並列処理
             if tasks:
-                executor = ThreadPoolExecutor(max_workers=self.args.parallel_workers)
+                worker_config = self._build_worker_runtime_config()
+                mp_context = mp.get_context("spawn")
+                executor = ProcessPoolExecutor(
+                    max_workers=self.args.parallel_workers,
+                    mp_context=mp_context,
+                    max_tasks_per_child=1,
+                )
+                _set_active_executor(executor)
                 try:
                     # 全タスクを投入
                     future_to_task = {
-                        executor.submit(self.process_segment, task): task 
+                        executor.submit(process_segment_worker, task, worker_config): task
                         for task in tasks
                     }
                     
@@ -1112,9 +1357,19 @@ class ParallelVideoProcessor:
                         
                         task = future_to_task[future]
                         try:
-                            idx, output_path_seg, status = future.result()
-                            results[idx] = output_path_seg
+                            result = future.result()
+                            idx = result['idx']
+                            output_path_seg = Path(result['output_path']) if result['output_path'] else None
+                            status = result['status']
+                            if output_path_seg is not None:
+                                results[idx] = output_path_seg
                             completed += 1
+                            if status == 'success':
+                                self.update_stats('processed')
+                            elif status == 'skipped':
+                                self.update_stats('skipped')
+                            else:
+                                self.update_stats('errors', [f"Segment {idx}: {result['error']}"])
                             if completed % self.args.memory_cleanup_interval == 0 and self._memory_pressure_high():
                                 self._aggressive_memory_cleanup()
                             
@@ -1134,6 +1389,8 @@ class ParallelVideoProcessor:
                                 
                                 # 常に改行表示（並列処理では上書きは混乱する）
                                 print(progress_msg, flush=True)
+                            if status == 'error':
+                                self.safe_print(f"[並列処理] セグメント #{idx} エラー: {result['error']}")
                             
                         except Exception as e:
                             self.safe_print(f"\n[エラー] タスク {task[0]} 失敗: {e}")
@@ -1143,13 +1400,13 @@ class ParallelVideoProcessor:
                 except KeyboardInterrupt:
                     print("\n\n🛑 KeyboardInterruptを受信。並列処理を即座に停止します...")
                     # 即座にシャットダウン（実行中タスクをキャンセル）
-                    executor.shutdown(wait=False, cancel_futures=True)
+                    _shutdown_executor(executor, wait=False, cancel_futures=True)
                     raise
                 
                 finally:
                     # 必ずexecutorをクリーンアップ
-                    if not executor._shutdown:
-                        executor.shutdown(wait=True)
+                    _shutdown_executor(executor, wait=True)
+                    _set_active_executor(None)
                 
                 # 並列処理完了後、強制的にメモリクリーンアップ
                 print("\n並列処理完了、メモリを解放中...")
