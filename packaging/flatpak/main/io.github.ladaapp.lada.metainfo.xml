@@ -1,0 +1,373 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+    <id>io.github.ladaapp.lada</id>
+
+    <name>Lada</name>
+    <summary>Recover pixelated adult videos</summary>
+
+    <metadata_license>CC0-1.0</metadata_license>
+    <project_license>AGPL-3.0-or-later</project_license>
+    
+    <branding>
+        <color type="primary" scheme_preference="light">#9141ac</color>
+        <color type="primary" scheme_preference="dark">#3d3846</color>
+    </branding>
+
+    <developer id="io.github.ladaapp">
+        <name>ladaapp</name>
+    </developer>
+
+    <content_rating type="oars-1.1">
+        <content_attribute id="sex-nudity">intense</content_attribute>
+        <content_attribute id="sex-themes">intense</content_attribute>
+    </content_rating>
+
+    <categories>
+        <category>Video</category>
+    </categories>
+
+    <description>
+        <p>Lada is a tool designed to recover pixelated adult videos (JAV). It helps restore the visual quality of such content, making it more enjoyable to watch:</p>
+        <ul>
+            <li>Recover Pixelated Videos: Restore pixelated or mosaic scenes in adult videos.</li>
+            <li>Watch/Export Videos: Use either the CLI or GUI to watch or export your restored videos.</li>
+        </ul>
+        <p>The process is pretty resource-intensive and will not run on all hardware. It is required that you install one Lada's Flatpak Add-Ons / Extensions compatible with your GPU.</p>
+        <p>You can find more information about which GPUs are supported on the project website hosted on Codeberg.</p>
+    </description>
+
+    <url type="homepage">https://codeberg.org/ladaapp/lada</url>
+    <url type="bugtracker">https://codeberg.org/ladaapp/lada/issues</url>
+	<url type="translate">https://translate.codeberg.org/projects/lada/lada/</url>
+	<url type="vcs-browser">https://codeberg.org/ladaapp/lada</url>
+
+    <launchable type="desktop-id">io.github.ladaapp.lada.desktop</launchable>
+
+    <screenshots>
+        <screenshot type="default">
+            <image>https://codeberg.org/ladaapp/lada/raw/main/assets/screenshot_gui_1_dark.png</image>
+            <caption>Watching restored video</caption>
+        </screenshot>
+        <screenshot>
+            <image>https://codeberg.org/ladaapp/lada/raw/main/assets/screenshot_gui_2_dark.png</image>
+            <caption>Exporting restored video</caption>
+        </screenshot>
+        <screenshot>
+            <image>https://codeberg.org/ladaapp/lada/raw/branch/main/assets/screenshot_cli_1.png</image>
+            <caption>Exporting restored video via CLI</caption>
+        </screenshot>
+    </screenshots>
+    <releases>
+        <release date="2026-02-09" version="0.11.0">
+            <description>
+                <p>Breaking change: If you're upgrading from a previous version you now have to install one of Lada's Flatpak Add-On matching your GPU (Nvidia or Intel) as the main Flatpak doesn't contain Nvidia-specific libraries anymore.</p>
+                <p>Features / Improvements:</p>
+                <ul>
+                    <li>CLI+GUI: Add support for Intel QSV (Quick Sync Video) hardware-encoding</li>
+                    <li>CLI+GUI: Add support for Intel Arc GPUs. Intel Arc-compatible packages of Lada are available for Windows (Standalone) and Flatpak (Install Intel Add-On)</li>
+                    <li>GUI: Add subtitle support. Open .srt file via button or drag-and-drop. If a .srt file exists with same file name as video file then it will be opened automatically</li>
+                    <li>CLI+GUI: Improve processing of corrupt video files. Duplicate previous frame if current frame cannot be decoded (only up to 10 frames, if more frames cannot be read we continue to error out and exit)</li>
+                    <li>GUI: Show playback controls and header bar as an overlay when in Watch view</li>
+                    <li>CLI+GUI: Add new translation: Korean</li>
+                    <li>GUI: Simplified installation from source on Windows by providing pre-compiled GUI dependencies</li>
+                </ul>
+                <p>Fixes:</p>
+                <ul>
+                    <li>CLI+GUI: Fix deadlock when attempting to restore certain kinds of broken video files</li>
+                    <li>GUI: Fix opening .wmv files containing WMA audio streams in GUI Watch mode on Windows</li>
+                    <li>GUI: Fix incomplete translations of About dialog on Windows</li>
+                    <li>CLI: Suppress printing verbose logging when using SVT AV1 encoder</li>
+                </ul>
+            </description>
+        </release>
+        <release date="2026-01-10" version="0.10.1">
+            <description>
+                <p>Features / Improvements:</p>
+                <ul>
+                    <li>CLI+GUI: Add French translations</li>
+                    <li>CLI: Print listings more space efficiently</li>
+                    <li>CLI+GUI: Include legacy v2 mosaic detection model again in releases</li>
+                </ul>
+                <p>Fixes:</p>
+                <ul>
+                    <li>CLI+GUI: Fix performance regression on Nvidia 50-series GPUs if FP16 is enabled</li>
+                    <li>CLI+GUI: Ensure to stop restoration pipeline and show error if any of the workers crashed</li>
+                    <li>GUI: Fix occasional freeze or spinner getting stuck when opening another file</li>
+                    <li>GUI: Ensure to only decode audio streams in gstreamer audio pipeline (Watch mode) to avoid potential issue by unhandled video- or metadata</li>
+                    <li>GUI: Fix short freeze of Spinner while opening another file</li>
+                    <li>CLI: Fix --list-encoding-presets not showing translated preset descriptions</li>
+                    <li>CLI: Fix table alignment of listings when using CJK languages if mixed with Latin letters</li>
+                </ul>
+            </description>
+        </release>
+        <release date="2026-01-01" version="0.10.0">
+            <description>
+                <p>Features / Improvements:</p>
+                <ul>
+                    <li>CLI: Add encoding presets. There are options available for selecting and listing presets. Alternatively, you can specify encoder and encoder options if the provided presets don't cover your use case</li>
+                    <li>GUI: Add encoding presets. View and select presets via Sidebar. If the provided presets don't cover your use case you can create custom presets</li>
+                    <li>CLI+GUI: Add new v4 mosaic detection models. Default model: v4-fast</li>
+                    <li>CLI+GUI: Reduce VRAM usage of restoration pipeline</li>
+                    <li>CLI+GUI: Add option to enable detect and ignore SFW face mosaics. Experimental</li>
+                    <li>GUI: Add option to toggle .mp4 Fast Start. If enabled a Preview button will be shown while export is running allowing watching the temporary file while it's being written</li>
+                    <li>CLI: Rename --moov-front to --mp4-fast-start</li>
+                    <li>CLI: Add option to set temporary directory</li>
+                    <li>CLI: Ensure to draw 100% completed progressbar after restoration of files with incorrect frame count metadata</li>
+                    <li>CLI: Update progress bar width and redraw if window got resized</li>
+                    <li>CLI: Remove --mosaic-detection-model-path and add --mosaic-detection-model which accepts either a name or a path</li>
+                    <li>CLI: Remove --mosaic-restoration-model and --mosaic-restoration-model-path and add --mosaic-restoration-model which accepts either a name or a path</li>
+                    <li>CLI+GUI: Added short descriptions for mosaic detection and restoration models (was previously documented only in README)</li>
+                </ul>
+                <p>Fixes:</p>
+                <ul>
+                    <li>GUI: Fix FP16 Setting Changes Not Take Effect Immediately Without Restart</li>
+                    <li>GUI: Fix occasional freeze when closing</li>
+                    <li>GUI: Fix occasional long wait times in GUI Watch mode when opening or seeking a file</li>
+                    <li>GUI: Don't stretch color scheme and initial view buttons in sidebar</li>
+                    <li>CLI+GUI: Fix parsing of encoder options if they contain "=" like "-x264opts deblock=-3,-3"</li>
+                    <li>GUI: Fix playback sometimes not being started after changing active file</li>
+                    <li>GUI: Fix Cancel export button not cancelling export if currently paused</li>
+                    <li>GUI: Fix Audio sometimes getting muted when switching/opening new files</li>
+                </ul>
+            </description>
+        </release>
+        <release date="2025-12-08" version="0.9.1">
+            <description>
+                <p>Features:</p>
+                <ul>
+                    <li>GUI: Add toggle to enable/disable FP16 precision (was only available via CLI previously). On some hardware FP16 can be slower so you might to disable it.</li>
+                    <li>GUI: Keep progress bar visible in single file export view after export job completed as is done in multi-file view</li>
+                    <li>CLI+GUI: Enable multithreaded video decoding for potentially higher processing speed</li>
+                </ul>
+                <p>Fixes:</p>
+                <ul>
+                    <li>CLI+GUI: Fix high-CPU load on certain system. This change should bring CPU back to pre v0.9.0 levels while keeping the speed increase.</li>
+                    <li>GUI: Fix Seek Preview still showing frames of old file after new file was selected</li>
+                    <li>GUI: Fix crash on Windows on systems were CUDA SDK was installed system-wide</li>
+                </ul>
+            </description>
+        </release>
+        <release date="2025-11-30" version="0.9.0">
+            <description>
+                <p>Features:</p>
+                <ul>
+                    <li>CLI+GUI: Optimized performance of restoration pipeline. Depending on your hardware and specific video content you could see faster processing speed from anywhere between 1x (no change) up to 1.5x compared to previous version v0.8.2.</li>
+                    <li>CLI+GUI: New Translations. This Release is available in Chinese (Simplified), Chinese (Traditional), Dutch, Spanish and Japanese</li>
+                    <li>GUI(Export): Post-export actions: Automatically shutdown your system or run a custom command or script after all exports have finished (Flatpak users might want to read tips in the README)</li>
+                    <li>GUI(Watch): Added seek previews, showing video frames when hovering over the timeline</li>
+                    <li>GUI(Export): Added setting to overwrite default location of temporary directory used for storing files while export is in-progress</li>
+                    <li>docs: Simplified build instructions (aka developer installation) on Windows</li>
+                </ul>
+                <p>Fixes:</p>
+                <ul>
+                    <li>CLI+GUI(Export): Fixed common crash on files with incorrect timestamps (Error: Application provided invalid, non monotonically increasing dts to muxer in stream 0)</li>
+                    <li>GUI(Watch): Fixed opening .ts files in Watch mode on Windows</li>
+                    <li>GUI: Fixed lada.exe process not ending after closing the Window, locking the restored file</li>
+                </ul>
+                <p>Known problems:</p>
+                <ul>
+                    <li>The new optimized restoration pipeline seems to cause increased CPU usage on some systems. See issue #140</li>
+                </ul>
+            </description>
+        </release>
+        <release date="2025-10-23" version="0.8.2">
+            <description>
+                <p>Features:</p>
+                <ul>
+                    <li>GUI+CLI: Set up translation project at Codeberg Translate. This release comes with a full Simplified Chinese translation!</li>
+                    <li>GUI(Export): Add buttons to pause/resume and cancel</li>
+                    <li>GUI(Export): Show processed and (estimated) remaining processing time as well as speed information. This was only available in CLI up until now</li>
+                    <li>I: Improve showing progress information matching what is shown in GUI now. This should give a more useful speed and remaining time estimate compared to what we had before</li>
+                    <li>GUI(Export): Show error message and error state when restoration fails. This was only available in CLI up until now</li>
+                    <li>GUI(Export): Add a button to remove an item from the list of files</li>
+                    <li>CLI: Support single file --input and directory --output combination</li>
+                    <li>GUI(Watch): Resize window based on video resolution/ratio to avoid having to show padding/borders if window ratio doesn't match video ratio</li>
+                </ul>
+                <p>Fixes:</p>
+                <ul>
+                    <li>GUI+CLI: Fix opening files with non UTF-8 encoded metadata</li>
+                    <li>GUI(Watch): Fix opening files located on a network drive in Watch mode on Windows</li>
+                    <li>GUI+CLI: Fix opening files where frame rate couldn't be determined resulting in ZeroDivisionError</li>
+                    <li>GUI(Export): Prevent opening multiple file dialogs</li>
+                    <li>GUI: Fix shared settings of export and watch sidebars not being synced when changed</li>
+                    <li>GUI(Export): Fix Button to open restored file opening wrong location if restore directory was changed while being queued</li>
+                    <li>GUI(Export): Fix Button to open restored file not opening file if export directory was changed after file was added</li>
+                    <li>GUI: Fix factory reset not resetting detection model and file name pattern</li>
+                </ul>
+            </description>
+            <url>https://translate.codeberg.org/projects/lada/lada/</url>
+        </release>
+        <release date="2025-10-06" version="0.8.1">
+            <description>
+                <p>This Release is mostly about packaging improvements as this marks the first release for Windows.</p>
+                <p>Changes:</p>
+                <ul>
+                    <li>GUI: Drop files onto Export View or use Add button to add to restore queue</li>
+                    <li>GUI: Drop files onto Watch View or use Open button to play them</li>
+                    <li>packaging: Lada is now packaged for Windows</li>
+                </ul>
+            </description>
+        </release>
+        <release date="2025-10-02" version="0.8.0">
+            <description>
+                <p>Revamped the GUI so it can be used with multiple files enabling you to queue a batch of files for restoration. You can choose if you want the start the app in watch mode (watch restored video in realtime) or in export mode (restore one or multiple files in the background to watch later)</p>
+                <p>Similarly, the CLI now also accepts multiple files by passing a directory of files as input.</p>
+                <p>Other changes:</p>
+                <ul>
+                    <li>GUI: Toggle fullscreen mode by double-clicking the video</li>
+                    <li>GUI/CLI: Set file name pattern used to determine file names of output file(s)</li>
+                    <li>GUI: Fix occasional glitch in fullscreen mode where screen became full black (or white on light theme)</li>
+                    <li>GUI: Set custom FFmpeg encoder options. Previously this was only available in CLI</li>
+                    <li>GUI: New setting to choose a default output directory. Use it if you don't want to see the File/Folder dialog when clicking Restore</li>
+                    <li>GUI: Fixed crash when opening files containing audio with samplerate other than 48 kHz. This probably only affected Windows users</li>
+                    <li>CLI: Removed --preserve-relative-scale. --output now is optional. Added --list-devices</li>
+                </ul>
+            </description>
+        </release>
+        <release date="2025-07-04" version="0.7.2">
+            <description>
+                <ul>
+                    <li>Turns out the new "accurate" model introduced in v0.7.1 wasn't as accurate as I hoped. The "fast" model is now the default model, if you need something more accurate try detection model v2 or v3.1-accurate. V2 probably works better in most scenarios.</li>
+                    <li>GUI: Added fullscreen option for Restoration Preview</li>
+                    <li>GUI: Added option to switch color scheme. System ist default (as it has been) but you can also explicitly set dark or light mode if you want or the system detection doesn't work</li>
+                    <li>Packaging:You can now use Nvidia hardware-accelerated video encoders also in Docker and Flatpak builds</li>
+                </ul>
+            </description>
+        </release>
+        <release date="2025-06-24" version="0.7.1">
+            <description>
+                <ul>
+                    <li>Updated mosaic detections models: "fast" and "accurate". "Fast" is pretty much the same model that was shipped in v0.7.0, the new and larger "accurate" model is somewhat slower but catches mosaics which the fast one doesn't detect (new default model).</li>
+                    <li>Detection model can now also be selected in the GUI sidebar</li>
+                    <li>Additional CLI options: --list-mosaic-detection-models, --list-mosaic-restoration-models</li>
+                    <li>Fix GUI becoming unresponsive when models are loaded for the first time (opening a file)</li>
+                    <li>Added build instructions for Windows</li>
+                </ul>
+            </description>
+        </release>
+        <release date="2025-03-31" version="0.7.0">
+            <description>
+                <ul>
+                    <li>New mosaic detection model: Much faster and more accurate</li>
+                    <li>Additional CLI options for video encoding settings: --custom-encoder-options, --list-codecs and --preset</li>
+                </ul>
+            </description>
+        </release>
+        <release date="2025-02-07" version="0.6.0">
+            <description>
+                <ul>
+                    <li>Mosaic restoration: Removes mosaics more consistently, especially on lower-quality videos</li>
+                    <li>Mosaic restoration: Slightly fewer artifacts on certain scenes due to training on a bigger dataset</li>
+                    <li>CLI: create output directory if it doesn't exist instead of crashing</li>
+                    <li>Removed bj-pov finetuned restoration model, no improvement compared to new generic model</li>
+                    <li>Mosaic restoration dataset creation script: more accuracy for the NSFW detection model</li>
+                </ul>
+            </description>
+        </release>
+        <release date="2025-01-24" version="0.5.0">
+            <description>
+                <p>The only user-visible change this time is the inclusion of DeepMosaics pretrained restoration model.</p>
+                <p>Otherwise, focused on improvements of dataset creation and reducing dependencies to make it easier to build and train new or enhance the existing mosaic restoration model.</p>
+                <p>Lada is now also available as a docker image on DockerHub (CLI only)</p>
+            </description>
+        </release>
+        <release date="2024-12-20" version="0.4.2">
+            <description>
+                <ul>
+                    <li>GUI: keep current playhead position after toggling preview or doing config adjustments</li>
+                    <li>GUI: fix preview/passthrough keyboard shortcut not working</li>
+                    <li>GUI: attempt to fix stuck playback after seeking very long files</li>
+                </ul>
+            </description>
+        </release>
+        <release date="2024-12-18" version="0.4.1">
+            <description>
+                <p>Fixes:</p>
+                <ul>
+                    <li>GUI: Fix occasional freeze when app gets closed</li>
+                    <li>GUI: Fix occasional freeze when seeking a video</li>
+                    <li>GUI: Fix audio/video getting out-of-sync</li>
+                    <li>Clean up temporary file after hitting an error or program is closed while export is running</li>
+                    <li>Fix always limiting queue sizes to 1 when setting up restoration pipeline</li>
+                    <li>GUI: Fix broken Passthrough (disabled preview) mode</li>
+                </ul>
+                <p>Changes:</p>
+                <ul>
+                    <li>GUI: Pause video if export button is clicked to select a file destination</li>
+                    <li>Support files where video stream has an offset to its audio stream</li>
+                </ul>
+            </description>
+        </release>
+        <release date="2024-12-15" version="0.4.0">
+            <description>
+                <p>Huge speed boost on high-performant hardware:</p>
+                <p>Parts of the restoration pipeline are now being run in parallel with buffering in between each step. This enhances utilization / reduces wait times.</p>
+                <p>Speed on my RTX 3090 on average doubled compared to v0.3.2. On the Laptop with a throttled RTX 3050 I didn't see a noticeable differance (was already fully utilized on v0.3.2)</p>
+                <p>You can find detailed speed performance numbers in the README.</p>
+            </description>
+        </release>
+        <release date="2024-12-11" version="0.3.2">
+            <description>
+                <p>GUI: fix memory leak when opening another file if we're already previewing a video</p>
+                <p>GUI: make sidebar scrollable if window height is not big enough to display everything</p>
+                <p>CLI: reformat and group CLI arguments in --help output</p>
+            </description>
+        </release>
+        <release date="2024-12-09" version="0.3.1">
+            <description>
+                <p>GUI: Move mosaic restoration preview processing to its own thread to avoid blocking the UI</p>
+                <p>GUI: Group common settings in sidebar</p>
+                <p>GUI: Fix crash when video file has no audio track</p>
+            </description>
+        </release>
+        <release date="2024-12-08" version="0.3.0">
+            <description>
+                <p>GUI: Add mute/unmute audio functionality</p>
+                <p>GUI: Implement keyboard shortcuts for common actions</p>
+                <p>GUI: Persist configuration so that user preferences survive a restart</p>
+                <p>GUI: Improve readability of config settings and tooltips</p>
+            </description>
+        </release>
+        <release date="2024-12-05" version="0.2.5">
+            <description>
+                <p>GUI: Adjustments and fixes for timeline playhead position updates</p>
+                <p>GUI: set initial folder and file name based on file input</p>
+            </description>
+        </release>
+        <release date="2024-12-04" version="0.2.4">
+            <description>
+                <p>Fix GUI crash when video width is not divisible by 4</p>
+                <p>Remove unused python dependencies and update dependencies to latest versions</p>
+            </description>
+        </release>
+        <release date="2024-12-02" version="0.2.3">
+            <description>
+                <p>Fix broken GUI export</p>
+                <p>Improve support for files using various audio formats</p>
+                <p>Fix handling overlapping detections that could result in flickering in certain scenes</p>
+            </description>
+        </release>
+        <release date="2024-11-09" version="0.2.2">
+            <description>
+                <p>Support light theme (use system default theme)</p>
+                <p>Show cursor timeline position</p>
+                <p>Support video files with variable frame rates</p>
+            </description>
+        </release>
+        <release date="2024-11-05" version="0.2.1">
+            <description>
+                <p>Small improvement to generic restoration model</p>
+            </description>
+        </release>
+        <release date="2024-11-02" version="0.2.0">
+            <description>
+                <p>New mosaic detection model</p>
+            </description>
+        </release>
+        <release date="2024-10-29" version="0.1.0">
+            <description>
+                <p>Initial release of this project including all trained models</p>
+            </description>
+        </release>
+    </releases>
+</component>

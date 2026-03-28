@@ -1,0 +1,30 @@
+/*
+ * SPDX-FileCopyrightText: Lada Authors
+ * SPDX-License-Identifier: AGPL-3.0
+ */
+
+#label_cursor_time {
+	background-color: color-mix(in srgb, var(--dialog-bg-color) 70%, transparent);
+}
+
+#drop_down_files > button:not(:checked):not(:hover) {
+  background: transparent;
+  box-shadow: none;
+}
+
+progressbar.finished > trough > progress {
+  background-color: var(--success-color);
+}
+
+progressbar.failed > trough > progress {
+  background-color: var(--error-color);
+}
+
+.fullscreen-video-player {
+	background-color: black;
+}
+
+.window-colored-background {
+  background-color: var(--window-bg-color);
+  color: var(--window-fg-color);
+}

@@ -1,0 +1,8 @@
+path: watermark_detection
+train: train/images
+val: val/images
+
+names:
+  0: logo
+  1: text
+nc: 2

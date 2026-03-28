@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!--
+SPDX-FileCopyrightText: Lada Authors
+SPDX-License-Identifier: AGPL-3.0
+-->
+
+<interface>
+    <requires lib="gtk" version="4.0"/>
+    <template class="HeaderbarFilesDropDown" parent="GtkDropDown">
+        <property name="name">drop_down_files</property>
+        <property name="enable-search">false</property>
+        <property name="search-match-mode">substring</property>
+    </template>
+</interface>

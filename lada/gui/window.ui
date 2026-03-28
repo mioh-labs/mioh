@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!--
+SPDX-FileCopyrightText: Lada Authors
+SPDX-License-Identifier: AGPL-3.0
+-->
+
+<interface>
+    <requires lib="gtk" version="4.0"/>
+    <requires lib="Adw" version="1.0"/>
+    <template class="MainWindow" parent="AdwApplicationWindow">
+        <property name="title">Lada</property>
+        <property name="default-width">900</property>
+        <property name="default-height">550</property>
+        <property name="resizable">true</property>
+        <child>
+            <object class='GtkShortcutController' id="shortcut_controller">
+                <property name='scope'>managed</property>
+            </object>
+        </child>
+        <child>
+        </child>
+        <child>
+            <object class="GtkStack" id="stack">
+                <property name="transition-type">crossfade</property>
+                <child>
+                    <object class="GtkStackPage">
+                        <property name="name">file-selection</property>
+                        <property name="child">
+                            <object class="FileSelectionView" id="file_selection_view">
+                                <property name="window-title" bind-source="MainWindow" bind-property="title"/>
+                            </object>
+                        </property>
+                    </object>
+                </child>
+                <child>
+                    <object class="GtkStackPage">
+                        <property name="name">main</property>
+                        <property name="child">
+                            <object class="AdwViewStack" id="view_stack">
+                                <child>
+                                    <object class="AdwViewStackPage">
+                                        <property name="name">watch</property>
+                                        <property name="title" translatable="true">Watch</property>
+                                        <property name="icon-name">playback-symbolic</property>
+                                        <property name="child">
+                                            <object class="WatchView" id="watch_view"/>
+                                        </property>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="AdwViewStackPage">
+                                        <property name="name">export</property>
+                                        <property name="title" translatable="true">Export</property>
+                                        <property name="icon-name">arrow-pointing-away-from-line-right-symbolic</property>
+                                        <property name="child">
+                                            <object class="ExportView" id="export_view"/>
+                                        </property>
+                                    </object>
+                                </child>
+                            </object>
+                        </property>
+                    </object>
+                </child>
+            </object>
+        </child>
+    </template>
+</interface>

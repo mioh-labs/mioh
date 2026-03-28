@@ -1,0 +1,22 @@
+--- old/lada/gui/preview/preview_view.ui	2025-10-02 00:00:00.0.0
++++ new/lada/gui/preview/preview_view.ui	2025-10-02 00:00:00.0.0
+@@ -91,7 +91,8 @@
+                                                                     </object>
+                                                                 </child>
+                                                                 <child type="overlay">
+-                                                                    <object class="AdwSpinner" id="spinner_overlay">
++                                                                    <object class="GtkSpinner" id="spinner_overlay">
++                                                                        <property name="spinning">True</property>
+                                                                         <property name="width-request">64</property>
+                                                                         <property name="height-request">64</property>
+                                                                         <property name="halign">center</property>
+@@ -180,7 +181,8 @@
+                                             <object class="GtkStackPage">
+                                                 <property name="name">spinner</property>
+                                                 <property name="child">
+-                                                    <object class="AdwSpinner">
++                                                    <object class="GtkSpinner">
++                                                        <property name="spinning">True</property>
+                                                         <property name="width-request">64</property>
+                                                         <property name="height-request">64</property>
+                                                         <property name="halign">center</property>
