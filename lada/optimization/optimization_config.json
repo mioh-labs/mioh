@@ -1,0 +1,231 @@
+{
+  "optimization_thresholds": {
+    "description": "apply threshold based on benchmark test results",
+    "version": "1.0",
+    "last_updated": "2025-11-01",
+    
+    "default_thresholds": {
+      "min_frame_pixels": 2073600,
+      "min_batch_size": 4,
+      "min_processing_complexity": 0.6,
+      "min_concurrent_tasks": 2,
+      "min_memory_usage_mb": 500,
+      "min_compute_time_sec": 0.5
+    },
+    
+    "scenario_specific_thresholds": {
+      "mosaic_restoration": {
+        "description": "mosaic restoration scenario - core feature, maximum optimization benefit",
+        "min_frame_pixels": 1920000,
+        "min_batch_size": 2,
+        "min_processing_complexity": 0.7,
+        "min_concurrent_tasks": 1,
+        "min_memory_usage_mb": 300,
+        "min_compute_time_sec": 0.3,
+        "force_enable_for_4k": true,
+        "force_enable_for_batch_gt_4": true
+      },
+      
+      "batch_export": {
+        "description": "batch export scenario - large-scale processing, significant optimization benefit",  
+        "min_frame_pixels": 1440000,
+        "min_batch_size": 8,
+        "min_processing_complexity": 0.5,
+        "min_concurrent_tasks": 2,
+        "min_memory_usage_mb": 800,
+        "min_compute_time_sec": 1.0
+      },
+      
+      "quality_enhancement": {
+        "description": "quality enhancement scenario - high processing complexity, moderate optimization benefit", 
+        "min_frame_pixels": 2073600,
+        "min_batch_size": 2,
+        "min_processing_complexity": 0.8,
+        "min_concurrent_tasks": 1,
+        "min_memory_usage_mb": 400,
+        "min_compute_time_sec": 0.4
+      },
+      
+      "preview": {
+        "description": "preview scenario - light load, disable optimization",
+        "min_frame_pixels": 999999999,
+        "min_batch_size": 999,
+        "min_processing_complexity": 1.0,
+        "min_concurrent_tasks": 999,
+        "min_memory_usage_mb": 999999,
+        "min_compute_time_sec": 999.0,
+        "force_disable": true
+      },
+      
+      "mosaic_detection": {
+        "description": "mosaic detection scenario - medium load, careful enablement",     
+        "min_frame_pixels": 3686400,
+        "min_batch_size": 8,
+        "min_processing_complexity": 0.6,
+        "min_concurrent_tasks": 4,
+        "min_memory_usage_mb": 600,
+        "min_compute_time_sec": 0.8
+      }
+    }
+  },
+  
+  "load_level_configs": {
+    "description": "define configuration parameters for different load levels",
+    
+    "light_load": {
+      "description": "light load - performance loss 23%, disable optimization",
+      "enable_optimization": false,
+      "expected_performance_change": -23.0,
+      "characteristics": {
+        "frame_pixels_max": 1440000,
+        "batch_size_max": 2,
+        "processing_complexity_max": 0.4,
+        "typical_scenarios": ["preview", "single_frame_view", "thumbnail_generation"]
+      }
+    },
+    
+    "medium_load": {
+      "description": "medium load - performance loss 23.2%, disable optimization",
+      "enable_optimization": false,
+      "expected_performance_change": -23.2,
+      "characteristics": {
+        "frame_pixels_range": [1440000, 2073600],
+        "batch_size_range": [2, 4],
+        "processing_complexity_range": [0.4, 0.6],
+        "typical_scenarios": ["small_batch_processing", "720p_restoration", "quick_preview"]
+      }
+    },
+    
+    "heavy_load": {
+      "description": "heavy load - performance gain 63.4%, enable optimization",
+      "enable_optimization": true,
+      "expected_performance_change": 63.4,
+      "characteristics": {
+        "frame_pixels_range": [2073600, 8294400],
+        "batch_size_range": [4, 8],
+        "processing_complexity_range": [0.6, 0.8],
+        "typical_scenarios": ["1080p_restoration", "medium_batch_processing", "quality_enhancement"]
+      },
+      "optimization_config": {
+        "enable_gpu_acceleration": true,
+        "enable_memory_optimization": true,
+        "enable_batch_processing": true,
+        "enable_predictive_scheduling": false,
+        "max_concurrent_tasks": 4,
+        "memory_pool_size_mb": 1024
+      }
+    },
+    
+    "stress_load": {
+      "description": "stress load - performance gain 51.3%, enable full optimization",
+      "enable_optimization": true,
+      "expected_performance_change": 51.3,
+      "characteristics": {
+        "frame_pixels_min": 8294400,
+        "batch_size_min": 8,
+        "processing_complexity_min": 0.8,
+        "typical_scenarios": ["4k_restoration", "large_batch_export", "professional_processing"]
+      },
+      "optimization_config": {
+        "enable_gpu_acceleration": true,
+        "enable_memory_optimization": true,
+        "enable_batch_processing": true,
+        "enable_predictive_scheduling": true,
+        "max_concurrent_tasks": 6,
+        "memory_pool_size_mb": 2048
+      }
+    }
+  },
+  
+  "benchmark_results": {
+    "description": "benchmark test results to validate the effectiveness of the configuration",
+    "test_date": "2025-11-01",
+    "test_environment": {
+      "device": "mps",
+      "system": "macOS",
+      "memory": "16GB",
+      "gpu": "Apple Silicon"
+    },
+    
+    "results": {
+      "light_load": {
+        "performance_gain_percent": -23.0,
+        "recommendation": "disable_optimization",
+        "confidence": 0.95
+      },
+      "medium_load": {
+        "performance_gain_percent": -23.2,
+        "recommendation": "disable_optimization", 
+        "confidence": 0.95
+      },
+      "heavy_load": {
+        "performance_gain_percent": 63.4,
+        "recommendation": "enable_optimization",
+        "confidence": 0.98
+      },
+      "stress_test": {
+        "performance_gain_percent": 51.3,
+        "recommendation": "enable_full_optimization",
+        "confidence": 0.97
+      }
+    },
+    
+    "overall_performance_gain": 17.1,
+    "optimization_effectiveness": "high_for_heavy_loads"
+  },
+  
+  "integration_settings": {
+    "description": "settings to integrate the optimization module into the LADA project",
+    
+    "auto_detection": {
+      "enable": true,
+      "detection_interval_ms": 100,
+      "history_window_size": 10,
+      "confidence_threshold": 0.7
+    },
+    
+    "fallback_behavior": {
+      "on_optimization_failure": "disable_and_continue",
+      "on_detection_failure": "use_conservative_thresholds",
+      "max_retry_attempts": 3
+    },
+    
+    "logging": {
+      "enable_performance_logging": true,
+      "log_level": "INFO",
+      "log_optimization_decisions": true,
+      "log_performance_metrics": true
+    },
+    
+    "gui_integration": {
+      "show_optimization_status": true,
+      "show_performance_metrics": false,
+      "allow_manual_override": true,
+      "optimization_indicator_position": "status_bar"
+    }
+  },
+  
+  "advanced_settings": {
+    "description": "advanced settings, modify with caution",
+    
+    "adaptive_thresholds": {
+      "enable": false,
+      "learning_rate": 0.1,
+      "adaptation_window": 100,
+      "min_samples_for_adaptation": 50
+    },
+    
+    "performance_monitoring": {
+      "enable_real_time_monitoring": true,
+      "monitoring_interval_ms": 500,
+      "performance_history_size": 1000,
+      "auto_adjust_on_performance_drop": false
+    },
+    
+    "experimental_features": {
+      "enable_predictive_optimization": false,
+      "enable_cross_session_learning": false,
+      "enable_hardware_specific_tuning": true
+    }
+  }
+}

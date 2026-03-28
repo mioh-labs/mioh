@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!--
+SPDX-FileCopyrightText: Lada Authors
+SPDX-License-Identifier: AGPL-3.0
+-->
+
+<interface>
+    <requires lib="gtk" version="4.0"/>
+    <requires lib="Adw" version="1.0"/>
+    <template class="FileSelectionView" parent="GtkWidget">
+        <property name="layout-manager">
+            <object class="GtkBinLayout">
+            </object>
+        </property>
+        <child>
+            <object class="AdwToolbarView">
+                <child type="top">
+                    <object class="AdwHeaderBar">
+                        <property name="title-widget">
+                            <object class="AdwWindowTitle">
+                                <property name="title" bind-source="FileSelectionView" bind-property="window-title"/>
+                            </object>
+                        </property>
+                        <child type="end">
+                            <object class="GtkMenuButton">
+                                <property name="primary">True</property>
+                                <property name="icon-name">open-menu-symbolic</property>
+                                <property name="tooltip-text">Main Menu</property>
+                                <property name="menu-model">primary_menu</property>
+                            </object>
+                        </child>
+                    </object>
+                </child>
+                <property name="content">
+                    <object class="AdwStatusPage" id="status_page">
+                        <property name="title" translatable="true">Restore pixelated adult videos</property>
+                        <property name="description" translatable="true">Drop one or more videos here</property>
+                        <child>
+                            <object class="GtkButton" id="button_open_file">
+                                <property name="label" translatable="true">Open Files…</property>
+                                <signal name="clicked" handler="button_open_file_callback"/>
+                                <property name="halign">center</property>
+                                <style>
+                                    <class name="suggested-action"/>
+                                    <class name="pill"/>
+                                </style>
+                            </object>
+                        </child>
+                    </object>
+                </property>
+            </object>
+        </child>
+
+    </template>
+
+    <menu id="primary_menu">
+        <section>
+            <item>
+                <attribute name="label" translatable="true">Keyboard Shortcuts</attribute>
+                <attribute name="action">app.shortcuts</attribute>
+            </item>
+            <item>
+                <attribute name="label" translatable="true">About Lada</attribute>
+                <attribute name="action">app.about</attribute>
+            </item>
+        </section>
+    </menu>
+</interface>

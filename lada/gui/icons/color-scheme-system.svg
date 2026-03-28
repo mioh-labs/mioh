@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+    <clipPath id="cut-off">
+        <rect x="0" y="0" width="16" height="32"/>
+    </clipPath>
+    <g transform="rotate(45 16 16)">
+        <circle cx="16" cy="16" r="14" fill="black" stroke="grey" stroke-width="2"/>
+        <circle cx="16" cy="16" r="14" fill="white" stroke="grey" stroke-width="2" clip-path="url(#cut-off)"/>
+    </g>
+</svg>

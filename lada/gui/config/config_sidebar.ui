@@ -1,0 +1,378 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!--
+SPDX-FileCopyrightText: Lada Authors
+SPDX-License-Identifier: AGPL-3.0
+-->
+
+<interface>
+    <requires lib="gtk" version="4.0"/>
+    <requires lib="Adw" version="1.0"/>
+
+    <template class="ConfigSidebar" parent="GtkBox">
+        <property name="orientation">vertical</property>
+        <child>
+            <object class="GtkScrolledWindow">
+                <property name="vexpand">True</property>
+                <child>
+                    <object class="AdwPreferencesPage" id="preferences_page">
+                        <property name="sensitive">true</property>
+                        <child>
+                            <object class="AdwPreferencesGroup">
+                                <property name="title" translatable="true">Mosaic Removal</property>
+                                <child>
+                                    <object class="AdwExpanderRow" id="expander_row_detection_models">
+                                        <property name="title" translatable="true">Detection model</property>
+                                        <property name="show-enable-switch">false</property>
+                                        <property name="expanded">false</property>
+                                    </object>
+                                </child>
+                               <child>
+                                    <object class="AdwExpanderRow" id="expander_row_restoration_models">
+                                        <property name="title" translatable="true">Restoration model</property>
+                                        <property name="show-enable-switch">false</property>
+                                        <property name="expanded">false</property>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="AdwSwitchRow" id="switch_row_detect_faces">
+                                        <property name="title" translatable="true">Detect face mosaics</property>
+                                        <property name="subtitle" translatable="true">Detect and ignore areas of pixelated faces. Can prevent restoration artifacts but may worsen detection of NSFW mosaics.</property>
+                                        <signal name="notify::active" handler="switch_row_detect_face_mosaics_callback"/>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="AdwSpinRow" id="spin_row_clip_max_duration">
+                                        <property name="title" translatable="true">Maximum clip duration</property>
+                                        <property name="subtitle" translatable="true">Maximum number of frames for restoration. Higher values improve temporal stability. Lower values reduce memory footprint.</property>
+                                        <signal name="notify::value"
+                                                handler="spin_row_clip_max_duration_selected_callback"/>
+                                        <property name="adjustment">
+                                            <object class="GtkAdjustment">
+                                                <property name="lower">20</property>
+                                                <property name="upper">400</property>
+                                                <property name="value">180</property>
+                                                <property name="step-increment">10</property>
+                                            </object>
+                                        </property>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="AdwComboRow" id="combo_row_gpu">
+                                        <property name="title" translatable="true">GPU</property>
+                                        <property name="subtitle" translatable="true">Selected GPU for model processing.</property>
+                                        <property name="model">
+                                            <object class="GtkStringList">
+                                                <items>
+                                                </items>
+                                            </object>
+                                        </property>
+                                        <signal name="notify::selected"
+                                                handler="combo_row_gpu_selected_callback"/>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="AdwSwitchRow" id="switch_row_fp16">
+                                        <property name="title" translatable="true">FP16 precision</property>
+                                        <property name="subtitle" translatable="true">Reduces VRAM usage and may increase speed on modern GPUs, with negligible quality difference.</property>
+                                        <signal name="notify::active" handler="switch_row_fp16_active_callback"/>
+                                    </object>
+                                </child>
+                            </object>
+                        </child>
+                        <child>
+                            <object class="AdwPreferencesGroup">
+                                <property name="title" translatable="true">Playback</property>
+                                <property name="visible" bind-source="ConfigSidebar" bind-property="show-playback-section"/>
+                                <child>
+                                    <object class="AdwSpinRow" id="spin_row_preview_buffer_duration">
+                                        <property name="title" translatable="true">Buffer duration</property>
+                                        <property name="subtitle" translatable="true">How much video is pre-loaded for playback, measured in seconds. If set to 0 this value will be chosen automatically.</property>
+                                        <signal name="notify::value"
+                                                handler="spin_row_preview_buffer_duration_selected_callback"/>
+                                        <property name="adjustment">
+                                            <object class="GtkAdjustment">
+                                                <property name="lower">0</property>
+                                                <property name="upper">30</property>
+                                                <property name="step-increment">2</property>
+                                            </object>
+                                        </property>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="AdwSwitchRow" id="switch_row_mute_audio">
+                                        <property name="title" translatable="true">Mute audio by default</property>
+                                        <property name="subtitle" translatable="true">When enabled, audio will be muted automatically when a new file is opened.</property>
+                                        <signal name="notify::active"
+                                                handler="switch_row_mute_audio_active_callback"/>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="AdwSwitchRow" id="switch_row_seek_preview">
+                                        <property name="title" translatable="true">Enable seek preview</property>
+                                        <property name="subtitle" translatable="true">Show a preview of the video frame when hovering over the timeline.</property>
+                                        <signal name="notify::active"
+                                                handler="switch_row_seek_preview_active_callback"/>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="AdwSpinRow" id="spin_row_subtitles_font_size">
+                                        <property name="title" translatable="true">Subtitle font size</property>
+                                        <signal name="notify::value"
+                                                handler="spin_row_subtitles_font_size_changed_callback"/>
+                                        <property name="adjustment">
+                                            <object class="GtkAdjustment">
+                                                <property name="lower">8</property>
+                                                <property name="upper">30</property>
+                                                <property name="value">16</property>
+                                                <property name="step-increment">1</property>
+                                            </object>
+                                        </property>
+                                    </object>
+                                </child>
+                            </object>
+                        </child>
+                        <child>
+                            <object class="AdwPreferencesGroup">
+                                <property name="title" translatable="true">Export</property>
+                                <property name="visible" bind-source="ConfigSidebar" bind-property="show-export-section"/>
+                                <child>
+                                    <object class="AdwExpanderRow" id="expander_row_encoding_presets">
+                                        <property name="title" translatable="true">Encoding Preset</property>
+                                        <property name="show-enable-switch">false</property>
+                                        <property name="expanded">false</property>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="AdwExpanderRow" id="expander_row_export_directory">
+                                        <property name="title" translatable="true">Output Directory</property>
+                                        <property name="tooltip-text" translatable="true">Directory where restored files will be saved</property>
+                                        <property name="show-enable-switch">false</property>
+                                        <property name="expanded">false</property>
+                                        <child>
+                                            <object class="AdwActionRow" id="action_row_export_directory_alwaysask">
+                                                <property name="title" translatable="true">Always ask</property>
+                                                <child type="prefix">
+                                                    <object class="GtkCheckButton" id="check_button_export_directory_alwaysask">
+                                                        <property name="active">true</property>
+                                                        <signal name="toggled" handler="check_button_export_directory_alwaysask_callback"/>
+                                                    </object>
+                                                </child>
+                                            </object>
+                                        </child>
+                                        <child>
+                                            <object class="AdwActionRow" id="action_row_export_directory">
+                                                <property name="title" translatable="true">Use this folder</property>
+                                                <property name="subtitle" translatable="true">Click the folder button to choose a default</property>
+                                                <child type="prefix">
+                                                    <object class="GtkCheckButton" id="check_button_export_directory_defaultdir">
+                                                        <property name="group">check_button_export_directory_alwaysask</property>
+                                                        <property name="active">false</property>
+                                                        <signal name="toggled" handler="check_button_export_directory_defaultdir_callback"/>
+                                                    </object>
+                                                </child>
+                                                <child type="suffix">
+                                                    <object class="GtkButton">
+                                                        <property name="icon-name">folder-open-symbolic</property>
+                                                        <property name="valign">3</property>
+                                                        <signal name="clicked" handler="toggle_button_export_directory_filepicker_callback"/>
+                                                    </object>
+                                                </child>
+                                            </object>
+                                        </child>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="AdwActionRow" id="action_row_temp_directory">
+                                        <property name="title" translatable="true">Temporary Directory</property>
+                                        <property name="tooltip-text" translatable="true">Directory for temporary video files during restoration process</property>
+                                        <child type="suffix">
+                                            <object class="GtkButton">
+                                                <property name="icon-name">folder-open-symbolic</property>
+                                                <property name="valign">3</property>
+                                                <signal name="clicked" handler="toggle_button_temp_directory_filepicker_callback"/>
+                                            </object>
+                                        </child>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="AdwEntryRow" id="entry_row_file_name_pattern">
+                                        <property name="title" translatable="true">File name pattern for restored files.&#xA;Must include placeholder &lt;span background=&quot;#D3D3D350&quot;&gt;&lt;tt&gt;{orig_file_name}&lt;/tt&gt;&lt;/span&gt;.</property>
+                                        <signal name="changed" handler="entry_row_file_name_pattern_changed_callback"/>
+                                        <!-- I could not find any other way to check if the row is focused except checking for focused css class. has-focus is never true -->
+                                        <signal name="notify::css-classes" handler="entry_row_file_name_pattern_focused_callback"/>
+                                    </object>
+                                </child>
+                                 <child>
+                                     <object class="AdwExpanderRow" id="expander_row_post_export_action">
+                                        <property name="title" translatable="true">Post-Export Action</property>
+                                        <property name="subtitle" translatable="true">Action to be run after all queued files have been restored.</property>
+                                        <property name="show-enable-switch">true</property>
+                                        <property name="enable-expansion">true</property>
+                                        <property name="expanded">false</property>
+                                        <signal name="notify::enable-expansion" handler="expander_row_post_export_action_enable_callback"/>
+                                         <child>
+                                             <object class="AdwActionRow">
+                                                 <property name="title" translatable="true">Shutdown system</property>
+                                                 <property name="subtitle" translatable="true">Automatically shutdown the system after export is completed.</property>
+                                                 <child type="prefix">
+                                                     <object class="GtkCheckButton" id="check_button_post_export_shutdown">
+                                                         <signal name="toggled" handler="check_button_post_export_shutdown_callback"/>
+                                                     </object>
+                                                 </child>
+                                             </object>
+                                         </child>
+                                         <child>
+                                             <object class="AdwActionRow">
+                                                 <property name="title" translatable="true">Execute custom command</property>
+                                                 <property name="subtitle" translatable="true">Run a custom shell command after export is completed.</property>
+                                                 <child type="prefix">
+                                                     <object class="GtkCheckButton" id="check_button_post_export_custom_command">
+                                                         <property name="group">check_button_post_export_shutdown</property>
+                                                         <signal name="toggled" handler="check_button_post_export_custom_command_callback"/>
+                                                     </object>
+                                                 </child>
+                                             </object>
+                                         </child>
+                                         <child>
+                                             <object class="AdwEntryRow" id="entry_row_post_export_custom_command">
+                                                 <property name="title" translatable="true">Custom command</property>
+                                                 <property name="visible">false</property>
+                                                 <signal name="changed" handler="entry_row_post_export_custom_command_changed_callback"/>
+                                             </object>
+                                         </child>
+                                     </object>
+                                 </child>
+                                <child>
+                                    <object class="AdwSwitchRow" id="switch_row_mp4_fast_start">
+                                        <property name="title" translatable="true">Enable .mp4 Fast Start</property>
+                                        <property name="subtitle" translatable="true">Allows playing the file while it's being written.</property>
+                                        <signal name="notify::active" handler="switch_row_mp4_fast_start_active_callback"/>
+                                    </object>
+                                </child>
+                             </object>
+                         </child>
+                         <child>
+                             <object class="AdwPreferencesGroup">
+                                 <property name="title" translatable="true">Troubleshooting</property>
+                                 <property name="visible" bind-source="ConfigSidebar" bind-property="show-playback-section"/>
+                                 <child>
+                                     <object class="AdwActionRow">
+                                         <property name="title" translatable="true">Show mosaic detections</property>
+                                         <property name="subtitle" translatable="true">Show detected mosaic areas. Useful to evaluate quality of detection model.</property>
+                                         <child type="prefix">
+                                             <object class="GtkCheckButton" id="check_button_show_mosaic_detections">
+                                                 <property name="active">true</property>
+                                                 <signal name="toggled" handler="check_button_show_mosaic_detections_callback"/>
+                                             </object>
+                                         </child>
+                                     </object>
+                                 </child>
+                             </object>
+                         </child>
+                        <child>
+                            <object class="AdwPreferencesGroup">
+                                <property name="title" translatable="true">UI</property>
+                                <child>
+                                    <object class="AdwComboRow">
+                                        <property name="title" translatable="true">Color Scheme</property>
+                                        <child>
+                                            <object class="GtkToggleButton" id="system_color_scheme_button">
+                                                <property name="sensitive">True</property>
+                                                <property name="tooltip-text" translatable="true">Follow System style</property>
+                                                <property name="icon-name">color-scheme-system</property>
+                                                <property name="valign">center</property>
+                                                <signal name="clicked" handler="toggle_button_system_color_scheme_callback"/>
+                                                <style>
+                                                    <class name="flat"/>
+                                                </style>
+                                            </object>
+                                        </child>
+                                        <child>
+                                            <object class="GtkToggleButton" id="light_color_scheme_button">
+                                                <property name="sensitive">True</property>
+                                                <property name="group">system_color_scheme_button</property>
+                                                <property name="tooltip-text" translatable="true">Light style</property>
+                                                <property name="icon-name">color-scheme-light</property>
+                                                <property name="valign">center</property>
+                                                <signal name="clicked" handler="toggle_button_light_color_scheme_callback"/>
+                                                <style>
+                                                    <class name="flat"/>
+                                                </style>
+                                            </object>
+                                        </child>
+                                        <child>
+                                            <object class="GtkToggleButton" id="dark_color_scheme_button">
+                                                <property name="sensitive">True</property>
+                                                <property name="group">system_color_scheme_button</property>
+                                                <property name="tooltip-text" translatable="true">Dark style</property>
+                                                <property name="icon-name">color-scheme-dark</property>
+                                                <property name="valign">center</property>
+                                                <signal name="clicked" handler="toggle_button_dark_color_scheme_callback"/>
+                                                <style>
+                                                    <class name="flat"/>
+                                                </style>
+                                            </object>
+                                        </child>
+                                    </object>
+                                </child>
+                                <child>
+                                    <object class="AdwActionRow">
+                                        <property name="title" translatable="true">Default View</property>
+                                        <property name="subtitle" translatable="true">View shown after opening files</property>
+                                        <child>
+                                            <object class="GtkToggleButton" id="toggle_button_initial_view_preview">
+                                                <property name="sensitive">True</property>
+                                                <property name="valign">center</property>
+                                                <property name="child">
+                                                    <object class="AdwButtonContent">
+                                                        <property name="icon-name">playback-symbolic</property>
+                                                        <property name="label" translatable="true">Watch</property>
+                                                    </object>
+                                                </property>
+                                                <signal name="clicked" handler="toggle_button_initial_view_watch_callback"/>
+                                                <style>
+                                                    <class name="flat"/>
+                                                </style>
+                                            </object>
+                                        </child>
+                                        <child>
+                                            <object class="GtkToggleButton" id="toggle_button_initial_view_export">
+                                                <property name="group">toggle_button_initial_view_preview</property>
+                                                <property name="valign">center</property>
+                                                <property name="child">
+                                                    <object class="AdwButtonContent">
+                                                        <property name="icon-name">arrow-pointing-away-from-line-right-symbolic</property>
+                                                        <property name="label" translatable="true">Export</property>
+                                                    </object>
+                                                </property>
+                                                <property name="sensitive">True</property>
+                                                <property name="active">True</property>
+                                                <signal name="clicked" handler="toggle_button_initial_view_export_callback"/>
+                                                <style>
+                                                    <class name="flat"/>
+                                                </style>
+                                            </object>
+                                        </child>
+                                    </object>
+                                </child>
+                            </object>
+                        </child>
+                    </object>
+                </child>
+            </object>
+        </child>
+        <child>
+            <object class="GtkActionBar">
+                <property name="revealed">true</property>
+                <child type="center">
+                    <object class="GtkButton">
+                        <property name="label" translatable="true">Reset to factory settings</property>
+                        <property name="sensitive">True</property>
+                        <signal name="clicked" handler="button_config_reset_callback"/>
+                    </object>
+                </child>
+            </object>
+        </child>
+    </template>
+</interface>

@@ -1,0 +1,7 @@
+path: mosaic_detection
+train: train/images
+val: val/images
+
+names:
+  0: 'mosaic_nsfw'
+  1: 'mosaic_sfw_head'
