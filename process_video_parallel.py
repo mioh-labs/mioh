@@ -37,7 +37,7 @@ import atexit
 import multiprocessing as mp
 from multiprocessing import resource_tracker
 import warnings
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import threading
 import psutil
 from dataclasses import dataclass
@@ -243,6 +243,18 @@ def process_segment_worker(segment_info, config: WorkerRuntimeConfig):
         }
     finally:
         aggressive_memory_cleanup_for_device(config.device)
+
+
+def create_parallel_executor(args):
+    if args.executor == "thread":
+        return ThreadPoolExecutor(max_workers=args.parallel_workers)
+
+    mp_context = mp.get_context("spawn")
+    return ProcessPoolExecutor(
+        max_workers=args.parallel_workers,
+        mp_context=mp_context,
+        max_tasks_per_child=1,
+    )
 
 # ===== グローバルクリーンアップ (MPS v0.11.0最適化版) =====
 def cleanup_resources():
@@ -1333,12 +1345,7 @@ class ParallelVideoProcessor:
             # 未処理のセグメントのみを並列処理
             if tasks:
                 worker_config = self._build_worker_runtime_config()
-                mp_context = mp.get_context("spawn")
-                executor = ProcessPoolExecutor(
-                    max_workers=self.args.parallel_workers,
-                    mp_context=mp_context,
-                    max_tasks_per_child=1,
-                )
+                executor = create_parallel_executor(self.args)
                 _set_active_executor(executor)
                 try:
                     # 全タスクを投入
@@ -1654,8 +1661,7 @@ def process_batch(input_dir, output_dir, temp_dir_base, args):
     print(f"スキップ: {skip_count}個")
     print(f"エラー: {error_count}個")
 
-# ===== メイン関数 =====
-def main():
+def build_arg_parser():
     parser = argparse.ArgumentParser(
         description='LADA動画処理スクリプト - 真の並列処理版 🚀',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1739,6 +1745,8 @@ def main():
     # 並列処理設定
     parser.add_argument('--parallel-workers', type=int, default=1,
                         help='並列処理数（デフォルト: 1、推奨: 8GB=1, 16GB=2, 32GB=4）')
+    parser.add_argument('--executor', choices=['process', 'thread'], default='process',
+                        help='セグメント処理の並列実行方式（process=プロセス分離、thread=旧ThreadPool方式。デフォルト: process）')
     
     # セグメント設定
     parser.add_argument('--segment-duration', type=int, default=60, 
@@ -1820,7 +1828,13 @@ def main():
     
     # その他
     parser.add_argument('--overwrite', action='store_true')
-    
+
+    return parser
+
+
+# ===== メイン関数 =====
+def main():
+    parser = build_arg_parser()
     args = parser.parse_args()
     
     # 並列数の検証
