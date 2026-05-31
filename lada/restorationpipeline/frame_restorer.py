@@ -17,7 +17,7 @@ from lada.utils.threading_utils import EOF_MARKER, STOP_MARKER, StopMarker, EofM
     ErrorMarker
 from lada.utils import image_utils, video_utils, threading_utils, mask_utils, ImageTensor, Image
 from lada.utils import visualization_utils
-from lada.utils.mps_utils import get_mps_available_memory_gb, get_mps_memory_stats
+from lada.utils.mps_utils import get_mps_available_memory_gb, get_mps_memory_stats, serialized_mps_execution
 from lada.restorationpipeline.mosaic_detector import MosaicDetector
 from lada.restorationpipeline.mosaic_detector import Clip
 from lada.models.yolo.yolo11_segmentation_model import Yolo11SegmentationModel
@@ -459,7 +459,11 @@ class FrameRestorer:
                     if queue_marker is STOP_MARKER:
                         break
 
-                    self._restore_frame(frame, frame_num, clip_buffer)
+                    if self.device.type == 'mps':
+                        with serialized_mps_execution():
+                            self._restore_frame(frame, frame_num, clip_buffer)
+                    else:
+                        self._restore_frame(frame, frame_num, clip_buffer)
                     self.frame_restoration_queue.put((frame, frame_pts))
                     if self.stop_requested:
                         logger.debug("frame restoration worker: frame_restoration_queue producer unblocked")

@@ -844,6 +844,28 @@ def split_video(input_video, output_dir, segment_duration=60, force_split=False,
     
     return segments
 
+
+def is_valid_processed_segment(path: Path) -> bool:
+    return path.exists() and path.stat().st_size > 100 * 1024
+
+
+def has_pending_segment_work(temp_dir: Path) -> bool:
+    """
+    Return True when reusable split segments exist but matching processed files
+    are missing or incomplete.
+    """
+    temp_dir = Path(temp_dir)
+    segments = sorted((temp_dir / "segments").glob("segment_*.mp4"))
+    if not segments:
+        return False
+
+    processed_dir = temp_dir / "processed"
+    for i, _segment in enumerate(segments):
+        if not is_valid_processed_segment(processed_dir / f"processed_{i:03d}.mp4"):
+            return True
+    return False
+
+
 def merge_videos(segment_paths, output_path, encoder='copy'):
     """複数の動画を結合（音声も含む）"""
     print(f"\n動画を結合中... ({len(segment_paths)}個のセグメント)")
@@ -1312,7 +1334,7 @@ class ParallelVideoProcessor:
                 # 既存の処理済みセグメントをチェック
                 if output_path_seg.exists() and not self.args.overwrite:
                     # ファイルサイズをチェック（100KB以上なら有効）
-                    if output_path_seg.stat().st_size > 100 * 1024:
+                    if is_valid_processed_segment(output_path_seg):
                         existing_processed[i] = output_path_seg
                         self.update_stats('skipped')
                     else:
@@ -1617,15 +1639,17 @@ def process_batch(input_dir, output_dir, temp_dir_base, args):
         
         output_file = output_dir / f"{video_file.stem}-UC{video_file.suffix}"
         
-        # 既に処理済みか確認
+        temp_dir = Path(temp_dir_base) / video_file.stem
+
+        # 既に処理済みか確認。ただし分割済みセグメントに未処理がある場合は再開を優先する。
         if output_file.exists() and not args.overwrite:
             # 簡易チェック（ファイルサイズが100KB以上）
-            if output_file.stat().st_size > 100 * 1024:
+            if output_file.stat().st_size > 100 * 1024 and not has_pending_segment_work(temp_dir):
                 print(f"スキップ: 既に存在します")
                 skip_count += 1
                 continue
-        
-        temp_dir = Path(temp_dir_base) / video_file.stem
+            if has_pending_segment_work(temp_dir):
+                print("再開: segments に未処理セグメントがあるため処理します")
         
         try:
             processor = ParallelVideoProcessor(args)
