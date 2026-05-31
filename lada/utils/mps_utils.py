@@ -11,10 +11,28 @@ including fallback mechanisms for unsupported operations.
 import torch
 import torch.nn.functional as F
 import logging
+import threading
+from contextlib import contextmanager
 from functools import wraps
 import psutil
 
 logger = logging.getLogger(__name__)
+
+_MPS_EXECUTION_LOCK = threading.RLock()
+
+
+@contextmanager
+def serialized_mps_execution():
+    """
+    Serialize MPS work inside a process.
+
+    PyTorch MPS/Metal can abort when multiple Python threads submit MPS work
+    concurrently from the same process. LADA's pipeline uses separate detection,
+    restoration and frame-composition threads, so keep MPS command submission
+    single-file while still allowing the outer segment process pool.
+    """
+    with _MPS_EXECUTION_LOCK:
+        yield
 
 
 def get_mps_memory_stats():

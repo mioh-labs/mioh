@@ -13,6 +13,7 @@ from ultralytics.utils import nms, ops
 from ultralytics.utils.checks import check_imgsz
 
 from lada.utils import ImageTensor
+from lada.utils.mps_utils import serialized_mps_execution
 from lada.utils.torch_letterbox import PyTorchLetterBox
 from lada.utils.ultralytics_utils import UltralyticsResults
 
@@ -73,14 +74,20 @@ class Yolo11SegmentationModel:
     def inference_and_postprocess(self, imgs: torch.Tensor, orig_imgs: list[ImageTensor]) -> list[UltralyticsResults]:
 
         with torch.inference_mode():
-            input = imgs.to(device=self.device).to(dtype=self.dtype).div_(255.0)
-            # Ensure tensor is contiguous for MPS compatibility
-            if input.device.type == 'mps' and not input.is_contiguous():
-                old_input = input  # メモリリーク対策: 元のテンソルを保存
-                input = input.contiguous()
-                del old_input  # 明示的に削除してメモリリーク防止
-            preds = self.inference(input)
-            return self.postprocess(preds, input, orig_imgs)
+            if self.device.type == 'mps':
+                with serialized_mps_execution():
+                    return self._inference_and_postprocess_unlocked(imgs, orig_imgs)
+            return self._inference_and_postprocess_unlocked(imgs, orig_imgs)
+
+    def _inference_and_postprocess_unlocked(self, imgs: torch.Tensor, orig_imgs: list[ImageTensor]) -> list[UltralyticsResults]:
+        input = imgs.to(device=self.device).to(dtype=self.dtype).div_(255.0)
+        # Ensure tensor is contiguous for MPS compatibility
+        if input.device.type == 'mps' and not input.is_contiguous():
+            old_input = input  # メモリリーク対策: 元のテンソルを保存
+            input = input.contiguous()
+            del old_input  # 明示的に削除してメモリリーク防止
+        preds = self.inference(input)
+        return self.postprocess(preds, input, orig_imgs)
 
     def postprocess(self, preds, img, orig_imgs: list[ImageTensor]) -> list[Results]:
         protos = preds[0][-1]
