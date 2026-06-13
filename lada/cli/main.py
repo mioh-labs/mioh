@@ -8,6 +8,22 @@ import sys
 import tempfile
 import textwrap
 
+# When frozen (PyInstaller) on macOS, multiprocessing spawn re-executes this
+# executable with -B -S -I -c "from multiprocessing.resource_tracker import main; main(...)".
+# PyTorch triggers this. Stdlib freeze_support() only handles worker processes
+# (argv[1] == '--multiprocessing-fork'); it does not handle the resource_tracker
+# process (which uses -c). See: Lib/multiprocessing/spawn.py `is_forking()` and
+# `freeze_support()` in CPython.
+# (https://github.com/python/cpython/blob/629a363ddd2889f023d5925506e61f5b6647accd/Lib/multiprocessing/spawn.py#L57-L80).
+# Run the -c code and exit so argparse never sees it.
+if getattr(sys, "frozen", False) and sys.platform == "darwin":
+    for i in range(1, len(sys.argv)):
+        if sys.argv[i] == "-c" and i + 1 < len(sys.argv):
+            exec(compile(sys.argv[i + 1], "<string>", "exec"))
+            sys.exit(0)
+        if sys.argv[i] == "-c":
+            break
+
 try:
     import torch
 except ModuleNotFoundError:
@@ -167,9 +183,11 @@ def main():
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         print(_("GPU {device} selected but CUDA is not available").format(device=args.device))
         sys.exit(1)
-    if args.device == "mps" and not torch.backends.mps.is_available():
-        print(_("GPU {device} selected but MPS is not available").format(device=args.device))
-        sys.exit(1)
+    if args.device == "mps":
+        from lada.utils.os_utils import has_mps
+        if not has_mps():
+            print(_("MPS selected but MPS (Metal) is not available"))
+            sys.exit(1)
     if args.mps_memory_fraction is not None and not (0.0 < args.mps_memory_fraction <= 1.0):
         print(_("Invalid MPS memory fraction. Value must be within (0, 1]."))
         sys.exit(1)

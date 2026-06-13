@@ -53,28 +53,38 @@ def flow_warp(x,
     grid_flow_x = 2.0 * grid_flow[:, :, :, 0] / max(w - 1, 1) - 1.0
     grid_flow_y = 2.0 * grid_flow[:, :, :, 1] / max(h - 1, 1) - 1.0
     grid_flow = torch.stack((grid_flow_x, grid_flow_y), dim=3)
-    
-    # MPS対応: 型変換とメモリ連続性の確保
+
     if x.device.type == 'mps':
-        # テンソル妥当性チェック
+        grid_flow = grid_flow.to(dtype=x.dtype, device=x.device)
+
+        # MPS: skip grid_sample when numel==0 to avoid empty Placeholder
+        # (PR #148133 https://github.com/pytorch/pytorch/pull/148133);
+        # applies to all padding modes.
+        if x.numel() == 0 or grid_flow.numel() == 0:
+            return torch.empty(x.shape, device=x.device, dtype=x.dtype)
+
         if not check_mps_tensor_validity(x, "input", silent=True):
-            if x.numel() == 0:
-                return torch.zeros_like(x)
             return torch.zeros_like(x)
-        
         if not check_mps_tensor_validity(grid_flow, "grid_flow", silent=True):
             return torch.zeros_like(x)
-        
-        # 型変換をMPS対応に
-        grid_flow = grid_flow.to(dtype=x.dtype, device=x.device)
-        
-        # メモリ連続性を確保
+
         x = ensure_mps_tensor_contiguous(x)
         grid_flow = ensure_mps_tensor_contiguous(grid_flow)
+
+        # MPS: border unsupported. Clamp grid to [-1,1] + zeros
+        # (issue #125098 https://github.com/pytorch/pytorch/issues/125098#issuecomment-2270384282)
+        # to have the same effect as `border`.
+        if padding_mode == 'border':
+            grid_flow = grid_flow.clamp(-1.0, 1.0)
+            return F.grid_sample(
+                x,
+                grid_flow,
+                mode=interpolation,
+                padding_mode='zeros',
+                align_corners=align_corners)
     else:
         grid_flow = grid_flow.type(x.type())
-    
-    # safe_mps_grid_sample を使用（MPS対応）
+
     output = safe_mps_grid_sample(
         x,
         grid_flow,
