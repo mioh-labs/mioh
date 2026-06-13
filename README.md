@@ -47,6 +47,9 @@ For more information about additional options, use the `--help` argument.
 
 ## Restoration options
 
+To run the app effectively, you'll need a GPU and some patience. A graphics card with at least 4-6GB of VRAM should work well for most cases.
+If your GPU isn't fast enough for real-time playback, you can export the video and watch it later in your preferred media player (this is supported in both the GUI and CLI).
+
 Lada utilizes specialized models for the two main steps of the processing pipeline: Detection and Restoration. You can choose different models for each task.
 
 **Mosaic Restoration Models:**
@@ -249,7 +252,7 @@ These steps describe installing the GUI/CLI on macOS and enabling MPS accelerati
 
 ## Build
 
-If you want to start hacking on this project you'll need to install the app from source. Check out the detailed installation guides for [Linux](docs/linux_install.md), [macOS](docs/macos_install.md) and [Windows](docs/windows_install.md).
+If you want to start hacking on this project you'll need to install the app from source. Check out the detailed installation guides for [Linux](docs/linux_install.md), [macOS](docs/macOS_install.md), and [Windows](docs/windows_install.md).
 
 ## Training and dataset creation
 
