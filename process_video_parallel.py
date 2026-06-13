@@ -47,6 +47,7 @@ from lada.utils.mps_utils import (
     get_mps_available_memory_gb,
     get_mps_memory_stats,
 )
+from lada.utils.video_utils import get_default_preset_name
 
 os.environ['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] = 'YES'
 
@@ -146,6 +147,22 @@ def build_lada_cli_command(config: WorkerRuntimeConfig, input_video: Path, outpu
         cmd.extend(['--temporary-directory', str(config.lada_temp_dir)])
 
     return cmd
+
+
+def get_lada_encoding_preset(args, optimal_encoder_options: str | None) -> str | None:
+    """
+    Mirror lada-cli's Apple VideoToolbox default when this wrapper has no
+    custom encoding settings to pass through.
+    """
+    if getattr(args, 'encoding_preset', None):
+        return args.encoding_preset
+    if getattr(args, 'encoder', None) or getattr(args, 'encoder_options', None) or optimal_encoder_options:
+        return None
+    if getattr(args, 'device', None) == 'mps':
+        preset = get_default_preset_name()
+        if 'apple' in preset or 'videotoolbox' in preset:
+            return preset
+    return None
 
 
 def aggressive_memory_cleanup_for_device(device: str):
@@ -983,7 +1000,7 @@ class ParallelVideoProcessor:
             fp16=self.args.fp16,
             mps_memory_fraction=get_effective_mps_memory_fraction(self.args),
             log_mps_memory=self.args.log_mps_memory,
-            encoding_preset=self.args.encoding_preset,
+            encoding_preset=get_lada_encoding_preset(self.args, self.optimal_encoder_options),
             encoder=self.args.encoder,
             encoder_options=self.args.encoder_options,
             optimal_encoder_options=self.optimal_encoder_options,
@@ -1119,9 +1136,10 @@ class ParallelVideoProcessor:
                 cmd.extend(['--mps-memory-fraction', str(effective_mps_fraction)])
         
         # エンコーディング設定（解像度最適化）
-        if self.args.encoding_preset:
+        lada_encoding_preset = get_lada_encoding_preset(self.args, self.optimal_encoder_options)
+        if lada_encoding_preset:
             # プリセット指定時はそのまま使用
-            cmd.extend(['--encoding-preset', self.args.encoding_preset])
+            cmd.extend(['--encoding-preset', lada_encoding_preset])
         elif self.args.encoder:
             # エンコーダー指定時
             cmd.extend(['--encoder', self.args.encoder])
