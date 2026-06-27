@@ -5,7 +5,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from experiments.mlx_dcnv2.backbone import residual_blocks_with_input_conv_forward
+from experiments.mlx_dcnv2.backbone import (
+    prepare_backbone_tensors_nhwc,
+    residual_blocks_with_input_conv_forward,
+    residual_blocks_with_input_conv_forward_nhwc,
+)
 
 
 class MLXBackboneTests(unittest.TestCase):
@@ -29,6 +33,31 @@ class MLXBackboneTests(unittest.TestCase):
                 num_blocks=num_blocks,
             )
         )
+
+        np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=5e-4)
+
+    def test_residual_blocks_nhwc_prepared_matches_pytorch(self):
+        rng = np.random.default_rng(456)
+        in_channels = 6
+        mid_channels = 4
+        num_blocks = 2
+        x = rng.normal(size=(1, in_channels, 7, 8)).astype(np.float32)
+        tensors = _random_backbone_tensors(rng, in_channels, mid_channels, num_blocks)
+
+        expected = _torch_backbone_forward(
+            torch.from_numpy(x),
+            {name: torch.from_numpy(value) for name, value in tensors.items()},
+            num_blocks,
+        ).numpy()
+        mlx_tensors = {name: mx.array(value) for name, value in tensors.items()}
+        actual_nhwc = np.array(
+            residual_blocks_with_input_conv_forward_nhwc(
+                mx.array(np.transpose(x, (0, 2, 3, 1))),
+                prepare_backbone_tensors_nhwc(mlx_tensors),
+                num_blocks=num_blocks,
+            )
+        )
+        actual = np.transpose(actual_nhwc, (0, 3, 1, 2))
 
         np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=5e-4)
 
