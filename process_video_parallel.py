@@ -39,6 +39,7 @@ from multiprocessing import resource_tracker
 import warnings
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import threading
+_spawn_semaphore = threading.Semaphore(1)
 import psutil
 from dataclasses import dataclass
 
@@ -80,6 +81,11 @@ class WorkerRuntimeConfig:
     detect_face_mosaics: bool
     lada_temp_dir: str | None
     overwrite: bool
+    mosaic_detection_empty_lookahead: int = 0
+    restore_sharpen_strength: float = 0.0
+    restore_detail_boost: float = 0.0
+    restore_blend_feather: float = 1.0
+    restore_texture_mix: float = 0.0
 
 
 def build_worker_env(config: WorkerRuntimeConfig) -> dict[str, str]:
@@ -140,7 +146,16 @@ def build_lada_cli_command(config: WorkerRuntimeConfig, input_video: Path, outpu
 
     cmd.extend(['--mosaic-restoration-model', config.mosaic_restoration_model])
     cmd.extend(['--max-clip-length', str(config.max_clip_length)])
+    if config.restore_sharpen_strength > 0:
+        cmd.extend(['--restore-sharpen-strength', str(config.restore_sharpen_strength)])
+    if config.restore_detail_boost > 0:
+        cmd.extend(['--restore-detail-boost', str(config.restore_detail_boost)])
+    cmd.extend(['--restore-blend-feather', str(config.restore_blend_feather)])
+    if config.restore_texture_mix > 0:
+        cmd.extend(['--restore-texture-mix', str(config.restore_texture_mix)])
     cmd.extend(['--mosaic-detection-model', config.mosaic_detection_model])
+    if config.mosaic_detection_empty_lookahead > 0:
+        cmd.extend(['--mosaic-detection-empty-lookahead', str(config.mosaic_detection_empty_lookahead)])
     cmd.append('--detect-face-mosaics' if config.detect_face_mosaics else '--no-detect-face-mosaics')
 
     if config.lada_temp_dir:
@@ -165,6 +180,29 @@ def get_lada_encoding_preset(args, optimal_encoder_options: str | None) -> str |
     return None
 
 
+def build_lada_cli_list_command(args) -> list[str] | None:
+    list_flags = [
+        "list_devices",
+        "list_encoding_presets",
+        "list_encoders",
+        "list_mosaic_restoration_models",
+        "list_mosaic_detection_models",
+    ]
+    for attr in list_flags:
+        if getattr(args, attr, False):
+            return ["lada-cli", f"--{attr.replace('_', '-')}"]
+    if getattr(args, "list_encoder_options", None):
+        return ["lada-cli", "--list-encoder-options", str(args.list_encoder_options)]
+    return None
+
+
+def run_lada_cli_list_command(args) -> int | None:
+    cmd = build_lada_cli_list_command(args)
+    if cmd is None:
+        return None
+    return subprocess.run(cmd).returncode
+
+
 def aggressive_memory_cleanup_for_device(device: str):
     try:
         import torch
@@ -184,6 +222,9 @@ def process_segment_worker(segment_info, config: WorkerRuntimeConfig):
     idx, input_path, output_path = segment_info
     input_path = Path(input_path)
     output_path = Path(output_path)
+
+    with _spawn_semaphore:
+        time.sleep(2.0)
 
     if output_path.exists() and not config.overwrite:
         return {
@@ -1011,6 +1052,11 @@ class ParallelVideoProcessor:
             detect_face_mosaics=self.args.detect_face_mosaics,
             lada_temp_dir=str(self.args.lada_temp_dir) if getattr(self.args, 'lada_temp_dir', None) else None,
             overwrite=self.args.overwrite,
+            mosaic_detection_empty_lookahead=self.args.mosaic_detection_empty_lookahead,
+            restore_sharpen_strength=self.args.restore_sharpen_strength,
+            restore_detail_boost=self.args.restore_detail_boost,
+            restore_blend_feather=self.args.restore_blend_feather,
+            restore_texture_mix=self.args.restore_texture_mix,
         )
     
     def process_segment(self, segment_info):
@@ -1169,7 +1215,16 @@ class ParallelVideoProcessor:
         
         cmd.extend(['--mosaic-restoration-model', self.args.mosaic_restoration_model])
         cmd.extend(['--max-clip-length', str(self.args.max_clip_length)])
+        if self.args.restore_sharpen_strength > 0:
+            cmd.extend(['--restore-sharpen-strength', str(self.args.restore_sharpen_strength)])
+        if self.args.restore_detail_boost > 0:
+            cmd.extend(['--restore-detail-boost', str(self.args.restore_detail_boost)])
+        cmd.extend(['--restore-blend-feather', str(self.args.restore_blend_feather)])
+        if self.args.restore_texture_mix > 0:
+            cmd.extend(['--restore-texture-mix', str(self.args.restore_texture_mix)])
         cmd.extend(['--mosaic-detection-model', self.args.mosaic_detection_model])
+        if self.args.mosaic_detection_empty_lookahead > 0:
+            cmd.extend(['--mosaic-detection-empty-lookahead', str(self.args.mosaic_detection_empty_lookahead)])
         
         # 顔モザイク検出の設定
         if self.args.detect_face_mosaics:
@@ -1778,8 +1833,8 @@ def build_arg_parser():
     )
     
     # 基本設定
-    parser.add_argument('--input', required=True, help='入力動画ファイルまたはディレクトリ')
-    parser.add_argument('--output', required=True, help='出力動画ファイルまたはディレクトリ')
+    parser.add_argument('--input', help='入力動画ファイルまたはディレクトリ')
+    parser.add_argument('--output', help='出力動画ファイルまたはディレクトリ')
     parser.add_argument('--temp-dir', default='/tmp', help='一時ディレクトリ')
     parser.add_argument('--ffmpeg-temp-dir', help='FFmpegが使用する一時ディレクトリ（未指定時は temp-dir 配下を自動使用）')
     parser.add_argument('--lada-temp-dir', help='lada-cli内部用一時ディレクトリ')
@@ -1828,8 +1883,14 @@ def build_arg_parser():
     
     # エンコーディング設定
     parser.add_argument('--encoding-preset', help='エンコーディングプリセット')
+    parser.add_argument('--list-encoding-presets', action='store_true',
+                        help='lada-cli のエンコーディングプリセット一覧を表示')
     parser.add_argument('--encoder', help='エンコーダー')
+    parser.add_argument('--list-encoders', action='store_true',
+                        help='lada-cli のエンコーダー一覧を表示')
     parser.add_argument('--encoder-options', help='エンコーダーオプション')
+    parser.add_argument('--list-encoder-options', metavar='ENCODER',
+                        help='指定エンコーダーの lada-cli オプション一覧を表示')
     parser.add_argument('--bitrate-multiplier', type=float, default=3.0,
                         help='ビットレート倍率（デフォルト: 3.0、範囲: 0.1〜10.0）')
     parser.add_argument('--quality', type=int, default=None,
@@ -1849,9 +1910,23 @@ def build_arg_parser():
                         help='自動最適化を無効化')
     
     # モザイク設定
+    parser.add_argument('--list-mosaic-restoration-models', action='store_true',
+                        help='lada-cli の復元モデル一覧を表示')
     parser.add_argument('--mosaic-restoration-model', default='basicvsrpp-v1.2')
     parser.add_argument('--max-clip-length', type=int, default=180)
+    parser.add_argument('--restore-sharpen-strength', type=float, default=0.0,
+                        help='復元ROIを合成前にunsharp maskでシャープ化する強度（0で無効、例: 0.3）')
+    parser.add_argument('--restore-detail-boost', type=float, default=0.0,
+                        help='復元ROIの局所ディテール/コントラストを合成前に強める強度（0で無効、例: 0.15）')
+    parser.add_argument('--restore-blend-feather', type=float, default=1.0,
+                        help='復元ROI境界ブレンドのぼかし倍率（1.0で標準、例: 1.0〜1.5）')
+    parser.add_argument('--restore-texture-mix', type=float, default=0.0,
+                        help='元ROIの中周波テクスチャを復元ROIへ薄く戻す強度（0で無効、例: 0.08）')
     parser.add_argument('--mosaic-detection-model', default='v4-fast')
+    parser.add_argument('--list-mosaic-detection-models', action='store_true',
+                        help='lada-cli の検出モデル一覧を表示')
+    parser.add_argument('--mosaic-detection-empty-lookahead', type=int, default=0,
+                        help='先読み範囲の先頭/末尾がどちらも検出なしなら、その範囲を検出なしとしてスキップ（0で無効、例: 10）')
     parser.add_argument('--detect-face-mosaics', action='store_true',
                         help='顔モザイク検出を有効化')
     parser.add_argument('--no-detect-face-mosaics', dest='detect_face_mosaics', action='store_false',
@@ -1869,6 +1944,8 @@ def build_arg_parser():
                         help='起動時に torch.mps のメモリ統計を表示')
     
     # その他
+    parser.add_argument('--list-devices', action='store_true',
+                        help='lada-cli の利用可能デバイス一覧を表示')
     parser.add_argument('--overwrite', action='store_true')
 
     return parser
@@ -1878,6 +1955,17 @@ def build_arg_parser():
 def main():
     parser = build_arg_parser()
     args = parser.parse_args()
+
+    list_return_code = run_lada_cli_list_command(args)
+    if list_return_code is not None:
+        if list_return_code != 0:
+            sys.exit(list_return_code)
+        return
+
+    if not args.input:
+        parser.error("--input is required unless using --list-*")
+    if not args.output:
+        parser.error("--output is required unless using --list-*")
     
     # 並列数の検証
     if args.parallel_workers < 1:
@@ -1891,6 +1979,21 @@ def main():
         return
     if args.mps_memory_fraction is not None and not (0.0 < args.mps_memory_fraction <= 1.0):
         print("エラー: --mps-memory-fraction は 0 より大きく 1 以下である必要があります")
+        return
+    if args.restore_sharpen_strength < 0:
+        print("エラー: --restore-sharpen-strength は0以上である必要があります")
+        return
+    if args.restore_detail_boost < 0:
+        print("エラー: --restore-detail-boost は0以上である必要があります")
+        return
+    if args.restore_blend_feather < 0:
+        print("エラー: --restore-blend-feather は0以上である必要があります")
+        return
+    if args.restore_texture_mix < 0:
+        print("エラー: --restore-texture-mix は0以上である必要があります")
+        return
+    if args.mosaic_detection_empty_lookahead < 0:
+        print("エラー: --mosaic-detection-empty-lookahead は0以上である必要があります")
         return
     
     if args.parallel_workers > 1:

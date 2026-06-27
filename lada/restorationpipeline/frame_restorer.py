@@ -26,6 +26,38 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=LOG_LEVEL)
 
 
+def apply_restore_sharpening(image: np.ndarray, strength: float, sigma: float = 1.0) -> np.ndarray:
+    if strength <= 0:
+        return image
+    blurred = cv2.GaussianBlur(image, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    sharpened = cv2.addWeighted(image, 1.0 + strength, blurred, -strength, 0)
+    return sharpened
+
+
+def apply_restore_detail_boost(image: np.ndarray, strength: float) -> np.ndarray:
+    if strength <= 0:
+        return image
+    lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
+    l_channel, a_channel, b_channel = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=1.0 + strength * 2.0, tileGridSize=(8, 8))
+    boosted_l = clahe.apply(l_channel)
+    mixed_l = cv2.addWeighted(l_channel, 1.0 - strength, boosted_l, strength, 0)
+    boosted_lab = cv2.merge((mixed_l, a_channel, b_channel))
+    return cv2.cvtColor(boosted_lab, cv2.COLOR_LAB2RGB)
+
+
+def apply_restore_texture_mix(restored: np.ndarray, original: np.ndarray, strength: float) -> np.ndarray:
+    if strength <= 0:
+        return restored
+    original_f = original.astype(np.float32)
+    restored_f = restored.astype(np.float32)
+    blur_small = cv2.GaussianBlur(original_f, (0, 0), sigmaX=0.7, sigmaY=0.7)
+    blur_large = cv2.GaussianBlur(original_f, (0, 0), sigmaX=2.0, sigmaY=2.0)
+    mid_frequency = blur_small - blur_large
+    mixed = restored_f + mid_frequency * strength
+    return np.clip(mixed, 0, 255).astype(np.uint8)
+
+
 def _get_mps_adaptive_profile(max_clip_length: int) -> dict:
     """
     Adaptive restore profile tuned for Apple Silicon unified memory.
@@ -108,7 +140,9 @@ def calculate_optimal_queue_size_mb(device: torch.device, video_resolution: tupl
 class FrameRestorer:
     def __init__(self, device, video_file, max_clip_length, mosaic_restoration_model_name,
                  mosaic_detection_model: Yolo11SegmentationModel, mosaic_restoration_model, preferred_pad_mode,
-                 mosaic_detection=False):
+                 mosaic_detection=False, restore_sharpen_strength: float = 0.0,
+                 restore_detail_boost: float = 0.0, restore_blend_feather: float = 1.0,
+                 restore_texture_mix: float = 0.0, mosaic_detection_empty_lookahead: int = 0):
         self.device = torch.device(device)
         self.mosaic_restoration_model_name = mosaic_restoration_model_name
         self.max_clip_length = max_clip_length
@@ -119,6 +153,11 @@ class FrameRestorer:
         self.start_ns = 0
         self.start_frame = 0
         self.mosaic_detection = mosaic_detection
+        self.restore_sharpen_strength = restore_sharpen_strength
+        self.restore_detail_boost = restore_detail_boost
+        self.restore_blend_feather = restore_blend_feather
+        self.restore_texture_mix = restore_texture_mix
+        self.mosaic_detection_empty_lookahead = mosaic_detection_empty_lookahead
         self.eof = False
         self.stop_requested = False
         self._mps_adaptive_profile = _get_mps_adaptive_profile(self.max_clip_length)
@@ -151,6 +190,7 @@ class FrameRestorer:
                                               max_clip_length=self.max_clip_length,
                                               pad_mode=self.preferred_pad_mode,
                                               batch_size=self._mps_adaptive_profile.get("detect_batch_init", 4),
+                                              empty_lookahead_frames=self.mosaic_detection_empty_lookahead,
                                               error_handler=self._on_worker_thread_error)
 
         self.clip_restoration_thread: PipelineThread | None = None
@@ -344,7 +384,24 @@ class FrameRestorer:
             clip_mask = image_utils.unpad_image(clip_mask, pad_after_resize)
             clip_img = image_utils.resize(clip_img, orig_crop_shape[:2])
             clip_mask = image_utils.resize(clip_mask, orig_crop_shape[:2],interpolation=cv2.INTER_NEAREST)
-            blend_mask = mask_utils.create_blend_mask(clip_mask.to(device=self.device).float()).to(device=clip_img.device, dtype=target_dtype)
+            if self.restore_texture_mix > 0 or self.restore_detail_boost > 0 or self.restore_sharpen_strength > 0:
+                t, l, b, r = orig_clip_box
+                original_roi = frame[t:b + 1, l:r + 1, :]
+                if isinstance(clip_img, torch.Tensor):
+                    clip_img_np = clip_img.cpu().numpy()
+                    original_roi_np = original_roi.cpu().numpy() if isinstance(original_roi, torch.Tensor) else original_roi
+                    clip_img_np = apply_restore_texture_mix(clip_img_np, original_roi_np, self.restore_texture_mix)
+                    clip_img_np = apply_restore_detail_boost(clip_img_np, self.restore_detail_boost)
+                    clip_img_np = apply_restore_sharpening(clip_img_np, self.restore_sharpen_strength)
+                    clip_img = torch.from_numpy(clip_img_np).to(device=clip_img.device)
+                else:
+                    clip_img = apply_restore_texture_mix(clip_img, original_roi, self.restore_texture_mix)
+                    clip_img = apply_restore_detail_boost(clip_img, self.restore_detail_boost)
+                    clip_img = apply_restore_sharpening(clip_img, self.restore_sharpen_strength)
+            blend_mask = mask_utils.create_blend_mask(
+                clip_mask.to(device=self.device).float(),
+                feather_multiplier=self.restore_blend_feather,
+            ).to(device=clip_img.device, dtype=target_dtype)
 
             blend(blend_mask, clip_img, orig_clip_box)
 
