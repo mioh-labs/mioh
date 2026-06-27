@@ -7,6 +7,7 @@ import torchvision
 from torch.nn import init as init
 from torch.nn.modules.utils import _pair, _single
 import math
+import os
 
 
 class MPSDeformConvUnavailableError(RuntimeError):
@@ -42,10 +43,15 @@ def _mps_deform_conv2d(x, offset, weight, bias, stride, padding, dilation, mask)
 
 def dispatch_deform_conv2d(x, offset, weight, bias, stride, padding, dilation, mask):
     if getattr(getattr(x, "device", None), "type", None) == "mps":
-        try:
+        if os.environ.get("LADA_DEFORM_CONV_BACKEND", "").lower() == "mps_deform_conv":
             return _mps_deform_conv2d(x, offset, weight, bias, stride, padding, dilation, mask)
-        except MPSDeformConvUnavailableError:
-            pass
+        try:
+            return _torchvision_deform_conv2d(x, offset, weight, bias, stride, padding, dilation, mask)
+        except RuntimeError as torchvision_error:
+            try:
+                return _mps_deform_conv2d(x, offset, weight, bias, stride, padding, dilation, mask)
+            except MPSDeformConvUnavailableError:
+                raise torchvision_error
     return _torchvision_deform_conv2d(x, offset, weight, bias, stride, padding, dilation, mask)
 
 class ModulatedDeformConv2d(nn.Module):

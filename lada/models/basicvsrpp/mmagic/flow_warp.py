@@ -32,6 +32,7 @@ def flow_warp(x,
         raise ValueError(f'The spatial sizes of input ({x.size()[-2:]}) and '
                          f'flow ({flow.size()[1:3]}) are not the same.')
     _, _, h, w = x.size()
+
     # create mesh grid
     device = flow.device
     # torch.meshgrid has been modified in 1.10.0 (compatibility with previous
@@ -70,18 +71,6 @@ def flow_warp(x,
 
         x = ensure_mps_tensor_contiguous(x)
         grid_flow = ensure_mps_tensor_contiguous(grid_flow)
-
-        # MPS: border unsupported. Clamp grid to [-1,1] + zeros
-        # (issue #125098 https://github.com/pytorch/pytorch/issues/125098#issuecomment-2270384282)
-        # to have the same effect as `border`.
-        if padding_mode == 'border':
-            grid_flow = grid_flow.clamp(-1.0, 1.0)
-            return F.grid_sample(
-                x,
-                grid_flow,
-                mode=interpolation,
-                padding_mode='zeros',
-                align_corners=align_corners)
     else:
         grid_flow = grid_flow.type(x.type())
 

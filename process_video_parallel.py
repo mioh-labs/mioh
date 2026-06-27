@@ -87,7 +87,7 @@ def build_worker_env(config: WorkerRuntimeConfig) -> dict[str, str]:
     if config.device == 'mps':
         env['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = '0.0'
         env['PYTORCH_MPS_LOW_WATERMARK_RATIO'] = '0.0'
-        env['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+        env.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
         env['PYTORCH_MPS_ALLOCATOR_POLICY'] = 'garbage_collection'
         if config.mps_memory_fraction is not None:
             env['LADA_MPS_MEMORY_FRACTION'] = str(config.mps_memory_fraction)
@@ -1103,7 +1103,7 @@ class ParallelVideoProcessor:
         if self.args.device == 'mps':
             env['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = '0.0'
             env['PYTORCH_MPS_LOW_WATERMARK_RATIO'] = '0.0'
-            env['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+            env.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
             env['PYTORCH_MPS_ALLOCATOR_POLICY'] = 'garbage_collection'
         
         env['OMP_NUM_THREADS'] = '2'

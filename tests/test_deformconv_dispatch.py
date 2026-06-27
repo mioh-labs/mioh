@@ -25,27 +25,52 @@ class DeformConvDispatchTests(unittest.TestCase):
         tv.assert_called_once()
         mps.assert_not_called()
 
-    def test_mps_uses_mps_extension_when_available(self):
+    def test_mps_uses_torchvision_native_before_legacy_extension(self):
         fake_x = types.SimpleNamespace(device=types.SimpleNamespace(type="mps"))
         with mock.patch.object(deformconv, "_torchvision_deform_conv2d", return_value="tv") as tv:
             with mock.patch.object(deformconv, "_mps_deform_conv2d", return_value="mps") as mps:
                 result = deformconv.dispatch_deform_conv2d(
                     fake_x, self.offset, self.weight, self.bias, 1, 1, 1, self.mask
                 )
+        self.assertEqual(result, "tv")
+        tv.assert_called_once()
+        mps.assert_not_called()
+
+    def test_mps_deform_conv_backend_env_forces_legacy_extension(self):
+        fake_x = types.SimpleNamespace(device=types.SimpleNamespace(type="mps"))
+        with mock.patch.dict("os.environ", {"LADA_DEFORM_CONV_BACKEND": "mps_deform_conv"}):
+            with mock.patch.object(deformconv, "_torchvision_deform_conv2d", return_value="tv") as tv:
+                with mock.patch.object(deformconv, "_mps_deform_conv2d", return_value="mps") as mps:
+                    result = deformconv.dispatch_deform_conv2d(
+                        fake_x, self.offset, self.weight, self.bias, 1, 1, 1, self.mask
+                    )
         self.assertEqual(result, "mps")
         mps.assert_called_once()
         tv.assert_not_called()
 
-    def test_mps_falls_back_to_torchvision_when_extension_missing(self):
+    def test_mps_falls_back_to_legacy_extension_when_torchvision_fails(self):
         fake_x = types.SimpleNamespace(device=types.SimpleNamespace(type="mps"))
-        with mock.patch.object(deformconv, "_torchvision_deform_conv2d", return_value="tv") as tv:
-            with mock.patch.object(deformconv, "_mps_deform_conv2d", side_effect=deformconv.MPSDeformConvUnavailableError("missing")) as mps:
+        with mock.patch.object(deformconv, "_torchvision_deform_conv2d", side_effect=RuntimeError("missing")) as tv:
+            with mock.patch.object(deformconv, "_mps_deform_conv2d", return_value="mps") as mps:
                 result = deformconv.dispatch_deform_conv2d(
                     fake_x, self.offset, self.weight, self.bias, 1, 1, 1, self.mask
                 )
-        self.assertEqual(result, "tv")
-        mps.assert_called_once()
+        self.assertEqual(result, "mps")
         tv.assert_called_once()
+        mps.assert_called_once()
+
+    def test_mps_reraises_torchvision_error_when_all_native_paths_fail(self):
+        fake_x = types.SimpleNamespace(device=types.SimpleNamespace(type="mps"))
+        with mock.patch.object(deformconv, "_torchvision_deform_conv2d", side_effect=RuntimeError("tv failed")):
+            with mock.patch.object(
+                deformconv,
+                "_mps_deform_conv2d",
+                side_effect=deformconv.MPSDeformConvUnavailableError("legacy failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "tv failed"):
+                    deformconv.dispatch_deform_conv2d(
+                        fake_x, self.offset, self.weight, self.bias, 1, 1, 1, self.mask
+                    )
 
 
 if __name__ == "__main__":
