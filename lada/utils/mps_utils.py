@@ -168,10 +168,7 @@ def ensure_mps_tensor_contiguous(tensor):
 def safe_mps_grid_sample(input, grid, mode='bilinear', padding_mode='zeros', 
                          align_corners=None):
     """
-    Safe grid_sample operation for MPS with automatic fallback
-    
-    MPS does not support 'border' padding mode, so we automatically
-    fallback to 'zeros' or CPU computation if needed.
+    Safe grid_sample operation for MPS.
     
     Args:
         input: Input tensor (N, C, H, W)
@@ -185,14 +182,7 @@ def safe_mps_grid_sample(input, grid, mode='bilinear', padding_mode='zeros',
     """
     device = input.device
     
-    # Check if using MPS
     if device.type == 'mps':
-        # MPS does not support 'border' padding mode
-        if padding_mode == 'border':
-            logger.debug("MPS: 'border' padding not supported, using 'zeros' instead")
-            padding_mode = 'zeros'
-        
-        # Try MPS operation
         try:
             output = F.grid_sample(
                 input, grid,
@@ -202,19 +192,8 @@ def safe_mps_grid_sample(input, grid, mode='bilinear', padding_mode='zeros',
             )
             return output
         except RuntimeError as e:
-            # If MPS fails, fallback to CPU
-            logger.warning(f"MPS grid_sample failed: {e}, falling back to CPU")
-            input_cpu = input.cpu()
-            grid_cpu = grid.cpu()
-            
-            output_cpu = F.grid_sample(
-                input_cpu, grid_cpu,
-                mode=mode,
-                padding_mode=padding_mode if padding_mode != 'border' else 'zeros',
-                align_corners=align_corners
-            )
-            
-            return output_cpu.to(device)
+            logger.warning(f"MPS grid_sample failed without CPU fallback: {e}")
+            raise
     else:
         # Non-MPS device, use standard grid_sample
         return F.grid_sample(

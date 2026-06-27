@@ -1,3 +1,4 @@
+import os
 import unittest
 from unittest import mock
 
@@ -110,6 +111,30 @@ class ProcessVideoParallelShutdownTests(unittest.TestCase):
 
         self.assertIn("PYTHONWARNINGS", env)
         self.assertIn("ignore::UserWarning:multiprocessing.resource_tracker", env["PYTHONWARNINGS"])
+
+    def test_build_worker_env_respects_existing_mps_fallback_override(self):
+        config = pvp.WorkerRuntimeConfig(
+            device="mps",
+            fp16=False,
+            mps_memory_fraction=None,
+            log_mps_memory=False,
+            encoding_preset=None,
+            encoder=None,
+            encoder_options=None,
+            optimal_encoder_options=None,
+            mp4_fast_start=False,
+            mosaic_restoration_model="basicvsrpp-v1.2",
+            max_clip_length=180,
+            mosaic_detection_model="v4-fast",
+            detect_face_mosaics=False,
+            lada_temp_dir=None,
+            overwrite=False,
+        )
+
+        with mock.patch.dict(os.environ, {"PYTORCH_ENABLE_MPS_FALLBACK": "0"}):
+            env = pvp.build_worker_env(config)
+
+        self.assertEqual(env["PYTORCH_ENABLE_MPS_FALLBACK"], "0")
 
 
 if __name__ == "__main__":

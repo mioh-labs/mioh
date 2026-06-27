@@ -2,6 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0 AND AGPL-3.0
 # Code vendored from: https://github.com/open-mmlab/mmagic
 
+import os
+import sys
+import time
+from contextlib import contextmanager
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,6 +21,88 @@ from .flow_warp import flow_warp
 from .model_utils import default_init_weights
 from .model_utils import make_layer
 from .registry import MODELS
+
+
+class _BasicVSRPPProfiler:
+    def __init__(self, reference_tensor):
+        value = os.environ.get('LADA_BASICVSRPP_PROFILE', '').strip().lower()
+        self.enabled = value not in ('', '0', 'false', 'no', 'off')
+        self.reference_tensor = reference_tensor
+        self.timings = {}
+        self.counts = {}
+
+    @contextmanager
+    def time(self, name):
+        if not self.enabled:
+            yield
+            return
+
+        started_at = time.perf_counter()
+        try:
+            yield
+        finally:
+            elapsed = time.perf_counter() - started_at
+            self.timings[name] = self.timings.get(name, 0.0) + elapsed
+            self.counts[name] = self.counts.get(name, 0) + 1
+
+    def emit(self, metadata=None):
+        if not self.enabled:
+            return
+
+        parts = ['[BASICVSRPP_PROFILE]']
+        for key, value in (metadata or {}).items():
+            parts.append(f'{key}={value}')
+        for key, value in self.timings.items():
+            parts.append(f'{key}={value:.3f}')
+        for key, value in self.counts.items():
+            parts.append(f'{key}.count={value}')
+        print(' '.join(parts), file=sys.stderr, flush=True)
+
+
+def _env_flag(name):
+    value = os.environ.get(name, '').strip().lower()
+    return value not in ('', '0', 'false', 'no', 'off')
+
+
+def _mlx_propagation_warp_bridge_enabled():
+    return _env_flag('LADA_BASICVSRPP_MLX_PROPAGATION_WARP')
+
+
+def _mlx_second_order_cond_bridge(feat_current, feat_prop, feat_n2, flow_n1, flow_n2):
+    """Build second-order propagation cond via MLX and return Torch tensors.
+
+    This is intentionally an experimental bridge. It preserves the Torch
+    alignment/backbone path, but measures whether batching the warp-side work
+    through MLX can outweigh Torch<->MLX transfer cost.
+    """
+
+    import mlx.core as mx
+    import numpy as np
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', '..'))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
+    from experiments.mlx_dcnv2.fused_propagation_warp import (
+        fused_cond_from_flow_total,
+        fused_second_order_flow,
+    )
+
+    device = feat_current.device
+    dtype = feat_current.dtype
+    feat_current_m = mx.array(feat_current.detach().cpu().numpy())
+    feat_prop_m = mx.array(feat_prop.detach().cpu().numpy())
+    feat_n2_m = mx.array(feat_n2.detach().cpu().numpy())
+    flow_n1_m = mx.array(flow_n1.detach().cpu().numpy())
+    flow_n2_m = mx.array(flow_n2.detach().cpu().numpy())
+
+    flow_total_m = fused_second_order_flow(flow_n1_m, flow_n2_m)
+    cond_m = fused_cond_from_flow_total(feat_current_m, feat_prop_m, feat_n2_m, flow_n1_m, flow_total_m)
+    mx.eval(cond_m, flow_total_m)
+
+    cond = torch.from_numpy(np.array(cond_m)).to(device=device, dtype=dtype)
+    flow_total = torch.from_numpy(np.array(flow_total_m)).to(device=device, dtype=dtype)
+    return cond, flow_total
 
 
 @MODELS.register_module()
@@ -111,7 +198,7 @@ class BasicVSRPlusPlusNet(BaseModule):
 
         return flows_forward, flows_backward
 
-    def propagate(self, feats, flows, module_name):
+    def propagate(self, feats, flows, module_name, profile=None):
         """Propagate the latent features throughout the sequence.
 
         Args:
@@ -127,6 +214,8 @@ class BasicVSRPlusPlusNet(BaseModule):
                 propagation branch, which is represented by a list of tensors.
         """
 
+        profile = profile or _BasicVSRPPProfiler(None)
+
         n, t, _, h, w = flows.size()
 
         # PyTorch 2.0 could not compile data type of 'range'
@@ -141,6 +230,11 @@ class BasicVSRPlusPlusNet(BaseModule):
             frame_idx = frame_idx[::-1]
             flow_idx = frame_idx
 
+        use_mlx_warp_bridge = (
+            _mlx_propagation_warp_bridge_enabled()
+            and flows.device.type == 'mps'
+            and flows.dtype == torch.float32
+        )
         feat_prop = flows.new_zeros(n, self.mid_channels, h, w)
         for i, idx in enumerate(frame_idx):
             feat_current = feats['spatial'][mapping_idx[idx]]
@@ -148,27 +242,47 @@ class BasicVSRPlusPlusNet(BaseModule):
             if i > 0:
                 flow_n1 = flows[:, flow_idx[i], :, :, :]
 
-                cond_n1 = flow_warp(feat_prop, flow_n1.permute(0, 2, 3, 1))
-
                 # initialize second-order features
                 feat_n2 = torch.zeros_like(feat_prop)
                 flow_n2 = torch.zeros_like(flow_n1)
-                cond_n2 = torch.zeros_like(cond_n1)
+                cond_n1 = None
+                cond_n2 = None
 
                 if i > 1:  # second-order features
                     feat_n2 = feats[module_name][-2]
 
                     flow_n2 = flows[:, flow_idx[i - 1], :, :, :]
 
-                    flow_n2 = flow_n1 + flow_warp(flow_n2,
-                                                  flow_n1.permute(0, 2, 3, 1))
-                    cond_n2 = flow_warp(feat_n2, flow_n2.permute(0, 2, 3, 1))
+                    if use_mlx_warp_bridge:
+                        with profile.time(f'propagate.{module_name}.flow_warp_mlx_bridge'):
+                            cond, flow_n2 = _mlx_second_order_cond_bridge(
+                                feat_current,
+                                feat_prop,
+                                feat_n2,
+                                flow_n1,
+                                flow_n2,
+                            )
+                    else:
+                        with profile.time(f'propagate.{module_name}.flow_warp'):
+                            flow_n2 = flow_n1 + flow_warp(flow_n2,
+                                                          flow_n1.permute(0, 2, 3, 1))
+                        with profile.time(f'propagate.{module_name}.flow_warp'):
+                            cond_n2 = flow_warp(feat_n2, flow_n2.permute(0, 2, 3, 1))
+                else:
+                    with profile.time(f'propagate.{module_name}.flow_warp'):
+                        cond_n1 = flow_warp(feat_prop, flow_n1.permute(0, 2, 3, 1))
+                    cond_n2 = torch.zeros_like(cond_n1)
 
                 # flow-guided deformable convolution
-                cond = torch.cat([cond_n1, feat_current, cond_n2], dim=1)
+                if not (use_mlx_warp_bridge and i > 1):
+                    if cond_n1 is None:
+                        with profile.time(f'propagate.{module_name}.flow_warp'):
+                            cond_n1 = flow_warp(feat_prop, flow_n1.permute(0, 2, 3, 1))
+                    cond = torch.cat([cond_n1, feat_current, cond_n2], dim=1)
                 feat_prop = torch.cat([feat_prop, feat_n2], dim=1)
-                feat_prop = self.deform_align[module_name](feat_prop, cond,
-                                                           flow_n1, flow_n2)
+                with profile.time(f'propagate.{module_name}.deform_align'):
+                    feat_prop = self.deform_align[module_name](feat_prop, cond,
+                                                               flow_n1, flow_n2)
 
             # concatenate and residual blocks
             feat = [feat_current] + [
@@ -177,7 +291,8 @@ class BasicVSRPlusPlusNet(BaseModule):
             ] + [feat_prop]
 
             feat = torch.cat(feat, dim=1)
-            feat_prop = feat_prop + self.backbone[module_name](feat)
+            with profile.time(f'propagate.{module_name}.backbone'):
+                feat_prop = feat_prop + self.backbone[module_name](feat)
             feats[module_name].append(feat_prop)
 
         if 'backward' in module_name:
@@ -231,15 +346,18 @@ class BasicVSRPlusPlusNet(BaseModule):
             Tensor: Output HR sequence with shape (n, t, c, 4h, 4w).
         """
 
-        n, t, c, h, w = lqs.size()
+        profile = _BasicVSRPPProfiler(lqs)
+        n, t, c, input_h, input_w = lqs.size()
 
-        lqs_downsample = F.interpolate(
-            lqs.view(-1, c, h, w), scale_factor=0.25,
-            mode='bicubic').view(n, t, c, h // 4, w // 4)
+        with profile.time('downsample'):
+            lqs_downsample = F.interpolate(
+                lqs.view(-1, c, input_h, input_w), scale_factor=0.25,
+                mode='bicubic').view(n, t, c, input_h // 4, input_w // 4)
 
         feats = {}
         # compute spatial features
-        feats_ = self.feat_extract(lqs.view(-1, c, h, w))
+        with profile.time('feat_extract'):
+            feats_ = self.feat_extract(lqs.view(-1, c, input_h, input_w))
         h, w = feats_.shape[2:]
         feats_ = feats_.view(n, t, -1, h, w)
         feats['spatial'] = [feats_[:, i, :, :, :] for i in range(0, t)]
@@ -248,7 +366,8 @@ class BasicVSRPlusPlusNet(BaseModule):
         assert lqs_downsample.size(3) >= 64 and lqs_downsample.size(4) >= 64, (
             'The height and width of low-res inputs must be at least 64, '
             f'but got {h} and {w}.')
-        flows_forward, flows_backward = self.compute_flow(lqs_downsample)
+        with profile.time('compute_flow'):
+            flows_forward, flows_backward = self.compute_flow(lqs_downsample)
 
         # feature propagation
         for iter_ in [1, 2]:
@@ -258,9 +377,18 @@ class BasicVSRPlusPlusNet(BaseModule):
                 feats[module] = []
                 flows = flows_backward if direction == 'backward' else flows_forward
 
-                feats = self.propagate(feats, flows, module)
+                with profile.time(f'propagate.{module}.total'):
+                    feats = self.propagate(feats, flows, module, profile=profile)
 
-        return self.upsample(lqs, feats)
+        with profile.time('upsample'):
+            outputs = self.upsample(lqs, feats)
+        profile.emit({
+            'frames': t,
+            'height': input_h,
+            'width': input_w,
+            'device': lqs.device.type,
+        })
+        return outputs
 
 
 class SecondOrderDeformableAlignment(ModulatedDeformConv2d):
