@@ -1833,27 +1833,27 @@ def build_arg_parser():
     )
     
     # 基本設定
-    parser.add_argument('--input', help='入力動画ファイルまたはディレクトリ')
-    parser.add_argument('--output', help='出力動画ファイルまたはディレクトリ')
-    parser.add_argument('--temp-dir', default='/tmp', help='一時ディレクトリ')
-    parser.add_argument('--ffmpeg-temp-dir', help='FFmpegが使用する一時ディレクトリ（未指定時は temp-dir 配下を自動使用）')
-    parser.add_argument('--lada-temp-dir', help='lada-cli内部用一時ディレクトリ')
+    parser.add_argument('--input', help='入力動画ファイルまたはディレクトリ。ディレクトリ指定時は対応動画をまとめて処理')
+    parser.add_argument('--output', help='出力動画ファイルまたはディレクトリ。入力がディレクトリの場合は出力もディレクトリ指定')
+    parser.add_argument('--temp-dir', default='/tmp', help='セグメント、処理済み中間動画、結合リストを置く一時ディレクトリ（デフォルト: /tmp）')
+    parser.add_argument('--ffmpeg-temp-dir', help='FFmpegの分割/結合用一時ディレクトリ。未指定時は temp-dir 配下を自動使用')
+    parser.add_argument('--lada-temp-dir', help='各セグメント内で lada-cli が使う一時ディレクトリ。未指定時はシステム既定')
     
     # 並列処理設定
     parser.add_argument('--parallel-workers', type=int, default=1,
-                        help='並列処理数（デフォルト: 1、推奨: 8GB=1, 16GB=2, 32GB=4）')
+                        help='同時に処理するセグメント数。MPS/統一メモリでは増やしすぎるとswapで遅くなる（デフォルト: 1、目安: 16GB=1〜2, 32GB=2〜4）')
     parser.add_argument('--executor', choices=['process', 'thread'], default='process',
                         help='セグメント処理の並列実行方式（process=プロセス分離、thread=旧ThreadPool方式。デフォルト: process）')
     
     # セグメント設定
-    parser.add_argument('--segment-duration', type=int, default=60, 
-                        help='セグメント長（秒）（デフォルト: 60）')
-    parser.add_argument('--merge-encoder', default='copy', 
-                        help='マージ時のエンコーダー（デフォルト: copy）')
-    parser.add_argument('--delete-segments', action='store_true', 
-                        help='処理済みセグメントを削除')
-    parser.add_argument('--keep-temp', action='store_true', 
-                        help='一時ファイルを保持（デバッグ用）')
+    parser.add_argument('--segment-duration', type=int, default=60,
+                        help='入力を分割する長さ（秒）。長いほど時間軸の整合性は保ちやすいが、失敗時のやり直しとメモリ負荷が増える（デフォルト: 60）')
+    parser.add_argument('--merge-encoder', default='copy',
+                        help='最終結合時のエンコーダー。copyは再エンコードせず高速・画質劣化なし（デフォルト: copy）')
+    parser.add_argument('--delete-segments', action='store_true',
+                        help='正常終了後に処理済みセグメントを削除してディスク使用量を減らす')
+    parser.add_argument('--keep-temp', action='store_true',
+                        help='一時ファイルを保持。処理済みセグメント確認、途中再開、品質比較に使う')
     parser.add_argument('--force-split', action='store_true',
                         help='既存セグメントを無視して強制的に再分割')
     
@@ -1876,23 +1876,25 @@ def build_arg_parser():
         default_device = 'cpu'
         default_fp16 = False
     
-    parser.add_argument('--device', default=default_device, 
-                        help=f'デバイス（デフォルト: {default_device}）')
-    parser.add_argument('--fp16', action='store_true', default=default_fp16)
-    parser.add_argument('--no-fp16', dest='fp16', action='store_false')
+    parser.add_argument('--device', default=default_device,
+                        help=f'lada-cli に渡す推論デバイス。例: cpu, cuda:0, mps（デフォルト: {default_device}）')
+    parser.add_argument('--fp16', action='store_true', default=default_fp16,
+                        help='半精度(fp16)を有効化。CUDAでは高速化しやすいが、MPSでは不安定な場合あり')
+    parser.add_argument('--no-fp16', dest='fp16', action='store_false',
+                        help='半精度(fp16)を無効化。MPSでabortや画質/安定性問題がある場合はこちらを推奨')
     
     # エンコーディング設定
-    parser.add_argument('--encoding-preset', help='エンコーディングプリセット')
+    parser.add_argument('--encoding-preset', help='lada-cli のエンコーディングプリセット名。未指定時は解像度/デバイスに応じて自動選択')
     parser.add_argument('--list-encoding-presets', action='store_true',
                         help='lada-cli のエンコーディングプリセット一覧を表示')
-    parser.add_argument('--encoder', help='エンコーダー')
+    parser.add_argument('--encoder', help='出力エンコーダー。例: h264_videotoolbox, hevc_videotoolbox, libx264。未指定時は自動選択')
     parser.add_argument('--list-encoders', action='store_true',
                         help='lada-cli のエンコーダー一覧を表示')
-    parser.add_argument('--encoder-options', help='エンコーダーオプション')
+    parser.add_argument('--encoder-options', help='lada-cli/FFmpegへ渡すエンコーダー追加オプション文字列。自動設定を上書きしたい場合に使用')
     parser.add_argument('--list-encoder-options', metavar='ENCODER',
                         help='指定エンコーダーの lada-cli オプション一覧を表示')
     parser.add_argument('--bitrate-multiplier', type=float, default=3.0,
-                        help='ビットレート倍率（デフォルト: 3.0、範囲: 0.1〜10.0）')
+                        help='元動画ビットレートに掛ける倍率。大きいほど画質保持・ファイルサイズ増（デフォルト: 3.0、範囲: 0.1〜10.0）')
     parser.add_argument('--quality', type=int, default=None,
                         help='品質値 -q:v（0-100、VideoToolbox専用、FFmpeg 4.4+/Apple Silicon必須）。100=最高品質、0=最低品質')
     parser.add_argument('--qmin', type=int, default=None,
@@ -1902,8 +1904,9 @@ def build_arg_parser():
     parser.add_argument('--fps', type=int, default=None,
                         help='出力フレームレート（例: 30）。指定しない場合は元のfpsを維持')
     parser.add_argument('--pre-fps-conversion', action='store_true',
-                        help='セグメント分割時にfps変換を実行（LADA処理前、処理高速化）')
-    parser.add_argument('--mp4-fast-start', action='store_true')
+                        help='LADA処理前にfps変換して処理フレーム数を減らす。速度優先だが、復元対象フレームも減る')
+    parser.add_argument('--mp4-fast-start', action='store_true',
+                        help='MP4のfaststart/fragment設定を有効化し、書き込み中/転送中の再生互換性を上げる')
     parser.add_argument('--auto-optimize', action='store_true', default=True,
                         help='解像度に応じた自動最適化（デフォルト: True）')
     parser.add_argument('--no-auto-optimize', dest='auto_optimize', action='store_false',
@@ -1912,8 +1915,10 @@ def build_arg_parser():
     # モザイク設定
     parser.add_argument('--list-mosaic-restoration-models', action='store_true',
                         help='lada-cli の復元モデル一覧を表示')
-    parser.add_argument('--mosaic-restoration-model', default='basicvsrpp-v1.2')
-    parser.add_argument('--max-clip-length', type=int, default=180)
+    parser.add_argument('--mosaic-restoration-model', default='basicvsrpp-v1.2',
+                        help='復元モデル名または重みパス。通常は basicvsrpp-v1.2（デフォルト: basicvsrpp-v1.2）')
+    parser.add_argument('--max-clip-length', type=int, default=180,
+                        help='復元モデルへ渡す最大フレーム数。大きいほど時間整合性は上がるがメモリ負荷も増える（デフォルト: 180）')
     parser.add_argument('--restore-sharpen-strength', type=float, default=0.0,
                         help='復元ROIを合成前にunsharp maskでシャープ化する強度（0で無効、例: 0.3）')
     parser.add_argument('--restore-detail-boost', type=float, default=0.0,
@@ -1922,7 +1927,8 @@ def build_arg_parser():
                         help='復元ROI境界ブレンドのぼかし倍率（1.0で標準、例: 1.0〜1.5）')
     parser.add_argument('--restore-texture-mix', type=float, default=0.0,
                         help='元ROIの中周波テクスチャを復元ROIへ薄く戻す強度（0で無効、例: 0.08）')
-    parser.add_argument('--mosaic-detection-model', default='v4-fast')
+    parser.add_argument('--mosaic-detection-model', default='v4-fast',
+                        help='検出モデル名または重みパス。速度重視は v4-fast（デフォルト: v4-fast）')
     parser.add_argument('--list-mosaic-detection-models', action='store_true',
                         help='lada-cli の検出モデル一覧を表示')
     parser.add_argument('--mosaic-detection-empty-lookahead', type=int, default=0,
@@ -1935,7 +1941,7 @@ def build_arg_parser():
     
     # メモリ管理
     parser.add_argument('--memory-cleanup-interval', type=int, default=1,
-                        help='（並列処理では常に各セグメント後にクリーンアップ実行）')
+                        help='何セグメントごとにメモリ掃除を試みるか。並列処理では各セグメント後にも掃除する（デフォルト: 1）')
     parser.add_argument('--cleanup-trigger-gb', type=float, default=4.0,
                         help='利用可能メモリがこの値(GB)未満の時のみ並列中クリーンアップを強化（デフォルト: 4.0）')
     parser.add_argument('--mps-memory-fraction', type=float, default=None,
@@ -1946,7 +1952,8 @@ def build_arg_parser():
     # その他
     parser.add_argument('--list-devices', action='store_true',
                         help='lada-cli の利用可能デバイス一覧を表示')
-    parser.add_argument('--overwrite', action='store_true')
+    parser.add_argument('--overwrite', action='store_true',
+                        help='既存の出力/処理済みセグメントを再利用せず、上書きして再処理する')
 
     return parser
 
