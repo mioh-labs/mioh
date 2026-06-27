@@ -103,20 +103,33 @@ def setup_argparser() -> argparse.ArgumentParser:
     group_restoration.add_argument('--mosaic-restoration-model', type=str, default='basicvsrpp-v1.2', help=_('Name of detection model or path to model weights file. Use "--list-mosaic-restoration-models" to see what\'s available. (default: %(default)s)'))
     group_restoration.add_argument('--mosaic-restoration-config-path', type=str, default=None, help=_("Path to restoration model configuration file. You'll not have to set this unless you're training your own custom models"))
     group_restoration.add_argument('--max-clip-length', type=int, default=180, help=_('Maximum number of frames for restoration. Higher values improve temporal stability. Lower values reduce memory footprint. If set too low flickering could appear (default: %(default)s)'))
+    group_restoration.add_argument('--restore-sharpen-strength', type=float, default=0.0, help=_('Apply unsharp masking to restored mosaic regions before compositing. 0 disables it. Start with 0.2-0.4 for testing. (default: %(default)s)'))
+    group_restoration.add_argument('--restore-detail-boost', type=float, default=0.0, help=_('Boost local detail/contrast in restored mosaic regions before compositing. 0 disables it. Start with 0.1-0.2 for testing. (default: %(default)s)'))
+    group_restoration.add_argument('--restore-blend-feather', type=float, default=1.0, help=_('Multiplier for restored mosaic region blend feathering. 1 keeps the default mask feather. Larger values soften boundaries more. (default: %(default)s)'))
+    group_restoration.add_argument('--restore-texture-mix', type=float, default=0.0, help=_('Mix mid-frequency texture from the source ROI into restored mosaic regions. 0 disables it. Start with 0.05-0.10 for testing. (default: %(default)s)'))
 
     group_detection = parser.add_argument_group(_('Mosaic Detection'))
     group_detection.add_argument('--mosaic-detection-model', type=str, default='v4-fast', help=_('Name of detection model or path to model weights file. Use "--list-mosaic-detection-models" to see what\'s available. (default: %(default)s)'))
     group_detection.add_argument('--list-mosaic-detection-models', action='store_true', help=_("List available detection models found in model weights directory and exit (default location is './model_weights' if not overwritten by environment variable LADA_MODEL_WEIGHTS_DIR)"))
+    group_detection.add_argument('--mosaic-detection-empty-lookahead', type=int, default=0, help=_('If greater than 1, infer only the first and last frame in this lookahead range; when both are empty, mark the whole range as no mosaic. 0 disables it. (default: %(default)s)'))
     group_detection.add_argument('--detect-face-mosaics', action=argparse.BooleanOptionalAction, default=False, help=_("Detect and ignore areas of pixelated faces. Can prevent restoration artifacts but may worsen detection of NSFW mosaics. Available for models v3 and newer. (default: %(default)s)"))
 
     return parser
 
 def process_video_file(input_path: str, output_path: str, temp_dir_path: str, device: torch.device, mosaic_restoration_model, mosaic_detection_model,
-                       mosaic_restoration_model_name, preferred_pad_mode, max_clip_length, encoder: str, encoder_options: str, mp4_fast_start):
+                       mosaic_restoration_model_name, preferred_pad_mode, max_clip_length, encoder: str, encoder_options: str, mp4_fast_start,
+                       restore_sharpen_strength: float = 0.0, restore_detail_boost: float = 0.0,
+                       restore_blend_feather: float = 1.0, restore_texture_mix: float = 0.0,
+                       mosaic_detection_empty_lookahead: int = 0):
     video_metadata = get_video_meta_data(input_path)
 
     frame_restorer = FrameRestorer(device, input_path, max_clip_length, mosaic_restoration_model_name,
-                 mosaic_detection_model, mosaic_restoration_model, preferred_pad_mode)
+                 mosaic_detection_model, mosaic_restoration_model, preferred_pad_mode,
+                 restore_sharpen_strength=restore_sharpen_strength,
+                 restore_detail_boost=restore_detail_boost,
+                 restore_blend_feather=restore_blend_feather,
+                 restore_texture_mix=restore_texture_mix,
+                 mosaic_detection_empty_lookahead=mosaic_detection_empty_lookahead)
     success = True
     video_tmp_file_output_path = os.path.join(temp_dir_path, f"{os.path.basename(os.path.splitext(output_path)[0])}.tmp{os.path.splitext(output_path)[1]}")
     pathlib.Path(output_path).parent.mkdir(exist_ok=True, parents=True)
@@ -190,6 +203,21 @@ def main():
             sys.exit(1)
     if args.mps_memory_fraction is not None and not (0.0 < args.mps_memory_fraction <= 1.0):
         print(_("Invalid MPS memory fraction. Value must be within (0, 1]."))
+        sys.exit(1)
+    if args.restore_sharpen_strength < 0:
+        print(_("Invalid restore sharpen strength. Value must be 0 or greater."))
+        sys.exit(1)
+    if args.restore_detail_boost < 0:
+        print(_("Invalid restore detail boost. Value must be 0 or greater."))
+        sys.exit(1)
+    if args.restore_blend_feather < 0:
+        print(_("Invalid restore blend feather. Value must be 0 or greater."))
+        sys.exit(1)
+    if args.restore_texture_mix < 0:
+        print(_("Invalid restore texture mix. Value must be 0 or greater."))
+        sys.exit(1)
+    if args.mosaic_detection_empty_lookahead < 0:
+        print(_("Invalid mosaic detection empty lookahead. Value must be 0 or greater."))
         sys.exit(1)
     if "{orig_file_name}" not in args.output_file_pattern or "." not in args.output_file_pattern:
         print(_("Invalid file name pattern. It must include the template string '{orig_file_name}' and a file extension"))
@@ -275,7 +303,12 @@ def main():
         try:
             process_video_file(input_path=input_path, output_path=output_path, temp_dir_path=args.temporary_directory, device=device, mosaic_restoration_model=mosaic_restoration_model, mosaic_detection_model=mosaic_detection_model,
                                mosaic_restoration_model_name=mosaic_restoration_model_name, preferred_pad_mode=preferred_pad_mode, max_clip_length=args.max_clip_length,
-                               encoder=encoder, encoder_options=encoder_options, mp4_fast_start=args.mp4_fast_start)
+                               encoder=encoder, encoder_options=encoder_options, mp4_fast_start=args.mp4_fast_start,
+                               restore_sharpen_strength=args.restore_sharpen_strength,
+                               restore_detail_boost=args.restore_detail_boost,
+                               restore_blend_feather=args.restore_blend_feather,
+                               restore_texture_mix=args.restore_texture_mix,
+                               mosaic_detection_empty_lookahead=args.mosaic_detection_empty_lookahead)
         except KeyboardInterrupt:
             print(_("Received Ctrl-C, stopping restoration."))
             break

@@ -59,13 +59,16 @@ class _BasicVSRPPProfiler:
         print(' '.join(parts), file=sys.stderr, flush=True)
 
 
-def _env_flag(name):
-    value = os.environ.get(name, '').strip().lower()
+def _env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    value = value.strip().lower()
     return value not in ('', '0', 'false', 'no', 'off')
 
 
 def _mlx_propagation_warp_bridge_enabled():
-    return _env_flag('LADA_BASICVSRPP_MLX_PROPAGATION_WARP')
+    return _env_flag('LADA_BASICVSRPP_MLX_PROPAGATION_WARP', default=True)
 
 
 def _mlx_second_order_cond_bridge(feat_current, feat_prop, feat_n2, flow_n1, flow_n2):

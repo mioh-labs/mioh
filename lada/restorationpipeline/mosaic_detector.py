@@ -164,7 +164,7 @@ class Clip:
         return self.frames[item], self.masks[item], self.boxes[item]
 
 class MosaicDetector:
-    def __init__(self, model: Yolo11SegmentationModel, video_metadata: VideoMetadata, frame_detection_queue: PipelineQueue, mosaic_clip_queue: PipelineQueue, error_handler: Callable[[ErrorMarker], None], max_clip_length=30, clip_size=256, device: torch.device | None = None, pad_mode='reflect', batch_size=4):
+    def __init__(self, model: Yolo11SegmentationModel, video_metadata: VideoMetadata, frame_detection_queue: PipelineQueue, mosaic_clip_queue: PipelineQueue, error_handler: Callable[[ErrorMarker], None], max_clip_length=30, clip_size=256, device: torch.device | None = None, pad_mode='reflect', batch_size=4, empty_lookahead_frames=0):
         self.model = model
         self.video_meta_data = video_metadata
         self.device = torch.device(device) if device is not None else device
@@ -185,6 +185,7 @@ class MosaicDetector:
         self.inference_thread: PipelineThread | None = None
         self.stop_requested = False
         self.batch_size = batch_size
+        self.empty_lookahead_frames = max(0, int(empty_lookahead_frames))
         self._adaptive_batching_enabled = self.device is not None and self.device.type == 'mps'
         self._min_batch_size = 2 if self._adaptive_batching_enabled else batch_size
         self._max_batch_size = 8 if self._adaptive_batching_enabled else batch_size
@@ -300,14 +301,18 @@ class MosaicDetector:
                 try:
                     self._maybe_adjust_batch_size()
                     frames = []
-                    for i in range(self.batch_size):
+                    read_count = self.empty_lookahead_frames if self.empty_lookahead_frames > 1 else self.batch_size
+                    for i in range(read_count):
                         frame, _ = next(video_frames_generator)
                         frames.append(frame)
                 except StopIteration:
                     eof = True
                 if len(frames) > 0:
-                    frames_batch = self.model.preprocess(frames)
-                    data = (frames_batch, frames, frame_num)
+                    if self.empty_lookahead_frames > 1:
+                        data = ("empty_lookahead", frames, frame_num)
+                    else:
+                        frames_batch = self.model.preprocess(frames)
+                        data = (frames_batch, frames, frame_num)
                     self.frame_feeder_queue.put(data)
                     if self.stop_requested:
                         logger.debug("frame feeder worker: frame_feeder_queue producer unblocked")
@@ -322,6 +327,29 @@ class MosaicDetector:
             logger.debug("frame feeder worker: stopped itself, EOF")
         else:
             logger.debug("frame feeder worker: stopped by request")
+
+    @staticmethod
+    def _has_mosaic_prediction(results: UltralyticsResults) -> bool:
+        return len(results.boxes) > 0
+
+    def _run_empty_lookahead_inference(self, frames: list[ImageTensor], frame_num: int):
+        if len(frames) == 0:
+            return ("skip_empty_range", frame_num, 0)
+
+        sample_indices = [0] if len(frames) == 1 else [0, len(frames) - 1]
+        sample_frames = [frames[i] for i in sample_indices]
+        sample_batch = self.model.preprocess(sample_frames)
+        sample_results = self.model.inference_and_postprocess(sample_batch, sample_frames)
+
+        if not any(self._has_mosaic_prediction(results) for results in sample_results):
+            return ("skip_empty_range", frame_num, len(frames))
+
+        if len(frames) == 1:
+            return (sample_results, frames, frame_num)
+
+        frames_batch = self.model.preprocess(frames)
+        batch_prediction_results = self.model.inference_and_postprocess(frames_batch, frames)
+        return (batch_prediction_results, frames, frame_num)
 
     def _maybe_adjust_batch_size(self):
         if not self._adaptive_batching_enabled:
@@ -366,6 +394,14 @@ class MosaicDetector:
                     logger.debug("inference worker: inference_queue producer unblocked")
                     break
                 break
+            if isinstance(frames_data, tuple) and len(frames_data) == 3 and frames_data[0] == "empty_lookahead":
+                _, frames, frame_num = frames_data
+                self.inference_queue.put(self._run_empty_lookahead_inference(frames, frame_num))
+                if self.stop_requested:
+                    logger.debug("inference worker: inference_queue producer unblocked")
+                    break
+                continue
+
             frames_batch, frames, frame_num = frames_data
 
             batch_prediction_results = self.model.inference_and_postprocess(frames_batch, frames)
@@ -401,6 +437,23 @@ class MosaicDetector:
                     logger.debug("frame detector worker: mosaic_clip_queue producer unblocked")
                     break
             else:
+                if isinstance(inference_data, tuple) and len(inference_data) == 3 and inference_data[0] == "skip_empty_range":
+                    _, skipped_frame_num, skipped_frame_count = inference_data
+                    assert frame_num == skipped_frame_num, "frame detector worker out of sync with skipped empty range"
+                    queue_marker = None
+                    for _ in range(skipped_frame_count):
+                        self.frame_detection_queue.put((frame_num, 0))
+                        if self.stop_requested:
+                            logger.debug("frame detector worker: frame_detection_queue producer unblocked")
+                            break
+                        queue_marker = self._create_clips_for_completed_scenes(scenes, frame_num, eof=False)
+                        if queue_marker is STOP_MARKER:
+                            break
+                        frame_num += 1
+                    if self.stop_requested or queue_marker is STOP_MARKER:
+                        break
+                    continue
+
                 batch_prediction_results, preprocessed_frames, _frame_num = inference_data
                 assert frame_num == _frame_num, "frame detector worker out of sync with frame reader"
                 assert len(preprocessed_frames) == len(batch_prediction_results)

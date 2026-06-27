@@ -9,6 +9,7 @@ import torch
 
 from lada.models.basicvsrpp.mmagic.basicvsr_plusplus_net import (
     _BasicVSRPPProfiler,
+    _mlx_propagation_warp_bridge_enabled,
     _mlx_second_order_cond_bridge,
 )
 from lada.models.basicvsrpp.mmagic.flow_warp import flow_warp
@@ -39,6 +40,14 @@ class BasicVSRPPProfilerTests(unittest.TestCase):
 
 
 class BasicVSRPPMLXWarpBridgeTests(unittest.TestCase):
+    def test_mlx_propagation_warp_bridge_enabled_by_default(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(_mlx_propagation_warp_bridge_enabled())
+
+    def test_mlx_propagation_warp_bridge_can_be_disabled(self):
+        with mock.patch.dict(os.environ, {"LADA_BASICVSRPP_MLX_PROPAGATION_WARP": "0"}):
+            self.assertFalse(_mlx_propagation_warp_bridge_enabled())
+
     def test_mlx_second_order_cond_bridge_matches_torch_warps(self):
         rng = np.random.default_rng(2027)
         channels = 3
