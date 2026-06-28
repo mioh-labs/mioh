@@ -2,11 +2,13 @@
 # SPDX-License-Identifier: AGPL-3.0
 
 import logging
+import sys
 import textwrap
 import threading
 import time
 import platform
 import psutil
+import types
 
 import cv2
 import torch
@@ -46,16 +48,144 @@ def apply_restore_detail_boost(image: np.ndarray, strength: float) -> np.ndarray
     return cv2.cvtColor(boosted_lab, cv2.COLOR_LAB2RGB)
 
 
-def apply_restore_texture_mix(restored: np.ndarray, original: np.ndarray, strength: float) -> np.ndarray:
+def _normalize_roi_mask(mask: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    if mask.ndim == 2:
+        mask = mask[:, :, None]
+    mask_f = (mask.astype(np.float32) > 0).astype(np.float32)
+    if mask_f.shape[:2] != shape:
+        mask_f = cv2.resize(mask_f, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
+        if mask_f.ndim == 2:
+            mask_f = mask_f[:, :, None]
+    return mask_f
+
+
+def _masked_gaussian_blur(image: np.ndarray, mask: np.ndarray, sigma: float) -> np.ndarray:
+    weighted = image * mask
+    blurred_weighted = cv2.GaussianBlur(weighted, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    blurred_mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    if blurred_mask.ndim == 2:
+        blurred_mask = blurred_mask[:, :, None]
+    return blurred_weighted / np.maximum(blurred_mask, 1e-6)
+
+
+def _apply_mask_to_processed(base: np.ndarray, processed: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    mask_f = _normalize_roi_mask(mask, base.shape[:2])
+    mixed = base.astype(np.float32) * (1.0 - mask_f) + processed.astype(np.float32) * mask_f
+    return np.clip(mixed, 0, 255).astype(np.uint8)
+
+
+def apply_restore_texture_mix(restored: np.ndarray, original: np.ndarray, strength: float, mask: np.ndarray | None = None) -> np.ndarray:
     if strength <= 0:
         return restored
     original_f = original.astype(np.float32)
     restored_f = restored.astype(np.float32)
-    blur_small = cv2.GaussianBlur(original_f, (0, 0), sigmaX=0.7, sigmaY=0.7)
-    blur_large = cv2.GaussianBlur(original_f, (0, 0), sigmaX=2.0, sigmaY=2.0)
+    mask_f = _normalize_roi_mask(mask, restored.shape[:2]) if mask is not None else None
+    if mask_f is not None and np.count_nonzero(mask_f) == 0:
+        return restored
+    if mask_f is None:
+        blur_small = cv2.GaussianBlur(original_f, (0, 0), sigmaX=0.7, sigmaY=0.7)
+        blur_large = cv2.GaussianBlur(original_f, (0, 0), sigmaX=2.0, sigmaY=2.0)
+    else:
+        blur_small = _masked_gaussian_blur(original_f, mask_f, sigma=0.7)
+        blur_large = _masked_gaussian_blur(original_f, mask_f, sigma=2.0)
     mid_frequency = blur_small - blur_large
+    if mask_f is not None:
+        mid_frequency *= mask_f
     mixed = restored_f + mid_frequency * strength
-    return np.clip(mixed, 0, 255).astype(np.uint8)
+    mixed = np.clip(mixed, 0, 255).astype(np.uint8)
+    return _apply_mask_to_processed(restored, mixed, mask_f) if mask_f is not None else mixed
+
+
+def _install_torchvision_functional_tensor_compat():
+    if "torchvision.transforms.functional_tensor" in sys.modules:
+        return
+    try:
+        import torchvision.transforms.functional as functional
+    except ImportError:
+        return
+    module = types.ModuleType("torchvision.transforms.functional_tensor")
+    module.rgb_to_grayscale = functional.rgb_to_grayscale
+    sys.modules["torchvision.transforms.functional_tensor"] = module
+
+
+def create_realesrgan_enhancer(model_path: str, scale: int = 2, tile: int = 0, fp16: bool = False, device=None):
+    if not model_path:
+        raise ValueError("--restore-roi-enhancer-model-path is required when --restore-roi-enhancer realesrgan is used")
+    _install_torchvision_functional_tensor_compat()
+    try:
+        from basicsr.archs.rrdbnet_arch import RRDBNet
+        from realesrgan import RealESRGANer
+    except ImportError as exc:
+        raise RuntimeError("Real-ESRGAN support requires installing realesrgan and basicsr") from exc
+
+    model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=scale)
+    gpu_id = 0 if torch.cuda.is_available() else None
+    return RealESRGANer(
+        scale=scale,
+        model_path=model_path,
+        model=model,
+        tile=tile,
+        tile_pad=10,
+        pre_pad=0,
+        half=fp16 and gpu_id is not None,
+        device=device,
+        gpu_id=gpu_id,
+    )
+
+
+def apply_restore_roi_enhancer(
+    restored: np.ndarray,
+    enhancer,
+    strength: float,
+    scale: int = 2,
+    mask: np.ndarray | None = None,
+) -> np.ndarray:
+    if strength <= 0 or enhancer is None:
+        return restored
+    enhanced_bgr, _ = enhancer.enhance(cv2.cvtColor(restored, cv2.COLOR_RGB2BGR), outscale=scale)
+    enhanced = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2RGB)
+    if enhanced.shape[:2] != restored.shape[:2]:
+        enhanced = cv2.resize(enhanced, (restored.shape[1], restored.shape[0]), interpolation=cv2.INTER_AREA)
+    blended = cv2.addWeighted(restored, 1.0 - strength, enhanced, strength, 0)
+    return _apply_mask_to_processed(restored, blended, mask) if mask is not None else blended
+
+
+def apply_restore_effect_upscale(
+    restored: np.ndarray,
+    original: np.ndarray,
+    mask: np.ndarray,
+    scale: int = 1,
+    texture_mix: float = 0.0,
+    detail_boost: float = 0.0,
+    sharpen_strength: float = 0.0,
+) -> np.ndarray:
+    if texture_mix <= 0 and detail_boost <= 0 and sharpen_strength <= 0:
+        return restored
+    mask_f = _normalize_roi_mask(mask, restored.shape[:2])
+    if np.count_nonzero(mask_f) == 0:
+        return restored
+    if scale <= 1:
+        processed = apply_restore_texture_mix(restored, original, texture_mix, mask=mask_f)
+        processed = apply_restore_detail_boost(processed, detail_boost)
+        processed = _apply_mask_to_processed(restored, processed, mask_f)
+        processed = apply_restore_sharpening(processed, sharpen_strength)
+        return _apply_mask_to_processed(restored, processed, mask_f)
+
+    target_size = (restored.shape[1] * scale, restored.shape[0] * scale)
+    restored_hr = cv2.resize(restored, target_size, interpolation=cv2.INTER_CUBIC)
+    original_hr = cv2.resize(original, target_size, interpolation=cv2.INTER_CUBIC)
+    mask_hr = cv2.resize(mask_f, target_size, interpolation=cv2.INTER_NEAREST)
+    if mask_hr.ndim == 2:
+        mask_hr = mask_hr[:, :, None]
+
+    processed_hr = apply_restore_texture_mix(restored_hr, original_hr, texture_mix, mask=mask_hr)
+    processed_hr = apply_restore_detail_boost(processed_hr, detail_boost)
+    processed_hr = _apply_mask_to_processed(restored_hr, processed_hr, mask_hr)
+    processed_hr = apply_restore_sharpening(processed_hr, sharpen_strength)
+    processed_hr = _apply_mask_to_processed(restored_hr, processed_hr, mask_hr)
+
+    processed = cv2.resize(processed_hr, (restored.shape[1], restored.shape[0]), interpolation=cv2.INTER_AREA)
+    return _apply_mask_to_processed(restored, processed, mask_f)
 
 
 def _get_mps_adaptive_profile(max_clip_length: int) -> dict:
@@ -142,7 +272,14 @@ class FrameRestorer:
                  mosaic_detection_model: Yolo11SegmentationModel, mosaic_restoration_model, preferred_pad_mode,
                  mosaic_detection=False, restore_sharpen_strength: float = 0.0,
                  restore_detail_boost: float = 0.0, restore_blend_feather: float = 1.0,
-                 restore_texture_mix: float = 0.0, mosaic_detection_empty_lookahead: int = 0):
+                 restore_texture_mix: float = 0.0, restore_roi_enhancer: str = "none",
+                 restore_roi_enhancer_model_path: str | None = None,
+                 restore_roi_enhancer_scale: int = 2,
+                 restore_roi_enhancer_strength: float = 0.0,
+                 restore_roi_enhancer_tile: int = 0,
+                 restore_effect_upscale: int = 1,
+                 fp16_enabled: bool = False,
+                 mosaic_detection_empty_lookahead: int = 0):
         self.device = torch.device(device)
         self.mosaic_restoration_model_name = mosaic_restoration_model_name
         self.max_clip_length = max_clip_length
@@ -157,6 +294,21 @@ class FrameRestorer:
         self.restore_detail_boost = restore_detail_boost
         self.restore_blend_feather = restore_blend_feather
         self.restore_texture_mix = restore_texture_mix
+        self.restore_roi_enhancer_name = restore_roi_enhancer
+        self.restore_roi_enhancer_scale = restore_roi_enhancer_scale
+        self.restore_roi_enhancer_strength = restore_roi_enhancer_strength
+        self.restore_effect_upscale = restore_effect_upscale
+        self.restore_roi_enhancer = None
+        if restore_roi_enhancer == "realesrgan":
+            self.restore_roi_enhancer = create_realesrgan_enhancer(
+                restore_roi_enhancer_model_path,
+                scale=restore_roi_enhancer_scale,
+                tile=restore_roi_enhancer_tile,
+                fp16=fp16_enabled,
+                device=self.device,
+            )
+        elif restore_roi_enhancer != "none":
+            raise ValueError(f"Unsupported restore ROI enhancer: {restore_roi_enhancer}")
         self.mosaic_detection_empty_lookahead = mosaic_detection_empty_lookahead
         self.eof = False
         self.stop_requested = False
@@ -384,20 +536,56 @@ class FrameRestorer:
             clip_mask = image_utils.unpad_image(clip_mask, pad_after_resize)
             clip_img = image_utils.resize(clip_img, orig_crop_shape[:2])
             clip_mask = image_utils.resize(clip_mask, orig_crop_shape[:2],interpolation=cv2.INTER_NEAREST)
-            if self.restore_texture_mix > 0 or self.restore_detail_boost > 0 or self.restore_sharpen_strength > 0:
+            if (
+                self.restore_roi_enhancer_strength > 0
+                or self.restore_texture_mix > 0
+                or self.restore_detail_boost > 0
+                or self.restore_sharpen_strength > 0
+            ):
                 t, l, b, r = orig_clip_box
                 original_roi = frame[t:b + 1, l:r + 1, :]
                 if isinstance(clip_img, torch.Tensor):
                     clip_img_np = clip_img.cpu().numpy()
+                    base_clip_img_np = clip_img_np.copy()
+                    clip_mask_np = clip_mask.cpu().numpy() if isinstance(clip_mask, torch.Tensor) else clip_mask
                     original_roi_np = original_roi.cpu().numpy() if isinstance(original_roi, torch.Tensor) else original_roi
-                    clip_img_np = apply_restore_texture_mix(clip_img_np, original_roi_np, self.restore_texture_mix)
-                    clip_img_np = apply_restore_detail_boost(clip_img_np, self.restore_detail_boost)
-                    clip_img_np = apply_restore_sharpening(clip_img_np, self.restore_sharpen_strength)
+                    clip_img_np = apply_restore_roi_enhancer(
+                        clip_img_np,
+                        enhancer=self.restore_roi_enhancer,
+                        strength=self.restore_roi_enhancer_strength,
+                        scale=self.restore_roi_enhancer_scale,
+                        mask=clip_mask_np,
+                    )
+                    clip_img_np = apply_restore_effect_upscale(
+                        clip_img_np,
+                        original_roi_np,
+                        clip_mask_np,
+                        scale=self.restore_effect_upscale,
+                        texture_mix=self.restore_texture_mix,
+                        detail_boost=self.restore_detail_boost,
+                        sharpen_strength=self.restore_sharpen_strength,
+                    )
+                    clip_img_np = _apply_mask_to_processed(base_clip_img_np, clip_img_np, clip_mask_np)
                     clip_img = torch.from_numpy(clip_img_np).to(device=clip_img.device)
                 else:
-                    clip_img = apply_restore_texture_mix(clip_img, original_roi, self.restore_texture_mix)
-                    clip_img = apply_restore_detail_boost(clip_img, self.restore_detail_boost)
-                    clip_img = apply_restore_sharpening(clip_img, self.restore_sharpen_strength)
+                    base_clip_img = clip_img.copy()
+                    clip_img = apply_restore_roi_enhancer(
+                        clip_img,
+                        enhancer=self.restore_roi_enhancer,
+                        strength=self.restore_roi_enhancer_strength,
+                        scale=self.restore_roi_enhancer_scale,
+                        mask=clip_mask,
+                    )
+                    clip_img = apply_restore_effect_upscale(
+                        clip_img,
+                        original_roi,
+                        clip_mask,
+                        scale=self.restore_effect_upscale,
+                        texture_mix=self.restore_texture_mix,
+                        detail_boost=self.restore_detail_boost,
+                        sharpen_strength=self.restore_sharpen_strength,
+                    )
+                    clip_img = _apply_mask_to_processed(base_clip_img, clip_img, clip_mask)
             blend_mask = mask_utils.create_blend_mask(
                 clip_mask.to(device=self.device).float(),
                 feather_multiplier=self.restore_blend_feather,

@@ -86,6 +86,12 @@ class WorkerRuntimeConfig:
     restore_detail_boost: float = 0.0
     restore_blend_feather: float = 1.0
     restore_texture_mix: float = 0.0
+    restore_roi_enhancer: str = "none"
+    restore_roi_enhancer_model_path: str | None = None
+    restore_roi_enhancer_scale: int = 2
+    restore_roi_enhancer_strength: float = 0.0
+    restore_roi_enhancer_tile: int = 0
+    restore_effect_upscale: int = 1
 
 
 def build_worker_env(config: WorkerRuntimeConfig) -> dict[str, str]:
@@ -153,6 +159,15 @@ def build_lada_cli_command(config: WorkerRuntimeConfig, input_video: Path, outpu
     cmd.extend(['--restore-blend-feather', str(config.restore_blend_feather)])
     if config.restore_texture_mix > 0:
         cmd.extend(['--restore-texture-mix', str(config.restore_texture_mix)])
+    if config.restore_effect_upscale > 1:
+        cmd.extend(['--restore-effect-upscale', str(config.restore_effect_upscale)])
+    if config.restore_roi_enhancer != "none":
+        cmd.extend(['--restore-roi-enhancer', config.restore_roi_enhancer])
+        if config.restore_roi_enhancer_model_path:
+            cmd.extend(['--restore-roi-enhancer-model-path', str(config.restore_roi_enhancer_model_path)])
+        cmd.extend(['--restore-roi-enhancer-scale', str(config.restore_roi_enhancer_scale)])
+        cmd.extend(['--restore-roi-enhancer-strength', str(config.restore_roi_enhancer_strength)])
+        cmd.extend(['--restore-roi-enhancer-tile', str(config.restore_roi_enhancer_tile)])
     cmd.extend(['--mosaic-detection-model', config.mosaic_detection_model])
     if config.mosaic_detection_empty_lookahead > 0:
         cmd.extend(['--mosaic-detection-empty-lookahead', str(config.mosaic_detection_empty_lookahead)])
@@ -1057,6 +1072,12 @@ class ParallelVideoProcessor:
             restore_detail_boost=self.args.restore_detail_boost,
             restore_blend_feather=self.args.restore_blend_feather,
             restore_texture_mix=self.args.restore_texture_mix,
+            restore_roi_enhancer=self.args.restore_roi_enhancer,
+            restore_roi_enhancer_model_path=self.args.restore_roi_enhancer_model_path,
+            restore_roi_enhancer_scale=self.args.restore_roi_enhancer_scale,
+            restore_roi_enhancer_strength=self.args.restore_roi_enhancer_strength,
+            restore_roi_enhancer_tile=self.args.restore_roi_enhancer_tile,
+            restore_effect_upscale=self.args.restore_effect_upscale,
         )
     
     def process_segment(self, segment_info):
@@ -1222,6 +1243,15 @@ class ParallelVideoProcessor:
         cmd.extend(['--restore-blend-feather', str(self.args.restore_blend_feather)])
         if self.args.restore_texture_mix > 0:
             cmd.extend(['--restore-texture-mix', str(self.args.restore_texture_mix)])
+        if self.args.restore_effect_upscale > 1:
+            cmd.extend(['--restore-effect-upscale', str(self.args.restore_effect_upscale)])
+        if self.args.restore_roi_enhancer != "none":
+            cmd.extend(['--restore-roi-enhancer', self.args.restore_roi_enhancer])
+            if self.args.restore_roi_enhancer_model_path:
+                cmd.extend(['--restore-roi-enhancer-model-path', str(self.args.restore_roi_enhancer_model_path)])
+            cmd.extend(['--restore-roi-enhancer-scale', str(self.args.restore_roi_enhancer_scale)])
+            cmd.extend(['--restore-roi-enhancer-strength', str(self.args.restore_roi_enhancer_strength)])
+            cmd.extend(['--restore-roi-enhancer-tile', str(self.args.restore_roi_enhancer_tile)])
         cmd.extend(['--mosaic-detection-model', self.args.mosaic_detection_model])
         if self.args.mosaic_detection_empty_lookahead > 0:
             cmd.extend(['--mosaic-detection-empty-lookahead', str(self.args.mosaic_detection_empty_lookahead)])
@@ -1927,6 +1957,18 @@ def build_arg_parser():
                         help='復元ROI境界ブレンドのぼかし倍率（1.0で標準、例: 1.0〜1.5）')
     parser.add_argument('--restore-texture-mix', type=float, default=0.0,
                         help='元ROIの中周波テクスチャを復元ROIへ薄く戻す強度（0で無効、例: 0.08）')
+    parser.add_argument('--restore-effect-upscale', type=int, default=1,
+                        help='texture/detail/sharpenをOpenCVで拡大後に適用して戻す倍率（1で無効、例: 2）')
+    parser.add_argument('--restore-roi-enhancer', choices=('none', 'realesrgan'), default='none',
+                        help='復元ROIに追加の高画質化処理をかける。realesrganは指定時のみロード（デフォルト: none）')
+    parser.add_argument('--restore-roi-enhancer-model-path',
+                        help='--restore-roi-enhancer realesrgan で使うReal-ESRGAN重みファイル')
+    parser.add_argument('--restore-roi-enhancer-scale', type=int, default=2,
+                        help='Real-ESRGANの倍率。処理後はROIサイズへ戻して合成（デフォルト: 2）')
+    parser.add_argument('--restore-roi-enhancer-strength', type=float, default=0.0,
+                        help='Real-ESRGAN結果を復元ROIへ混ぜる強度（0で無効、例: 0.25）')
+    parser.add_argument('--restore-roi-enhancer-tile', type=int, default=0,
+                        help='Real-ESRGANのtileサイズ。0で無効。メモリ削減時に指定（デフォルト: 0）')
     parser.add_argument('--mosaic-detection-model', default='v4-fast',
                         help='検出モデル名または重みパス。速度重視は v4-fast（デフォルト: v4-fast）')
     parser.add_argument('--list-mosaic-detection-models', action='store_true',
@@ -1998,6 +2040,21 @@ def main():
         return
     if args.restore_texture_mix < 0:
         print("エラー: --restore-texture-mix は0以上である必要があります")
+        return
+    if args.restore_effect_upscale < 1:
+        print("エラー: --restore-effect-upscale は1以上である必要があります")
+        return
+    if args.restore_roi_enhancer == "realesrgan" and not args.restore_roi_enhancer_model_path:
+        print("エラー: --restore-roi-enhancer realesrgan には --restore-roi-enhancer-model-path が必要です")
+        return
+    if args.restore_roi_enhancer_scale < 1:
+        print("エラー: --restore-roi-enhancer-scale は1以上である必要があります")
+        return
+    if args.restore_roi_enhancer_strength < 0:
+        print("エラー: --restore-roi-enhancer-strength は0以上である必要があります")
+        return
+    if args.restore_roi_enhancer_tile < 0:
+        print("エラー: --restore-roi-enhancer-tile は0以上である必要があります")
         return
     if args.mosaic_detection_empty_lookahead < 0:
         print("エラー: --mosaic-detection-empty-lookahead は0以上である必要があります")
