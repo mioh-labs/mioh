@@ -107,6 +107,12 @@ def setup_argparser() -> argparse.ArgumentParser:
     group_restoration.add_argument('--restore-detail-boost', type=float, default=0.0, help=_('Boost local detail/contrast in restored mosaic regions before compositing. 0 disables it. Start with 0.1-0.2 for testing. (default: %(default)s)'))
     group_restoration.add_argument('--restore-blend-feather', type=float, default=1.0, help=_('Multiplier for restored mosaic region blend feathering. 1 keeps the default mask feather. Larger values soften boundaries more. (default: %(default)s)'))
     group_restoration.add_argument('--restore-texture-mix', type=float, default=0.0, help=_('Mix mid-frequency texture from the source ROI into restored mosaic regions. 0 disables it. Start with 0.05-0.10 for testing. (default: %(default)s)'))
+    group_restoration.add_argument('--restore-effect-upscale', type=int, default=1, help=_('Upscale restored mosaic mask areas before applying texture/detail/sharpen effects, then resize back before compositing. 1 disables it; use 2 for OpenCV 2x processing. (default: %(default)s)'))
+    group_restoration.add_argument('--restore-roi-enhancer', choices=('none', 'realesrgan'), default='none', help=_('Optional ROI enhancer applied to restored mosaic regions before compositing. Real-ESRGAN is loaded only when selected. (default: %(default)s)'))
+    group_restoration.add_argument('--restore-roi-enhancer-model-path', type=str, default=None, help=_('Path to the Real-ESRGAN model weights used when --restore-roi-enhancer realesrgan is selected.'))
+    group_restoration.add_argument('--restore-roi-enhancer-scale', type=int, default=2, help=_('Real-ESRGAN output scale. The result is resized back to the ROI before compositing. (default: %(default)s)'))
+    group_restoration.add_argument('--restore-roi-enhancer-strength', type=float, default=0.0, help=_('Blend strength for the ROI enhancer output. 0 disables enhancer application even if configured. Start with 0.15-0.30. (default: %(default)s)'))
+    group_restoration.add_argument('--restore-roi-enhancer-tile', type=int, default=0, help=_('Real-ESRGAN tile size. 0 disables tiling. Use smaller values to reduce memory. (default: %(default)s)'))
 
     group_detection = parser.add_argument_group(_('Mosaic Detection'))
     group_detection.add_argument('--mosaic-detection-model', type=str, default='v4-fast', help=_('Name of detection model or path to model weights file. Use "--list-mosaic-detection-models" to see what\'s available. (default: %(default)s)'))
@@ -120,6 +126,10 @@ def process_video_file(input_path: str, output_path: str, temp_dir_path: str, de
                        mosaic_restoration_model_name, preferred_pad_mode, max_clip_length, encoder: str, encoder_options: str, mp4_fast_start,
                        restore_sharpen_strength: float = 0.0, restore_detail_boost: float = 0.0,
                        restore_blend_feather: float = 1.0, restore_texture_mix: float = 0.0,
+                       restore_roi_enhancer: str = "none", restore_roi_enhancer_model_path: str | None = None,
+                       restore_roi_enhancer_scale: int = 2, restore_roi_enhancer_strength: float = 0.0,
+                       restore_roi_enhancer_tile: int = 0, restore_effect_upscale: int = 1,
+                       fp16_enabled: bool = False,
                        mosaic_detection_empty_lookahead: int = 0):
     video_metadata = get_video_meta_data(input_path)
 
@@ -129,6 +139,13 @@ def process_video_file(input_path: str, output_path: str, temp_dir_path: str, de
                  restore_detail_boost=restore_detail_boost,
                  restore_blend_feather=restore_blend_feather,
                  restore_texture_mix=restore_texture_mix,
+                 restore_roi_enhancer=restore_roi_enhancer,
+                 restore_roi_enhancer_model_path=restore_roi_enhancer_model_path,
+                 restore_roi_enhancer_scale=restore_roi_enhancer_scale,
+                 restore_roi_enhancer_strength=restore_roi_enhancer_strength,
+                 restore_roi_enhancer_tile=restore_roi_enhancer_tile,
+                 restore_effect_upscale=restore_effect_upscale,
+                 fp16_enabled=fp16_enabled,
                  mosaic_detection_empty_lookahead=mosaic_detection_empty_lookahead)
     success = True
     video_tmp_file_output_path = os.path.join(temp_dir_path, f"{os.path.basename(os.path.splitext(output_path)[0])}.tmp{os.path.splitext(output_path)[1]}")
@@ -215,6 +232,21 @@ def main():
         sys.exit(1)
     if args.restore_texture_mix < 0:
         print(_("Invalid restore texture mix. Value must be 0 or greater."))
+        sys.exit(1)
+    if args.restore_effect_upscale < 1:
+        print(_("Invalid restore effect upscale. Value must be 1 or greater."))
+        sys.exit(1)
+    if args.restore_roi_enhancer == "realesrgan" and not args.restore_roi_enhancer_model_path:
+        print(_("--restore-roi-enhancer-model-path is required when --restore-roi-enhancer realesrgan is used."))
+        sys.exit(1)
+    if args.restore_roi_enhancer_scale < 1:
+        print(_("Invalid restore ROI enhancer scale. Value must be 1 or greater."))
+        sys.exit(1)
+    if args.restore_roi_enhancer_strength < 0:
+        print(_("Invalid restore ROI enhancer strength. Value must be 0 or greater."))
+        sys.exit(1)
+    if args.restore_roi_enhancer_tile < 0:
+        print(_("Invalid restore ROI enhancer tile. Value must be 0 or greater."))
         sys.exit(1)
     if args.mosaic_detection_empty_lookahead < 0:
         print(_("Invalid mosaic detection empty lookahead. Value must be 0 or greater."))
@@ -308,6 +340,13 @@ def main():
                                restore_detail_boost=args.restore_detail_boost,
                                restore_blend_feather=args.restore_blend_feather,
                                restore_texture_mix=args.restore_texture_mix,
+                               restore_roi_enhancer=args.restore_roi_enhancer,
+                               restore_roi_enhancer_model_path=args.restore_roi_enhancer_model_path,
+                               restore_roi_enhancer_scale=args.restore_roi_enhancer_scale,
+                               restore_roi_enhancer_strength=args.restore_roi_enhancer_strength,
+                               restore_roi_enhancer_tile=args.restore_roi_enhancer_tile,
+                               restore_effect_upscale=args.restore_effect_upscale,
+                               fp16_enabled=args.fp16,
                                mosaic_detection_empty_lookahead=args.mosaic_detection_empty_lookahead)
         except KeyboardInterrupt:
             print(_("Received Ctrl-C, stopping restoration."))
