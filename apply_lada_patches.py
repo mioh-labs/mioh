@@ -15,9 +15,17 @@ import os
 import sys
 import shutil
 import subprocess
+import json
+import tarfile
+import tempfile
+import urllib.request
+import importlib.util
 from pathlib import Path
 from datetime import datetime
 import site
+
+REALESRGAN_VERSION = "0.3.0"
+BASICSR_VERSION = "1.4.2"
 
 
 def find_site_packages() -> Path:
@@ -81,6 +89,170 @@ def create_backup(file_path: Path) -> Path:
     shutil.copy2(file_path, backup_path)
     print(f"  ✓ Backup created: {backup_path.name}")
     return backup_path
+
+
+def patch_basicsr_setup_py(setup_py_path: Path) -> bool:
+    """
+    Patch BasicSR 1.4.2 setup.py for Python 3.13.
+
+    BasicSR's setup.py executes basicsr/version.py and then reads
+    locals()['__version__']. On Python 3.13 this can be empty after exec(),
+    causing `KeyError: '__version__'` during pip metadata generation.
+    """
+    if not setup_py_path.exists():
+        print(f"  ✗ File not found: {setup_py_path}")
+        return False
+
+    content = setup_py_path.read_text(encoding="utf-8")
+    old_block = """def get_version():
+    with open(version_file, 'r') as f:
+        exec(compile(f.read(), version_file, 'exec'))
+    return locals()['__version__']
+"""
+    new_block = """def get_version():
+    namespace = {}
+    with open(version_file, 'r') as f:
+        exec(compile(f.read(), version_file, 'exec'), namespace)
+    return namespace['__version__']
+"""
+
+    if new_block in content:
+        print("  ⚠ BasicSR setup.py already patched")
+        return True
+    if old_block not in content:
+        print("  ✗ BasicSR setup.py get_version block not found")
+        return False
+
+    setup_py_path.write_text(content.replace(old_block, new_block), encoding="utf-8")
+    print("  ✓ Patched BasicSR setup.py for Python 3.13")
+    return True
+
+
+def safe_extract_tar(tar: tarfile.TarFile, destination: Path):
+    """Extract a tar archive while preventing path traversal."""
+    destination = destination.resolve()
+    for member in tar.getmembers():
+        target = (destination / member.name).resolve()
+        if os.path.commonpath([destination, target]) != str(destination):
+            raise RuntimeError(f"Unsafe path in tar archive: {member.name}")
+    tar.extractall(destination)
+
+
+def install_roi_enhancer_dependencies() -> bool:
+    """
+    Install optional Real-ESRGAN ROI enhancer dependencies.
+
+    `realesrgan==0.3.0` depends on `basicsr>=1.4.2`, but BasicSR 1.4.2's
+    source distribution fails metadata generation on Python 3.13. We download
+    the BasicSR sdist directly from PyPI, patch setup.py before pip evaluates
+    it, install that patched tree, and then install Real-ESRGAN normally.
+    """
+    print("\n" + "=" * 70)
+    print("Installing optional ROI enhancer dependencies")
+    print("=" * 70)
+    print(f"BasicSR: {BASICSR_VERSION}")
+    print(f"Real-ESRGAN: {REALESRGAN_VERSION}")
+
+    if importlib.util.find_spec("basicsr") and importlib.util.find_spec("realesrgan"):
+        print("\nBasicSR and Real-ESRGAN packages are already installed")
+        apply_patch_basicsr_torchvision_functional_tensor_compat()
+        if verify_roi_enhancer_imports():
+            print("✓ basicsr and realesrgan are already importable")
+            return True
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="lada-realesrgan-") as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            metadata_url = f"https://pypi.org/pypi/basicsr/{BASICSR_VERSION}/json"
+            print(f"\nFetching BasicSR metadata: {metadata_url}")
+            with urllib.request.urlopen(metadata_url) as response:
+                metadata = json.load(response)
+
+            sdist_url = next(
+                item["url"]
+                for item in metadata["urls"]
+                if item.get("packagetype") == "sdist"
+            )
+            sdist_path = tmp_path / f"basicsr-{BASICSR_VERSION}.tar.gz"
+            print(f"Downloading BasicSR sdist: {sdist_url}")
+            urllib.request.urlretrieve(sdist_url, sdist_path)
+
+            with tarfile.open(sdist_path, "r:gz") as tar:
+                safe_extract_tar(tar, tmp_path)
+
+            source_dir = tmp_path / f"basicsr-{BASICSR_VERSION}"
+            if not source_dir.exists():
+                print(f"  ✗ Extracted BasicSR source not found: {source_dir}")
+                return False
+
+            if not patch_basicsr_setup_py(source_dir / "setup.py"):
+                return False
+
+            print("\nInstalling patched BasicSR...")
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", str(source_dir)],
+                check=True,
+            )
+
+        print("\nInstalling Real-ESRGAN...")
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", f"realesrgan=={REALESRGAN_VERSION}"],
+            check=True,
+        )
+
+        apply_patch_basicsr_torchvision_functional_tensor_compat()
+
+        print("\nVerifying imports...")
+        if not verify_roi_enhancer_imports():
+            return False
+        print("✓ Optional ROI enhancer dependencies installed")
+        return True
+    except (subprocess.CalledProcessError, OSError, StopIteration, KeyError, RuntimeError) as exc:
+        print(f"\n✗ Failed to install ROI enhancer dependencies: {exc}")
+        return False
+
+
+def verify_roi_enhancer_imports() -> bool:
+    try:
+        subprocess.run(
+            [sys.executable, "-c", "import basicsr, realesrgan; print('basicsr/realesrgan import OK')"],
+            check=True,
+        )
+        return True
+    except subprocess.CalledProcessError as exc:
+        print(f"  ✗ ROI enhancer import verification failed: {exc}")
+        return False
+
+
+def apply_patch_basicsr_torchvision_functional_tensor_compat() -> bool:
+    """
+    Patch BasicSR for newer torchvision versions.
+
+    BasicSR 1.4.2 imports torchvision.transforms.functional_tensor, which was
+    removed from newer torchvision releases. Replace it with the public
+    torchvision.transforms.functional import used for rgb_to_grayscale.
+    """
+    print("\nApplying BasicSR torchvision functional_tensor compatibility patch...")
+    file_path = SITE_PACKAGES / "basicsr" / "data" / "degradations.py"
+    if not file_path.exists():
+        print(f"  ✗ File not found: {file_path}")
+        return False
+
+    content = file_path.read_text(encoding="utf-8")
+    old_line = "from torchvision.transforms.functional_tensor import rgb_to_grayscale"
+    new_line = "from torchvision.transforms.functional import rgb_to_grayscale"
+
+    if new_line in content:
+        print("  ⚠ Already patched")
+        return True
+    if old_line not in content:
+        print("  ✗ torchvision functional_tensor import not found")
+        return False
+
+    create_backup(file_path)
+    file_path.write_text(content.replace(old_line, new_line), encoding="utf-8")
+    print("  ✓ Patch applied successfully")
+    return True
 
 
 def apply_patch_mmengine_resume_dataloader():
@@ -604,6 +776,9 @@ Examples:
   
   # Skip model downloads
   python %(prog)s --skip-downloads
+
+  # Install optional Real-ESRGAN ROI enhancer dependencies
+  python %(prog)s --install-roi-enhancer-deps --skip-downloads
         """
     )
     
@@ -617,6 +792,12 @@ Examples:
         '--skip-downloads',
         action='store_true',
         help='Skip downloading model weights'
+    )
+
+    parser.add_argument(
+        '--install-roi-enhancer-deps',
+        action='store_true',
+        help='Install optional Real-ESRGAN ROI enhancer dependencies, including a Python 3.13 BasicSR setup.py compatibility patch'
     )
     
     args = parser.parse_args()
@@ -658,6 +839,10 @@ Examples:
     if not SITE_PACKAGES.exists():
         print(f"\n✗ Error: Site-packages directory not found: {SITE_PACKAGES}")
         sys.exit(1)
+
+    roi_enhancer_deps_success = True
+    if args.install_roi_enhancer_deps:
+        roi_enhancer_deps_success = install_roi_enhancer_dependencies()
     
     print("\nApplying patches...\n")
     
@@ -710,6 +895,8 @@ Examples:
     print("Overall Status")
     print("=" * 70)
     print(f"Patches: {success_count}/{total_count} successful")
+    if args.install_roi_enhancer_deps:
+        print(f"ROI enhancer deps: {'Installed/verified' if roi_enhancer_deps_success else 'Failed'}")
     if not args.skip_downloads:
         print(f"Models: {'All downloaded/verified' if download_success else 'Some downloads failed'}")
     else:
