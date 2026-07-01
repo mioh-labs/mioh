@@ -86,6 +86,7 @@ class WorkerRuntimeConfig:
     restore_detail_boost: float = 0.0
     restore_blend_feather: float = 1.0
     restore_texture_mix: float = 0.0
+    restore_smooth_strength: float = 0.0
     restore_roi_enhancer: str = "none"
     restore_roi_enhancer_model_path: str | None = None
     restore_roi_enhancer_scale: int = 2
@@ -159,6 +160,8 @@ def build_lada_cli_command(config: WorkerRuntimeConfig, input_video: Path, outpu
     cmd.extend(['--restore-blend-feather', str(config.restore_blend_feather)])
     if config.restore_texture_mix > 0:
         cmd.extend(['--restore-texture-mix', str(config.restore_texture_mix)])
+    if config.restore_smooth_strength > 0:
+        cmd.extend(['--restore-smooth-strength', str(config.restore_smooth_strength)])
     if config.restore_effect_upscale > 1:
         cmd.extend(['--restore-effect-upscale', str(config.restore_effect_upscale)])
     if config.restore_roi_enhancer != "none":
@@ -1072,6 +1075,7 @@ class ParallelVideoProcessor:
             restore_detail_boost=self.args.restore_detail_boost,
             restore_blend_feather=self.args.restore_blend_feather,
             restore_texture_mix=self.args.restore_texture_mix,
+            restore_smooth_strength=self.args.restore_smooth_strength,
             restore_roi_enhancer=self.args.restore_roi_enhancer,
             restore_roi_enhancer_model_path=self.args.restore_roi_enhancer_model_path,
             restore_roi_enhancer_scale=self.args.restore_roi_enhancer_scale,
@@ -1243,6 +1247,8 @@ class ParallelVideoProcessor:
         cmd.extend(['--restore-blend-feather', str(self.args.restore_blend_feather)])
         if self.args.restore_texture_mix > 0:
             cmd.extend(['--restore-texture-mix', str(self.args.restore_texture_mix)])
+        if self.args.restore_smooth_strength > 0:
+            cmd.extend(['--restore-smooth-strength', str(self.args.restore_smooth_strength)])
         if self.args.restore_effect_upscale > 1:
             cmd.extend(['--restore-effect-upscale', str(self.args.restore_effect_upscale)])
         if self.args.restore_roi_enhancer != "none":
@@ -1957,6 +1963,8 @@ def build_arg_parser():
                         help='復元ROI境界ブレンドのぼかし倍率（1.0で標準、例: 1.0〜1.5）')
     parser.add_argument('--restore-texture-mix', type=float, default=0.0,
                         help='元ROIの中周波テクスチャを復元ROIへ薄く戻す強度（0で無効、例: 0.08）')
+    parser.add_argument('--restore-smooth-strength', type=float, default=0.0,
+                        help='texture/detail/sharpen後の復元ROIを合成前に滑らかにする強度（0で無効、例: 0.10〜0.25）')
     parser.add_argument('--restore-effect-upscale', type=int, default=1,
                         help='texture/detail/sharpenをOpenCVで拡大後に適用して戻す倍率（1で無効、例: 2）')
     parser.add_argument('--restore-roi-enhancer', choices=('none', 'realesrgan'), default='none',
@@ -2040,6 +2048,9 @@ def main():
         return
     if args.restore_texture_mix < 0:
         print("エラー: --restore-texture-mix は0以上である必要があります")
+        return
+    if args.restore_smooth_strength < 0:
+        print("エラー: --restore-smooth-strength は0以上である必要があります")
         return
     if args.restore_effect_upscale < 1:
         print("エラー: --restore-effect-upscale は1以上である必要があります")
