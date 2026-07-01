@@ -107,6 +107,7 @@ def setup_argparser() -> argparse.ArgumentParser:
     group_restoration.add_argument('--restore-detail-boost', type=float, default=0.0, help=_('Boost local detail/contrast in restored mosaic regions before compositing. 0 disables it. Start with 0.1-0.2 for testing. (default: %(default)s)'))
     group_restoration.add_argument('--restore-blend-feather', type=float, default=1.0, help=_('Multiplier for restored mosaic region blend feathering. 1 keeps the default mask feather. Larger values soften boundaries more. (default: %(default)s)'))
     group_restoration.add_argument('--restore-texture-mix', type=float, default=0.0, help=_('Mix mid-frequency texture from the source ROI into restored mosaic regions. 0 disables it. Start with 0.05-0.10 for testing. (default: %(default)s)'))
+    group_restoration.add_argument('--restore-smooth-strength', type=float, default=0.0, help=_('Smooth restored mosaic regions after texture/detail/sharpen effects before compositing. 0 disables it. Start with 0.10-0.25. (default: %(default)s)'))
     group_restoration.add_argument('--restore-effect-upscale', type=int, default=1, help=_('Upscale restored mosaic mask areas before applying texture/detail/sharpen effects, then resize back before compositing. 1 disables it; use 2 for OpenCV 2x processing. (default: %(default)s)'))
     group_restoration.add_argument('--restore-roi-enhancer', choices=('none', 'realesrgan'), default='none', help=_('Optional ROI enhancer applied to restored mosaic regions before compositing. Real-ESRGAN is loaded only when selected. (default: %(default)s)'))
     group_restoration.add_argument('--restore-roi-enhancer-model-path', type=str, default=None, help=_('Path to the Real-ESRGAN model weights used when --restore-roi-enhancer realesrgan is selected.'))
@@ -126,6 +127,7 @@ def process_video_file(input_path: str, output_path: str, temp_dir_path: str, de
                        mosaic_restoration_model_name, preferred_pad_mode, max_clip_length, encoder: str, encoder_options: str, mp4_fast_start,
                        restore_sharpen_strength: float = 0.0, restore_detail_boost: float = 0.0,
                        restore_blend_feather: float = 1.0, restore_texture_mix: float = 0.0,
+                       restore_smooth_strength: float = 0.0,
                        restore_roi_enhancer: str = "none", restore_roi_enhancer_model_path: str | None = None,
                        restore_roi_enhancer_scale: int = 2, restore_roi_enhancer_strength: float = 0.0,
                        restore_roi_enhancer_tile: int = 0, restore_effect_upscale: int = 1,
@@ -139,6 +141,7 @@ def process_video_file(input_path: str, output_path: str, temp_dir_path: str, de
                  restore_detail_boost=restore_detail_boost,
                  restore_blend_feather=restore_blend_feather,
                  restore_texture_mix=restore_texture_mix,
+                 restore_smooth_strength=restore_smooth_strength,
                  restore_roi_enhancer=restore_roi_enhancer,
                  restore_roi_enhancer_model_path=restore_roi_enhancer_model_path,
                  restore_roi_enhancer_scale=restore_roi_enhancer_scale,
@@ -232,6 +235,9 @@ def main():
         sys.exit(1)
     if args.restore_texture_mix < 0:
         print(_("Invalid restore texture mix. Value must be 0 or greater."))
+        sys.exit(1)
+    if args.restore_smooth_strength < 0:
+        print(_("Invalid restore smooth strength. Value must be 0 or greater."))
         sys.exit(1)
     if args.restore_effect_upscale < 1:
         print(_("Invalid restore effect upscale. Value must be 1 or greater."))
@@ -340,6 +346,7 @@ def main():
                                restore_detail_boost=args.restore_detail_boost,
                                restore_blend_feather=args.restore_blend_feather,
                                restore_texture_mix=args.restore_texture_mix,
+                               restore_smooth_strength=args.restore_smooth_strength,
                                restore_roi_enhancer=args.restore_roi_enhancer,
                                restore_roi_enhancer_model_path=args.restore_roi_enhancer_model_path,
                                restore_roi_enhancer_scale=args.restore_roi_enhancer_scale,

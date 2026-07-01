@@ -7,6 +7,7 @@ from lada.restorationpipeline.frame_restorer import (
     apply_restore_effect_upscale,
     apply_restore_detail_boost,
     apply_restore_sharpening,
+    apply_restore_smoothing,
     apply_restore_texture_mix,
 )
 from lada.cli.main import setup_argparser
@@ -90,6 +91,23 @@ class RestoreSharpenTests(unittest.TestCase):
         self.assertTrue(np.array_equal(mixed[mask.squeeze() == 0], restored[mask.squeeze() == 0]))
         self.assertFalse(np.array_equal(mixed[mask.squeeze() > 0], restored[mask.squeeze() > 0]))
 
+    def test_apply_restore_smoothing_zero_strength_returns_input(self):
+        image = np.arange(75, dtype=np.uint8).reshape(5, 5, 3)
+
+        smoothed = apply_restore_smoothing(image, strength=0.0)
+
+        self.assertIs(smoothed, image)
+
+    def test_apply_restore_smoothing_positive_strength_softens_variation(self):
+        image = np.zeros((9, 9, 3), dtype=np.uint8)
+        image[::2, ::2, :] = 255
+
+        smoothed = apply_restore_smoothing(image, strength=0.5)
+
+        self.assertEqual(smoothed.dtype, np.uint8)
+        self.assertEqual(smoothed.shape, image.shape)
+        self.assertLess(smoothed.astype(np.float32).var(), image.astype(np.float32).var())
+
     def test_apply_restore_roi_enhancer_zero_strength_returns_restored(self):
         restored = np.full((5, 5, 3), 64, dtype=np.uint8)
 
@@ -146,6 +164,7 @@ class RestoreSharpenTests(unittest.TestCase):
             texture_mix=1.0,
             detail_boost=0.5,
             sharpen_strength=0.8,
+            smooth_strength=0.4,
         )
 
         self.assertTrue(np.array_equal(enhanced[mask.squeeze() == 0], restored[mask.squeeze() == 0]))
@@ -160,6 +179,7 @@ class RestoreSharpenTests(unittest.TestCase):
             "--restore-detail-boost", "0.15",
             "--restore-blend-feather", "1.0",
             "--restore-texture-mix", "0.08",
+            "--restore-smooth-strength", "0.25",
             "--restore-roi-enhancer", "realesrgan",
             "--restore-roi-enhancer-model-path", "RealESRGAN_x2plus.pth",
             "--restore-roi-enhancer-scale", "2",
@@ -173,6 +193,7 @@ class RestoreSharpenTests(unittest.TestCase):
         self.assertEqual(args.restore_detail_boost, 0.15)
         self.assertEqual(args.restore_blend_feather, 1.0)
         self.assertEqual(args.restore_texture_mix, 0.08)
+        self.assertEqual(args.restore_smooth_strength, 0.25)
         self.assertEqual(args.restore_roi_enhancer, "realesrgan")
         self.assertEqual(args.restore_roi_enhancer_model_path, "RealESRGAN_x2plus.pth")
         self.assertEqual(args.restore_roi_enhancer_scale, 2)
@@ -203,6 +224,7 @@ class RestoreSharpenTests(unittest.TestCase):
             restore_detail_boost=0.15,
             restore_blend_feather=1.0,
             restore_texture_mix=0.08,
+            restore_smooth_strength=0.25,
             restore_roi_enhancer="realesrgan",
             restore_roi_enhancer_model_path="RealESRGAN_x2plus.pth",
             restore_roi_enhancer_scale=2,
@@ -221,6 +243,8 @@ class RestoreSharpenTests(unittest.TestCase):
         self.assertIn("1.0", cmd)
         self.assertIn("--restore-texture-mix", cmd)
         self.assertIn("0.08", cmd)
+        self.assertIn("--restore-smooth-strength", cmd)
+        self.assertIn("0.25", cmd)
         self.assertIn("--restore-roi-enhancer", cmd)
         self.assertIn("realesrgan", cmd)
         self.assertIn("--restore-roi-enhancer-model-path", cmd)

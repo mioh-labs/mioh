@@ -48,6 +48,14 @@ def apply_restore_detail_boost(image: np.ndarray, strength: float) -> np.ndarray
     return cv2.cvtColor(boosted_lab, cv2.COLOR_LAB2RGB)
 
 
+def apply_restore_smoothing(image: np.ndarray, strength: float, sigma: float = 1.0) -> np.ndarray:
+    if strength <= 0:
+        return image
+    strength = min(strength, 1.0)
+    blurred = cv2.GaussianBlur(image, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    return cv2.addWeighted(image, 1.0 - strength, blurred, strength, 0)
+
+
 def _normalize_roi_mask(mask: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     if mask.ndim == 2:
         mask = mask[:, :, None]
@@ -158,8 +166,9 @@ def apply_restore_effect_upscale(
     texture_mix: float = 0.0,
     detail_boost: float = 0.0,
     sharpen_strength: float = 0.0,
+    smooth_strength: float = 0.0,
 ) -> np.ndarray:
-    if texture_mix <= 0 and detail_boost <= 0 and sharpen_strength <= 0:
+    if texture_mix <= 0 and detail_boost <= 0 and sharpen_strength <= 0 and smooth_strength <= 0:
         return restored
     mask_f = _normalize_roi_mask(mask, restored.shape[:2])
     if np.count_nonzero(mask_f) == 0:
@@ -169,6 +178,8 @@ def apply_restore_effect_upscale(
         processed = apply_restore_detail_boost(processed, detail_boost)
         processed = _apply_mask_to_processed(restored, processed, mask_f)
         processed = apply_restore_sharpening(processed, sharpen_strength)
+        processed = _apply_mask_to_processed(restored, processed, mask_f)
+        processed = apply_restore_smoothing(processed, smooth_strength)
         return _apply_mask_to_processed(restored, processed, mask_f)
 
     target_size = (restored.shape[1] * scale, restored.shape[0] * scale)
@@ -182,6 +193,8 @@ def apply_restore_effect_upscale(
     processed_hr = apply_restore_detail_boost(processed_hr, detail_boost)
     processed_hr = _apply_mask_to_processed(restored_hr, processed_hr, mask_hr)
     processed_hr = apply_restore_sharpening(processed_hr, sharpen_strength)
+    processed_hr = _apply_mask_to_processed(restored_hr, processed_hr, mask_hr)
+    processed_hr = apply_restore_smoothing(processed_hr, smooth_strength)
     processed_hr = _apply_mask_to_processed(restored_hr, processed_hr, mask_hr)
 
     processed = cv2.resize(processed_hr, (restored.shape[1], restored.shape[0]), interpolation=cv2.INTER_AREA)
@@ -272,7 +285,8 @@ class FrameRestorer:
                  mosaic_detection_model: Yolo11SegmentationModel, mosaic_restoration_model, preferred_pad_mode,
                  mosaic_detection=False, restore_sharpen_strength: float = 0.0,
                  restore_detail_boost: float = 0.0, restore_blend_feather: float = 1.0,
-                 restore_texture_mix: float = 0.0, restore_roi_enhancer: str = "none",
+                 restore_texture_mix: float = 0.0, restore_smooth_strength: float = 0.0,
+                 restore_roi_enhancer: str = "none",
                  restore_roi_enhancer_model_path: str | None = None,
                  restore_roi_enhancer_scale: int = 2,
                  restore_roi_enhancer_strength: float = 0.0,
@@ -294,6 +308,7 @@ class FrameRestorer:
         self.restore_detail_boost = restore_detail_boost
         self.restore_blend_feather = restore_blend_feather
         self.restore_texture_mix = restore_texture_mix
+        self.restore_smooth_strength = restore_smooth_strength
         self.restore_roi_enhancer_name = restore_roi_enhancer
         self.restore_roi_enhancer_scale = restore_roi_enhancer_scale
         self.restore_roi_enhancer_strength = restore_roi_enhancer_strength
@@ -541,6 +556,7 @@ class FrameRestorer:
                 or self.restore_texture_mix > 0
                 or self.restore_detail_boost > 0
                 or self.restore_sharpen_strength > 0
+                or self.restore_smooth_strength > 0
             ):
                 t, l, b, r = orig_clip_box
                 original_roi = frame[t:b + 1, l:r + 1, :]
@@ -564,6 +580,7 @@ class FrameRestorer:
                         texture_mix=self.restore_texture_mix,
                         detail_boost=self.restore_detail_boost,
                         sharpen_strength=self.restore_sharpen_strength,
+                        smooth_strength=self.restore_smooth_strength,
                     )
                     clip_img_np = _apply_mask_to_processed(base_clip_img_np, clip_img_np, clip_mask_np)
                     clip_img = torch.from_numpy(clip_img_np).to(device=clip_img.device)
@@ -584,6 +601,7 @@ class FrameRestorer:
                         texture_mix=self.restore_texture_mix,
                         detail_boost=self.restore_detail_boost,
                         sharpen_strength=self.restore_sharpen_strength,
+                        smooth_strength=self.restore_smooth_strength,
                     )
                     clip_img = _apply_mask_to_processed(base_clip_img, clip_img, clip_mask)
             blend_mask = mask_utils.create_blend_mask(
