@@ -942,6 +942,20 @@ def has_pending_segment_work(temp_dir: Path) -> bool:
     return False
 
 
+def resolve_single_output_path(input_path: Path, output_path: Path) -> Path:
+    """
+    For single-file runs, allow --output to be a directory-like path.
+    This mirrors batch naming and prevents ffmpeg from receiving an
+    extensionless directory path as the final muxer output.
+    """
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+    if output_path.is_dir() or not output_path.suffix:
+        output_path.mkdir(parents=True, exist_ok=True)
+        return output_path / f"{input_path.stem}-UC{input_path.suffix}"
+    return output_path
+
+
 def merge_videos(segment_paths, output_path, encoder='copy'):
     """複数の動画を結合（音声も含む）"""
     print(f"\n動画を結合中... ({len(segment_paths)}個のセグメント)")
@@ -2108,6 +2122,7 @@ def main():
     # 単一ファイル処理
     if input_path.is_file():
         temp_dir = Path(args.temp_dir) / input_path.stem
+        output_path = resolve_single_output_path(input_path, output_path)
         processor = ParallelVideoProcessor(args)
         processor.process(input_path, output_path, temp_dir)
     
