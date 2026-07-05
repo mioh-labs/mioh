@@ -605,7 +605,7 @@ class FrameRestorer:
                     )
                     clip_img = _apply_mask_to_processed(base_clip_img, clip_img, clip_mask)
             blend_mask = mask_utils.create_blend_mask(
-                clip_mask.to(device=self.device).float(),
+                clip_mask.float(),
                 feather_multiplier=self.restore_blend_feather,
             ).to(device=clip_img.device, dtype=target_dtype)
 
@@ -625,6 +625,26 @@ class FrameRestorer:
         for i in range(len(restored_clip_images)):
             assert clip.frames[i].shape == restored_clip_images[i].shape
             clip.frames[i] = restored_clip_images[i]
+        self._move_clip_to_cpu(clip)
+
+    def _move_clip_to_cpu(self, clip: Clip):
+        """
+        Hand restored clips to the composition thread as CPU tensors. One
+        batched transfer per clip is much cheaper than the per-frame
+        transfers and device syncs composition triggers otherwise, and it
+        lets composition of CPU frames run without the MPS execution lock.
+        """
+        if self.device.type != 'mps':
+            return
+
+        def to_cpu_batched(items):
+            if items and all(isinstance(x, torch.Tensor) and x.device.type == 'mps' for x in items):
+                for i, item in enumerate(torch.stack(items).cpu().unbind(0)):
+                    items[i] = item
+
+        with serialized_mps_execution():
+            to_cpu_batched(clip.frames)
+            to_cpu_batched(clip.masks)
 
     def _collect_garbage(self, clip_buffer):
         processed_clips = list(filter(lambda _clip: len(_clip) == 0, clip_buffer))
@@ -728,7 +748,14 @@ class FrameRestorer:
                     if queue_marker is STOP_MARKER:
                         break
 
-                    if self.device.type == 'mps':
+                    # Restored clips arrive as CPU tensors, so composing CPU
+                    # frames touches no MPS state; only take the MPS lock when
+                    # the frame or the optional ROI enhancer runs on the GPU.
+                    composition_needs_mps = (
+                        frame.device.type != 'cpu'
+                        or (self.restore_roi_enhancer is not None and self.restore_roi_enhancer_strength > 0)
+                    )
+                    if self.device.type == 'mps' and composition_needs_mps:
                         with serialized_mps_execution():
                             self._restore_frame(frame, frame_num, clip_buffer)
                     else:
