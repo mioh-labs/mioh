@@ -119,6 +119,9 @@ def _install_torchvision_functional_tensor_compat():
 def create_realesrgan_enhancer(model_path: str, scale: int = 2, tile: int = 0, fp16: bool = False, device=None):
     if not model_path:
         raise ValueError("--restore-roi-enhancer-model-path is required when --restore-roi-enhancer realesrgan is used")
+    if str(model_path).endswith(".mlpackage"):
+        from lada.restorationpipeline.coreml_realesrgan import CoreMLRealESRGANEnhancer
+        return CoreMLRealESRGANEnhancer(model_path)
     _install_torchvision_functional_tensor_compat()
     try:
         from basicsr.archs.rrdbnet_arch import RRDBNet
@@ -128,6 +131,7 @@ def create_realesrgan_enhancer(model_path: str, scale: int = 2, tile: int = 0, f
 
     model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=scale)
     gpu_id = 0 if torch.cuda.is_available() else None
+    device_type = torch.device(device).type if device is not None else None
     return RealESRGANer(
         scale=scale,
         model_path=model_path,
@@ -135,7 +139,7 @@ def create_realesrgan_enhancer(model_path: str, scale: int = 2, tile: int = 0, f
         tile=tile,
         tile_pad=10,
         pre_pad=0,
-        half=fp16 and gpu_id is not None,
+        half=fp16 and (gpu_id is not None or device_type == 'mps'),
         device=device,
         gpu_id=gpu_id,
     )
@@ -753,7 +757,8 @@ class FrameRestorer:
                     # the frame or the optional ROI enhancer runs on the GPU.
                     composition_needs_mps = (
                         frame.device.type != 'cpu'
-                        or (self.restore_roi_enhancer is not None and self.restore_roi_enhancer_strength > 0)
+                        or (self.restore_roi_enhancer is not None and self.restore_roi_enhancer_strength > 0
+                            and getattr(self.restore_roi_enhancer, 'uses_torch_device', True))
                     )
                     if self.device.type == 'mps' and composition_needs_mps:
                         with serialized_mps_execution():
