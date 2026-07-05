@@ -35,7 +35,7 @@ except ModuleNotFoundError:
     else:
         raise
 
-from lada import VERSION, ModelFiles
+from lada import VERSION, MODEL_WEIGHTS_DIR, ModelFiles
 from lada.cli import utils
 from lada.utils import audio_utils, video_utils
 from lada.utils.mps_utils import configure_mps_runtime, get_mps_memory_stats
@@ -245,6 +245,16 @@ def main():
     if args.restore_roi_enhancer == "realesrgan" and not args.restore_roi_enhancer_model_path:
         print(_("--restore-roi-enhancer-model-path is required when --restore-roi-enhancer realesrgan is used."))
         sys.exit(1)
+    if args.restore_roi_enhancer_model_path and not os.path.exists(args.restore_roi_enhancer_model_path):
+        # allow a well-known name (e.g. mewzoom-x4-coreml) or a bare filename in the model weights dir
+        in_weights_dir = os.path.join(MODEL_WEIGHTS_DIR, args.restore_roi_enhancer_model_path)
+        if enhancer_modelfile := ModelFiles.get_enhancer_model_by_name(args.restore_roi_enhancer_model_path):
+            args.restore_roi_enhancer_model_path = enhancer_modelfile.path
+        elif os.path.exists(in_weights_dir):
+            args.restore_roi_enhancer_model_path = in_weights_dir
+        else:
+            print(_("Invalid restore ROI enhancer model path"))
+            sys.exit(1)
     if args.restore_roi_enhancer_scale < 1:
         print(_("Invalid restore ROI enhancer scale. Value must be 1 or greater."))
         sys.exit(1)
