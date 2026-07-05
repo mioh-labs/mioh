@@ -1,12 +1,14 @@
 # SPDX-FileCopyrightText: Lada Authors
 # SPDX-License-Identifier: AGPL-3.0
 
-"""Core ML backend for the Real-ESRGAN ROI enhancer.
+"""Core ML backend for ROI enhancer models (Real-ESRGAN, MewZoom, ...).
 
 Runs an .mlpackage exported by scripts/apple/export_realesrgan_coreml.py
-on the Neural Engine via coremltools. Exposes the same enhance() call
-shape as realesrgan.RealESRGANer so frame_restorer can use either
-implementation interchangeably.
+or scripts/apple/export_mewzoom_coreml.py on the Neural Engine via
+coremltools. Exposes the same enhance() call shape as
+realesrgan.RealESRGANer so frame_restorer can use any implementation
+interchangeably. The export must carry lada.enhancer, lada.scale and
+lada.imgsz metadata and use fixed-size image input/output.
 """
 
 import logging
@@ -18,7 +20,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-class CoreMLRealESRGANEnhancer:
+class CoreMLROIEnhancer:
     # Composition can run without the MPS execution lock with this enhancer.
     uses_torch_device = False
 
@@ -31,8 +33,9 @@ class CoreMLRealESRGANEnhancer:
         unit = getattr(ct.ComputeUnit, unit_name, ct.ComputeUnit.CPU_AND_NE)
         self.model = ct.models.MLModel(str(model_path), compute_units=unit)
         metadata = dict(self.model.user_defined_metadata)
-        if metadata.get("lada.enhancer") != "realesrgan":
-            raise ValueError(f"{model_path} is not a LADA Real-ESRGAN Core ML export")
+        if "lada.enhancer" not in metadata or "lada.scale" not in metadata or "lada.imgsz" not in metadata:
+            raise ValueError(f"{model_path} is not a LADA ROI enhancer Core ML export")
+        self.enhancer_name = metadata["lada.enhancer"]
         self.scale = int(metadata["lada.scale"])
         self.imgsz = int(metadata["lada.imgsz"])
         spec = self.model.get_spec()

@@ -8,7 +8,7 @@ from unittest import mock
 import numpy as np
 from PIL import Image
 
-from lada.restorationpipeline.coreml_realesrgan import CoreMLRealESRGANEnhancer
+from lada.restorationpipeline.coreml_roi_enhancer import CoreMLROIEnhancer
 from scripts.apple import export_realesrgan_coreml as export_mod
 
 
@@ -28,10 +28,10 @@ def make_fake_mlmodel(metadata=None):
     return fake
 
 
-class CoreMLRealESRGANEnhancerTests(unittest.TestCase):
+class CoreMLROIEnhancerTests(unittest.TestCase):
     def make_enhancer(self, metadata=None):
         with mock.patch("coremltools.models.MLModel", return_value=make_fake_mlmodel(metadata)):
-            return CoreMLRealESRGANEnhancer("enhancer.mlpackage")
+            return CoreMLROIEnhancer("enhancer.mlpackage")
 
     def test_rejects_foreign_mlpackage(self):
         with self.assertRaises(ValueError):
@@ -64,10 +64,29 @@ class ExportRealESRGANArgsTests(unittest.TestCase):
         self.assertEqual(args.scale, 4)
 
 
+class ExportMewZoomArgsTests(unittest.TestCase):
+    def test_defaults(self):
+        from scripts.apple import export_mewzoom_coreml as mewzoom_mod
+        args = mewzoom_mod.parse_args([])
+        self.assertEqual(args.repo, "andrewdalpino/MewZoom-V1-4X-Unet")
+        self.assertEqual(str(args.output_dir), "model_weights")
+        self.assertEqual(args.imgsz, 256)
+
+
+class MetadataGuardTests(unittest.TestCase):
+    def test_accepts_any_lada_enhancer_metadata(self):
+        with mock.patch("coremltools.models.MLModel", return_value=make_fake_mlmodel({
+            "lada.enhancer": "mewzoom", "lada.scale": "4", "lada.imgsz": "256",
+        })):
+            enhancer = CoreMLROIEnhancer("mewzoom.mlpackage")
+        self.assertEqual(enhancer.enhancer_name, "mewzoom")
+        self.assertEqual(enhancer.scale, 4)
+
+
 class EnhancerFactoryTests(unittest.TestCase):
     def test_mlpackage_path_uses_coreml_backend(self):
         from lada.restorationpipeline.frame_restorer import create_realesrgan_enhancer
-        with mock.patch("lada.restorationpipeline.coreml_realesrgan.CoreMLRealESRGANEnhancer") as coreml_cls:
+        with mock.patch("lada.restorationpipeline.coreml_roi_enhancer.CoreMLROIEnhancer") as coreml_cls:
             create_realesrgan_enhancer("enhancer.mlpackage", scale=4)
         coreml_cls.assert_called_once_with("enhancer.mlpackage")
 
