@@ -2,9 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0 AND AGPL-3.0
 # Code vendored from: https://github.com/open-mmlab/mmagic
 
+import os
+
 import torch
 import torch.nn.functional as F
 from lada.utils.mps_utils import safe_mps_grid_sample, check_mps_tensor_validity, ensure_mps_tensor_contiguous
+
+# The NaN/Inf validity checks force a full GPU sync per flow_warp call
+# (.any() round-trip), which dominates BasicVSR++ propagation time on MPS.
+# Keep them opt-in for debugging numeric issues.
+_VALIDATE_MPS_TENSORS = os.environ.get('LADA_MPS_VALIDATE_TENSORS', '').strip().lower() not in ('', '0', 'false', 'no', 'off')
 
 
 def flow_warp(x,
@@ -64,10 +71,11 @@ def flow_warp(x,
         if x.numel() == 0 or grid_flow.numel() == 0:
             return torch.empty(x.shape, device=x.device, dtype=x.dtype)
 
-        if not check_mps_tensor_validity(x, "input", silent=True):
-            return torch.zeros_like(x)
-        if not check_mps_tensor_validity(grid_flow, "grid_flow", silent=True):
-            return torch.zeros_like(x)
+        if _VALIDATE_MPS_TENSORS:
+            if not check_mps_tensor_validity(x, "input", silent=True):
+                return torch.zeros_like(x)
+            if not check_mps_tensor_validity(grid_flow, "grid_flow", silent=True):
+                return torch.zeros_like(x)
 
         x = ensure_mps_tensor_contiguous(x)
         grid_flow = ensure_mps_tensor_contiguous(grid_flow)
