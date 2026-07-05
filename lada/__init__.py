@@ -88,6 +88,7 @@ class ModelFiles:
         ModelFile('v4-fast', _("Fast and efficient. Recommended"), os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_detection_model_v4_fast.pt')),
         ModelFile('v4-accurate', _("Can be slightly more accurate than v4-fast but slower"), os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_detection_model_v4_accurate.pt')),
         ModelFile('v4-fast-coreml', _("v4-fast running on Apple Neural Engine via Core ML"), os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_detection_model_v4_fast.mlpackage')),
+        ModelFile('v2-coreml', _("v2 running on Apple Neural Engine via Core ML"), os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_detection_model_v2.mlpackage')),
     ]
 
     @staticmethod
