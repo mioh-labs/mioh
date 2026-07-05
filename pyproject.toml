@@ -61,9 +61,21 @@ apple = [
     "torchvision==0.27.0; sys_platform == 'darwin'",
     "mps-deform-conv; sys_platform == 'darwin' and (platform_machine == 'arm64' or platform_machine == 'aarch64')",
 ]
-# Core ML detection backend (.mlpackage export and runtime inference)
+# Core ML backends (.mlpackage export and runtime inference for detection
+# and ROI enhancers). huggingface_hub/safetensors are needed by the MewZoom
+# export script, which uses a vendored architecture (lada/models/mewzoom)
+# instead of the mewzoom package because the latter pins torch~=2.9.
 apple-coreml = [
     "coremltools>=9.0; sys_platform == 'darwin'",
+    "huggingface_hub; sys_platform == 'darwin'",
+    "safetensors; sys_platform == 'darwin'",
+]
+# PyTorch backend for --restore-roi-enhancer with .pth weights.
+# Run apply_lada_patches.py after installing (basicsr needs a torchvision
+# compatibility patch).
+roi-enhancer-torch = [
+    "realesrgan>=0.3.0",
+    "basicsr>=1.4.2",
 ]
 apple-mlx = [
     "mlx==0.31.2; sys_platform == 'darwin' and (platform_machine == 'arm64' or platform_machine == 'aarch64')",

@@ -136,12 +136,18 @@ PyTorch/MPS. Detection then executes on the Neural Engine / GPU as chosen
 by Core ML, stays off the MPS command queue used by restoration, and is
 significantly faster per frame.
 
-1) Export the detection model (one-time, requires `coremltools`):
+1) Export the detection model (one-time). Install the Core ML extra
+   first — it covers all Core ML export and runtime dependencies
+   (`coremltools`, `huggingface_hub`, `safetensors`):
 
    ```bash
-   pip install coremltools
+   pip install -e ".[apple-coreml]"   # or: uv sync --extra cpu --extra apple-coreml
    python scripts/apple/export_v4_fast_coreml.py --output-dir model_weights
    ```
+
+   For the PyTorch (.pth) ROI enhancer backend, add the
+   `roi-enhancer-torch` extra and run `python apply_lada_patches.py`
+   afterwards.
 
 2) Run with the Core ML detector:
 
@@ -192,9 +198,11 @@ blur/noise/compression artifact removal — the open counterpart of
 jasna's unet-4x):
 
 ```bash
-pip install --no-deps mewzoom  # pins torch~=2.9; install without deps
 python scripts/apple/export_mewzoom_coreml.py
 ```
+
+The MewZoom architecture is vendored in `lada/models/mewzoom` — do not
+`pip install mewzoom`, its `torch~=2.9` pin would downgrade PyTorch.
 
 Then pass `model_weights/MewZoom-V1-4X-Unet_256.mlpackage` as
 `--restore-roi-enhancer-model-path`. Measured ~100 ms/frame on the

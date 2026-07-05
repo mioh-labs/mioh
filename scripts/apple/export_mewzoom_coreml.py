@@ -38,7 +38,8 @@ def export_model(repo: str, output_dir: Path, imgsz: int, allow_overwrite: bool 
     if output_path.exists() and not allow_overwrite:
         return output_path
 
-    from mewzoom.model import MewZoom, SubpixelConv2d
+    # vendored copy avoids the mewzoom package's torch~=2.9 pin
+    from lada.models.mewzoom.model import MewZoom, SubpixelConv2d
 
     model = MewZoom.from_pretrained(repo)
     model.eval()
