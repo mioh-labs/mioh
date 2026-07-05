@@ -111,9 +111,9 @@ def setup_argparser() -> argparse.ArgumentParser:
     group_restoration.add_argument('--restore-effect-upscale', type=int, default=1, help=_('Upscale restored mosaic mask areas before applying texture/detail/sharpen effects, then resize back before compositing. 1 disables it; use 2 for OpenCV 2x processing. (default: %(default)s)'))
     group_restoration.add_argument('--restore-roi-enhancer', choices=('none', 'realesrgan', 'mewzoom'), default='none', help=_('Optional ROI enhancer applied to restored mosaic regions before compositing. The model is loaded only when selected. (default: %(default)s)'))
     group_restoration.add_argument('--restore-roi-enhancer-model-path', type=str, default=None, help=_('Enhancer model: a well-known name, a filename in the model weights dir, or a path. Defaults to <enhancer>-x4-coreml when omitted.'))
-    group_restoration.add_argument('--restore-roi-enhancer-scale', type=int, default=2, help=_('Real-ESRGAN output scale. The result is resized back to the ROI before compositing. (default: %(default)s)'))
+    group_restoration.add_argument('--restore-roi-enhancer-scale', type=int, default=2, help=_('Enhancer output scale. The result is resized back to the ROI before compositing. (default: %(default)s)'))
     group_restoration.add_argument('--restore-roi-enhancer-strength', type=float, default=0.0, help=_('Blend strength for the ROI enhancer output. 0 disables enhancer application even if configured. Start with 0.15-0.30. (default: %(default)s)'))
-    group_restoration.add_argument('--restore-roi-enhancer-tile', type=int, default=0, help=_('Real-ESRGAN tile size. 0 disables tiling. Use smaller values to reduce memory. (default: %(default)s)'))
+    group_restoration.add_argument('--restore-roi-enhancer-tile', type=int, default=0, help=_('Tile size for the PyTorch Real-ESRGAN backend. 0 disables tiling. Not used by Core ML enhancers. (default: %(default)s)'))
 
     group_detection = parser.add_argument_group(_('Mosaic Detection'))
     group_detection.add_argument('--mosaic-detection-model', type=str, default='v4-fast', help=_('Name of detection model or path to model weights file. Use "--list-mosaic-detection-models" to see what\'s available. (default: %(default)s)'))

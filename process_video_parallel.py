@@ -2006,13 +2006,14 @@ def build_arg_parser():
     parser.add_argument('--restore-roi-enhancer', choices=('none', 'realesrgan', 'mewzoom'), default='none',
                         help='復元ROIに追加の高画質化処理をかける。モデルは指定時のみロード（デフォルト: none）')
     parser.add_argument('--restore-roi-enhancer-model-path',
-                        help='--restore-roi-enhancer realesrgan で使うReal-ESRGAN重みファイル')
+                        help='エンハンサーモデル。登録名（realesrgan-x2/x4, realesrgan-x4-coreml, mewzoom-x4-coreml）、'
+                             'model_weights内のファイル名、またはパス。省略時は <enhancer>-x4-coreml に自動解決')
     parser.add_argument('--restore-roi-enhancer-scale', type=int, default=2,
-                        help='Real-ESRGANの倍率。処理後はROIサイズへ戻して合成（デフォルト: 2）')
+                        help='エンハンサーの倍率。処理後はROIサイズへ戻して合成（デフォルト: 2）')
     parser.add_argument('--restore-roi-enhancer-strength', type=float, default=0.0,
-                        help='Real-ESRGAN結果を復元ROIへ混ぜる強度（0で無効、例: 0.25）')
+                        help='エンハンサー結果を復元ROIへ混ぜる強度（0で無効、例: 0.25）')
     parser.add_argument('--restore-roi-enhancer-tile', type=int, default=0,
-                        help='Real-ESRGANのtileサイズ。0で無効。メモリ削減時に指定（デフォルト: 0）')
+                        help='PyTorch版Real-ESRGANのtileサイズ。0で無効。Core ML版では未使用（デフォルト: 0）')
     parser.add_argument('--mosaic-detection-model', default='v4-fast',
                         help='検出モデル名または重みパス。速度重視は v4-fast（デフォルト: v4-fast）')
     parser.add_argument('--list-mosaic-detection-models', action='store_true',
