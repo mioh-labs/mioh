@@ -26,6 +26,7 @@ LADA v0.11.0 MPS Complete 統合版対応:
 import subprocess
 import os
 import argparse
+from collections import deque
 from pathlib import Path
 import json
 import gc
@@ -274,6 +275,7 @@ def process_segment_worker(segment_info, config: WorkerRuntimeConfig):
 
     cmd = build_lada_cli_command(config, input_path, output_path)
     env = build_worker_env(config)
+    recent_lines = deque(maxlen=15)
 
     try:
         if os.environ.get('DEBUG_LADA_CMD'):
@@ -295,8 +297,10 @@ def process_segment_worker(segment_info, config: WorkerRuntimeConfig):
                 continue
             if 'Processing video:' in line:
                 print(f"\r  {line}", end='', flush=True)
-            elif 'error' in line.lower() or 'warning' in line.lower():
-                print(f"\n  {line}", flush=True)
+            else:
+                recent_lines.append(line)
+                if 'error' in line.lower() or 'warning' in line.lower():
+                    print(f"\n  {line}", flush=True)
 
         return_code = process.wait()
         if return_code != 0:
@@ -316,6 +320,10 @@ def process_segment_worker(segment_info, config: WorkerRuntimeConfig):
         print(f"\n[ERROR] lada-cli実行エラー:", flush=True)
         print(f"  コマンド: {' '.join(cmd)}", flush=True)
         print(f"  終了コード: {e.returncode}", flush=True)
+        if recent_lines:
+            print(f"  --- worker出力(末尾) ---", flush=True)
+            for output_line in recent_lines:
+                print(f"  | {output_line}", flush=True)
         return {
             'idx': idx,
             'output_path': None,
@@ -1297,6 +1305,7 @@ class ParallelVideoProcessor:
             self.safe_print(f"[DEBUG] 実行コマンド: {' '.join(cmd)}")
         
         # 実行（進捗バーを表示）
+        recent_lines = deque(maxlen=15)
         try:
             # サブプロセスをパイプで実行
             process = subprocess.Popen(
@@ -1307,35 +1316,41 @@ class ParallelVideoProcessor:
                 text=True,
                 bufsize=1
             )
-            
+
             # 出力を逐次処理
             for line in process.stdout:
                 line = line.strip()
                 if not line:
                     continue
-                
+
                 # "Processing video:" の行のみ表示（進捗バー）
                 if 'Processing video:' in line:
                     # スレッドセーフに1行で表示（上書き）
                     print(f"\r  {line}", end='', flush=True)
-                # エラーメッセージは表示
-                elif 'error' in line.lower() or 'warning' in line.lower():
-                    print(f"\n  {line}")
-            
+                else:
+                    recent_lines.append(line)
+                    # エラーメッセージは表示
+                    if 'error' in line.lower() or 'warning' in line.lower():
+                        print(f"\n  {line}")
+
             # プロセスの終了を待つ
             return_code = process.wait()
-            
+
             if return_code != 0:
                 raise subprocess.CalledProcessError(return_code, cmd)
-            
+
             # 進捗バー表示後に改行
             print()
-            
+
         except subprocess.CalledProcessError as e:
             # エラー時に詳細情報を表示
             self.safe_print(f"\n[ERROR] lada-cli実行エラー:")
             self.safe_print(f"  コマンド: {' '.join(cmd)}")
             self.safe_print(f"  終了コード: {e.returncode}")
+            if recent_lines:
+                self.safe_print(f"  --- worker出力(末尾) ---")
+                for output_line in recent_lines:
+                    self.safe_print(f"  | {output_line}")
             raise
         except Exception as e:
             self.safe_print(f"\n[ERROR] 予期しないエラー: {e}")
