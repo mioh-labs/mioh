@@ -24,6 +24,21 @@ from lada.models.yolo.yolo11_segmentation_model import Yolo11SegmentationModel
 logger = logging.getLogger(__name__)
 
 
+class _CoremltoolsTorchVersionWarningFilter(logging.Filter):
+    """
+    coremltools warns at import time that the installed torch is newer than
+    the version its converter was tested with. That only concerns model
+    conversion; runtime inference goes through Core ML and never touches the
+    torch converter, so keep the warning out of CLI/GUI logs.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "has not been tested with coremltools" not in record.getMessage()
+
+
+logging.getLogger("coremltools").addFilter(_CoremltoolsTorchVersionWarningFilter())
+
+
 class Yolo11CoreMLSegmentationModel(Yolo11SegmentationModel):
     def __init__(self, model_path: str, device=None, imgsz=640, fp16=False, **kwargs):
         model_path = str(model_path)
