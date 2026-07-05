@@ -109,8 +109,8 @@ def setup_argparser() -> argparse.ArgumentParser:
     group_restoration.add_argument('--restore-texture-mix', type=float, default=0.0, help=_('Mix mid-frequency texture from the source ROI into restored mosaic regions. 0 disables it. Start with 0.05-0.10 for testing. (default: %(default)s)'))
     group_restoration.add_argument('--restore-smooth-strength', type=float, default=0.0, help=_('Smooth restored mosaic regions after texture/detail/sharpen effects before compositing. 0 disables it. Start with 0.10-0.25. (default: %(default)s)'))
     group_restoration.add_argument('--restore-effect-upscale', type=int, default=1, help=_('Upscale restored mosaic mask areas before applying texture/detail/sharpen effects, then resize back before compositing. 1 disables it; use 2 for OpenCV 2x processing. (default: %(default)s)'))
-    group_restoration.add_argument('--restore-roi-enhancer', choices=('none', 'realesrgan'), default='none', help=_('Optional ROI enhancer applied to restored mosaic regions before compositing. Real-ESRGAN is loaded only when selected. (default: %(default)s)'))
-    group_restoration.add_argument('--restore-roi-enhancer-model-path', type=str, default=None, help=_('Path to the Real-ESRGAN model weights used when --restore-roi-enhancer realesrgan is selected.'))
+    group_restoration.add_argument('--restore-roi-enhancer', choices=('none', 'realesrgan', 'mewzoom'), default='none', help=_('Optional ROI enhancer applied to restored mosaic regions before compositing. The model is loaded only when selected. (default: %(default)s)'))
+    group_restoration.add_argument('--restore-roi-enhancer-model-path', type=str, default=None, help=_('Enhancer model: a well-known name, a filename in the model weights dir, or a path. Defaults to <enhancer>-x4-coreml when omitted.'))
     group_restoration.add_argument('--restore-roi-enhancer-scale', type=int, default=2, help=_('Real-ESRGAN output scale. The result is resized back to the ROI before compositing. (default: %(default)s)'))
     group_restoration.add_argument('--restore-roi-enhancer-strength', type=float, default=0.0, help=_('Blend strength for the ROI enhancer output. 0 disables enhancer application even if configured. Start with 0.15-0.30. (default: %(default)s)'))
     group_restoration.add_argument('--restore-roi-enhancer-tile', type=int, default=0, help=_('Real-ESRGAN tile size. 0 disables tiling. Use smaller values to reduce memory. (default: %(default)s)'))
@@ -242,9 +242,14 @@ def main():
     if args.restore_effect_upscale < 1:
         print(_("Invalid restore effect upscale. Value must be 1 or greater."))
         sys.exit(1)
-    if args.restore_roi_enhancer == "realesrgan" and not args.restore_roi_enhancer_model_path:
-        print(_("--restore-roi-enhancer-model-path is required when --restore-roi-enhancer realesrgan is used."))
-        sys.exit(1)
+    if args.restore_roi_enhancer != "none" and not args.restore_roi_enhancer_model_path:
+        # default to the Core ML x4 export of the selected enhancer
+        default_name = f"{args.restore_roi_enhancer}-x4-coreml"
+        if enhancer_modelfile := ModelFiles.get_enhancer_model_by_name(default_name):
+            args.restore_roi_enhancer_model_path = enhancer_modelfile.path
+        else:
+            print(_("--restore-roi-enhancer-model-path is required: no default model found for {name}").format(name=default_name))
+            sys.exit(1)
     if args.restore_roi_enhancer_model_path and not os.path.exists(args.restore_roi_enhancer_model_path):
         # allow a well-known name (e.g. mewzoom-x4-coreml) or a bare filename in the model weights dir
         in_weights_dir = os.path.join(MODEL_WEIGHTS_DIR, args.restore_roi_enhancer_model_path)
