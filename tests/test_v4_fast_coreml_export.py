@@ -5,6 +5,7 @@ from pathlib import Path
 import unittest
 
 from scripts.apple import export_v4_fast_coreml as export_mod
+from scripts.apple import validate_v4_fast_coreml as validate_mod
 
 
 class V4FastCoreMLExportTests(unittest.TestCase):
@@ -21,6 +22,18 @@ class V4FastCoreMLExportTests(unittest.TestCase):
         self.assertFalse(opts["half"])
         self.assertFalse(opts["nms"])
         self.assertTrue(opts["simplify"])
+
+
+class V4FastCoreMLValidationTests(unittest.TestCase):
+    def test_box_difference_uses_max_abs_delta(self):
+        self.assertEqual(
+            validate_mod.max_box_abs_diff([1, 2, 3, 4], [1, 5, 2, 4]),
+            3,
+        )
+
+    def test_relative_area_difference_handles_zero(self):
+        self.assertEqual(validate_mod.relative_area_diff(0, 0), 0.0)
+        self.assertEqual(validate_mod.relative_area_diff(10, 5), 0.5)
 
 
 if __name__ == "__main__":
