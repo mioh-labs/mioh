@@ -70,6 +70,26 @@ class Yolo11CoreMLSegmentationModel(Yolo11SegmentationModel):
             raise ValueError(f"Expected segment model, got {task!r}")
         self.model.eval()
         self.dtype = torch.float32
+        self._pin_compute_units(model_path)
+
+    def _pin_compute_units(self, model_path: str):
+        """
+        Reload the underlying MLModel pinned to CPU+ANE. The default ALL
+        lets Core ML compile a Metal variant, which is flaky for this model
+        (MPSGraph MLIR assertion) and would contend with restoration for the
+        GPU. Override via LADA_COREML_COMPUTE_UNITS (e.g. ALL, CPU_ONLY).
+        """
+        import os
+        unit_name = os.environ.get("LADA_COREML_COMPUTE_UNITS", "CPU_AND_NE").upper()
+        if unit_name == "ALL":
+            return
+        try:
+            import coremltools as ct
+            unit = getattr(ct.ComputeUnit, unit_name)
+            self.model.model = ct.models.MLModel(model_path, compute_units=unit)
+            logger.info("Core ML detection compute units pinned to %s", unit_name)
+        except Exception as e:
+            logger.warning("Could not pin Core ML compute units to %s, keeping default: %s", unit_name, e)
 
     def preprocess(self, imgs: list[ImageTensor]) -> torch.Tensor:
         imgs = [img if img.device.type == "cpu" else img.cpu() for img in imgs]
