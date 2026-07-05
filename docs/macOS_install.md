@@ -197,8 +197,9 @@ python scripts/apple/export_mewzoom_coreml.py
 ```
 
 Then pass `model_weights/MewZoom-V1-4X-Unet_256.mlpackage` as
-`--restore-roi-enhancer-model-path`. Note: the ANE compiler currently
-fails on this network, so it runs ~790 ms/frame on CPU+NE or ~305 ms on
-the GPU (`LADA_COREML_COMPUTE_UNITS=ALL`, which then competes with
-restoration). Visually it denoises more but sharpens less than
-Real-ESRGAN; Real-ESRGAN remains the default recommendation.
+`--restore-roi-enhancer-model-path`. Measured ~100 ms/frame on the
+Neural Engine, faster than Real-ESRGAN (~300 ms). The ANE compiler
+crashes on this network's decoder as-is (conv emitting 1536 channels
+into pixel_shuffle); the export script works around it by splitting the
+shuffle into channel chunks, which is bit-identical. Visually MewZoom
+denoises more while Real-ESRGAN sharpens more — pick per source.

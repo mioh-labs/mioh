@@ -38,11 +38,41 @@ def export_model(repo: str, output_dir: Path, imgsz: int, allow_overwrite: bool 
     if output_path.exists() and not allow_overwrite:
         return output_path
 
-    from mewzoom.model import MewZoom
+    from mewzoom.model import MewZoom, SubpixelConv2d
 
     model = MewZoom.from_pretrained(repo)
     model.eval()
-    scale = int(getattr(model.model, "upscale_ratio", 4) if hasattr(model.model, "upscale_ratio") else 4)
+
+    class ChunkedSubpixelConv2d(torch.nn.Module):
+        """
+        Bit-identical replacement for SubpixelConv2d that the ANE compiler
+        accepts. ANECCompile crashes on conv -> pixel_shuffle when the conv
+        emits more than ~1024 channels; PixelShuffle consumes channels in
+        contiguous groups of r^2, so shuffling channel chunks separately and
+        concatenating gives exactly the same output.
+        """
+
+        def __init__(self, subpixel: SubpixelConv2d, chunks: int):
+            super().__init__()
+            self.conv = subpixel.conv
+            self.shuffle = subpixel.shuffle
+            self.chunks = chunks
+
+        def forward(self, x):
+            y = self.conv(x)
+            return torch.cat([self.shuffle(c) for c in y.chunk(self.chunks, dim=1)], dim=1)
+
+    def make_ane_friendly(module: torch.nn.Module):
+        for name, child in module.named_children():
+            if isinstance(child, SubpixelConv2d) and child.conv.out_channels > 1024:
+                upscale_groups = child.shuffle.upscale_factor ** 2
+                chunks = 2
+                assert (child.conv.out_channels // chunks) % upscale_groups == 0
+                setattr(module, name, ChunkedSubpixelConv2d(child, chunks))
+            else:
+                make_ane_friendly(child)
+
+    make_ane_friendly(model)
 
     class ImageWrapper(torch.nn.Module):
         """0..1 float in, 0..255 image out; drops the auxiliary QA output."""
