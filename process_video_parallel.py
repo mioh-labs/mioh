@@ -95,8 +95,23 @@ class WorkerRuntimeConfig:
     restore_effect_upscale: int = 1
 
 
+REPO_ROOT = Path(__file__).resolve().parent
+
+
+def lada_cli_command_prefix() -> list[str]:
+    """
+    Launch lada-cli with this interpreter and the code tree next to this
+    script. A `lada-cli` on PATH resolves through the editable install and
+    would run a different checkout when this wrapper lives in a worktree.
+    """
+    return [sys.executable, '-m', 'lada.cli.main']
+
+
 def build_worker_env(config: WorkerRuntimeConfig) -> dict[str, str]:
     env = os.environ.copy()
+    env['PYTHONPATH'] = os.pathsep.join(
+        [str(REPO_ROOT)] + ([env['PYTHONPATH']] if env.get('PYTHONPATH') else [])
+    )
     if config.device == 'mps':
         env['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = '0.0'
         env['PYTORCH_MPS_LOW_WATERMARK_RATIO'] = '0.0'
@@ -122,7 +137,7 @@ def build_worker_env(config: WorkerRuntimeConfig) -> dict[str, str]:
 
 def build_lada_cli_command(config: WorkerRuntimeConfig, input_video: Path, output_video: Path) -> list[str]:
     cmd = [
-        'lada-cli',
+        *lada_cli_command_prefix(),
         '--input', str(input_video),
         '--output', str(output_video),
         '--device', config.device,
@@ -208,9 +223,9 @@ def build_lada_cli_list_command(args) -> list[str] | None:
     ]
     for attr in list_flags:
         if getattr(args, attr, False):
-            return ["lada-cli", f"--{attr.replace('_', '-')}"]
+            return [*lada_cli_command_prefix(), f"--{attr.replace('_', '-')}"]
     if getattr(args, "list_encoder_options", None):
-        return ["lada-cli", "--list-encoder-options", str(args.list_encoder_options)]
+        return [*lada_cli_command_prefix(), "--list-encoder-options", str(args.list_encoder_options)]
     return None
 
 
@@ -1034,25 +1049,17 @@ class ParallelVideoProcessor:
         self.gui_mode = os.environ.get('LADA_GUI_MODE') == '1'
     
     def _check_lada_cli(self):
-        """lada-cliコマンドが利用可能か確認"""
-        import shutil
-        
-        lada_cli_path = shutil.which('lada-cli')
-        
-        if lada_cli_path is None:
+        """lada-cliが利用可能か確認"""
+        cli_main = REPO_ROOT / 'lada' / 'cli' / 'main.py'
+        if not cli_main.is_file():
             print("\n" + "=" * 70)
-            print("⚠️  エラー: lada-cliコマンドが見つかりません")
+            print("⚠️  エラー: ladaパッケージが見つかりません")
             print("=" * 70)
-            print("\n以下のいずれかの方法で解決してください:\n")
-            print("方法1: LADAをインストール")
-            print("  cd /path/to/lada-integrated")
-            print("  pip install -e .\n")
-            print("方法2: python -m lada.cliを使用")
-            print("  スクリプトを編集して呼び出し方法を変更してください\n")
+            print(f"\n{cli_main} が存在しません。")
+            print("このスクリプトはリポジトリルートに置いたまま実行してください。\n")
             print("=" * 70)
-            raise FileNotFoundError("lada-cli command not found")
-        else:
-            print(f"✓ lada-cli検出: {lada_cli_path}")
+            raise FileNotFoundError(f"lada package not found at {REPO_ROOT}")
+        print(f"✓ lada-cli検出: {' '.join(lada_cli_command_prefix())} ({REPO_ROOT})")
     
     def safe_print(self, msg):
         """スレッドセーフなprint"""
@@ -1205,7 +1212,7 @@ class ParallelVideoProcessor:
         
         # コマンド構築
         cmd = [
-            'lada-cli',
+            *lada_cli_command_prefix(),
             '--input', str(input_video),
             '--output', str(output_video),
             '--device', self.args.device,
