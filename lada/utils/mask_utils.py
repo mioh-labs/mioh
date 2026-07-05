@@ -79,11 +79,20 @@ def create_blend_mask(crop_mask: torch.Tensor, feather_multiplier: float = 1.0):
     blur_size = int(border_size)
     if blur_size % 2 == 0:
         blur_size += 1
-    inner = torch.ones((h_inner, w_inner), device=mask.device, dtype=mask.dtype)
     pad_top = h_outer // 2
     pad_bottom = h_outer - pad_top
     pad_left = w_outer // 2
     pad_right = w_outer - pad_left
+    if mask.device.type == 'cpu':
+        # cv2.blur is an O(1) integral-image box filter and its default
+        # BORDER_REFLECT_101 matches F.pad(mode='reflect') used below
+        blend_np = np.zeros((h, w), dtype=np.float32)
+        blend_np[pad_top:h - pad_bottom, pad_left:w - pad_right] = 1.0
+        np.maximum(blend_np, (mask > 0).numpy().astype(np.float32), out=blend_np)
+        blend = torch.from_numpy(cv2.blur(blend_np, (blur_size, blur_size))).to(dtype=mask.dtype)
+        assert blend.shape == mask.shape
+        return blend
+    inner = torch.ones((h_inner, w_inner), device=mask.device, dtype=mask.dtype)
     blend = F.pad(inner, (pad_left, pad_right, pad_top, pad_bottom), value=0.0)
     mask4 = (mask > 0)
     blend = torch.maximum(mask4, blend)

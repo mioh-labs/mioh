@@ -67,12 +67,14 @@ def convert_yolo_mask_tensor(yolo_mask: UltralyticsMasks, img_shape) -> torch.Te
     if mask_img.ndim == 2:
         mask_img = mask_img.unsqueeze(-1)
     mask_img = scale_and_unpad_image(mask_img, img_shape)
-    mask_img = torch.where(mask_img > 127, 255, 0).to(torch.uint8)
+    # bool compare + uint8 multiply; torch.where(cond, 255, 0) would allocate
+    # a full-frame int64 intermediate
+    mask_img = (mask_img > 127).to(torch.uint8).mul_(255)
     assert mask_img.ndim == 3 and mask_img.shape[2] == 1
     return mask_img
 
 def _to_mask_img_tensor(masks: torch.Tensor, class_val=0, pixel_val=255) -> torch.Tensor:
-    masks_tensor = torch.where(masks != class_val, pixel_val, 0).to(torch.uint8)
+    masks_tensor = (masks != class_val).to(torch.uint8).mul_(pixel_val)
     return masks_tensor[0]
 
 def convert_yolo_mask(yolo_mask: UltralyticsMasks, img_shape) -> Mask:
