@@ -186,3 +186,19 @@ Measured on this machine: ~300 ms per enhanced frame on the Neural
 Engine vs ~1.8 s (fp16 ~1.6 s) through PyTorch/MPS, with PSNR 57 dB
 against the fp32 output. The PyTorch path is still used when the model
 path ends in .pth.
+
+An alternative enhancer is MewZoom (Apache-2.0, UNet-based, trained for
+blur/noise/compression artifact removal — the open counterpart of
+jasna's unet-4x):
+
+```bash
+pip install --no-deps mewzoom  # pins torch~=2.9; install without deps
+python scripts/apple/export_mewzoom_coreml.py
+```
+
+Then pass `model_weights/MewZoom-V1-4X-Unet_256.mlpackage` as
+`--restore-roi-enhancer-model-path`. Note: the ANE compiler currently
+fails on this network, so it runs ~790 ms/frame on CPU+NE or ~305 ms on
+the GPU (`LADA_COREML_COMPUTE_UNITS=ALL`, which then competes with
+restoration). Visually it denoises more but sharpens less than
+Real-ESRGAN; Real-ESRGAN remains the default recommendation.

@@ -120,8 +120,8 @@ def create_realesrgan_enhancer(model_path: str, scale: int = 2, tile: int = 0, f
     if not model_path:
         raise ValueError("--restore-roi-enhancer-model-path is required when --restore-roi-enhancer realesrgan is used")
     if str(model_path).endswith(".mlpackage"):
-        from lada.restorationpipeline.coreml_realesrgan import CoreMLRealESRGANEnhancer
-        return CoreMLRealESRGANEnhancer(model_path)
+        from lada.restorationpipeline.coreml_roi_enhancer import CoreMLROIEnhancer
+        return CoreMLROIEnhancer(model_path)
     _install_torchvision_functional_tensor_compat()
     try:
         from basicsr.archs.rrdbnet_arch import RRDBNet
