@@ -27,7 +27,7 @@ Generated model artifacts belong in `build/apple/coreml/` and should not be comm
 - Create: `scripts/apple/export_v4_fast_coreml.py`
 - Test: `tests/test_v4_fast_coreml_export.py`
 
-- [ ] **Step 1: Write failing tests for defaults and export options**
+- [x] **Step 1: Write failing tests for defaults and export options**
 
 Add tests that import the export module and verify defaults without running Core ML conversion:
 
@@ -54,7 +54,7 @@ class V4FastCoreMLExportTests(unittest.TestCase):
         self.assertTrue(opts["simplify"])
 ```
 
-- [ ] **Step 2: Run tests to verify failure**
+- [x] **Step 2: Run tests to verify failure**
 
 Run:
 
@@ -64,7 +64,7 @@ Run:
 
 Expected: FAIL because `scripts.apple.export_v4_fast_coreml` does not exist.
 
-- [ ] **Step 3: Implement minimal export module**
+- [x] **Step 3: Implement minimal export module**
 
 Create `scripts/apple/__init__.py` as an empty file.
 
@@ -159,7 +159,7 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
-- [ ] **Step 4: Run tests to verify pass**
+- [x] **Step 4: Run tests to verify pass**
 
 Run:
 
@@ -169,7 +169,7 @@ Run:
 
 Expected: PASS.
 
-- [ ] **Step 5: Run export smoke manually**
+- [x] **Step 5: Run export smoke manually**
 
 Run:
 
@@ -179,7 +179,7 @@ Run:
 
 Expected: creates `build/apple/coreml/lada_mosaic_detection_model_v4_fast.mlpackage` and prints metadata with input `image` and two multi-array outputs.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add scripts/apple/__init__.py scripts/apple/export_v4_fast_coreml.py tests/test_v4_fast_coreml_export.py
@@ -192,7 +192,7 @@ git commit -m "Add v4-fast Core ML export script"
 - Modify: `scripts/apple/validate_v4_fast_coreml.py`
 - Modify: `tests/test_v4_fast_coreml_export.py`
 
-- [ ] **Step 1: Write failing tests for comparison helpers**
+- [x] **Step 1: Write failing tests for comparison helpers**
 
 Extend `tests/test_v4_fast_coreml_export.py`:
 
@@ -212,7 +212,7 @@ class V4FastCoreMLValidationTests(unittest.TestCase):
         self.assertEqual(validate_mod.relative_area_diff(10, 5), 0.5)
 ```
 
-- [ ] **Step 2: Run tests to verify failure**
+- [x] **Step 2: Run tests to verify failure**
 
 Run:
 
@@ -222,7 +222,7 @@ Run:
 
 Expected: FAIL because `validate_v4_fast_coreml` does not exist.
 
-- [ ] **Step 3: Implement validation module**
+- [x] **Step 3: Implement validation module**
 
 Create `scripts/apple/validate_v4_fast_coreml.py`:
 
@@ -380,7 +380,7 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
-- [ ] **Step 4: Run tests to verify pass**
+- [x] **Step 4: Run tests to verify pass**
 
 Run:
 
@@ -390,7 +390,7 @@ Run:
 
 Expected: PASS.
 
-- [ ] **Step 5: Run validation smoke with known frame**
+- [x] **Step 5: Run validation smoke with known frame**
 
 If `build/apple/coreml/lada_mosaic_detection_model_v4_fast.mlpackage` exists, run:
 
@@ -403,7 +403,7 @@ If `build/apple/coreml/lada_mosaic_detection_model_v4_fast.mlpackage` exists, ru
 
 Expected: JSON summary. It should pass on the known positive frame observed during design.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add scripts/apple/validate_v4_fast_coreml.py tests/test_v4_fast_coreml_export.py
@@ -415,7 +415,7 @@ git commit -m "Add v4-fast Core ML validation harness"
 **Files:**
 - Create: `docs/apple/v4-fast-coreml-postprocess.md`
 
-- [ ] **Step 1: Draft postprocess contract**
+- [x] **Step 1: Draft postprocess contract**
 
 Create `docs/apple/v4-fast-coreml-postprocess.md` with:
 
@@ -456,7 +456,7 @@ Create `docs/apple/v4-fast-coreml-postprocess.md` with:
 The native implementation must be validated against `scripts/apple/validate_v4_fast_coreml.py` before being used by a macOS/iOS runtime.
 ```
 
-- [ ] **Step 2: Cross-check against current Python implementation**
+- [x] **Step 2: Cross-check against current Python implementation**
 
 Review:
 
@@ -472,7 +472,7 @@ Confirm the doc references the same preprocess/postprocess stages:
 - `ops.process_mask`
 - `ops.scale_boxes`
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add docs/apple/v4-fast-coreml-postprocess.md
@@ -484,7 +484,7 @@ git commit -m "Document v4-fast Core ML postprocess contract"
 **Files:**
 - Verify only.
 
-- [ ] **Step 1: Run unit tests**
+- [x] **Step 1: Run unit tests**
 
 Run:
 
@@ -494,7 +494,7 @@ Run:
 
 Expected: PASS.
 
-- [ ] **Step 2: Run export smoke**
+- [x] **Step 2: Run export smoke**
 
 Run:
 
@@ -504,7 +504,7 @@ Run:
 
 Expected: `.mlpackage` exists in `build/apple/coreml/`.
 
-- [ ] **Step 3: Run validation smoke**
+- [x] **Step 3: Run validation smoke**
 
 Run:
 
@@ -517,7 +517,7 @@ Run:
 
 Expected: exit `0` with `"passed": true`. If the external video is unavailable, report that the validation smoke was skipped and run the unit tests plus export smoke.
 
-- [ ] **Step 4: Check git status**
+- [x] **Step 4: Check git status**
 
 Run:
 
@@ -527,7 +527,7 @@ git status --short
 
 Expected: only generated ignored/untracked build artifacts, or clean if build artifacts are ignored/removed.
 
-- [ ] **Step 5: Report result**
+- [x] **Step 5: Report result**
 
 Report:
 
