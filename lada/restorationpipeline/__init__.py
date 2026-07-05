@@ -38,5 +38,9 @@ def load_models(
             logger.info("Mosaic detection model v2 does not support detecting face mosaics. Use detection models v3 or newer. Ignoring...")
     else:
         classes = None
-    mosaic_detection_model = Yolo11SegmentationModel(mosaic_detection_model_path, device, classes=classes, conf=0.15, fp16=fp16)
+    if str(mosaic_detection_model_path).endswith(".mlpackage"):
+        from lada.models.yolo.yolo11_coreml_segmentation_model import Yolo11CoreMLSegmentationModel
+        mosaic_detection_model = Yolo11CoreMLSegmentationModel(mosaic_detection_model_path, device, classes=classes, conf=0.15)
+    else:
+        mosaic_detection_model = Yolo11SegmentationModel(mosaic_detection_model_path, device, classes=classes, conf=0.15, fp16=fp16)
     return mosaic_detection_model, mosaic_restoration_model, pad_mode
