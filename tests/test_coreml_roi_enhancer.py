@@ -83,6 +83,22 @@ class MetadataGuardTests(unittest.TestCase):
         self.assertEqual(enhancer.scale, 4)
 
 
+class EnhancerNameResolutionTests(unittest.TestCase):
+    def test_well_known_names_resolve_to_weights_paths(self):
+        import lada
+        with mock.patch("lada.os.path.exists", return_value=True):
+            mf = lada.ModelFiles.get_enhancer_model_by_name("mewzoom-x4-coreml")
+            self.assertIsNotNone(mf)
+            self.assertTrue(mf.path.endswith("MewZoom-V1-4X-Unet_256.mlpackage"))
+            mf = lada.ModelFiles.get_enhancer_model_by_name("realesrgan-x4-coreml")
+            self.assertTrue(mf.path.endswith("RealESRGAN_x4plus_256.mlpackage"))
+
+    def test_unknown_name_returns_none(self):
+        import lada
+        with mock.patch("lada.os.path.exists", return_value=True):
+            self.assertIsNone(lada.ModelFiles.get_enhancer_model_by_name("nope"))
+
+
 class EnhancerFactoryTests(unittest.TestCase):
     def test_mlpackage_path_uses_coreml_backend(self):
         from lada.restorationpipeline.frame_restorer import create_realesrgan_enhancer

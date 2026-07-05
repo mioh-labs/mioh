@@ -93,6 +93,12 @@ class ModelFiles:
         ModelFile('v3.1-accurate-coreml', _("v3.1-accurate running on Apple Neural Engine via Core ML"), os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_detection_model_v3.1_accurate.mlpackage')),
         ModelFile('v2-coreml', _("v2 running on Apple Neural Engine via Core ML"), os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_detection_model_v2.mlpackage')),
     ]
+    _WELL_KNOWN_ENHANCER_MODELS = [
+        ModelFile('realesrgan-x2', _("Real-ESRGAN 2x upscaler (PyTorch)"), os.path.join(MODEL_WEIGHTS_DIR, 'RealESRGAN_x2plus.pth')),
+        ModelFile('realesrgan-x4', _("Real-ESRGAN 4x upscaler (PyTorch)"), os.path.join(MODEL_WEIGHTS_DIR, 'RealESRGAN_x4plus.pth')),
+        ModelFile('realesrgan-x4-coreml', _("Real-ESRGAN 4x on Apple Neural Engine via Core ML"), os.path.join(MODEL_WEIGHTS_DIR, 'RealESRGAN_x4plus_256.mlpackage')),
+        ModelFile('mewzoom-x4-coreml', _("MewZoom 4x on Apple Neural Engine via Core ML"), os.path.join(MODEL_WEIGHTS_DIR, 'MewZoom-V1-4X-Unet_256.mlpackage')),
+    ]
 
     @staticmethod
     def _get_custom_detection_models() -> list[ModelFile]:
@@ -172,5 +178,16 @@ class ModelFiles:
     def get_detection_model_by_path(model_path: str) -> ModelFile | None:
         for model in ModelFiles.get_detection_models():
             if model.path == model_path:
+                return model
+        return None
+
+    @staticmethod
+    def get_enhancer_models() -> list[ModelFile]:
+        return [model for model in ModelFiles._WELL_KNOWN_ENHANCER_MODELS if os.path.exists(model.path)]
+
+    @staticmethod
+    def get_enhancer_model_by_name(model_name: str) -> ModelFile | None:
+        for model in ModelFiles.get_enhancer_models():
+            if model.name == model_name:
                 return model
         return None
