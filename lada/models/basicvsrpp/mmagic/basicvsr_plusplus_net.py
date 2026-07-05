@@ -27,9 +27,18 @@ class _BasicVSRPPProfiler:
     def __init__(self, reference_tensor):
         value = os.environ.get('LADA_BASICVSRPP_PROFILE', '').strip().lower()
         self.enabled = value not in ('', '0', 'false', 'no', 'off')
+        # MPS executes asynchronously, so plain wall timings only measure op
+        # submission and whatever block happens to hit an implicit sync.
+        # LADA_BASICVSRPP_PROFILE=sync inserts device syncs around each block
+        # for true per-stage GPU times (slows the run; measurement only).
+        self.sync = self.enabled and value == 'sync'
         self.reference_tensor = reference_tensor
         self.timings = {}
         self.counts = {}
+
+    def _synchronize(self):
+        if self.reference_tensor is not None and self.reference_tensor.device.type == 'mps':
+            torch.mps.synchronize()
 
     @contextmanager
     def time(self, name):
@@ -37,10 +46,14 @@ class _BasicVSRPPProfiler:
             yield
             return
 
+        if self.sync:
+            self._synchronize()
         started_at = time.perf_counter()
         try:
             yield
         finally:
+            if self.sync:
+                self._synchronize()
             elapsed = time.perf_counter() - started_at
             self.timings[name] = self.timings.get(name, 0.0) + elapsed
             self.counts[name] = self.counts.get(name, 0) + 1
