@@ -203,3 +203,12 @@ crashes on this network's decoder as-is (conv emitting 1536 channels
 into pixel_shuffle); the export script works around it by splitting the
 shuffle into channel chunks, which is bit-identical. Visually MewZoom
 denoises more while Real-ESRGAN sharpens more — pick per source.
+
+The enhancer can also be selected by name alone; the model path defaults
+to the `<enhancer>-x4-coreml` export in `model_weights/`:
+
+```bash
+lada-cli --input <video> --mosaic-detection-model v4-fast-coreml \
+  --restore-roi-enhancer mewzoom \
+  --restore-roi-enhancer-scale 4 --restore-roi-enhancer-strength 0.25
+```

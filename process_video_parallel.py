@@ -2003,8 +2003,8 @@ def build_arg_parser():
                         help='texture/detail/sharpen後の復元ROIを合成前に滑らかにする強度（0で無効、例: 0.10〜0.25）')
     parser.add_argument('--restore-effect-upscale', type=int, default=1,
                         help='texture/detail/sharpenをOpenCVで拡大後に適用して戻す倍率（1で無効、例: 2）')
-    parser.add_argument('--restore-roi-enhancer', choices=('none', 'realesrgan'), default='none',
-                        help='復元ROIに追加の高画質化処理をかける。realesrganは指定時のみロード（デフォルト: none）')
+    parser.add_argument('--restore-roi-enhancer', choices=('none', 'realesrgan', 'mewzoom'), default='none',
+                        help='復元ROIに追加の高画質化処理をかける。モデルは指定時のみロード（デフォルト: none）')
     parser.add_argument('--restore-roi-enhancer-model-path',
                         help='--restore-roi-enhancer realesrgan で使うReal-ESRGAN重みファイル')
     parser.add_argument('--restore-roi-enhancer-scale', type=int, default=2,
@@ -2091,9 +2091,7 @@ def main():
     if args.restore_effect_upscale < 1:
         print("エラー: --restore-effect-upscale は1以上である必要があります")
         return
-    if args.restore_roi_enhancer == "realesrgan" and not args.restore_roi_enhancer_model_path:
-        print("エラー: --restore-roi-enhancer realesrgan には --restore-roi-enhancer-model-path が必要です")
-        return
+    # model-path省略時はlada-cli側で <enhancer>-x4-coreml に既定解決される
     if args.restore_roi_enhancer_scale < 1:
         print("エラー: --restore-roi-enhancer-scale は1以上である必要があります")
         return
