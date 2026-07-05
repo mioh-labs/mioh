@@ -156,3 +156,9 @@ significantly faster per frame.
 Parity against the PyTorch detector can be checked with
 `scripts/apple/validate_v4_fast_coreml.py`; see
 `docs/apple/v4-fast-coreml-postprocess.md` for the postprocess contract.
+
+Detection runs pinned to CPU+Neural Engine (`LADA_COREML_COMPUTE_UNITS`
+overrides this, e.g. `ALL`). Note that the ANE duty cycle is small — a few
+milliseconds per frame at restoration-bound throughput — so monitoring
+tools like asitop will show ANE utilization near zero even though
+detection is running there.
