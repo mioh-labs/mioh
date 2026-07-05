@@ -162,3 +162,27 @@ overrides this, e.g. `ALL`). Note that the ANE duty cycle is small — a few
 milliseconds per frame at restoration-bound throughput — so monitoring
 tools like asitop will show ANE utilization near zero even though
 detection is running there.
+
+### Real-ESRGAN ROI Enhancer on the Neural Engine (optional)
+
+The optional ROI enhancer (`--restore-roi-enhancer realesrgan`) can also
+run through Core ML. Export once:
+
+```bash
+python scripts/apple/export_realesrgan_coreml.py \
+  --model model_weights/RealESRGAN_x4plus.pth --scale 4
+```
+
+Then pass the `.mlpackage` as the enhancer model:
+
+```bash
+lada-cli --input <video> --mosaic-detection-model v4-fast-coreml \
+  --restore-roi-enhancer realesrgan \
+  --restore-roi-enhancer-model-path model_weights/RealESRGAN_x4plus_256.mlpackage \
+  --restore-roi-enhancer-scale 4 --restore-roi-enhancer-strength 0.25
+```
+
+Measured on this machine: ~300 ms per enhanced frame on the Neural
+Engine vs ~1.8 s (fp16 ~1.6 s) through PyTorch/MPS, with PSNR 57 dB
+against the fp32 output. The PyTorch path is still used when the model
+path ends in .pth.
