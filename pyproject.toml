@@ -61,6 +61,10 @@ apple = [
     "torchvision==0.27.0; sys_platform == 'darwin'",
     "mps-deform-conv; sys_platform == 'darwin' and (platform_machine == 'arm64' or platform_machine == 'aarch64')",
 ]
+# Core ML detection backend (.mlpackage export and runtime inference)
+apple-coreml = [
+    "coremltools>=9.0; sys_platform == 'darwin'",
+]
 apple-mlx = [
     "mlx==0.31.2; sys_platform == 'darwin' and (platform_machine == 'arm64' or platform_machine == 'aarch64')",
 ]
