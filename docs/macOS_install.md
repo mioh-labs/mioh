@@ -128,3 +128,31 @@ If you prefer the app in a language other than English:
    ```
 
 The CLI will use translations based on your locale (e.g. `LANG` or `LANGUAGE`).
+
+### Core ML Detection on Apple Neural Engine (optional)
+
+On Apple Silicon you can run mosaic detection through Core ML instead of
+PyTorch/MPS. Detection then executes on the Neural Engine / GPU as chosen
+by Core ML, stays off the MPS command queue used by restoration, and is
+significantly faster per frame.
+
+1) Export the detection model (one-time, requires `coremltools`):
+
+   ```bash
+   pip install coremltools
+   python scripts/apple/export_v4_fast_coreml.py --output-dir model_weights
+   ```
+
+2) Run with the Core ML detector:
+
+   ```bash
+   lada-cli --input <video> --mosaic-detection-model v4-fast-coreml
+   ```
+
+   The name `v4-fast-coreml` resolves to
+   `model_weights/lada_mosaic_detection_model_v4_fast.mlpackage`. You can
+   also pass a path to any exported `.mlpackage` directly.
+
+Parity against the PyTorch detector can be checked with
+`scripts/apple/validate_v4_fast_coreml.py`; see
+`docs/apple/v4-fast-coreml-postprocess.md` for the postprocess contract.
