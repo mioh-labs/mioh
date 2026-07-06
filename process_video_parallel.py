@@ -511,6 +511,13 @@ def calculate_segment_count(duration, segment_duration):
     """セグメント数を計算"""
     return math.ceil(duration / segment_duration)
 
+
+def resolve_segment_duration(duration, segment_duration, segment_count=None):
+    if segment_count is None:
+        return segment_duration
+    return duration / segment_count
+
+
 def get_video_resolution(video_path):
     """動画の解像度を取得"""
     cmd = [
@@ -843,7 +850,7 @@ def get_optimal_encoder_options(video_path, user_options=None, auto_optimize=Tru
     
     return options
 
-def split_video(input_video, output_dir, segment_duration=60, force_split=False, pre_fps=None, encoder_options=None):
+def split_video(input_video, output_dir, segment_duration=60, force_split=False, pre_fps=None, encoder_options=None, segment_count=None):
     """
     動画を指定時間ごとに分割
     
@@ -857,15 +864,17 @@ def split_video(input_video, output_dir, segment_duration=60, force_split=False,
     
     output_pattern = output_dir / "segment_%03d.mp4"
     
+    duration = get_video_duration(input_video)
+    effective_segment_duration = resolve_segment_duration(duration, segment_duration, segment_count) if duration else segment_duration
+
     # 既存セグメントをチェック
     existing_segments = sorted(output_dir.glob("segment_*.mp4"))
     
     if existing_segments and not force_split:
         # 既存セグメントがある場合
         # 期待されるセグメント数を計算
-        duration = get_video_duration(input_video)
         if duration:
-            expected_count = calculate_segment_count(duration, segment_duration)
+            expected_count = segment_count if segment_count is not None else calculate_segment_count(duration, effective_segment_duration)
             
             if len(existing_segments) == expected_count:
                 # セグメント数が一致 → スキップ
@@ -885,7 +894,10 @@ def split_video(input_video, output_dir, segment_duration=60, force_split=False,
     # 分割実行
     if pre_fps:
         # fps変換しながら分割（再エンコード）
-        print(f"動画を{segment_duration}秒ごとに分割中（fps変換: {pre_fps}fps）...")
+        if segment_count is not None:
+            print(f"動画を{segment_count}個に均等分割中（目標: {effective_segment_duration:.3f}秒/segment, fps変換: {pre_fps}fps）...")
+        else:
+            print(f"動画を{segment_duration}秒ごとに分割中（fps変換: {pre_fps}fps）...")
         
         # エンコーダーオプションをパース
         encoder_opts = []
@@ -911,21 +923,24 @@ def split_video(input_video, output_dir, segment_duration=60, force_split=False,
         cmd.extend([
             '-c:a', 'copy',                # 音声はコピー
             '-map', '0',
-            '-segment_time', str(segment_duration),
+            '-segment_time', str(effective_segment_duration),
             '-f', 'segment',
             '-reset_timestamps', '1',
             str(output_pattern)
         ])
     else:
         # コピーモード（従来の動作）
-        print(f"動画を{segment_duration}秒ごとに分割中...")
+        if segment_count is not None:
+            print(f"動画を{segment_count}個に均等分割中（目標: {effective_segment_duration:.3f}秒/segment）...")
+        else:
+            print(f"動画を{segment_duration}秒ごとに分割中...")
         cmd = [
             'ffmpeg', '-i', str(input_video),
             '-map', '0:v',              # ビデオストリーム
             '-map', '0:a?',             # 音声ストリーム（あれば）
             '-c:v', 'copy',             # ビデオをコピー
             '-c:a', 'copy',             # 音声をコピー
-            '-segment_time', str(segment_duration),
+            '-segment_time', str(effective_segment_duration),
             '-f', 'segment',
             '-reset_timestamps', '1',
             str(output_pattern)
@@ -1373,7 +1388,11 @@ class ParallelVideoProcessor:
         print(f"出力: {output_path}")
         print(f"デバイス: {self.args.device}")
         print(f"並列数: {self.args.parallel_workers}")
-        print(f"セグメント長: {self.args.segment_duration}秒")
+        segment_count = getattr(self.args, 'segment_count', None)
+        if segment_count is not None:
+            print(f"セグメント数: {segment_count}個")
+        else:
+            print(f"セグメント長: {self.args.segment_duration}秒")
         print("=" * 70 + "\n")
         
         # 一時ディレクトリ作成
@@ -1459,7 +1478,8 @@ class ParallelVideoProcessor:
                     self.args.segment_duration, 
                     force_split,
                     pre_fps=self.args.fps,
-                    encoder_options=self.optimal_encoder_options
+                    encoder_options=self.optimal_encoder_options,
+                    segment_count=segment_count,
                 )
             else:
                 # 従来の動作（コピーモード）
@@ -1467,7 +1487,8 @@ class ParallelVideoProcessor:
                     input_video, 
                     segments_dir, 
                     self.args.segment_duration, 
-                    force_split
+                    force_split,
+                    segment_count=segment_count,
                 )
             
             self.stats['total_segments'] = len(segments)
@@ -1926,6 +1947,8 @@ def build_arg_parser():
     # セグメント設定
     parser.add_argument('--segment-duration', type=int, default=60,
                         help='入力を分割する長さ（秒）。長いほど時間軸の整合性は保ちやすいが、失敗時のやり直しとメモリ負荷が増える（デフォルト: 60）')
+    parser.add_argument('--segment-count', type=int, default=None,
+                        help='入力を指定個数に均等分割する。指定時は --segment-duration より優先（例: --segment-count 8）')
     parser.add_argument('--merge-encoder', default='copy',
                         help='最終結合時のエンコーダー。copyは再エンコードせず高速・画質劣化なし（デフォルト: copy）')
     parser.add_argument('--delete-segments', action='store_true',
@@ -2072,6 +2095,9 @@ def main():
     # 並列数の検証
     if args.parallel_workers < 1:
         print("エラー: --parallel-workers は1以上である必要があります")
+        return
+    if args.segment_count is not None and args.segment_count < 1:
+        print("エラー: --segment-count は1以上である必要があります")
         return
     if args.memory_cleanup_interval < 1:
         print("エラー: --memory-cleanup-interval は1以上である必要があります")
