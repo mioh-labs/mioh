@@ -98,6 +98,7 @@ class ModelFiles:
         ModelFile('realesrgan-x4', _("Real-ESRGAN 4x upscaler (PyTorch)"), os.path.join(MODEL_WEIGHTS_DIR, 'RealESRGAN_x4plus.pth')),
         ModelFile('realesrgan-x4-coreml', _("Real-ESRGAN 4x on Apple Neural Engine via Core ML"), os.path.join(MODEL_WEIGHTS_DIR, 'RealESRGAN_x4plus_256.mlpackage')),
         ModelFile('mewzoom-x4-coreml', _("MewZoom 4x on Apple Neural Engine via Core ML"), os.path.join(MODEL_WEIGHTS_DIR, 'MewZoom-V1-4X-Unet_256.mlpackage')),
+        ModelFile('mewzoom-x4-coreml-512', _("MewZoom 4x 512px on Apple Neural Engine via Core ML"), os.path.join(MODEL_WEIGHTS_DIR, 'MewZoom-V1-4X-Unet_512.mlpackage')),
     ]
 
     @staticmethod

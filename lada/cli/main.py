@@ -103,6 +103,7 @@ def setup_argparser() -> argparse.ArgumentParser:
     group_restoration.add_argument('--mosaic-restoration-model', type=str, default='basicvsrpp-v1.2', help=_('Name of detection model or path to model weights file. Use "--list-mosaic-restoration-models" to see what\'s available. (default: %(default)s)'))
     group_restoration.add_argument('--mosaic-restoration-config-path', type=str, default=None, help=_("Path to restoration model configuration file. You'll not have to set this unless you're training your own custom models"))
     group_restoration.add_argument('--max-clip-length', type=int, default=180, help=_('Maximum number of frames for restoration. Higher values improve temporal stability. Lower values reduce memory footprint. If set too low flickering could appear (default: %(default)s)'))
+    group_restoration.add_argument('--restore-max-frames', type=int, default=None, help=_('Override BasicVSR++ restore chunk size. Omit for Apple Silicon adaptive chunking, use -1 to disable chunking, or a positive value to force a fixed chunk size.'))
     group_restoration.add_argument('--restore-sharpen-strength', type=float, default=0.0, help=_('Apply unsharp masking to restored mosaic regions before compositing. 0 disables it. Start with 0.2-0.4 for testing. (default: %(default)s)'))
     group_restoration.add_argument('--restore-detail-boost', type=float, default=0.0, help=_('Boost local detail/contrast in restored mosaic regions before compositing. 0 disables it. Start with 0.1-0.2 for testing. (default: %(default)s)'))
     group_restoration.add_argument('--restore-blend-feather', type=float, default=1.0, help=_('Multiplier for restored mosaic region blend feathering. 1 keeps the default mask feather. Larger values soften boundaries more. (default: %(default)s)'))
@@ -132,7 +133,8 @@ def process_video_file(input_path: str, output_path: str, temp_dir_path: str, de
                        restore_roi_enhancer_scale: int = 2, restore_roi_enhancer_strength: float = 0.0,
                        restore_roi_enhancer_tile: int = 0, restore_effect_upscale: int = 1,
                        fp16_enabled: bool = False,
-                       mosaic_detection_empty_lookahead: int = 0):
+                       mosaic_detection_empty_lookahead: int = 0,
+                       restore_max_frames: int | None = None):
     video_metadata = get_video_meta_data(input_path)
 
     frame_restorer = FrameRestorer(device, input_path, max_clip_length, mosaic_restoration_model_name,
@@ -149,7 +151,8 @@ def process_video_file(input_path: str, output_path: str, temp_dir_path: str, de
                  restore_roi_enhancer_tile=restore_roi_enhancer_tile,
                  restore_effect_upscale=restore_effect_upscale,
                  fp16_enabled=fp16_enabled,
-                 mosaic_detection_empty_lookahead=mosaic_detection_empty_lookahead)
+                 mosaic_detection_empty_lookahead=mosaic_detection_empty_lookahead,
+                 restore_max_frames=restore_max_frames)
     success = True
     video_tmp_file_output_path = os.path.join(temp_dir_path, f"{os.path.basename(os.path.splitext(output_path)[0])}.tmp{os.path.splitext(output_path)[1]}")
     pathlib.Path(output_path).parent.mkdir(exist_ok=True, parents=True)
@@ -370,7 +373,8 @@ def main():
                                restore_roi_enhancer_tile=args.restore_roi_enhancer_tile,
                                restore_effect_upscale=args.restore_effect_upscale,
                                fp16_enabled=args.fp16,
-                               mosaic_detection_empty_lookahead=args.mosaic_detection_empty_lookahead)
+                               mosaic_detection_empty_lookahead=args.mosaic_detection_empty_lookahead,
+                               restore_max_frames=args.restore_max_frames)
         except KeyboardInterrupt:
             print(_("Received Ctrl-C, stopping restoration."))
             break

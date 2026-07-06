@@ -297,7 +297,8 @@ class FrameRestorer:
                  restore_roi_enhancer_tile: int = 0,
                  restore_effect_upscale: int = 1,
                  fp16_enabled: bool = False,
-                 mosaic_detection_empty_lookahead: int = 0):
+                 mosaic_detection_empty_lookahead: int = 0,
+                 restore_max_frames: int | None = None):
         self.device = torch.device(device)
         self.mosaic_restoration_model_name = mosaic_restoration_model_name
         self.max_clip_length = max_clip_length
@@ -317,6 +318,7 @@ class FrameRestorer:
         self.restore_roi_enhancer_scale = restore_roi_enhancer_scale
         self.restore_roi_enhancer_strength = restore_roi_enhancer_strength
         self.restore_effect_upscale = restore_effect_upscale
+        self.restore_max_frames = restore_max_frames
         self.restore_roi_enhancer = None
         if restore_roi_enhancer in ("realesrgan", "mewzoom"):
             if restore_roi_enhancer == "mewzoom" and not str(restore_roi_enhancer_model_path).endswith(".mlpackage"):
@@ -492,7 +494,9 @@ class FrameRestorer:
             from lada.restorationpipeline.basicvsrpp_mosaic_restorer import BasicvsrppMosaicRestorer
             assert isinstance(self.mosaic_restoration_model, BasicvsrppMosaicRestorer)
             restore_max_frames = -1
-            if self.device.type == 'mps':
+            if self.restore_max_frames is not None:
+                restore_max_frames = self.restore_max_frames
+            elif self.device.type == 'mps':
                 available_gb = get_mps_available_memory_gb()
                 mps_stats = get_mps_memory_stats()
                 pressure_ratio = mps_stats.get("pressure_ratio")
@@ -555,6 +559,31 @@ class FrameRestorer:
             clip_img, clip_mask, orig_clip_box, orig_crop_shape, pad_after_resize = buffered_clip.pop()
             clip_img = image_utils.unpad_image(clip_img, pad_after_resize)
             clip_mask = image_utils.unpad_image(clip_mask, pad_after_resize)
+            enhancer_before_resize = (
+                self.restore_roi_enhancer_strength > 0
+                and self.restore_roi_enhancer is not None
+                and getattr(self.restore_roi_enhancer, "prefer_pre_resize", False)
+            )
+            if enhancer_before_resize:
+                if isinstance(clip_img, torch.Tensor):
+                    clip_img_np = clip_img.cpu().numpy()
+                    clip_mask_np = clip_mask.cpu().numpy() if isinstance(clip_mask, torch.Tensor) else clip_mask
+                    clip_img_np = apply_restore_roi_enhancer(
+                        clip_img_np,
+                        enhancer=self.restore_roi_enhancer,
+                        strength=self.restore_roi_enhancer_strength,
+                        scale=self.restore_roi_enhancer_scale,
+                        mask=clip_mask_np,
+                    )
+                    clip_img = torch.from_numpy(clip_img_np).to(device=clip_img.device)
+                else:
+                    clip_img = apply_restore_roi_enhancer(
+                        clip_img,
+                        enhancer=self.restore_roi_enhancer,
+                        strength=self.restore_roi_enhancer_strength,
+                        scale=self.restore_roi_enhancer_scale,
+                        mask=clip_mask,
+                    )
             clip_img = image_utils.resize(clip_img, orig_crop_shape[:2])
             clip_mask = image_utils.resize(clip_mask, orig_crop_shape[:2],interpolation=cv2.INTER_NEAREST)
             if (
@@ -571,13 +600,14 @@ class FrameRestorer:
                     base_clip_img_np = clip_img_np.copy()
                     clip_mask_np = clip_mask.cpu().numpy() if isinstance(clip_mask, torch.Tensor) else clip_mask
                     original_roi_np = original_roi.cpu().numpy() if isinstance(original_roi, torch.Tensor) else original_roi
-                    clip_img_np = apply_restore_roi_enhancer(
-                        clip_img_np,
-                        enhancer=self.restore_roi_enhancer,
-                        strength=self.restore_roi_enhancer_strength,
-                        scale=self.restore_roi_enhancer_scale,
-                        mask=clip_mask_np,
-                    )
+                    if not enhancer_before_resize:
+                        clip_img_np = apply_restore_roi_enhancer(
+                            clip_img_np,
+                            enhancer=self.restore_roi_enhancer,
+                            strength=self.restore_roi_enhancer_strength,
+                            scale=self.restore_roi_enhancer_scale,
+                            mask=clip_mask_np,
+                        )
                     clip_img_np = apply_restore_effect_upscale(
                         clip_img_np,
                         original_roi_np,
@@ -592,13 +622,14 @@ class FrameRestorer:
                     clip_img = torch.from_numpy(clip_img_np).to(device=clip_img.device)
                 else:
                     base_clip_img = clip_img.copy()
-                    clip_img = apply_restore_roi_enhancer(
-                        clip_img,
-                        enhancer=self.restore_roi_enhancer,
-                        strength=self.restore_roi_enhancer_strength,
-                        scale=self.restore_roi_enhancer_scale,
-                        mask=clip_mask,
-                    )
+                    if not enhancer_before_resize:
+                        clip_img = apply_restore_roi_enhancer(
+                            clip_img,
+                            enhancer=self.restore_roi_enhancer,
+                            strength=self.restore_roi_enhancer_strength,
+                            scale=self.restore_roi_enhancer_scale,
+                            mask=clip_mask,
+                        )
                     clip_img = apply_restore_effect_upscale(
                         clip_img,
                         original_roi,
