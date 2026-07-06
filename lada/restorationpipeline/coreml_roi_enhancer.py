@@ -38,6 +38,7 @@ class CoreMLROIEnhancer:
         self.enhancer_name = metadata["lada.enhancer"]
         self.scale = int(metadata["lada.scale"])
         self.imgsz = int(metadata["lada.imgsz"])
+        self.prefer_pre_resize = self.enhancer_name == "mewzoom"
         spec = self.model.get_spec()
         self._input_name = spec.description.input[0].name
         self._output_name = spec.description.output[0].name

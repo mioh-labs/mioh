@@ -90,6 +90,8 @@ class EnhancerNameResolutionTests(unittest.TestCase):
             mf = lada.ModelFiles.get_enhancer_model_by_name("mewzoom-x4-coreml")
             self.assertIsNotNone(mf)
             self.assertTrue(mf.path.endswith("MewZoom-V1-4X-Unet_256.mlpackage"))
+            mf = lada.ModelFiles.get_enhancer_model_by_name("mewzoom-x4-coreml-512")
+            self.assertTrue(mf.path.endswith("MewZoom-V1-4X-Unet_512.mlpackage"))
             mf = lada.ModelFiles.get_enhancer_model_by_name("realesrgan-x4-coreml")
             self.assertTrue(mf.path.endswith("RealESRGAN_x4plus_256.mlpackage"))
 
@@ -105,6 +107,13 @@ class EnhancerFactoryTests(unittest.TestCase):
         with mock.patch("lada.restorationpipeline.coreml_roi_enhancer.CoreMLROIEnhancer") as coreml_cls:
             create_realesrgan_enhancer("enhancer.mlpackage", scale=4)
         coreml_cls.assert_called_once_with("enhancer.mlpackage")
+
+    def test_mewzoom_coreml_prefers_pre_resize_application(self):
+        with mock.patch("coremltools.models.MLModel", return_value=make_fake_mlmodel({
+            "lada.enhancer": "mewzoom", "lada.scale": "4", "lada.imgsz": "512",
+        })):
+            enhancer = CoreMLROIEnhancer("mewzoom.mlpackage")
+        self.assertTrue(enhancer.prefer_pre_resize)
 
 
 if __name__ == "__main__":

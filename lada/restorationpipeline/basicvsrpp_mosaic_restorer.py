@@ -24,10 +24,7 @@ class BasicvsrppMosaicRestorer:
             inference_view = torch.stack([x.permute(2, 0, 1) for x in video], dim=0).to(device=self.device).to(dtype=self.dtype).div_(255.0).unsqueeze(0)
 
             if max_frames > 0:
-                for i in range(0, inference_view.shape[1], max_frames):
-                    output = self.model(inputs=inference_view[:, i:i + max_frames])
-                    result.append(output)
-                result = torch.cat(result, dim=1)
+                result = self._restore_chunked_with_overlap(inference_view, max_frames)
             else:
                 result = self.model(inputs=inference_view)
 
@@ -40,3 +37,49 @@ class BasicvsrppMosaicRestorer:
             assert input_frame_count == output_frame_count and input_frame_shape == output_frame_shape
 
         return result
+
+    def _restore_chunked_with_overlap(self, inference_view: torch.Tensor, max_frames: int) -> torch.Tensor:
+        frame_count = inference_view.shape[1]
+        if frame_count <= max_frames:
+            return self.model(inputs=inference_view)
+
+        overlap = min(2, max_frames // 2, frame_count - 1)
+        if overlap <= 0:
+            result = []
+            for start in range(0, frame_count, max_frames):
+                result.append(self.model(inputs=inference_view[:, start:start + max_frames]))
+            return torch.cat(result, dim=1)
+
+        stride = max_frames - overlap
+        output_accum = None
+        weight_accum = None
+        starts = []
+        start = 0
+        while start < frame_count:
+            starts.append(start)
+            if start + max_frames >= frame_count:
+                break
+            start += stride
+        for chunk_index, start in enumerate(starts):
+            end = min(frame_count, start + max_frames)
+            output = self.model(inputs=inference_view[:, start:end])
+            if output_accum is None:
+                output_shape = (output.shape[0], frame_count, *output.shape[2:])
+                output_accum = torch.zeros(output_shape, dtype=output.dtype, device=output.device)
+                weight_accum = torch.zeros((output.shape[0], frame_count, 1, 1, 1), dtype=output.dtype, device=output.device)
+
+            weights = torch.ones((output.shape[1],), dtype=output.dtype, device=output.device)
+            if chunk_index > 0:
+                ramp = torch.arange(1, min(overlap, output.shape[1]) + 1, dtype=output.dtype, device=output.device) / (overlap + 1)
+                weights[: ramp.numel()] = ramp
+            if end < frame_count:
+                ramp_len = min(overlap, output.shape[1])
+                ramp = torch.arange(ramp_len, 0, -1, dtype=output.dtype, device=output.device) / (overlap + 1)
+                weights[-ramp_len:] = torch.minimum(weights[-ramp_len:], ramp)
+
+            weight_view = weights.view(1, output.shape[1], 1, 1, 1)
+            output_accum[:, start:end] += output * weight_view
+            weight_accum[:, start:end] += weight_view
+
+        assert output_accum is not None and weight_accum is not None
+        return output_accum / weight_accum.clamp_min(torch.finfo(weight_accum.dtype).eps)

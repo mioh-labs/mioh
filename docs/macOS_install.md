@@ -199,14 +199,18 @@ jasna's unet-4x):
 
 ```bash
 python scripts/apple/export_mewzoom_coreml.py
+# Optional higher-resolution input variant. Slower, but can preserve more
+# detail before LADA resizes the restored ROI back onto the source frame.
+python scripts/apple/export_mewzoom_coreml.py --imgsz 512
 ```
 
 The MewZoom architecture is vendored in `lada/models/mewzoom` — do not
 `pip install mewzoom`, its `torch~=2.9` pin would downgrade PyTorch.
 
 Then pass `model_weights/MewZoom-V1-4X-Unet_256.mlpackage` as
-`--restore-roi-enhancer-model-path`. Measured ~100 ms/frame on the
-Neural Engine, faster than Real-ESRGAN (~300 ms). The ANE compiler
+`--restore-roi-enhancer-model-path`, or use the registered
+`mewzoom-x4-coreml-512` name after exporting the 512px variant.
+Measured ~100 ms/frame on the Neural Engine, faster than Real-ESRGAN (~300 ms). The ANE compiler
 crashes on this network's decoder as-is (conv emitting 1536 channels
 into pixel_shuffle); the export script works around it by splitting the
 shuffle into channel chunks, which is bit-identical. Visually MewZoom
@@ -220,3 +224,8 @@ lada-cli --input <video> --mosaic-detection-model v4-fast-coreml \
   --restore-roi-enhancer mewzoom \
   --restore-roi-enhancer-scale 4 --restore-roi-enhancer-strength 0.25
 ```
+
+MewZoom Core ML enhancer output is applied before the restored crop is resized
+back to the original ROI, so the 4x output has a chance to survive the final
+downscale/composite step. Try `mewzoom-x4-coreml-512` when the default 256px
+export looks too subtle on larger ROIs.

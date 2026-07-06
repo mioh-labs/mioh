@@ -82,6 +82,7 @@ class WorkerRuntimeConfig:
     detect_face_mosaics: bool
     lada_temp_dir: str | None
     overwrite: bool
+    restore_max_frames: int | None = None
     mosaic_detection_empty_lookahead: int = 0
     restore_sharpen_strength: float = 0.0
     restore_detail_boost: float = 0.0
@@ -169,6 +170,8 @@ def build_lada_cli_command(config: WorkerRuntimeConfig, input_video: Path, outpu
 
     cmd.extend(['--mosaic-restoration-model', config.mosaic_restoration_model])
     cmd.extend(['--max-clip-length', str(config.max_clip_length)])
+    if config.restore_max_frames is not None:
+        cmd.extend(['--restore-max-frames', str(config.restore_max_frames)])
     if config.restore_sharpen_strength > 0:
         cmd.extend(['--restore-sharpen-strength', str(config.restore_sharpen_strength)])
     if config.restore_detail_boost > 0:
@@ -1095,6 +1098,7 @@ class ParallelVideoProcessor:
             mp4_fast_start=self.args.mp4_fast_start,
             mosaic_restoration_model=self.args.mosaic_restoration_model,
             max_clip_length=self.args.max_clip_length,
+            restore_max_frames=self.args.restore_max_frames,
             mosaic_detection_model=self.args.mosaic_detection_model,
             detect_face_mosaics=self.args.detect_face_mosaics,
             lada_temp_dir=str(self.args.lada_temp_dir) if getattr(self.args, 'lada_temp_dir', None) else None,
@@ -1269,6 +1273,8 @@ class ParallelVideoProcessor:
         
         cmd.extend(['--mosaic-restoration-model', self.args.mosaic_restoration_model])
         cmd.extend(['--max-clip-length', str(self.args.max_clip_length)])
+        if self.args.restore_max_frames is not None:
+            cmd.extend(['--restore-max-frames', str(self.args.restore_max_frames)])
         if self.args.restore_sharpen_strength > 0:
             cmd.extend(['--restore-sharpen-strength', str(self.args.restore_sharpen_strength)])
         if self.args.restore_detail_boost > 0:
@@ -1991,6 +1997,8 @@ def build_arg_parser():
                         help='復元モデル名または重みパス。通常は basicvsrpp-v1.2（デフォルト: basicvsrpp-v1.2）')
     parser.add_argument('--max-clip-length', type=int, default=180,
                         help='復元モデルへ渡す最大フレーム数。大きいほど時間整合性は上がるがメモリ負荷も増える（デフォルト: 180）')
+    parser.add_argument('--restore-max-frames', type=int, default=None,
+                        help='BasicVSR++復元チャンク数の上書き。未指定はMPS自動調整、-1は分割なし、正の値は固定チャンク')
     parser.add_argument('--restore-sharpen-strength', type=float, default=0.0,
                         help='復元ROIを合成前にunsharp maskでシャープ化する強度（0で無効、例: 0.3）')
     parser.add_argument('--restore-detail-boost', type=float, default=0.0,

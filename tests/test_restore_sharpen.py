@@ -1,8 +1,10 @@
 import unittest
 
 import numpy as np
+import torch
 
 from lada.restorationpipeline.frame_restorer import (
+    FrameRestorer,
     apply_restore_roi_enhancer,
     apply_restore_effect_upscale,
     apply_restore_detail_boost,
@@ -128,6 +130,56 @@ class RestoreSharpenTests(unittest.TestCase):
 
         self.assertTrue(np.array_equal(enhanced[mask.squeeze() == 0], restored[mask.squeeze() == 0]))
         self.assertFalse(np.array_equal(enhanced[mask.squeeze() > 0], restored[mask.squeeze() > 0]))
+
+    def test_restore_frame_applies_pre_resize_enhancer_before_original_roi_resize(self):
+        class FakeEnhancer:
+            prefer_pre_resize = True
+            uses_torch_device = False
+
+            def __init__(self):
+                self.seen_shapes = []
+
+            def enhance(self, image_bgr, outscale=4):
+                self.seen_shapes.append(image_bgr.shape)
+                return np.full_like(image_bgr, 128), None
+
+        class FakeClip:
+            frame_start = 0
+
+            def __init__(self):
+                self.frame_end = 0
+                self.frames = [torch.full((6, 6, 3), 64, dtype=torch.uint8)]
+                self.masks = [torch.ones((6, 6), dtype=torch.uint8)]
+                self.boxes = [(0, 0, 7, 7)]
+                self.crop_shapes = [(8, 8, 3)]
+                self.pad_after_resizes = [(1, 1, 1, 1)]
+
+            def pop(self):
+                return (
+                    self.frames.pop(0),
+                    self.masks.pop(0),
+                    self.boxes.pop(0),
+                    self.crop_shapes.pop(0),
+                    self.pad_after_resizes.pop(0),
+                )
+
+        enhancer = FakeEnhancer()
+        restorer = FrameRestorer.__new__(FrameRestorer)
+        restorer.restore_roi_enhancer = enhancer
+        restorer.restore_roi_enhancer_strength = 1.0
+        restorer.restore_roi_enhancer_scale = 4
+        restorer.restore_texture_mix = 0.0
+        restorer.restore_detail_boost = 0.0
+        restorer.restore_sharpen_strength = 0.0
+        restorer.restore_smooth_strength = 0.0
+        restorer.restore_effect_upscale = 1
+        restorer.restore_blend_feather = 0.0
+        restorer.mosaic_restoration_model = type("FakeModel", (), {"dtype": torch.float32})()
+
+        frame = torch.zeros((8, 8, 3), dtype=torch.uint8)
+        restorer._restore_frame(frame, 0, [FakeClip()])
+
+        self.assertEqual(enhancer.seen_shapes, [(4, 4, 3)])
 
     def test_apply_restore_effect_upscale_one_returns_existing_effects(self):
         original = np.full((9, 9, 3), 64, dtype=np.uint8)
