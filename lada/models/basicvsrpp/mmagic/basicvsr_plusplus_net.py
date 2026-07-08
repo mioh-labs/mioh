@@ -81,7 +81,11 @@ def _env_flag(name, default=False):
 
 
 def _mlx_propagation_warp_bridge_enabled():
-    return _env_flag('LADA_BASICVSRPP_MLX_PROPAGATION_WARP', default=True)
+    # Default OFF: the MLX warp bridge round-trips MPS->CPU->MLX->CPU->MPS per
+    # propagation step (MLX 0.31.2 has no zero-copy), which measured ~45%
+    # slower than the pure Torch/MPS path on M5 Pro (48.5 vs 70.5 fps on
+    # 256x256 clips). Opt back in with LADA_BASICVSRPP_MLX_PROPAGATION_WARP=1.
+    return _env_flag('LADA_BASICVSRPP_MLX_PROPAGATION_WARP', default=False)
 
 
 def _mlx_second_order_cond_bridge(feat_current, feat_prop, feat_n2, flow_n1, flow_n2):
