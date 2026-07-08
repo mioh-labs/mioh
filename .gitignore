@@ -16,3 +16,10 @@ model_weights/MewZoom-V1-4X-Unet_256.mlpackage/
 # Downloaded + exported by scripts/apple/export_srvgg_coreml.py (re-generatable)
 model_weights/realesr-general-x4v3.pth
 model_weights/realesr-general-x4v3_256.mlpackage/
+
+# Large model weights (downloaded / exported, re-obtainable) — keep out of git
+model_weights/MewZoom-V1-4X-Unet_512.mlpackage/
+model_weights/RealESRGAN_x2plus.pth
+model_weights/RealESRGAN_x4plus.pth
+model_weights/RealESRGAN_x4plus_256.mlpackage/
+model_weights/lada_mosaic_detection_model_v2.pt
