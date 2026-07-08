@@ -38,7 +38,13 @@ class CoreMLROIEnhancer:
         self.enhancer_name = metadata["lada.enhancer"]
         self.scale = int(metadata["lada.scale"])
         self.imgsz = int(metadata["lada.imgsz"])
-        self.prefer_pre_resize = self.enhancer_name == "mewzoom"
+        # Enhance the fixed-size restored crop before it is resized onto the
+        # ROI (higher quality). Opt-in per export via lada.prefer_pre_resize;
+        # MewZoom exports predate the flag so keep them on by name.
+        if "lada.prefer_pre_resize" in metadata:
+            self.prefer_pre_resize = metadata["lada.prefer_pre_resize"] not in ("0", "false", "False", "")
+        else:
+            self.prefer_pre_resize = self.enhancer_name == "mewzoom"
         spec = self.model.get_spec()
         self._input_name = spec.description.input[0].name
         self._output_name = spec.description.output[0].name
