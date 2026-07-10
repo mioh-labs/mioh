@@ -320,9 +320,9 @@ class FrameRestorer:
         self.restore_effect_upscale = restore_effect_upscale
         self.restore_max_frames = restore_max_frames
         self.restore_roi_enhancer = None
-        if restore_roi_enhancer in ("realesrgan", "mewzoom"):
-            if restore_roi_enhancer == "mewzoom" and not str(restore_roi_enhancer_model_path).endswith(".mlpackage"):
-                raise ValueError("mewzoom enhancer requires a Core ML .mlpackage model (see scripts/apple/export_mewzoom_coreml.py)")
+        if restore_roi_enhancer in ("realesrgan", "mewzoom", "swinir"):
+            if restore_roi_enhancer in ("mewzoom", "swinir") and not str(restore_roi_enhancer_model_path).endswith(".mlpackage"):
+                raise ValueError(f"{restore_roi_enhancer} enhancer requires a Core ML .mlpackage model")
             self.restore_roi_enhancer = create_realesrgan_enhancer(
                 restore_roi_enhancer_model_path,
                 scale=restore_roi_enhancer_scale,
