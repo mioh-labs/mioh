@@ -73,6 +73,19 @@ class ExportMewZoomArgsTests(unittest.TestCase):
         self.assertEqual(args.imgsz, 256)
 
 
+class ExportSwinIRArgsTests(unittest.TestCase):
+    def test_defaults(self):
+        from scripts.apple import export_swinir_coreml as swinir_mod
+        args = swinir_mod.parse_args(["--swinir-repo-dir", "vendor/SwinIR"])
+        self.assertEqual(str(args.model), "model_weights/003_realSR_BSRGAN_DFO_s64w8_SwinIR-M_x4_GAN.pth")
+        self.assertEqual(str(args.swinir_repo_dir), "vendor/SwinIR")
+        self.assertEqual(str(args.output_dir), "model_weights")
+        self.assertEqual(args.output_name, "swinir-real-x4")
+        self.assertEqual(args.imgsz, 256)
+        self.assertEqual(args.scale, 4)
+        self.assertEqual(args.arch, "medium")
+
+
 class MetadataGuardTests(unittest.TestCase):
     def test_accepts_any_lada_enhancer_metadata(self):
         with mock.patch("coremltools.models.MLModel", return_value=make_fake_mlmodel({
@@ -94,6 +107,12 @@ class EnhancerNameResolutionTests(unittest.TestCase):
             self.assertTrue(mf.path.endswith("MewZoom-V1-4X-Unet_512.mlpackage"))
             mf = lada.ModelFiles.get_enhancer_model_by_name("realesrgan-x4-coreml")
             self.assertTrue(mf.path.endswith("RealESRGAN_x4plus_256.mlpackage"))
+            mf = lada.ModelFiles.get_enhancer_model_by_name("realesr-general-x4v3-coreml")
+            self.assertTrue(mf.path.endswith("realesr-general-x4v3_256.mlpackage"))
+            mf = lada.ModelFiles.get_enhancer_model_by_name("swinir-x4-coreml")
+            self.assertTrue(mf.path.endswith("swinir-real-x4_256.mlpackage"))
+            mf = lada.ModelFiles.get_enhancer_model_by_name("swinir-real-x4-coreml")
+            self.assertTrue(mf.path.endswith("swinir-real-x4_256.mlpackage"))
 
     def test_unknown_name_returns_none(self):
         import lada
@@ -113,6 +132,14 @@ class EnhancerFactoryTests(unittest.TestCase):
             "lada.enhancer": "mewzoom", "lada.scale": "4", "lada.imgsz": "512",
         })):
             enhancer = CoreMLROIEnhancer("mewzoom.mlpackage")
+        self.assertTrue(enhancer.prefer_pre_resize)
+
+    def test_metadata_flag_controls_pre_resize_application(self):
+        with mock.patch("coremltools.models.MLModel", return_value=make_fake_mlmodel({
+            "lada.enhancer": "swinir", "lada.scale": "4", "lada.imgsz": "256",
+            "lada.prefer_pre_resize": "1",
+        })):
+            enhancer = CoreMLROIEnhancer("swinir.mlpackage")
         self.assertTrue(enhancer.prefer_pre_resize)
 
 

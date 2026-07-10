@@ -254,6 +254,22 @@ class RestoreSharpenTests(unittest.TestCase):
         self.assertEqual(args.restore_effect_upscale, 2)
         self.assertEqual(args.mosaic_detection_empty_lookahead, 10)
 
+    def test_lada_cli_accepts_swinir_roi_enhancer(self):
+        parser = setup_argparser()
+
+        args = parser.parse_args([
+            "--input", "in.mp4",
+            "--restore-roi-enhancer", "swinir",
+            "--restore-roi-enhancer-model-path", "swinir-x4-coreml",
+            "--restore-roi-enhancer-scale", "4",
+            "--restore-roi-enhancer-strength", "0.25",
+        ])
+
+        self.assertEqual(args.restore_roi_enhancer, "swinir")
+        self.assertEqual(args.restore_roi_enhancer_model_path, "swinir-x4-coreml")
+        self.assertEqual(args.restore_roi_enhancer_scale, 4)
+        self.assertEqual(args.restore_roi_enhancer_strength, 0.25)
+
     def test_parallel_command_passes_restore_sharpen_strength(self):
         config = pvp.WorkerRuntimeConfig(
             device="mps",

@@ -229,3 +229,44 @@ MewZoom Core ML enhancer output is applied before the restored crop is resized
 back to the original ROI, so the 4x output has a chance to survive the final
 downscale/composite step. Try `mewzoom-x4-coreml-512` when the default 256px
 export looks too subtle on larger ROIs.
+
+### SwinIR ROI Enhancer on the Neural Engine (optional)
+
+SwinIR can also be exported as a Core ML ROI enhancer. It is a heavier
+Transformer-based restoration model, so treat it as an experimental quality
+comparison against MewZoom and Real-ESRGAN/SRVGG rather than a default fast
+path.
+
+Install the Core ML extra and the `timm` dependency used by the official
+SwinIR architecture:
+
+```bash
+uv sync --extra cpu --extra apple-coreml
+uv pip install timm
+```
+
+Clone the official SwinIR repository once, then export the real-world x4
+checkpoint:
+
+```bash
+git clone https://github.com/JingyunLiang/SwinIR.git vendor/SwinIR
+curl -L -o model_weights/003_realSR_BSRGAN_DFO_s64w8_SwinIR-M_x4_GAN.pth \
+  https://github.com/JingyunLiang/SwinIR/releases/download/v0.0/003_realSR_BSRGAN_DFO_s64w8_SwinIR-M_x4_GAN.pth
+python scripts/apple/export_swinir_coreml.py \
+  --swinir-repo-dir vendor/SwinIR \
+  --model model_weights/003_realSR_BSRGAN_DFO_s64w8_SwinIR-M_x4_GAN.pth
+```
+
+The exported model is registered as both `swinir-x4-coreml` and
+`swinir-real-x4-coreml`:
+
+```bash
+lada-cli --input <video> --mosaic-detection-model v4-fast-coreml \
+  --restore-roi-enhancer swinir \
+  --restore-roi-enhancer-model-path swinir-x4-coreml \
+  --restore-roi-enhancer-scale 4 --restore-roi-enhancer-strength 0.25
+```
+
+Like MewZoom and SRVGG, the export opts into pre-resize enhancement using
+`lada.prefer_pre_resize=1`, so the enhancer runs on the fixed restored crop
+before LADA resizes it back onto the original ROI.

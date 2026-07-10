@@ -2034,7 +2034,7 @@ def build_arg_parser():
                         help='texture/detail/sharpen後の復元ROIを合成前に滑らかにする強度（0で無効、例: 0.10〜0.25）')
     parser.add_argument('--restore-effect-upscale', type=int, default=1,
                         help='texture/detail/sharpenをOpenCVで拡大後に適用して戻す倍率（1で無効、例: 2）')
-    parser.add_argument('--restore-roi-enhancer', choices=('none', 'realesrgan', 'mewzoom'), default='none',
+    parser.add_argument('--restore-roi-enhancer', choices=('none', 'realesrgan', 'mewzoom', 'swinir'), default='none',
                         help='復元ROIに追加の高画質化処理をかける。モデルは指定時のみロード（デフォルト: none）')
     parser.add_argument('--restore-roi-enhancer-model-path',
                         help='エンハンサーモデル。登録名（realesrgan-x2/x4, realesrgan-x4-coreml, mewzoom-x4-coreml）、'
