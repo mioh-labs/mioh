@@ -4,7 +4,6 @@
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
 from lada.utils import Box, Mask, box_utils
 from lada.utils import image_utils
 
@@ -68,36 +67,22 @@ def smooth_mask(mask: Mask, kernel_size: int) -> Mask:
     return cv2.medianBlur(mask, kernel_size).reshape(mask.shape)
 
 def create_blend_mask(crop_mask: torch.Tensor, feather_multiplier: float = 1.0):
-    mask = crop_mask.squeeze()
+    mask = (crop_mask.squeeze() > 0).to(dtype=crop_mask.dtype)
     h, w = mask.shape
-    border_ratio = 0.05
-    h_inner, w_inner = int(h * (1.0 - border_ratio)), int(w * (1.0 - border_ratio))
-    h_outer, w_outer = h - h_inner, w - w_inner
-    border_size = int(round(min(h_outer, w_outer) * feather_multiplier))
-    if border_size < 5:
-        return torch.ones_like(mask)
-    blur_size = int(border_size)
+    if feather_multiplier <= 0:
+        return mask
+
+    blur_size = max(1, int(round(min(h, w) * 0.05 * feather_multiplier)))
     if blur_size % 2 == 0:
         blur_size += 1
-    pad_top = h_outer // 2
-    pad_bottom = h_outer - pad_top
-    pad_left = w_outer // 2
-    pad_right = w_outer - pad_left
     if mask.device.type == 'cpu':
-        # cv2.blur is an O(1) integral-image box filter and its default
-        # BORDER_REFLECT_101 matches F.pad(mode='reflect') used below
-        blend_np = np.zeros((h, w), dtype=np.float32)
-        blend_np[pad_top:h - pad_bottom, pad_left:w - pad_right] = 1.0
-        np.maximum(blend_np, (mask > 0).numpy().astype(np.float32), out=blend_np)
-        blend = torch.from_numpy(cv2.blur(blend_np, (blur_size, blur_size))).to(dtype=mask.dtype)
-        assert blend.shape == mask.shape
-        return blend
-    inner = torch.ones((h_inner, w_inner), device=mask.device, dtype=mask.dtype)
-    blend = F.pad(inner, (pad_left, pad_right, pad_top, pad_bottom), value=0.0)
-    mask4 = (mask > 0)
-    blend = torch.maximum(mask4, blend)
-    kernel = torch.tensor(1.0 / (blur_size**2), device=blend.device, dtype=blend.dtype).expand(1, blur_size, blur_size)
-    blend = image_utils.filter2D(blend.unsqueeze(0).unsqueeze(0), kernel).squeeze(0).squeeze(0)
+        # Keep the feather strictly inside the segmentation mask so contextual
+        # pixels from the square restoration crop are never composited.
+        blend = torch.from_numpy(cv2.blur(mask.numpy(), (blur_size, blur_size))).to(dtype=mask.dtype)
+    else:
+        kernel = torch.tensor(1.0 / (blur_size**2), device=mask.device, dtype=mask.dtype).expand(1, blur_size, blur_size)
+        blend = image_utils.filter2D(mask.unsqueeze(0).unsqueeze(0), kernel).squeeze(0).squeeze(0)
+    blend = torch.minimum(mask, blend)
     assert blend.shape == mask.shape
     return blend
 
