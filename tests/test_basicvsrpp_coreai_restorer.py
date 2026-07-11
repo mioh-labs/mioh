@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: AGPL-3.0
 
 import asyncio
+import io
+import os
 import sys
 import tempfile
 import types
@@ -84,7 +86,74 @@ class FakeRunner:
         self.closed = True
 
 
+class FakeBridgeProcess:
+    def __init__(self, completed_slots: bytes):
+        self.stdin = io.BytesIO()
+        self.stdout = io.BytesIO(completed_slots)
+        self.stderr = io.BytesIO()
+        self.returncode = None
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = -15
+
+    def wait(self, timeout=None):
+        self.returncode = 0
+        return 0
+
+
 class CoreAIBasicVSRPPRestorerTests(unittest.TestCase):
+    def test_compiled_model_uses_persistent_swift_runner(self):
+        inputs = [
+            torch.full((1, 18, 3, 2, 2), value, dtype=torch.float16)
+            for value in (1, 2)
+        ]
+        process = FakeBridgeProcess(b"\x00\x00")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "model-t18.aimodelc"
+            model_path.mkdir()
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"LADA_COREAI_SWIFT_RUNNER": "/fake/lada-coreai-runner"},
+                ),
+                mock.patch(
+                    "subprocess.Popen",
+                    return_value=process,
+                ) as popen,
+            ):
+                runtime = CoreAIModelRuntime(model_path, frame_count=18)
+                self.assertEqual(getattr(runtime, "_backend", None), "swift")
+                self.assertEqual(
+                    getattr(runtime, "_transport", None), "shared-memory"
+                )
+                self.assertEqual(runtime.max_inflight, 1)
+                outputs = runtime.infer_many(inputs)
+                shared_memory_path = runtime._shared_memory_path
+                runtime.close()
+
+        popen.assert_called_once()
+        command = popen.call_args.args[0]
+        self.assertEqual(
+            command[:3],
+            [
+                "/fake/lada-coreai-runner",
+                str(model_path.resolve()),
+                "18",
+            ],
+        )
+        self.assertEqual(command[3], str(shared_memory_path))
+        self.assertEqual(command[4], "1")
+        self.assertEqual(
+            [output.tolist() for output in outputs],
+            [input_tensor.tolist() for input_tensor in inputs],
+        )
+        request = process.stdin.getvalue()
+        self.assertEqual(request, b"\x00\x00\xff")
+        self.assertFalse(shared_memory_path.exists())
+
     def test_runtime_close_releases_asyncio_runner_and_loaded_model(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             runtime = CoreAIModelRuntime(Path(temp_dir))
@@ -113,12 +182,48 @@ class CoreAIBasicVSRPPRestorerTests(unittest.TestCase):
                 torch.full((1, 18, 3, 2, 2), value, dtype=torch.float16)
                 for value in range(3)
             ]
-            with mock.patch.dict(sys.modules, {"coreai.runtime": coreai_runtime}):
+            with (
+                mock.patch.dict(sys.modules, {"coreai.runtime": coreai_runtime}),
+                mock.patch(
+                    "psutil.virtual_memory",
+                    return_value=types.SimpleNamespace(total=100, available=80),
+                ),
+            ):
                 outputs = runtime.infer_many(inputs)
             runtime._runner.close()
 
         self.assertEqual(function.max_active, 2)
         self.assertEqual([int(output[0, 0, 0, 0, 0]) for output in outputs], [0, 1, 2])
+
+    def test_t90_runtime_limits_inflight_calls_to_one(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = CoreAIModelRuntime(Path(temp_dir), frame_count=90)
+
+        self.assertEqual(runtime.max_inflight, 1)
+
+    def test_system_memory_pressure_limits_inflight_calls_to_one(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = CoreAIModelRuntime(Path(temp_dir), frame_count=18)
+            function = ConcurrentFakeFunction()
+            runtime._runner = asyncio.Runner()
+            runtime._function = function
+            coreai_runtime = types.ModuleType("coreai.runtime")
+            coreai_runtime.NDArray = FakeNDArray
+            inputs = [
+                torch.zeros((1, 18, 3, 2, 2), dtype=torch.float16)
+                for _ in range(2)
+            ]
+            with (
+                mock.patch.dict(sys.modules, {"coreai.runtime": coreai_runtime}),
+                mock.patch(
+                    "psutil.virtual_memory",
+                    return_value=types.SimpleNamespace(total=100, available=20),
+                ),
+            ):
+                runtime.infer_many(inputs)
+            runtime._runner.close()
+
+        self.assertEqual(function.max_active, 1)
 
     def test_short_clip_is_padded_to_t18_and_trimmed(self):
         runtime = RecordingRuntime()
@@ -321,9 +426,33 @@ class CoreAIBasicVSRPPRestorerTests(unittest.TestCase):
         self.assertEqual(restorer.device, torch.device("cpu"))
         self.assertEqual(pad_mode, "zero")
 
+    def test_restoration_loader_selects_coreai_for_compiled_aimodel(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "basicvsrpp-t90.aimodelc"
+            model_path.mkdir()
+
+            restorer, pad_mode = restorationpipeline.load_restoration_model(
+                torch.device("mps"),
+                "basicvsrpp-v1.2-coreai-t90",
+                str(model_path),
+                None,
+                fp16=True,
+            )
+
+        self.assertIsInstance(restorer, CoreAIBasicvsrppMosaicRestorer)
+        self.assertEqual(restorer.frame_count, 90)
+        self.assertEqual(pad_mode, "zero")
+
     def test_cli_accepts_aimodel_directory_as_custom_restoration_model(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             model_path = Path(temp_dir) / "custom.aimodel"
+            model_path.mkdir()
+
+            self.assertTrue(cli_main.is_restoration_model_path(str(model_path)))
+
+    def test_cli_accepts_aimodelc_directory_as_custom_restoration_model(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "custom.aimodelc"
             model_path.mkdir()
 
             self.assertTrue(cli_main.is_restoration_model_path(str(model_path)))

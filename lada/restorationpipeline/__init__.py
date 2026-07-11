@@ -29,7 +29,7 @@ def load_restoration_model(
     config_path: str | None,
     fp16: bool,
 ):
-    if model_path.endswith(".aimodel"):
+    if model_path.endswith((".aimodel", ".aimodelc")):
         from lada.restorationpipeline.basicvsrpp_coreai_restorer import (
             CoreAIBasicvsrppMosaicRestorer,
         )
@@ -80,7 +80,7 @@ def load_models(
             logger.info("Mosaic detection model v2 does not support detecting face mosaics. Use detection models v3 or newer. Ignoring...")
     else:
         classes = None
-    if str(mosaic_detection_model_path).endswith(".aimodel"):
+    if str(mosaic_detection_model_path).endswith((".aimodel", ".aimodelc")):
         from lada.models.yolo.yolo11_coreai_segmentation_model import Yolo11CoreAISegmentationModel
         mosaic_detection_model = Yolo11CoreAISegmentationModel(mosaic_detection_model_path, device, classes=classes, conf=0.15)
     elif str(mosaic_detection_model_path).endswith(".mlpackage"):

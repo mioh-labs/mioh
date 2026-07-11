@@ -48,7 +48,9 @@ from lada.utils.video_utils import get_video_meta_data, VideoWriter, get_default
 
 def is_restoration_model_path(model_path: str) -> bool:
     path = pathlib.Path(model_path)
-    return path.is_file() or (path.suffix == ".aimodel" and path.is_dir())
+    return path.is_file() or (
+        path.suffix in {".aimodel", ".aimodelc"} and path.is_dir()
+    )
 
 
 def setup_argparser() -> argparse.ArgumentParser:

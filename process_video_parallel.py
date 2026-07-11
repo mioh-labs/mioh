@@ -145,6 +145,19 @@ def get_effective_max_clip_length(
     )
 
 
+def get_memory_safe_parallel_workers(
+    mosaic_restoration_model: str,
+    requested_workers: int,
+) -> int:
+    """Keep fixed-T90 Core AI restoration within unified-memory limits."""
+    model = mosaic_restoration_model.lower()
+    is_t90_coreai = model == 'basicvsrpp-v1.2-coreai-t90' or (
+        't90' in Path(model).name
+        and Path(model).suffix in {'.aimodel', '.aimodelc'}
+    )
+    return 1 if is_t90_coreai else requested_workers
+
+
 def lada_cli_command_prefix(
     mosaic_restoration_model: str | None = None,
     mosaic_detection_model: str | None = None,
@@ -158,11 +171,11 @@ def lada_cli_command_prefix(
     interpreter = (
         COREAI_PYTHON
         if mosaic_restoration_model in COREAI_RESTORATION_MODELS
-        or str(mosaic_restoration_model).endswith('.aimodel')
+        or str(mosaic_restoration_model).endswith(('.aimodel', '.aimodelc'))
         or mosaic_detection_model in COREAI_DETECTION_MODELS
-        or str(mosaic_detection_model).endswith('.aimodel')
+        or str(mosaic_detection_model).endswith(('.aimodel', '.aimodelc'))
         or roi_enhancer_model in COREAI_ENHANCER_MODELS
-        or str(roi_enhancer_model).endswith('.aimodel')
+        or str(roi_enhancer_model).endswith(('.aimodel', '.aimodelc'))
         else Path(sys.executable)
     )
     return [str(interpreter), '-m', 'lada.cli.main']
@@ -2164,6 +2177,16 @@ def main():
         args.mosaic_restoration_model,
         args.max_clip_length,
     )
+    requested_workers = args.parallel_workers
+    args.parallel_workers = get_memory_safe_parallel_workers(
+        args.mosaic_restoration_model,
+        requested_workers,
+    )
+    if args.parallel_workers != requested_workers:
+        print(
+            "Core AI T90は統一メモリ使用量が大きいため、"
+            f"並列数を {requested_workers} から 1 に制限します"
+        )
 
     if not args.input:
         parser.error("--input is required unless using --list-*")
