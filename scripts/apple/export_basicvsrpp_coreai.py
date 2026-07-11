@@ -41,7 +41,7 @@ else:
 DEFAULT_MODEL = Path("model_weights/lada_mosaic_restoration_model_generic_v1.2.pth")
 DEFAULT_OUTPUT = Path("model_weights/basicvsrpp-v1.2-t18-fp16.aimodel")
 FIXED_FRAMES = 18
-SUPPORTED_FRAME_COUNTS = (18, 36)
+SUPPORTED_FRAME_COUNTS = (18, 36, 90)
 FIXED_IMAGE_SIZE = 256
 
 _T = TypeVar("_T")
@@ -205,11 +205,18 @@ def summarize_exported_operators(
     return dict(sorted(counts.items()))
 
 
-def load_generator(model_path: Path) -> BasicVSRPPExportWrapper:
+def load_generator(
+    model_path: Path,
+) -> BasicVSRPPExportWrapper:
     from lada.models.basicvsrpp.inference import load_model
 
     model = load_model(None, str(model_path), device="cpu", fp16=True)
-    return BasicVSRPPExportWrapper(model.generator.eval()).eval()
+    generator = (
+        model.generator_ema
+        if model.is_use_ema and model.generator_ema is not None
+        else model.generator
+    )
+    return BasicVSRPPExportWrapper(generator.eval()).eval()
 
 
 def import_coreai() -> tuple[Any, Any]:
@@ -332,7 +339,7 @@ def run_probe(args: argparse.Namespace) -> int:
         def preflight() -> tuple[Any, Any]:
             if args.frames not in SUPPORTED_FRAME_COUNTS or args.imgsz != FIXED_IMAGE_SIZE:
                 raise ValueError(
-                    "this exporter supports fixed T18/T36 FP16 inputs at 256x256"
+                    "this exporter supports fixed T18/T36/T90 FP16 inputs at 256x256"
                 )
             if not args.model.is_file():
                 raise FileNotFoundError(args.model)

@@ -211,6 +211,26 @@ class CoreAIBasicVSRPPRestorerTests(unittest.TestCase):
         )
         self.assertEqual(len(restored), 40)
 
+    def test_t90_model_pads_and_processes_fixed_90_frame_chunks(self):
+        runtime = RecordingRuntime(step=90.0)
+        restorer = CoreAIBasicvsrppMosaicRestorer(
+            Path("unused-t90.aimodel"),
+            frame_count=90,
+            runtime=runtime,
+        )
+        video = [torch.zeros((2, 2, 3), dtype=torch.uint8) for _ in range(92)]
+
+        restored = restorer.restore(video)
+
+        self.assertEqual(
+            runtime.calls,
+            [
+                (1, 90, 3, 2, 2),
+                (1, 90, 3, 2, 2),
+            ],
+        )
+        self.assertEqual(len(restored), 92)
+
     def test_coreai_model_is_registered_as_well_known_restoration_model(self):
         models = {
             model.name: model.path
@@ -221,6 +241,8 @@ class CoreAIBasicVSRPPRestorerTests(unittest.TestCase):
         self.assertTrue(models["basicvsrpp-v1.2-coreai"].endswith(".aimodel"))
         self.assertIn("basicvsrpp-v1.2-coreai-t36", models)
         self.assertTrue(models["basicvsrpp-v1.2-coreai-t36"].endswith("t36-fp16.aimodel"))
+        self.assertIn("basicvsrpp-v1.2-coreai-t90", models)
+        self.assertTrue(models["basicvsrpp-v1.2-coreai-t90"].endswith("t90-fp16.aimodel"))
 
     def test_restoration_loader_selects_t36_contract_from_model_name(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -251,6 +273,36 @@ class CoreAIBasicVSRPPRestorerTests(unittest.TestCase):
             )
 
         self.assertEqual(restorer.frame_count, 36)
+
+    def test_restoration_loader_selects_t90_contract_from_model_name(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "basicvsrpp-t90.aimodel"
+            model_path.mkdir()
+
+            restorer, _pad_mode = restorationpipeline.load_restoration_model(
+                torch.device("mps"),
+                "basicvsrpp-v1.2-coreai-t90",
+                str(model_path),
+                None,
+                fp16=True,
+            )
+
+        self.assertEqual(restorer.frame_count, 90)
+
+    def test_restoration_loader_detects_t90_from_custom_aimodel_filename(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "custom-basicvsrpp-t90-fp16.aimodel"
+            model_path.mkdir()
+
+            restorer, _pad_mode = restorationpipeline.load_restoration_model(
+                torch.device("mps"),
+                "basicvsrpp-coreai",
+                str(model_path),
+                None,
+                fp16=True,
+            )
+
+        self.assertEqual(restorer.frame_count, 90)
 
     def test_restoration_loader_selects_coreai_for_aimodel(self):
         with tempfile.TemporaryDirectory() as temp_dir:

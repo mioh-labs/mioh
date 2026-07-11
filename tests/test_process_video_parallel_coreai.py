@@ -38,6 +38,12 @@ class ProcessVideoParallelCoreAITests(unittest.TestCase):
             104,
         )
 
+    def test_t90_coreai_uses_two_window_clip_length_by_default(self):
+        self.assertEqual(
+            pvp.get_effective_max_clip_length("basicvsrpp-v1.2-coreai-t90", None),
+            178,
+        )
+
     def test_non_coreai_model_keeps_legacy_default_clip_length(self):
         self.assertEqual(
             pvp.get_effective_max_clip_length("basicvsrpp-v1.2", None),
@@ -50,7 +56,7 @@ class ProcessVideoParallelCoreAITests(unittest.TestCase):
             162,
         )
 
-    def test_t36_coreai_is_default_when_runtime_and_asset_exist(self):
+    def test_standard_model_remains_default_when_coreai_assets_exist(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = pvp.Path(temp_dir)
             python = root / "bin" / "python"
@@ -65,7 +71,7 @@ class ProcessVideoParallelCoreAITests(unittest.TestCase):
             ):
                 default_model = pvp.get_default_mosaic_restoration_model()
 
-        self.assertEqual(default_model, "basicvsrpp-v1.2-coreai-t36")
+        self.assertEqual(default_model, "basicvsrpp-v1.2")
 
     def test_standard_model_is_default_without_t36_asset(self):
         with (
@@ -130,6 +136,14 @@ class ProcessVideoParallelCoreAITests(unittest.TestCase):
 
         self.assertEqual(cmd[:3], ["/repo/.venv-coreai/bin/python", "-m", "lada.cli.main"])
 
+    def test_t90_coreai_model_uses_coreai_virtualenv_for_worker(self):
+        config = make_config("basicvsrpp-v1.2-coreai-t90")
+
+        with mock.patch.object(pvp, "COREAI_PYTHON", pvp.Path("/repo/.venv-coreai/bin/python")):
+            cmd = pvp.build_lada_cli_command(config, pvp.Path("in.mp4"), pvp.Path("out.mp4"))
+
+        self.assertEqual(cmd[:3], ["/repo/.venv-coreai/bin/python", "-m", "lada.cli.main"])
+
     def test_coreai_detection_model_uses_coreai_virtualenv_for_worker(self):
         config = make_config("basicvsrpp-v1.2")
         config = pvp.WorkerRuntimeConfig(
@@ -143,6 +157,56 @@ class ProcessVideoParallelCoreAITests(unittest.TestCase):
             cmd = pvp.build_lada_cli_command(config, pvp.Path("in.mp4"), pvp.Path("out.mp4"))
 
         self.assertEqual(cmd[:3], ["/repo/.venv-coreai/bin/python", "-m", "lada.cli.main"])
+
+    def test_coreai_enhancer_uses_coreai_virtualenv_for_worker(self):
+        config = make_config("basicvsrpp-v1.2")
+        config = pvp.WorkerRuntimeConfig(
+            **{
+                **config.__dict__,
+                "restore_roi_enhancer": "realesrgan",
+                "restore_roi_enhancer_model_path": "realesr-general-x4v3-coreai",
+                "restore_roi_enhancer_strength": 1.0,
+            }
+        )
+
+        with (
+            mock.patch.object(
+                pvp,
+                "COREAI_PYTHON",
+                pvp.Path("/repo/.venv-coreai/bin/python"),
+            ),
+            mock.patch.object(pvp.sys, "executable", "/current/python"),
+        ):
+            cmd = pvp.build_lada_cli_command(
+                config,
+                pvp.Path("in.mp4"),
+                pvp.Path("out.mp4"),
+            )
+
+        self.assertEqual(
+            cmd[:3],
+            ["/repo/.venv-coreai/bin/python", "-m", "lada.cli.main"],
+        )
+
+    def test_x4plus_coreai_name_uses_coreai_virtualenv(self):
+        with (
+            mock.patch.object(
+                pvp,
+                "COREAI_PYTHON",
+                pvp.Path("/repo/.venv-coreai/bin/python"),
+            ),
+            mock.patch.object(pvp.sys, "executable", "/current/python"),
+        ):
+            command = pvp.lada_cli_command_prefix(
+                "basicvsrpp-v1.2",
+                "v4-fast",
+                "realesrgan-x4-coreai",
+            )
+
+        self.assertEqual(
+            command,
+            ["/repo/.venv-coreai/bin/python", "-m", "lada.cli.main"],
+        )
 
     def test_non_coreai_model_keeps_current_interpreter_for_worker(self):
         config = make_config("basicvsrpp-v1.2")
