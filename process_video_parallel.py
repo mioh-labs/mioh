@@ -926,6 +926,108 @@ def get_optimal_encoder_options(video_path, user_options=None, auto_optimize=Tru
     
     return options
 
+def get_pre_fps_encoder_options(encoder_options: str | None) -> list[str]:
+    """Keep rate control while making the intermediate fps pass quality-first."""
+    import shlex
+
+    if encoder_options:
+        try:
+            tokens = shlex.split(encoder_options)
+        except ValueError:
+            tokens = encoder_options.split()
+    else:
+        tokens = []
+
+    replaced_options = {
+        '-power_efficient',
+        '-realtime',
+        '-prio_speed',
+        '-spatial_aq',
+        '-frames_before',
+        '-frames_after',
+    }
+    filtered = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in replaced_options:
+            index += 2
+            continue
+        filtered.append(token)
+        index += 1
+
+    filtered.extend([
+        '-power_efficient', '0',
+        '-realtime', '0',
+        '-prio_speed', '0',
+        '-spatial_aq', '1',
+    ])
+    return filtered
+
+
+def convert_fps_segments_parallel(
+    input_segments,
+    output_dir,
+    fps,
+    encoder_options=None,
+    max_workers=2,
+):
+    """Convert already-split segments with at most two concurrent FFmpeg jobs."""
+    input_segments = [Path(segment) for segment in input_segments]
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if not input_segments:
+        return []
+
+    encoder_opts = get_pre_fps_encoder_options(encoder_options)
+    output_segments = [
+        output_dir / f"segment_{index:03d}.mp4"
+        for index in range(len(input_segments))
+    ]
+
+    def convert_one(input_segment, output_segment):
+        partial_output = output_segment.with_name(
+            f"{output_segment.stem}.partial{output_segment.suffix}"
+        )
+        partial_output.unlink(missing_ok=True)
+        cmd = [
+            'ffmpeg', '-y',
+            '-hwaccel', 'videotoolbox',
+            '-hwaccel_output_format', 'videotoolbox_vld',
+            '-i', str(input_segment),
+            '-c:v', 'h264_videotoolbox',
+            '-r', str(fps),
+            *encoder_opts,
+            '-c:a', 'copy',
+            '-map', '0:v:0',
+            '-map', '0:a?',
+            str(partial_output),
+        ]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            os.replace(partial_output, output_segment)
+        except Exception:
+            partial_output.unlink(missing_ok=True)
+            raise
+        return output_segment
+
+    worker_count = min(max_workers, len(input_segments))
+    print(f"fps変換開始: {len(input_segments)}個 × FFmpeg {worker_count}並列")
+    completed = 0
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {
+            executor.submit(convert_one, input_segment, output_segment): output_segment
+            for input_segment, output_segment in zip(input_segments, output_segments)
+        }
+        for future in as_completed(futures):
+            future.result()
+            completed += 1
+            print(f"\rfps変換: {completed}/{len(input_segments)}", end='', flush=True)
+    print()
+    print(f"✓ {len(output_segments)}個のfps変換完了")
+    return output_segments
+
+
 def split_video(input_video, output_dir, segment_duration=60, force_split=False, pre_fps=None, encoder_options=None, segment_count=None):
     """
     動画を指定時間ごとに分割
@@ -967,60 +1069,45 @@ def split_video(input_video, output_dir, segment_duration=60, force_split=False,
             print(f"✓ 既存のセグメントを使用: {len(existing_segments)}個")
             return existing_segments
     
-    # 分割実行
+    # fps変換時は、まずコピーで分割してから各セグメントを並列変換する。
     if pre_fps:
-        # fps変換しながら分割（再エンコード）
         if segment_count is not None:
-            print(f"動画を{segment_count}個に均等分割中（目標: {effective_segment_duration:.3f}秒/segment, fps変換: {pre_fps}fps）...")
+            print(f"動画を{segment_count}個にコピー分割後、{pre_fps}fpsへ2並列変換します")
         else:
-            print(f"動画を{segment_duration}秒ごとに分割中（fps変換: {pre_fps}fps）...")
-        
-        # エンコーダーオプションをパース
-        encoder_opts = []
-        if encoder_options:
-            # 文字列を安全に分割してリストに変換
-            import shlex
-            try:
-                encoder_opts = shlex.split(encoder_options)
-            except ValueError:
-                # shlex.splitが失敗した場合は単純にスペースで分割
-                encoder_opts = encoder_options.split()
-        
-        cmd = [
-            'ffmpeg', '-i', str(input_video),
-            '-c:v', 'h264_videotoolbox',  # Apple Silicon向け高速エンコーダー
-            '-r', str(pre_fps),            # fps変換
-        ]
-        
-        # エンコーダーオプションを追加
-        if encoder_opts:
-            cmd.extend(encoder_opts)
-        
-        cmd.extend([
-            '-c:a', 'copy',                # 音声はコピー
-            '-map', '0',
-            '-segment_time', str(effective_segment_duration),
-            '-f', 'segment',
-            '-reset_timestamps', '1',
-            str(output_pattern)
-        ])
+            print(f"動画を{segment_duration}秒ごとにコピー分割後、{pre_fps}fpsへ2並列変換します")
+
+        source_dir = output_dir.parent / f"{output_dir.name}_pre_fps_source"
+        source_segments = split_video(
+            input_video,
+            source_dir,
+            segment_duration=segment_duration,
+            force_split=force_split,
+            segment_count=segment_count,
+        )
+        return convert_fps_segments_parallel(
+            source_segments,
+            output_dir,
+            pre_fps,
+            encoder_options=encoder_options,
+            max_workers=2,
+        )
+
+    # コピーモード（従来の動作）
+    if segment_count is not None:
+        print(f"動画を{segment_count}個に均等分割中（目標: {effective_segment_duration:.3f}秒/segment）...")
     else:
-        # コピーモード（従来の動作）
-        if segment_count is not None:
-            print(f"動画を{segment_count}個に均等分割中（目標: {effective_segment_duration:.3f}秒/segment）...")
-        else:
-            print(f"動画を{segment_duration}秒ごとに分割中...")
-        cmd = [
-            'ffmpeg', '-i', str(input_video),
-            '-map', '0:v',              # ビデオストリーム
-            '-map', '0:a?',             # 音声ストリーム（あれば）
-            '-c:v', 'copy',             # ビデオをコピー
-            '-c:a', 'copy',             # 音声をコピー
-            '-segment_time', str(effective_segment_duration),
-            '-f', 'segment',
-            '-reset_timestamps', '1',
-            str(output_pattern)
-        ]
+        print(f"動画を{segment_duration}秒ごとに分割中...")
+    cmd = [
+        'ffmpeg', '-i', str(input_video),
+        '-map', '0:v',              # ビデオストリーム
+        '-map', '0:a?',             # 音声ストリーム（あれば）
+        '-c:v', 'copy',             # ビデオをコピー
+        '-c:a', 'copy',             # 音声をコピー
+        '-segment_time', str(effective_segment_duration),
+        '-f', 'segment',
+        '-reset_timestamps', '1',
+        str(output_pattern)
+    ]
     
     print(f"分割コマンド: {' '.join(cmd)}")
     result = subprocess.run(cmd, check=True, capture_output=True, text=True)
@@ -2112,7 +2199,7 @@ def build_arg_parser():
     parser.add_argument('--restore-detail-boost', type=float, default=0.0,
                         help='復元ROIの局所ディテール/コントラストを合成前に強める強度（0で無効、例: 0.15）')
     parser.add_argument('--restore-blend-feather', type=float, default=1.0,
-                        help='復元ROI境界ブレンドのぼかし倍率（1.0で標準、例: 1.0〜1.5）')
+                        help='復元境界のフェザー倍率。1.0は1080pで内側6px・外側20px、解像度比例（0で無効）')
     parser.add_argument('--restore-texture-mix', type=float, default=0.0,
                         help='元ROIの中周波テクスチャを復元ROIへ薄く戻す強度（0で無効、例: 0.08）')
     parser.add_argument('--restore-smooth-strength', type=float, default=0.0,

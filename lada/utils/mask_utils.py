@@ -66,25 +66,36 @@ def get_mask_area(mask: Mask) -> float:
 def smooth_mask(mask: Mask, kernel_size: int) -> Mask:
     return cv2.medianBlur(mask, kernel_size).reshape(mask.shape)
 
-def create_blend_mask(crop_mask: torch.Tensor, feather_multiplier: float = 1.0):
-    mask = (crop_mask.squeeze() > 0).to(dtype=crop_mask.dtype)
-    h, w = mask.shape
-    if feather_multiplier <= 0:
-        return mask
+def create_outward_feather_mask(crop_mask: torch.Tensor, feather_pixels: int) -> torch.Tensor:
+    """Return weights that fade outside the segmentation mask only."""
+    mask = crop_mask.squeeze() > 0
+    weights = np.zeros(tuple(mask.shape), dtype=np.float32)
+    if feather_pixels > 0 and mask.any():
+        mask_np = mask.detach().cpu().numpy()
+        distance = cv2.distanceTransform(
+            (~mask_np).astype(np.uint8),
+            cv2.DIST_L2,
+            cv2.DIST_MASK_PRECISE,
+        )
+        weights = np.clip(1.0 - distance / float(feather_pixels), 0.0, 1.0)
+        weights[mask_np] = 0.0
+    return torch.from_numpy(weights).to(device=crop_mask.device)
 
-    blur_size = max(1, int(round(min(h, w) * 0.05 * feather_multiplier)))
-    if blur_size % 2 == 0:
-        blur_size += 1
-    if mask.device.type == 'cpu':
-        # Keep the feather strictly inside the segmentation mask so contextual
-        # pixels from the square restoration crop are never composited.
-        blend = torch.from_numpy(cv2.blur(mask.numpy(), (blur_size, blur_size))).to(dtype=mask.dtype)
+
+def create_inner_feather_mask(crop_mask: torch.Tensor, feather_pixels: int) -> torch.Tensor:
+    """Return weights that rise from the mask boundary toward its interior."""
+    mask = crop_mask.squeeze() > 0
+    mask_np = mask.detach().cpu().numpy()
+    if feather_pixels <= 0:
+        weights = mask_np.astype(np.float32)
     else:
-        kernel = torch.tensor(1.0 / (blur_size**2), device=mask.device, dtype=mask.dtype).expand(1, blur_size, blur_size)
-        blend = image_utils.filter2D(mask.unsqueeze(0).unsqueeze(0), kernel).squeeze(0).squeeze(0)
-    blend = torch.minimum(mask, blend)
-    assert blend.shape == mask.shape
-    return blend
+        distance = cv2.distanceTransform(
+            mask_np.astype(np.uint8),
+            cv2.DIST_L2,
+            cv2.DIST_MASK_PRECISE,
+        )
+        weights = np.clip(distance / float(feather_pixels), 0.0, 1.0)
+    return torch.from_numpy(weights).to(device=crop_mask.device)
 
 def apply_random_mask_extensions(mask: Mask) -> Mask:
     value = np.random.choice([0, 0, 1, 1, 2])
