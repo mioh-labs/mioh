@@ -31,6 +31,7 @@ class Scene:
         self.frames: list[ImageTensor] = []
         self.masks: list[MaskTensor] = []
         self.boxes: list[Box] = []
+        self.cropped_boxes: list[Box | None] = []
         self.frame_start: int | None = None
         self.frame_end: int | None = None
         self._index: int = 0
@@ -49,9 +50,11 @@ class Scene:
         self.frames.append(img)
         self.masks.append(mask)
         self.boxes.append(box)
+        self.cropped_boxes.append(None)
 
     def merge_mask_box(self, mask: MaskTensor, box: Box):
         assert self.belongs(box)
+        assert self.cropped_boxes[-1] is None
         current_box = self.boxes[-1]
         t = min(current_box[0], box[0])
         l = min(current_box[1], box[1])
@@ -60,6 +63,27 @@ class Scene:
         new_box = (t, l, b, r)
         self.boxes[-1] = new_box
         self.masks[-1] = torch.maximum(self.masks[-1], mask)
+
+    def compact_last_frame(self, size: int):
+        if not self.frames or self.cropped_boxes[-1] is not None:
+            return
+        cropped_img, cropped_mask, cropped_box, _ = crop_to_box_v3(
+            self.boxes[-1],
+            self.frames[-1],
+            self.masks[-1],
+            (size, size),
+            max_box_expansion_factor=1.0,
+            border_size=0.06,
+        )
+        # Crops are views. Clone them so the original full-frame storage can
+        # be released as soon as this detection frame is complete.
+        self.frames[-1] = cropped_img.detach().cpu().clone(
+            memory_format=torch.contiguous_format
+        )
+        self.masks[-1] = cropped_mask.detach().cpu().clone(
+            memory_format=torch.contiguous_format
+        )
+        self.cropped_boxes[-1] = cropped_box
 
     def belongs(self, box: Box):
         if len(self.boxes) == 0:
@@ -98,7 +122,18 @@ class Clip:
         # crop scene
         for i in range(len(scene)):
             img, mask, box = scene.frames[i], scene.masks[i], scene.boxes[i]
-            cropped_img, cropped_mask, cropped_box, _ = crop_to_box_v3(box, img, mask, (size, size), max_box_expansion_factor=1., border_size=0.06)
+            cropped_box = scene.cropped_boxes[i]
+            if cropped_box is None:
+                cropped_img, cropped_mask, cropped_box, _ = crop_to_box_v3(
+                    box,
+                    img,
+                    mask,
+                    (size, size),
+                    max_box_expansion_factor=1.0,
+                    border_size=0.06,
+                )
+            else:
+                cropped_img, cropped_mask = img, mask
             self.frames.append(cropped_img)
             self.masks.append(cropped_mask)
             self.boxes.append(cropped_box)
@@ -288,6 +323,10 @@ class MosaicDetector:
                 current_scene = Scene(self.video_meta_data.video_file, self.video_meta_data)
                 scenes.append(current_scene)
                 current_scene.add_frame(frame_num, results.orig_img, mask, box)
+
+        for scene in scenes:
+            if scene.frame_end == frame_num:
+                scene.compact_last_frame(self.clip_size)
 
     def _frame_feeder_worker(self):
         logger.debug("frame feeder: started")
