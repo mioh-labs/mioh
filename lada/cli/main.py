@@ -45,6 +45,12 @@ from lada.restorationpipeline import load_models
 from lada.utils.threading_utils import STOP_MARKER, ErrorMarker
 from lada.utils.video_utils import get_video_meta_data, VideoWriter, get_default_preset_name
 
+
+def is_restoration_model_path(model_path: str) -> bool:
+    path = pathlib.Path(model_path)
+    return path.is_file() or (path.suffix == ".aimodel" and path.is_dir())
+
+
 def setup_argparser() -> argparse.ArgumentParser:
     examples_header_text = _("Examples:")
 
@@ -291,7 +297,8 @@ def main():
     if detection_modelfile := ModelFiles.get_detection_model_by_name(args.mosaic_detection_model):
         mosaic_detection_model_path = detection_modelfile.path
     elif os.path.isfile(args.mosaic_detection_model) or (
-            args.mosaic_detection_model.endswith(".mlpackage") and os.path.isdir(args.mosaic_detection_model)):
+            args.mosaic_detection_model.endswith((".mlpackage", ".aimodel"))
+            and os.path.isdir(args.mosaic_detection_model)):
         mosaic_detection_model_path = args.mosaic_detection_model
     else:
         print(_("Invalid mosaic detection model"))
@@ -300,9 +307,14 @@ def main():
     if restoration_modelfile := ModelFiles.get_restoration_model_by_name(args.mosaic_restoration_model):
         mosaic_restoration_model_name = args.mosaic_restoration_model
         mosaic_restoration_model_path = restoration_modelfile.path
-    elif os.path.isfile(args.mosaic_restoration_model):
+    elif is_restoration_model_path(args.mosaic_restoration_model):
         mosaic_restoration_model_path = args.mosaic_restoration_model
-        mosaic_restoration_model_name = 'basicvsrpp' # Assume custom model is basicvsrpp. DeepMosaics custom path is not supported
+        if args.mosaic_restoration_model.endswith(".aimodel"):
+            mosaic_restoration_model_name = "basicvsrpp-coreai"
+        else:
+            # Assume custom weight files are BasicVSR++. DeepMosaics custom
+            # paths are not supported.
+            mosaic_restoration_model_name = "basicvsrpp"
     else:
         print(_("Invalid mosaic restoration model"))
         sys.exit(1)

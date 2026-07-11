@@ -98,15 +98,67 @@ class WorkerRuntimeConfig:
 
 
 REPO_ROOT = Path(__file__).resolve().parent
+COREAI_RESTORATION_MODELS = {
+    'basicvsrpp-v1.2-coreai',
+    'basicvsrpp-v1.2-coreai-t36',
+}
+DEFAULT_MAX_CLIP_LENGTH = 180
+COREAI_STREAMING_CLIP_LENGTHS = {
+    'basicvsrpp-v1.2-coreai': 98,
+    'basicvsrpp-v1.2-coreai-t36': 104,
+}
+COREAI_PYTHON = REPO_ROOT / '.venv-coreai' / 'bin' / 'python'
+COREAI_T36_MODEL_PATH = (
+    REPO_ROOT / 'model_weights' / 'basicvsrpp-v1.2-t36-fp16.aimodel'
+)
+COREAI_DETECTION_MODELS = {'v4-fast-coreai'}
+COREAI_V4_FAST_MODEL_PATH = (
+    REPO_ROOT / 'model_weights' / 'lada_mosaic_detection_model_v4_fast-fp16.aimodel'
+)
 
 
-def lada_cli_command_prefix() -> list[str]:
+def get_default_mosaic_restoration_model() -> str:
+    if COREAI_PYTHON.is_file() and COREAI_T36_MODEL_PATH.is_dir():
+        return 'basicvsrpp-v1.2-coreai-t36'
+    return 'basicvsrpp-v1.2'
+
+
+def get_default_mosaic_detection_model() -> str:
+    if COREAI_PYTHON.is_file() and COREAI_V4_FAST_MODEL_PATH.is_dir():
+        return 'v4-fast-coreai'
+    return 'v4-fast'
+
+
+def get_effective_max_clip_length(
+    mosaic_restoration_model: str,
+    requested_length: int | None,
+) -> int:
+    if requested_length is not None:
+        return requested_length
+    return COREAI_STREAMING_CLIP_LENGTHS.get(
+        mosaic_restoration_model,
+        DEFAULT_MAX_CLIP_LENGTH,
+    )
+
+
+def lada_cli_command_prefix(
+    mosaic_restoration_model: str | None = None,
+    mosaic_detection_model: str | None = None,
+) -> list[str]:
     """
     Launch lada-cli with this interpreter and the code tree next to this
     script. A `lada-cli` on PATH resolves through the editable install and
     would run a different checkout when this wrapper lives in a worktree.
     """
-    return [sys.executable, '-m', 'lada.cli.main']
+    interpreter = (
+        COREAI_PYTHON
+        if mosaic_restoration_model in COREAI_RESTORATION_MODELS
+        or str(mosaic_restoration_model).endswith('.aimodel')
+        or mosaic_detection_model in COREAI_DETECTION_MODELS
+        or str(mosaic_detection_model).endswith('.aimodel')
+        else Path(sys.executable)
+    )
+    return [str(interpreter), '-m', 'lada.cli.main']
 
 
 def build_worker_env(config: WorkerRuntimeConfig) -> dict[str, str]:
@@ -139,7 +191,10 @@ def build_worker_env(config: WorkerRuntimeConfig) -> dict[str, str]:
 
 def build_lada_cli_command(config: WorkerRuntimeConfig, input_video: Path, output_video: Path) -> list[str]:
     cmd = [
-        *lada_cli_command_prefix(),
+        *lada_cli_command_prefix(
+            config.mosaic_restoration_model,
+            config.mosaic_detection_model,
+        ),
         '--input', str(input_video),
         '--output', str(output_video),
         '--device', config.device,
@@ -1085,7 +1140,11 @@ class ParallelVideoProcessor:
             print("このスクリプトはリポジトリルートに置いたまま実行してください。\n")
             print("=" * 70)
             raise FileNotFoundError(f"lada package not found at {REPO_ROOT}")
-        print(f"✓ lada-cli検出: {' '.join(lada_cli_command_prefix())} ({REPO_ROOT})")
+        prefix = lada_cli_command_prefix(
+            self.args.mosaic_restoration_model,
+            self.args.mosaic_detection_model,
+        )
+        print(f"✓ lada-cli検出: {' '.join(prefix)} ({REPO_ROOT})")
     
     def safe_print(self, msg):
         """スレッドセーフなprint"""
@@ -1239,7 +1298,10 @@ class ParallelVideoProcessor:
         
         # コマンド構築
         cmd = [
-            *lada_cli_command_prefix(),
+            *lada_cli_command_prefix(
+                self.args.mosaic_restoration_model,
+                self.args.mosaic_detection_model,
+            ),
             '--input', str(input_video),
             '--output', str(output_video),
             '--device', self.args.device,
@@ -2016,10 +2078,11 @@ def build_arg_parser():
     # モザイク設定
     parser.add_argument('--list-mosaic-restoration-models', action='store_true',
                         help='lada-cli の復元モデル一覧を表示')
-    parser.add_argument('--mosaic-restoration-model', default='basicvsrpp-v1.2',
-                        help='復元モデル名または重みパス。通常は basicvsrpp-v1.2（デフォルト: basicvsrpp-v1.2）')
-    parser.add_argument('--max-clip-length', type=int, default=180,
-                        help='復元モデルへ渡す最大フレーム数。大きいほど時間整合性は上がるがメモリ負荷も増える（デフォルト: 180）')
+    default_restoration_model = get_default_mosaic_restoration_model()
+    parser.add_argument('--mosaic-restoration-model', default=default_restoration_model,
+                        help=f'復元モデル名または重みパス（デフォルト: {default_restoration_model}）')
+    parser.add_argument('--max-clip-length', type=int, default=None,
+                        help='復元モデルへ渡す最大フレーム数。未指定時はCore AI T18=98、T36=104、その他=180')
     parser.add_argument('--restore-max-frames', type=int, default=None,
                         help='BasicVSR++復元チャンク数の上書き。未指定はMPS自動調整、-1は分割なし、正の値は固定チャンク')
     parser.add_argument('--restore-sharpen-strength', type=float, default=0.0,
@@ -2045,12 +2108,13 @@ def build_arg_parser():
                         help='エンハンサー結果を復元ROIへ混ぜる強度（0で無効、例: 0.25）')
     parser.add_argument('--restore-roi-enhancer-tile', type=int, default=0,
                         help='PyTorch版Real-ESRGANのtileサイズ。0で無効。Core ML版では未使用（デフォルト: 0）')
-    parser.add_argument('--mosaic-detection-model', default='v4-fast',
-                        help='検出モデル名または重みパス。速度重視は v4-fast（デフォルト: v4-fast）')
+    default_detection_model = get_default_mosaic_detection_model()
+    parser.add_argument('--mosaic-detection-model', default=default_detection_model,
+                        help=f'検出モデル名または重みパス（デフォルト: {default_detection_model}）')
     parser.add_argument('--list-mosaic-detection-models', action='store_true',
                         help='lada-cli の検出モデル一覧を表示')
-    parser.add_argument('--mosaic-detection-empty-lookahead', type=int, default=0,
-                        help='先読み範囲の先頭/末尾がどちらも検出なしなら、その範囲を検出なしとしてスキップ（0で無効、例: 10）')
+    parser.add_argument('--mosaic-detection-empty-lookahead', type=int, default=10,
+                        help='先読み範囲の先頭/末尾がどちらも検出なしなら、その範囲を検出なしとしてスキップ（0で無効、デフォルト: 10）')
     parser.add_argument('--detect-face-mosaics', action='store_true',
                         help='顔モザイク検出を有効化')
     parser.add_argument('--no-detect-face-mosaics', dest='detect_face_mosaics', action='store_false',
@@ -2087,6 +2151,11 @@ def main():
             sys.exit(list_return_code)
         return
 
+    args.max_clip_length = get_effective_max_clip_length(
+        args.mosaic_restoration_model,
+        args.max_clip_length,
+    )
+
     if not args.input:
         parser.error("--input is required unless using --list-*")
     if not args.output:
@@ -2095,6 +2164,9 @@ def main():
     # 並列数の検証
     if args.parallel_workers < 1:
         print("エラー: --parallel-workers は1以上である必要があります")
+        return
+    if args.max_clip_length < 1:
+        print("エラー: --max-clip-length は1以上である必要があります")
         return
     if args.segment_count is not None and args.segment_count < 1:
         print("エラー: --segment-count は1以上である必要があります")
@@ -2155,6 +2227,7 @@ def main():
     print("=" * 70)
     print(f"選択デバイス: {args.device}")
     print(f"並列処理数: {args.parallel_workers}")
+    print(f"復元Clip長: {args.max_clip_length}フレーム")
     if args.device == 'mps':
         effective_mps_fraction = get_effective_mps_memory_fraction(args)
         if effective_mps_fraction is not None:
