@@ -43,6 +43,15 @@ class BasicVSRPPCoreAIArgumentTests(unittest.TestCase):
             Path("model_weights/basicvsrpp-v1.2-t36-fp16.aimodel"),
         )
 
+    def test_t90_contract_uses_t90_default_output(self):
+        args = exporter.parse_args(["--frames", "90"])
+
+        self.assertEqual(args.frames, 90)
+        self.assertEqual(
+            args.output,
+            Path("model_weights/basicvsrpp-v1.2-t90-fp16.aimodel"),
+        )
+
     def test_report_path_is_derived_from_aimodel_output(self):
         output = Path("model_weights/basicvsrpp-t18-fp16.aimodel")
 
@@ -124,9 +133,10 @@ class BasicVSRPPCoreAIContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "output shape"):
             exporter.validate_output(example[:, :-1], example)
 
-    def test_model_loader_passes_checkpoint_as_string(self):
+    def test_model_loader_exports_ema_generator_used_for_inference(self):
         loaded_model = mock.Mock()
         loaded_model.generator = IdentityGenerator()
+        loaded_model.generator_ema = torch.nn.Sequential(IdentityGenerator())
 
         with mock.patch(
             "lada.models.basicvsrpp.inference.load_model",
@@ -135,6 +145,7 @@ class BasicVSRPPCoreAIContractTests(unittest.TestCase):
             wrapper = exporter.load_generator(Path("checkpoint.pth"))
 
         self.assertIsInstance(wrapper, exporter.BasicVSRPPExportWrapper)
+        self.assertIs(wrapper.generator, loaded_model.generator_ema)
         load_model.assert_called_once_with(
             None,
             "checkpoint.pth",

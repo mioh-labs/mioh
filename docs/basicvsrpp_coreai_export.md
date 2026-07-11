@@ -1,8 +1,8 @@
 # BasicVSR++ Core AI Export Probe
 
 `scripts/apple/export_basicvsrpp_coreai.py` diagnoses conversion of the full
-BasicVSR++ v1.2 generator to fixed FP16 Core AI models. The supported input
-and output shapes are `[1, 18, 3, 256, 256]` and `[1, 36, 3, 256, 256]`.
+BasicVSR++ v1.2 EMA generator to fixed FP16 Core AI models. The supported input
+and output frame counts are T18, T36, and T90 at 256 by 256.
 
 ## Environment
 
@@ -50,6 +50,14 @@ For the fixed-T36 asset, `--frames 36` automatically selects
   --allow-overwrite \
   --verbose
 ```
+
+Use `--frames 90` to export the fixed-T90 asset. T90 provides a longer temporal
+window and should be paired with `--max-clip-length 178` so two windows cover
+each clip without a one-frame third window.
+
+The checkpoint enables EMA inference. The exporter must therefore select
+`generator_ema`, matching `BasicVSRPlusPlusGan.forward_tensor`; exporting
+`generator` produces a valid but different restoration model.
 
 The exporter replaces BasicVSR++ flow warping and modulated deformable
 alignment with inline Metal 4 kernels. It does not modify the normal Lada
@@ -123,7 +131,8 @@ runtime fell from 97.49 to 95.47 seconds. The streamed and original outputs
 were pixel-identical after decoding (`PSNR=inf`, 1,800 frames).
 
 `process_video_parallel.py` also chooses padding-free Clip lengths when
-`--max-clip-length` is omitted: 98 frames for T18 and 104 frames for T36. These
+`--max-clip-length` is omitted: 98 frames for T18, 104 frames for T36, and 178
+frames for T90. These
 lengths keep detection, restoration, and composition moving in shorter bursts
 and align exactly with each model's two-frame-overlap stride. Explicit values
 are always preserved. On the same 60-second benchmark, T18/98 completed in
@@ -158,3 +167,15 @@ Against the previous threadgroup SIMD output, the decoded TensorOps video
 measured 49.34 dB PSNR and 0.9938 SSIM. A direct fixed-random-input comparison
 of the two T36 model outputs measured maximum absolute error 0.00390625, mean
 absolute error 0.00010339, and 77.86 dB PSNR.
+
+An earlier quality audit accidentally compared a Core AI export of `generator`
+against PyTorch/MPS inference from `generator_ema`. On an actual pipeline T36
+window, the mismatched export measured 45.15 dB against EMA but 67.44 dB
+against the non-EMA generator. Selecting EMA in the exporter corrected T36 to
+69.33 dB against MPS, with 0.028 mean 8-bit-level error.
+
+On the 178-frame SNOS-252 crop, corrected Core AI T90 measured 69.03 dB against
+MPS T90. Against unbounded MPS it measured 47.29 dB, effectively matching the
+47.33 dB of MPS T90 itself. The remaining difference is therefore the fixed
+T90 window, not Core AI numerical precision. The first T90 two-window call took
+272.38 seconds including specialization and the warm call took 1.78 seconds.

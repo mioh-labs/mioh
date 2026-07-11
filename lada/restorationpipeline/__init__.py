@@ -12,11 +12,13 @@ logging.basicConfig(level=LOG_LEVEL)
 
 
 def _coreai_frame_count(model_name: str, model_path: str) -> int:
-    if model_name.endswith("-t36"):
-        return 36
     asset_name = Path(model_path).name.lower()
-    if re.search(r"(?:^|[-_.])t36(?:[-_.]|$)", asset_name):
-        return 36
+    for frame_count in (90, 36):
+        suffix = f"-t{frame_count}"
+        if model_name.endswith(suffix):
+            return frame_count
+        if re.search(rf"(?:^|[-_.])t{frame_count}(?:[-_.]|$)", asset_name):
+            return frame_count
     return 18
 
 

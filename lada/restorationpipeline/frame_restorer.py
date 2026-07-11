@@ -119,6 +119,9 @@ def _install_torchvision_functional_tensor_compat():
 def create_realesrgan_enhancer(model_path: str, scale: int = 2, tile: int = 0, fp16: bool = False, device=None):
     if not model_path:
         raise ValueError("--restore-roi-enhancer-model-path is required when --restore-roi-enhancer realesrgan is used")
+    if str(model_path).endswith(".aimodel"):
+        from lada.restorationpipeline.coreai_roi_enhancer import CoreAIROIEnhancer
+        return CoreAIROIEnhancer(model_path, scale=scale)
     if str(model_path).endswith(".mlpackage"):
         from lada.restorationpipeline.coreml_roi_enhancer import CoreMLROIEnhancer
         return CoreMLROIEnhancer(model_path)

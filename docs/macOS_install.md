@@ -193,6 +193,46 @@ Engine vs ~1.8 s (fp16 ~1.6 s) through PyTorch/MPS, with PSNR 57 dB
 against the fp32 output. The PyTorch path is still used when the model
 path ends in .pth.
 
+The compact `realesr-general-x4v3` model can also be exported to the new
+Core AI format on macOS 27:
+
+```bash
+.venv-coreai/bin/python scripts/apple/export_srvgg_coreai.py \
+  --allow-overwrite
+```
+
+Select it explicitly with `realesr-general-x4v3-coreai`:
+
+```bash
+python process_video_parallel.py --input <video> --output <output> \
+  --restore-roi-enhancer realesrgan \
+  --restore-roi-enhancer-model-path realesr-general-x4v3-coreai \
+  --restore-roi-enhancer-scale 4 --restore-roi-enhancer-strength 0.25
+```
+
+On this M5 Pro, replacing PReLU with an equivalent Core AI-friendly expression
+gave about 48 ms per 256px ROI on the local Core AI GPU runtime, while the
+existing Core ML/Neural Engine export measured about 24 ms. Core AI with an
+explicit Neural Engine specialization reached about 17 ms, but enabling the OS
+Core AI runtime also slowed the custom-Metal BasicVSR++ model. Therefore the
+Core AI SRVGG backend remains an explicit comparison option; Core ML SRVGG is
+recommended when using Core AI BasicVSR++.
+
+The larger RRDB-based `RealESRGAN_x4plus` model has the same experimental Core
+AI path:
+
+```bash
+.venv-coreai/bin/python scripts/apple/export_realesrgan_coreai.py \
+  --allow-overwrite
+```
+
+Its registered name is `realesrgan-x4-coreai`. On this M5 Pro it measured about
+427 ms per 256px ROI on the local Core AI GPU runtime and 146 ms with an explicit
+Neural Engine specialization. The existing Core ML/Neural Engine export took
+about 126 ms, so `realesrgan-x4-coreml` remains the recommended x4plus backend.
+Core AI and Core ML outputs measured 52.83 dB PSNR on the deterministic test
+image.
+
 An alternative enhancer is MewZoom (Apache-2.0, UNet-based, trained for
 blur/noise/compression artifact removal — the open counterpart of
 jasna's unet-4x):

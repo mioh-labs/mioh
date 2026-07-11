@@ -101,25 +101,29 @@ REPO_ROOT = Path(__file__).resolve().parent
 COREAI_RESTORATION_MODELS = {
     'basicvsrpp-v1.2-coreai',
     'basicvsrpp-v1.2-coreai-t36',
+    'basicvsrpp-v1.2-coreai-t90',
 }
 DEFAULT_MAX_CLIP_LENGTH = 180
 COREAI_STREAMING_CLIP_LENGTHS = {
     'basicvsrpp-v1.2-coreai': 98,
     'basicvsrpp-v1.2-coreai-t36': 104,
+    'basicvsrpp-v1.2-coreai-t90': 178,
 }
 COREAI_PYTHON = REPO_ROOT / '.venv-coreai' / 'bin' / 'python'
 COREAI_T36_MODEL_PATH = (
     REPO_ROOT / 'model_weights' / 'basicvsrpp-v1.2-t36-fp16.aimodel'
 )
 COREAI_DETECTION_MODELS = {'v4-fast-coreai'}
+COREAI_ENHANCER_MODELS = {
+    'realesr-general-x4v3-coreai',
+    'realesrgan-x4-coreai',
+}
 COREAI_V4_FAST_MODEL_PATH = (
     REPO_ROOT / 'model_weights' / 'lada_mosaic_detection_model_v4_fast-fp16.aimodel'
 )
 
 
 def get_default_mosaic_restoration_model() -> str:
-    if COREAI_PYTHON.is_file() and COREAI_T36_MODEL_PATH.is_dir():
-        return 'basicvsrpp-v1.2-coreai-t36'
     return 'basicvsrpp-v1.2'
 
 
@@ -144,6 +148,7 @@ def get_effective_max_clip_length(
 def lada_cli_command_prefix(
     mosaic_restoration_model: str | None = None,
     mosaic_detection_model: str | None = None,
+    roi_enhancer_model: str | None = None,
 ) -> list[str]:
     """
     Launch lada-cli with this interpreter and the code tree next to this
@@ -156,6 +161,8 @@ def lada_cli_command_prefix(
         or str(mosaic_restoration_model).endswith('.aimodel')
         or mosaic_detection_model in COREAI_DETECTION_MODELS
         or str(mosaic_detection_model).endswith('.aimodel')
+        or roi_enhancer_model in COREAI_ENHANCER_MODELS
+        or str(roi_enhancer_model).endswith('.aimodel')
         else Path(sys.executable)
     )
     return [str(interpreter), '-m', 'lada.cli.main']
@@ -194,6 +201,7 @@ def build_lada_cli_command(config: WorkerRuntimeConfig, input_video: Path, outpu
         *lada_cli_command_prefix(
             config.mosaic_restoration_model,
             config.mosaic_detection_model,
+            config.restore_roi_enhancer_model_path,
         ),
         '--input', str(input_video),
         '--output', str(output_video),
@@ -1301,6 +1309,7 @@ class ParallelVideoProcessor:
             *lada_cli_command_prefix(
                 self.args.mosaic_restoration_model,
                 self.args.mosaic_detection_model,
+                self.args.restore_roi_enhancer_model_path,
             ),
             '--input', str(input_video),
             '--output', str(output_video),
@@ -2082,7 +2091,7 @@ def build_arg_parser():
     parser.add_argument('--mosaic-restoration-model', default=default_restoration_model,
                         help=f'復元モデル名または重みパス（デフォルト: {default_restoration_model}）')
     parser.add_argument('--max-clip-length', type=int, default=None,
-                        help='復元モデルへ渡す最大フレーム数。未指定時はCore AI T18=98、T36=104、その他=180')
+                        help='復元モデルへ渡す最大フレーム数。未指定時はCore AI T18=98、T36=104、T90=178、その他=180')
     parser.add_argument('--restore-max-frames', type=int, default=None,
                         help='BasicVSR++復元チャンク数の上書き。未指定はMPS自動調整、-1は分割なし、正の値は固定チャンク')
     parser.add_argument('--restore-sharpen-strength', type=float, default=0.0,

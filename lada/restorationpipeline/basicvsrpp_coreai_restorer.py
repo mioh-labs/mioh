@@ -19,7 +19,7 @@ from lada.restorationpipeline.basicvsrpp_mosaic_restorer import (
 )
 
 DEFAULT_COREAI_FRAME_COUNT = 18
-SUPPORTED_COREAI_FRAME_COUNTS = (18, 36)
+SUPPORTED_COREAI_FRAME_COUNTS = (18, 36, 90)
 DEFAULT_COREAI_MAX_INFLIGHT = 2
 
 
