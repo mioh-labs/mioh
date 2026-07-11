@@ -38,6 +38,9 @@ class BasicvsrppMosaicRestorer:
 
         return result
 
+    def _run_model_chunks(self, chunks: list[torch.Tensor]) -> list[torch.Tensor]:
+        return [self.model(inputs=chunk) for chunk in chunks]
+
     def _restore_chunked_with_overlap(self, inference_view: torch.Tensor, max_frames: int) -> torch.Tensor:
         frame_count = inference_view.shape[1]
         if frame_count <= max_frames:
@@ -45,10 +48,11 @@ class BasicvsrppMosaicRestorer:
 
         overlap = min(2, max_frames // 2, frame_count - 1)
         if overlap <= 0:
-            result = []
-            for start in range(0, frame_count, max_frames):
-                result.append(self.model(inputs=inference_view[:, start:start + max_frames]))
-            return torch.cat(result, dim=1)
+            chunks = [
+                inference_view[:, start:start + max_frames]
+                for start in range(0, frame_count, max_frames)
+            ]
+            return torch.cat(self._run_model_chunks(chunks), dim=1)
 
         stride = max_frames - overlap
         output_accum = None
@@ -60,9 +64,25 @@ class BasicvsrppMosaicRestorer:
             if start + max_frames >= frame_count:
                 break
             start += stride
-        for chunk_index, start in enumerate(starts):
+        chunk_specs = []
+        for start in starts:
             end = min(frame_count, start + max_frames)
-            output = self.model(inputs=inference_view[:, start:end])
+            model_start = start
+            if end - start < max_frames:
+                model_start = max(0, end - max_frames)
+            chunk_specs.append((
+                inference_view[:, model_start:end],
+                start - model_start,
+                end - start,
+            ))
+        chunks = [chunk for chunk, _offset, _length in chunk_specs]
+        outputs = self._run_model_chunks(chunks)
+        for chunk_index, (start, output, chunk_spec) in enumerate(
+            zip(starts, outputs, chunk_specs, strict=True)
+        ):
+            end = min(frame_count, start + max_frames)
+            _chunk, output_offset, output_length = chunk_spec
+            output = output[:, output_offset:output_offset + output_length]
             if output_accum is None:
                 output_shape = (output.shape[0], frame_count, *output.shape[2:])
                 output_accum = torch.zeros(output_shape, dtype=output.dtype, device=output.device)

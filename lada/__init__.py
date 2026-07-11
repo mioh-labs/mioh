@@ -78,6 +78,8 @@ class ModelFiles:
         ModelFile('basicvsrpp-v1.0', None, os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_restoration_model_generic.pth')),
         ModelFile('basicvsrpp-v1.1', None, os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_restoration_model_generic_v1.1.pth')),
         ModelFile('basicvsrpp-v1.2', _("Latest Lada restoration model. Recommended"), os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_restoration_model_generic_v1.2.pth')),
+        ModelFile('basicvsrpp-v1.2-coreai', _("BasicVSR++ v1.2 on Core AI with Metal 4 kernels"), os.path.join(MODEL_WEIGHTS_DIR, 'basicvsrpp-v1.2-t18-fp16.aimodel')),
+        ModelFile('basicvsrpp-v1.2-coreai-t36', _("BasicVSR++ v1.2 fixed-T36 on Core AI with Metal 4 kernels"), os.path.join(MODEL_WEIGHTS_DIR, 'basicvsrpp-v1.2-t36-fp16.aimodel')),
         ModelFile('deepmosaics', _("Restoration model from abandoned DeepMosaics project"), os.path.join(MODEL_WEIGHTS_DIR, '3rd_party', 'clean_youknow_video.pth')),
     ]
     _WELL_KNOWN_DETECTION_MODELS = [
@@ -88,6 +90,7 @@ class ModelFiles:
         ModelFile('v4-fast', _("Fast and efficient. Recommended"), os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_detection_model_v4_fast.pt')),
         ModelFile('v4-accurate', _("Can be slightly more accurate than v4-fast but slower"), os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_detection_model_v4_accurate.pt')),
         ModelFile('v4-fast-coreml', _("v4-fast running on Apple Neural Engine via Core ML"), os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_detection_model_v4_fast.mlpackage')),
+        ModelFile('v4-fast-coreai', _("v4-fast FP16 running with Core AI"), os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_detection_model_v4_fast-fp16.aimodel')),
         ModelFile('v4-accurate-coreml', _("v4-accurate running on Apple Neural Engine via Core ML"), os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_detection_model_v4_accurate.mlpackage')),
         ModelFile('v3.1-fast-coreml', _("v3.1-fast running on Apple Neural Engine via Core ML"), os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_detection_model_v3.1_fast.mlpackage')),
         ModelFile('v3.1-accurate-coreml', _("v3.1-accurate running on Apple Neural Engine via Core ML"), os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_detection_model_v3.1_accurate.mlpackage')),
