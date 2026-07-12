@@ -457,7 +457,7 @@ def process_segment_worker(segment_info, config: WorkerRuntimeConfig, progress_q
     idx, input_path, output_path = segment_info
     input_path = Path(input_path)
     output_path = Path(output_path)
-    lane = f"worker-{os.getpid()}"
+    lane = f"worker-{os.getpid()}-{threading.get_ident()}-segment-{idx}"
 
     with _spawn_semaphore:
         time.sleep(2.0)
@@ -1932,7 +1932,7 @@ class ParallelVideoProcessor:
                                       f"| 推定残り: {eta_str}")
 
                                 completion_message = (
-                                    f"[並列処理] セグメント #{idx} 完了"
+                                    f"[並列処理] セグメント #{idx} 完了 ({result['elapsed']:.1f}秒)"
                                     if status != 'error'
                                     else f"[並列処理] セグメント #{idx} エラー"
                                 )
