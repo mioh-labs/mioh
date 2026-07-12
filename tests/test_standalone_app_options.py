@@ -79,6 +79,19 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn("logHistory", source)
         self.assertIn("rebuildVisibleLog()", source)
 
+    def test_gui_has_always_visible_multiline_ffmpeg_options(self):
+        source = APP_SOURCE.read_text()
+
+        self.assertIn('Section("FFmpeg詳細設定")', source)
+        self.assertIn('Text("追加FFmpegオプション")', source)
+        self.assertIn('TextEditor(text: $runner.encoderOptions)', source)
+        self.assertEqual(
+            source.count(
+                'addOptional(&args, "--encoder-options", encoderOptions)'
+            ),
+            1,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
