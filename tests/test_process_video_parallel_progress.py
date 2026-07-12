@@ -210,6 +210,37 @@ class ProcessVideoParallelProgressTests(unittest.TestCase):
 
         self.assertNotEqual(lanes[0], lanes[1])
 
+    def test_worker_error_details_are_queued_without_corrupting_progress_rows(self):
+        progress_queue = queue.Queue()
+        process = mock.Mock()
+        process.stdout = iter([
+            "Processing video: 50%\n",
+            "RuntimeError: model failed\n",
+        ])
+        process.wait.return_value = 1
+        stdout = io.StringIO()
+
+        with mock.patch.object(pvp.subprocess, "Popen", return_value=process):
+            with mock.patch.object(pvp, "aggressive_memory_cleanup_for_device"):
+                with mock.patch.object(pvp.time, "sleep"):
+                    with redirect_stdout(stdout):
+                        result = pvp.process_segment_worker(
+                            (4, Path("input.mp4"), Path("output.mp4")),
+                            self.worker_config(),
+                            progress_queue,
+                        )
+
+        events = []
+        while not progress_queue.empty():
+            events.append(progress_queue.get_nowait())
+        log_text = "\n".join(
+            event["text"] for event in events if event["kind"] == "log"
+        )
+        self.assertIn("lada-cli実行エラー", log_text)
+        self.assertIn("RuntimeError: model failed", log_text)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(result["status"], "error")
+
 
 if __name__ == "__main__":
     unittest.main()
