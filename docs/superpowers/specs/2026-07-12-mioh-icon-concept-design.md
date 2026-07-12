@@ -7,6 +7,8 @@ Create a preview image for a new `mioh` app icon based on a custom lowercase wor
 ## Mark construction
 
 - The readable sequence is lowercase `m`, a large lowercase `h` containing `i`, then a separate lowercase `o`.
+- The `m`, enclosed `i`, and final `o` use exactly the same cap height, stroke weight, and baseline.
+- Scale only the enclosing `h` to about 1.35 times their height and about 2.2 times the `i` width.
 - Draw the complete lowercase `h` with a left stem, arch, and right downstroke.
 - Place a smaller complete lowercase `i`, including its dot, entirely inside the open space between the two legs of `h`.
 - The `i` does not share a stem with `h` and must not sit outside the `h` arch.
