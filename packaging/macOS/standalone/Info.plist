@@ -5,15 +5,15 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>ja</string>
     <key>CFBundleDisplayName</key>
-    <string>Lada</string>
+    <string>mioh</string>
     <key>CFBundleExecutable</key>
-    <string>Lada</string>
+    <string>mioh</string>
     <key>CFBundleIdentifier</key>
     <string>com.okatti.lada.coreai</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>Lada</string>
+    <string>mioh</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

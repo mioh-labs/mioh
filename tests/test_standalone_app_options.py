@@ -1,13 +1,35 @@
 import unittest
+import plistlib
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-APP_SOURCE = ROOT / "packaging" / "macOS" / "standalone" / "LadaApp.swift"
+APP_SOURCE = ROOT / "packaging" / "macOS" / "standalone" / "MiohApp.swift"
 BUILD_SCRIPT = ROOT / "packaging" / "macOS" / "standalone" / "build_app.sh"
+INFO_PLIST = ROOT / "packaging" / "macOS" / "standalone" / "Info.plist"
 
 
 class StandaloneAppOptionTests(unittest.TestCase):
+    def test_product_is_named_mioh(self):
+        self.assertTrue(APP_SOURCE.is_file(), "MiohApp.swift must be the app entry source")
+        source = APP_SOURCE.read_text()
+        build_script = BUILD_SCRIPT.read_text()
+        with INFO_PLIST.open("rb") as handle:
+            info = plistlib.load(handle)
+
+        self.assertIn('Text("mioh")', source)
+        self.assertIn('PathSettingRow(title: "mioh一時フォルダ"', source)
+        self.assertIn("struct MiohStandaloneApp: App", source)
+        self.assertEqual(info["CFBundleDisplayName"], "mioh")
+        self.assertEqual(info["CFBundleName"], "mioh")
+        self.assertEqual(info["CFBundleExecutable"], "mioh")
+        self.assertEqual(info["CFBundleIdentifier"], "com.okatti.lada.coreai")
+        self.assertIn('APP="$BUILD_DIR/mioh.app"', build_script)
+        self.assertIn('-o "$CONTENTS/MacOS/mioh"', build_script)
+        self.assertIn('DMG="$BUILD_DIR/mioh-0.11.0-unsigned.dmg"', build_script)
+        self.assertIn('--volumeName "mioh"', build_script)
+        self.assertIn('ditto "$APP" "$DMG_ROOT/mioh.app"', build_script)
+
     def test_gui_exposes_all_processing_options(self):
         source = APP_SOURCE.read_text()
         expected_options = {
