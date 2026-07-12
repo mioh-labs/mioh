@@ -247,8 +247,8 @@ final class RestorationRunner: ObservableObject {
       add(&args, "--encoding-preset", encodingPreset)
     } else if encodingMode == "custom" {
       add(&args, "--encoder", encoder)
-      addOptional(&args, "--encoder-options", encoderOptions)
     }
+    addOptional(&args, "--encoder-options", encoderOptions)
     add(&args, "--bitrate-multiplier", bitrateMultiplier)
     if useQuality { add(&args, "--quality", quality) }
     if useQMin { add(&args, "--qmin", qmin) }
@@ -640,10 +640,22 @@ struct ContentView: View {
           }
         } else if runner.encodingMode == "custom" {
           LabeledContent("エンコーダー") { TextField("", text: $runner.encoder).frame(width: 260) }
-          LabeledContent("追加オプション") { TextField("", text: $runner.encoderOptions).frame(width: 380) }
         }
         doubleField("ビットレート倍率", value: $runner.bitrateMultiplier)
         Toggle("MP4 Fast Start", isOn: $runner.mp4FastStart)
+      }
+      Section("FFmpeg詳細設定") {
+        Text("追加FFmpegオプション").font(.headline)
+        TextEditor(text: $runner.encoderOptions)
+          .font(.system(.body, design: .monospaced))
+          .frame(minHeight: 72)
+          .overlay(
+            RoundedRectangle(cornerRadius: 6)
+              .stroke(Color.secondary.opacity(0.25))
+          )
+        Text("例: -pix_fmt yuv420p10le -profile:v main10 -b:v 20M")
+          .font(.caption)
+          .foregroundStyle(.secondary)
       }
       Section("品質") {
         optionalInt("Quality", enabled: $runner.useQuality, value: $runner.quality, range: 0...100)
