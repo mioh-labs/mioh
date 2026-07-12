@@ -43,6 +43,20 @@ class ProcessVideoParallelProgressTests(unittest.TestCase):
         )
         self.assertIsNone(pvp.parse_progress_line("ordinary log message"))
 
+    def test_progress_manager_uses_tcp_instead_of_temp_directory_socket(self):
+        context = mock.Mock()
+        manager = mock.Mock()
+        with mock.patch.object(pvp.mp, "get_context", return_value=context):
+            with mock.patch.object(pvp, "SyncManager", return_value=manager) as manager_type:
+                result = pvp.create_progress_manager()
+
+        self.assertIs(result, manager)
+        manager_type.assert_called_once_with(
+            address=("127.0.0.1", 0),
+            ctx=context,
+        )
+        manager.start.assert_called_once_with()
+
     def test_app_protocol_keeps_worker_lanes_distinct(self):
         stream = io.StringIO()
         renderer = pvp.ParallelProgressRenderer(
