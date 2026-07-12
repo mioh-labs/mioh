@@ -34,6 +34,7 @@ import time
 import math
 import queue
 import re
+import shlex
 import signal
 import sys
 import atexit
@@ -841,6 +842,71 @@ def has_audio_stream(video_path):
     except Exception:
         return False
 
+def _is_encoder_option_key(token: str) -> bool:
+    return len(token) > 1 and token.startswith('-') and not (
+        token[1].isdigit() or token[1] == '.'
+    )
+
+
+def parse_encoder_options(
+    options: str | None,
+) -> list[tuple[str, str | None]]:
+    if not options or not options.strip():
+        return []
+    try:
+        tokens = shlex.split(options)
+    except ValueError as exc:
+        raise ValueError(
+            f"追加FFmpegオプションの引用符が不正です: {exc}"
+        ) from exc
+
+    parsed: list[tuple[str, str | None]] = []
+    index = 0
+    while index < len(tokens):
+        key = tokens[index]
+        if not _is_encoder_option_key(key):
+            raise ValueError(
+                f"追加FFmpegオプションにはオプション名が必要です: {key}"
+            )
+        value = None
+        if (
+            index + 1 < len(tokens)
+            and not _is_encoder_option_key(tokens[index + 1])
+        ):
+            value = tokens[index + 1]
+            index += 1
+        parsed.append((key, value))
+        index += 1
+    return parsed
+
+
+def merge_encoder_options(
+    base: str | None,
+    additional: str | None,
+) -> str:
+    merged: dict[str, str | None] = {}
+    for key, value in [
+        *parse_encoder_options(base),
+        *parse_encoder_options(additional),
+    ]:
+        merged[key] = value
+
+    tokens: list[str] = []
+    for key, value in merged.items():
+        tokens.append(key)
+        if value is not None:
+            tokens.append(value)
+    return shlex.join(tokens)
+
+
+def encoder_options_argument(value: str) -> str:
+    try:
+        parse_encoder_options(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return value
+
+
 def get_optimal_encoder_options(video_path, user_options=None, auto_optimize=True, fps=None, bitrate_multiplier=3.0, qmin=None, qmax=None, quality=None, pre_fps_conversion=False):
     """
     元のファイルと同程度のファイルサイズになるようにエンコーダーオプションを設定
@@ -1007,54 +1073,8 @@ def get_optimal_encoder_options(video_path, user_options=None, auto_optimize=Tru
     if fps and not pre_fps_conversion:
         options += f' -r {fps}'
     
-    # user_optionsが指定されている場合は、デフォルトに追加/上書き
+    options = merge_encoder_options(options, user_options)
     if user_options:
-        # user_optionsをパース
-        user_opts_dict = {}
-        if user_options:
-            parts = user_options.strip().split()
-            i = 0
-            while i < len(parts):
-                if parts[i].startswith('-'):
-                    key = parts[i]
-                    # 次の要素が値かどうか確認
-                    if i + 1 < len(parts) and not parts[i + 1].startswith('-'):
-                        user_opts_dict[key] = parts[i + 1]
-                        i += 2
-                    else:
-                        user_opts_dict[key] = ''
-                        i += 1
-                else:
-                    i += 1
-        
-        # デフォルトoptionsをパース
-        default_opts_dict = {}
-        parts = options.strip().split()
-        i = 0
-        while i < len(parts):
-            if parts[i].startswith('-'):
-                key = parts[i]
-                if i + 1 < len(parts) and not parts[i + 1].startswith('-'):
-                    default_opts_dict[key] = parts[i + 1]
-                    i += 2
-                else:
-                    default_opts_dict[key] = ''
-                    i += 1
-            else:
-                i += 1
-        
-        # user_optionsでデフォルトを上書き
-        default_opts_dict.update(user_opts_dict)
-        
-        # 再構築
-        options_list = []
-        for key, value in default_opts_dict.items():
-            if value:
-                options_list.append(f"{key} {value}")
-            else:
-                options_list.append(key)
-        options = ' '.join(options_list)
-        
         print(f"📝 ユーザーオプション適用: {user_options}")
     
     # 情報表示
@@ -2370,7 +2390,11 @@ def build_arg_parser():
     parser.add_argument('--encoder', help='出力エンコーダー。例: h264_videotoolbox, hevc_videotoolbox, libx264。未指定時は自動選択')
     parser.add_argument('--list-encoders', action='store_true',
                         help='lada-cli のエンコーダー一覧を表示')
-    parser.add_argument('--encoder-options', help='lada-cli/FFmpegへ渡すエンコーダー追加オプション文字列。自動設定を上書きしたい場合に使用')
+    parser.add_argument(
+        '--encoder-options',
+        type=encoder_options_argument,
+        help='プリセットまたは自動設定へ追加するFFmpegエンコーダーオプション。同じキーは指定値を優先',
+    )
     parser.add_argument('--list-encoder-options', metavar='ENCODER',
                         help='指定エンコーダーの lada-cli オプション一覧を表示')
     parser.add_argument('--bitrate-multiplier', type=float, default=3.0,
