@@ -2,15 +2,15 @@
 
 ## Goal
 
-Create a preview image for a new `mioh` app icon based on a custom lowercase wordmark.
+Create a preview image for a new `mioh` app icon based on a custom lowercase wordmark where `h` encloses `i`.
 
 ## Mark construction
 
-- The readable base is lowercase `mio`.
-- The `i` and lowercase `h` share the same vertical stem.
-- Keep the `i` dot visible so `mio` remains legible.
-- Add only the shoulder and right stroke of `h` over the `i`, producing a compact `i/h` ligature.
-- Avoid making the overlay look like an unrelated fourth letter placed after `mio`.
+- The readable sequence is lowercase `m`, a large lowercase `h` containing `i`, then a separate lowercase `o`.
+- Draw the complete lowercase `h` with a left stem, arch, and right downstroke.
+- Place a smaller complete lowercase `i`, including its dot, entirely inside the open space between the two legs of `h`.
+- The `i` does not share a stem with `h` and must not sit outside the `h` arch.
+- Keep `m` and the final `o` unchanged and separate from the `h/i` construction.
 
 ## Visual direction
 

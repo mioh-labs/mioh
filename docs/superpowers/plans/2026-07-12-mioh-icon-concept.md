@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Generate one square preview of the approved `mio` plus overlaid `h` ligature concept.
+**Goal:** Generate one square preview of the approved `m` + enclosing `h/i` + `o` concept.
 
 **Architecture:** Use the built-in image generation tool for a preview-only raster concept. Keep the current application icon untouched until the user approves the visual direction.
 
@@ -10,8 +10,8 @@
 
 ## Global Constraints
 
-- Base text must read lowercase `mio`.
-- The `i` and lowercase `h` share one vertical stem, with the `i` dot retained.
+- The sequence must be lowercase `m`, a large `h` containing `i`, then a separate `o`.
+- The full point-topped `i` must sit entirely between the left and right legs of `h`.
 - Use dark charcoal on a soft light-gray square macOS icon field.
 - No gradients, shadows, 3D effects, objects, watermark, or extra text.
 - Do not replace the current project icon during this task.
@@ -34,12 +34,12 @@ Use this prompt:
 ```text
 Use case: logo-brand
 Asset type: square macOS application icon concept preview
-Primary request: Create a minimal custom lowercase wordmark based on the exact readable letters "mio". Overlay a lowercase "h" onto the "i" so the i and h share exactly one vertical stem. Keep the i dot clearly visible. Add only the h shoulder and right downstroke, flowing rightward from the shared i stem. The result should suggest "mioh" as one compact ligature while the base "mio" remains readable.
+Primary request: Edit the reference logo into a minimal custom lowercase wordmark arranged as "m", then a large lowercase "h", then a separate lowercase "o". Place a smaller complete lowercase "i", including its round dot and vertical stem, entirely inside the open space under the h arch, centered between the h's left stem and right downstroke. The h visibly surrounds the i with both legs outside it.
 Style/medium: clean geometric vector-style logo, crisp flat shapes, professional optical spacing
 Composition/framing: centered on a square icon field with generous padding and a strong small-size silhouette
 Color palette: dark charcoal mark on a soft light-gray background
-Text (verbatim): "mio" with the overlaid lowercase h ligature on i
-Constraints: one shared i/h stem; retain i dot; no separate h after the o; no other letters
+Text construction: lowercase m + enclosing h/i glyph + lowercase o
+Constraints: i has its own stem; i is fully inside h; h has two visible outer legs; retain i dot; o stays separate; no extra letters
 Avoid: gradients, shadows, bevels, 3D, decorative objects, watermark, mockup framing, extra text
 ```
 
