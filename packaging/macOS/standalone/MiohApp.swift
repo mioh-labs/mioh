@@ -516,7 +516,7 @@ struct ContentView: View {
     HStack(spacing: 12) {
       Image(nsImage: NSImage(named: "AppIcon") ?? NSImage()).resizable().frame(width: 34, height: 34)
       VStack(alignment: .leading, spacing: 2) {
-        Text("Lada").font(.title2.weight(.semibold))
+        Text("mioh").font(.title2.weight(.semibold))
         Text(runner.restorationModel).font(.caption).foregroundStyle(.secondary)
       }
       Spacer()
@@ -533,7 +533,7 @@ struct ContentView: View {
         PathRow(title: "出力", icon: "externaldrive", url: runner.outputURL, action: runner.chooseOutput)
         PathSettingRow(title: "一時フォルダ", value: $runner.tempDirectory) { runner.choosePath(\.tempDirectory) }
         PathSettingRow(title: "FFmpeg一時フォルダ", value: $runner.ffmpegTempDirectory) { runner.choosePath(\.ffmpegTempDirectory) }
-        PathSettingRow(title: "Lada一時フォルダ", value: $runner.ladaTempDirectory) { runner.choosePath(\.ladaTempDirectory) }
+        PathSettingRow(title: "mioh一時フォルダ", value: $runner.ladaTempDirectory) { runner.choosePath(\.ladaTempDirectory) }
       }
       Section("実行") {
         Picker("デバイス", selection: $runner.device) {
@@ -713,7 +713,7 @@ struct ContentView: View {
 }
 
 @main
-struct LadaStandaloneApp: App {
+struct MiohStandaloneApp: App {
   var body: some Scene {
     WindowGroup { ContentView() }
       .windowResizability(.contentMinSize)

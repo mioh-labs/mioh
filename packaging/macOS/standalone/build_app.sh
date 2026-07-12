@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="${0:A:h:h:h:h}"
 PACKAGE_DIR="$ROOT/packaging/macos/standalone"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build/macos-standalone}"
-APP="$BUILD_DIR/Lada.app"
+APP="$BUILD_DIR/mioh.app"
 CONTENTS="$APP/Contents"
 RESOURCES="$CONTENTS/Resources"
 PYTHON_SOURCE="${PYTHON_SOURCE:-$HOME/.local/share/uv/python/cpython-3.12-macos-aarch64-none}"
@@ -13,7 +13,8 @@ SITE_PACKAGES="$ROOT/.venv-coreai/lib/python3.12/site-packages"
 COMPILED_MODELS="${COMPILED_MODELS:-$BUILD_DIR/compiled-models}"
 FFMPEG_CACHE="${FFMPEG_CACHE:-$BUILD_DIR/ffmpeg-static}"
 
-rm -rf "$APP"
+rm -rf "$APP" "$BUILD_DIR/Lada.app"
+rm -f "$BUILD_DIR/Lada-0.11.0-unsigned.dmg"
 mkdir -p "$CONTENTS/MacOS" "$RESOURCES/bin" "$RESOURCES/models"
 
 xcrun swiftc \
@@ -23,8 +24,8 @@ xcrun swiftc \
   -framework AppKit \
   -framework SwiftUI \
   -framework CoreAI \
-  "$PACKAGE_DIR/LadaApp.swift" \
-  -o "$CONTENTS/MacOS/Lada"
+  "$PACKAGE_DIR/MiohApp.swift" \
+  -o "$CONTENTS/MacOS/mioh"
 xcrun swiftc \
   -O \
   -parse-as-library \
@@ -133,7 +134,7 @@ for spec in "16 icon_16x16" "32 icon_16x16@2x" "32 icon_32x32" \
 done
 iconutil -c icns "$ICONSET" -o "$RESOURCES/AppIcon.icns"
 
-chmod +x "$CONTENTS/MacOS/Lada" "$RESOURCES/runtime/bin/python3.12" \
+chmod +x "$CONTENTS/MacOS/mioh" "$RESOURCES/runtime/bin/python3.12" \
   "$RESOURCES/bin/ffmpeg" "$RESOURCES/bin/ffprobe" \
   "$RESOURCES/bin/lada-coreai-runner"
 
@@ -142,15 +143,15 @@ find "$RESOURCES/runtime" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
 
 codesign --force --deep --sign - "$APP"
 
-DMG="$BUILD_DIR/Lada-0.11.0-unsigned.dmg"
+DMG="$BUILD_DIR/mioh-0.11.0-unsigned.dmg"
 DMG_ROOT="$BUILD_DIR/dmg-root"
 rm -f "$DMG"
 rm -rf "$DMG_ROOT"
 mkdir -p "$DMG_ROOT"
-ditto "$APP" "$DMG_ROOT/Lada.app"
+ditto "$APP" "$DMG_ROOT/mioh.app"
 ln -s /Applications "$DMG_ROOT/Applications"
 diskutil image create from \
-  --volumeName "Lada" \
+  --volumeName "mioh" \
   --format UDZO \
   "$DMG_ROOT" \
   "$DMG"
