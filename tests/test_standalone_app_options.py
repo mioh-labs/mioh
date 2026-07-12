@@ -61,6 +61,14 @@ class StandaloneAppOptionTests(unittest.TestCase):
         script = BUILD_SCRIPT.read_text()
         self.assertIn("process_video_parallel.py", script)
 
+    def test_standalone_app_uses_mioh_icon(self):
+        icon = ROOT / "lada" / "gui" / "icons" / "mioh-icon.png"
+        script = BUILD_SCRIPT.read_text()
+
+        self.assertTrue(icon.is_file())
+        self.assertEqual(icon.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertIn('SOURCE_ICON="$ROOT/lada/gui/icons/mioh-icon.png"', script)
+
     def test_app_replaces_structured_progress_rows(self):
         source = APP_SOURCE.read_text()
 
