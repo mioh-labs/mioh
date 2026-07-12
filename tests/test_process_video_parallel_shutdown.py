@@ -142,7 +142,10 @@ class ProcessVideoParallelShutdownTests(unittest.TestCase):
 
         cmd = pvp.build_lada_cli_list_command(args)
 
-        self.assertEqual(cmd, ["lada-cli", "--list-mosaic-detection-models"])
+        self.assertEqual(
+            cmd,
+            [*pvp.lada_cli_command_prefix(), "--list-mosaic-detection-models"],
+        )
 
     def test_list_encoder_options_builds_lada_cli_passthrough_with_value(self):
         parser = pvp.build_arg_parser()
@@ -150,7 +153,14 @@ class ProcessVideoParallelShutdownTests(unittest.TestCase):
 
         cmd = pvp.build_lada_cli_list_command(args)
 
-        self.assertEqual(cmd, ["lada-cli", "--list-encoder-options", "hevc_videotoolbox"])
+        self.assertEqual(
+            cmd,
+            [
+                *pvp.lada_cli_command_prefix(),
+                "--list-encoder-options",
+                "hevc_videotoolbox",
+            ],
+        )
 
 
 if __name__ == "__main__":
