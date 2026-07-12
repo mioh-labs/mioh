@@ -453,6 +453,16 @@ def aggressive_memory_cleanup_for_device(device: str):
     time.sleep(0.05)
 
 
+def emit_worker_log(progress_queue, message: str) -> None:
+    if progress_queue is not None:
+        try:
+            progress_queue.put({'kind': 'log', 'text': message})
+            return
+        except Exception:
+            pass
+    print(message, flush=True)
+
+
 def process_segment_worker(segment_info, config: WorkerRuntimeConfig, progress_queue=None):
     idx, input_path, output_path = segment_info
     input_path = Path(input_path)
@@ -475,10 +485,7 @@ def process_segment_worker(segment_info, config: WorkerRuntimeConfig, progress_q
     start_time = time.time()
     worker_name = f"PID:{os.getpid()}"
     start_message = f"[並列処理] セグメント #{idx} 開始 (ワーカー: {worker_name})"
-    if progress_queue is None:
-        print(start_message, flush=True)
-    else:
-        progress_queue.put({'kind': 'log', 'text': start_message})
+    emit_worker_log(progress_queue, start_message)
 
     cmd = build_lada_cli_command(config, input_path, output_path)
     env = build_worker_env(config)
@@ -524,7 +531,7 @@ def process_segment_worker(segment_info, config: WorkerRuntimeConfig, progress_q
                     if progress_queue is None:
                         print(f"\n  {line}", flush=True)
                     else:
-                        progress_queue.put({'kind': 'log', 'text': f"  {line}"})
+                        emit_worker_log(progress_queue, f"  {line}")
 
         return_code = process.wait()
         if return_code != 0:
@@ -543,13 +550,13 @@ def process_segment_worker(segment_info, config: WorkerRuntimeConfig, progress_q
             'error': None,
         }
     except subprocess.CalledProcessError as e:
-        print(f"\n[ERROR] lada-cli実行エラー:", flush=True)
-        print(f"  コマンド: {' '.join(cmd)}", flush=True)
-        print(f"  終了コード: {e.returncode}", flush=True)
+        emit_worker_log(progress_queue, "[ERROR] lada-cli実行エラー:")
+        emit_worker_log(progress_queue, f"  コマンド: {' '.join(cmd)}")
+        emit_worker_log(progress_queue, f"  終了コード: {e.returncode}")
         if recent_lines:
-            print(f"  --- worker出力(末尾) ---", flush=True)
+            emit_worker_log(progress_queue, "  --- worker出力(末尾) ---")
             for output_line in recent_lines:
-                print(f"  | {output_line}", flush=True)
+                emit_worker_log(progress_queue, f"  | {output_line}")
         return {
             'idx': idx,
             'lane': lane,
@@ -559,7 +566,7 @@ def process_segment_worker(segment_info, config: WorkerRuntimeConfig, progress_q
             'error': f"Command '{' '.join(cmd)}' returned non-zero exit status {e.returncode}.",
         }
     except Exception as e:
-        print(f"\n[ERROR] 予期しないエラー: {e}", flush=True)
+        emit_worker_log(progress_queue, f"[ERROR] 予期しないエラー: {e}")
         return {
             'idx': idx,
             'lane': lane,
