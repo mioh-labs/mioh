@@ -53,7 +53,7 @@ from lada.utils.mps_utils import (
     get_mps_available_memory_gb,
     get_mps_memory_stats,
 )
-from lada.utils.video_utils import get_default_preset_name
+from lada.utils.video_utils import get_default_preset_name, get_encoding_presets
 
 os.environ['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] = 'YES'
 
@@ -340,6 +340,41 @@ def build_worker_env(config: WorkerRuntimeConfig) -> dict[str, str]:
     return env
 
 
+def resolve_worker_encoding(
+    config: WorkerRuntimeConfig,
+) -> tuple[str | None, str | None]:
+    if config.encoding_preset:
+        preset = next(
+            (
+                item
+                for item in get_encoding_presets()
+                if item.name == config.encoding_preset
+            ),
+            None,
+        )
+        if preset is None:
+            raise ValueError(
+                f"不明なエンコーディングプリセット: {config.encoding_preset}"
+            )
+        return preset.encoder_name, merge_encoder_options(
+            preset.encoder_options,
+            config.encoder_options,
+        )
+    if config.encoder:
+        return (
+            config.encoder,
+            config.optimal_encoder_options or config.encoder_options or '',
+        )
+    if config.optimal_encoder_options and config.device == 'mps':
+        return 'hevc_videotoolbox', config.optimal_encoder_options
+    if config.encoder_options:
+        default_encoder = (
+            'hevc_videotoolbox' if config.device == 'mps' else 'libx264'
+        )
+        return default_encoder, config.encoder_options
+    return None, None
+
+
 def build_lada_cli_command(config: WorkerRuntimeConfig, input_video: Path, output_video: Path) -> list[str]:
     cmd = [
         *lada_cli_command_prefix(
@@ -357,20 +392,10 @@ def build_lada_cli_command(config: WorkerRuntimeConfig, input_video: Path, outpu
     if config.device == 'mps' and config.mps_memory_fraction is not None:
         cmd.extend(['--mps-memory-fraction', str(config.mps_memory_fraction)])
 
-    if config.encoding_preset:
-        cmd.extend(['--encoding-preset', config.encoding_preset])
-    elif config.encoder:
-        cmd.extend(['--encoder', config.encoder])
-        if config.optimal_encoder_options:
-            cmd.extend(['--encoder-options', str(config.optimal_encoder_options)])
-        elif config.encoder_options:
-            cmd.extend(['--encoder-options', str(config.encoder_options)])
-    elif config.optimal_encoder_options and config.device == 'mps':
-        cmd.extend(['--encoder', 'hevc_videotoolbox'])
-        cmd.extend(['--encoder-options', str(config.optimal_encoder_options)])
-    elif config.encoder_options:
-        cmd.extend(['--encoder', 'hevc_videotoolbox' if config.device == 'mps' else 'libx264'])
-        cmd.extend(['--encoder-options', str(config.encoder_options)])
+    encoder, encoder_options = resolve_worker_encoding(config)
+    if encoder:
+        cmd.extend(['--encoder', encoder])
+        cmd.extend(['--encoder-options', encoder_options or ''])
 
     if config.mp4_fast_start:
         cmd.append('--mp4-fast-start')
@@ -1417,6 +1442,7 @@ class ParallelVideoProcessor:
         self.start_time = None
         
         # 解像度最適化されたエンコーダーオプション
+        self.intermediate_encoder_options = None
         self.optimal_encoder_options = None
         
         # GUIモード検出
@@ -1569,113 +1595,9 @@ class ParallelVideoProcessor:
         
         注意: lada-cliは自動的に音声をコピーします
         """
-        # 環境変数設定
-        env = os.environ.copy()
-        if self.args.device == 'mps':
-            env['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = '0.0'
-            env['PYTORCH_MPS_LOW_WATERMARK_RATIO'] = '0.0'
-            env.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
-            env['PYTORCH_MPS_ALLOCATOR_POLICY'] = 'garbage_collection'
-        
-        env['OMP_NUM_THREADS'] = '2'
-        env['MKL_NUM_THREADS'] = '2'
-        env['OPENBLAS_NUM_THREADS'] = '1'
-        env['NUMEXPR_NUM_THREADS'] = '2'
-        env['PYTHONMALLOC'] = 'malloc'
-        env['OBJC_DISABLE_INITIALIZE_FORK_SAFETY'] = 'YES'
-        effective_mps_fraction = get_effective_mps_memory_fraction(self.args)
-        if self.args.device == 'mps' and effective_mps_fraction is not None:
-            env['LADA_MPS_MEMORY_FRACTION'] = str(effective_mps_fraction)
-            if self.args.log_mps_memory:
-                env['LADA_LOG_MPS_MEMORY'] = '1'
-        
-        # コマンド構築
-        cmd = [
-            *lada_cli_command_prefix(
-                self.args.mosaic_restoration_model,
-                self.args.mosaic_detection_model,
-                self.args.restore_roi_enhancer_model_path,
-            ),
-            '--input', str(input_video),
-            '--output', str(output_video),
-            '--device', self.args.device,
-        ]
-        
-        if self.args.fp16:
-            cmd.append('--fp16')
-        else:
-            cmd.append('--no-fp16')
-        if self.args.device == 'mps':
-            effective_mps_fraction = get_effective_mps_memory_fraction(self.args)
-            if effective_mps_fraction is not None:
-                cmd.extend(['--mps-memory-fraction', str(effective_mps_fraction)])
-        
-        # エンコーディング設定（解像度最適化）
-        lada_encoding_preset = get_lada_encoding_preset(self.args, self.optimal_encoder_options)
-        if lada_encoding_preset:
-            # プリセット指定時はそのまま使用
-            cmd.extend(['--encoding-preset', lada_encoding_preset])
-        elif self.args.encoder:
-            # エンコーダー指定時
-            cmd.extend(['--encoder', self.args.encoder])
-            # 最適化されたオプションを使用（ユーザー指定がある場合はそちらを優先）
-            if self.optimal_encoder_options:
-                # encoder-optionsは文字列として1つの引数で渡す
-                cmd.extend(['--encoder-options', str(self.optimal_encoder_options)])
-        elif self.optimal_encoder_options and self.args.device == 'mps':
-            # MPS環境で最適化オプションがある場合はVideoToolboxを明示
-            cmd.extend(['--encoder', 'hevc_videotoolbox'])
-            # encoder-optionsは文字列として1つの引数で渡す
-            cmd.extend(['--encoder-options', str(self.optimal_encoder_options)])
-        elif self.args.encoder_options:
-            # ユーザーがencoder-optionsのみ指定した場合はデバイスに応じて既定エンコーダーを補完
-            if not self.args.encoder:
-                if self.args.device == 'mps':
-                    cmd.extend(['--encoder', 'hevc_videotoolbox'])
-                else:
-                    cmd.extend(['--encoder', 'libx264'])
-            cmd.extend(['--encoder-options', str(self.args.encoder_options)])
-        else:
-            # 明示設定がなければ、LADA本体側の既定プリセット選択に委ねる
-            pass
-        
-        if self.args.mp4_fast_start:
-            cmd.append('--mp4-fast-start')
-        
-        cmd.extend(['--mosaic-restoration-model', self.args.mosaic_restoration_model])
-        cmd.extend(['--max-clip-length', str(self.args.max_clip_length)])
-        if self.args.restore_max_frames is not None:
-            cmd.extend(['--restore-max-frames', str(self.args.restore_max_frames)])
-        if self.args.restore_sharpen_strength > 0:
-            cmd.extend(['--restore-sharpen-strength', str(self.args.restore_sharpen_strength)])
-        if self.args.restore_detail_boost > 0:
-            cmd.extend(['--restore-detail-boost', str(self.args.restore_detail_boost)])
-        cmd.extend(['--restore-blend-feather', str(self.args.restore_blend_feather)])
-        if self.args.restore_texture_mix > 0:
-            cmd.extend(['--restore-texture-mix', str(self.args.restore_texture_mix)])
-        if self.args.restore_smooth_strength > 0:
-            cmd.extend(['--restore-smooth-strength', str(self.args.restore_smooth_strength)])
-        if self.args.restore_effect_upscale > 1:
-            cmd.extend(['--restore-effect-upscale', str(self.args.restore_effect_upscale)])
-        if self.args.restore_roi_enhancer != "none":
-            cmd.extend(['--restore-roi-enhancer', self.args.restore_roi_enhancer])
-            if self.args.restore_roi_enhancer_model_path:
-                cmd.extend(['--restore-roi-enhancer-model-path', str(self.args.restore_roi_enhancer_model_path)])
-            cmd.extend(['--restore-roi-enhancer-scale', str(self.args.restore_roi_enhancer_scale)])
-            cmd.extend(['--restore-roi-enhancer-strength', str(self.args.restore_roi_enhancer_strength)])
-            cmd.extend(['--restore-roi-enhancer-tile', str(self.args.restore_roi_enhancer_tile)])
-        cmd.extend(['--mosaic-detection-model', self.args.mosaic_detection_model])
-        if self.args.mosaic_detection_empty_lookahead > 0:
-            cmd.extend(['--mosaic-detection-empty-lookahead', str(self.args.mosaic_detection_empty_lookahead)])
-        
-        # 顔モザイク検出の設定
-        if self.args.detect_face_mosaics:
-            cmd.append('--detect-face-mosaics')
-        else:
-            cmd.append('--no-detect-face-mosaics')
-        
-        if hasattr(self.args, 'lada_temp_dir') and self.args.lada_temp_dir:
-            cmd.extend(['--temporary-directory', str(self.args.lada_temp_dir)])
+        config = self._build_worker_runtime_config()
+        env = build_worker_env(config)
+        cmd = build_lada_cli_command(config, input_video, output_video)
         
         # デバッグ: 実際のコマンドを表示
         if os.environ.get('DEBUG_LADA_CMD'):
@@ -1797,9 +1719,9 @@ class ParallelVideoProcessor:
         print("解像度検出と最適化設定")
         print("=" * 70)
         if self.args.device == 'mps':
-            self.optimal_encoder_options = get_optimal_encoder_options(
+            self.intermediate_encoder_options = get_optimal_encoder_options(
                 input_video,
-                self.args.encoder_options,
+                None,
                 self.args.auto_optimize,
                 self.args.fps,
                 self.args.bitrate_multiplier,
@@ -1808,9 +1730,22 @@ class ParallelVideoProcessor:
                 getattr(self.args, 'quality', None),
                 use_pre_fps_conversion  # ローカル変数を使用
             )
+            self.optimal_encoder_options = merge_encoder_options(
+                self.intermediate_encoder_options,
+                self.args.encoder_options,
+            )
         else:
+            self.intermediate_encoder_options = None
             self.optimal_encoder_options = None
             print("ℹ️  非MPS環境のためVideoToolbox最適化オプションは適用しません（LADA既定設定を使用）")
+        resolved_encoder, resolved_options = resolve_worker_encoding(
+            self._build_worker_runtime_config()
+        )
+        if resolved_encoder:
+            print(
+                f"🎬 最終エンコーダー設定: "
+                f"{resolved_encoder} {resolved_options or ''}".rstrip()
+            )
         print("=" * 70 + "\n")
         
         # 開始時刻
@@ -1834,7 +1769,7 @@ class ParallelVideoProcessor:
                     self.args.segment_duration, 
                     force_split,
                     pre_fps=self.args.fps,
-                    encoder_options=self.optimal_encoder_options,
+                    encoder_options=self.intermediate_encoder_options,
                     segment_count=segment_count,
                 )
             else:

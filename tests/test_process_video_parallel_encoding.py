@@ -1,7 +1,29 @@
 import unittest
+from dataclasses import replace
+from pathlib import Path
 from unittest import mock
 
 import process_video_parallel as pvp
+
+
+def make_worker_config() -> pvp.WorkerRuntimeConfig:
+    return pvp.WorkerRuntimeConfig(
+        device="mps",
+        fp16=True,
+        mps_memory_fraction=0.46,
+        log_mps_memory=False,
+        encoding_preset="hevc-apple-gpu-balanced",
+        encoder=None,
+        encoder_options=None,
+        optimal_encoder_options=None,
+        mp4_fast_start=False,
+        mosaic_restoration_model="basicvsrpp-v1.2",
+        max_clip_length=180,
+        mosaic_detection_model="v4-fast",
+        detect_face_mosaics=False,
+        lada_temp_dir=None,
+        overwrite=False,
+    )
 
 
 class ProcessVideoParallelEncodingTests(unittest.TestCase):
@@ -48,6 +70,80 @@ class ProcessVideoParallelEncodingTests(unittest.TestCase):
     def test_parser_rejects_value_before_option_name(self):
         with self.assertRaisesRegex(ValueError, "オプション名"):
             pvp.parse_encoder_options("orphan -crf 18")
+
+    def test_preset_options_are_overridden_by_additional_values(self):
+        config = replace(
+            make_worker_config(),
+            encoder_options="-q:v 70 -profile:v main10",
+            optimal_encoder_options="-b:v 99M",
+        )
+
+        encoder, options = pvp.resolve_worker_encoding(config)
+        parsed = pvp.parse_encoder_options(options)
+
+        self.assertEqual(encoder, "hevc_videotoolbox")
+        self.assertIn(("-q:v", "70"), parsed)
+        self.assertIn(("-profile:v", "main10"), parsed)
+        self.assertNotIn(("-b:v", "99M"), parsed)
+
+    def test_preset_command_uses_resolved_encoder_and_options(self):
+        config = replace(make_worker_config(), encoder_options="-q:v 70")
+
+        cmd = pvp.build_lada_cli_command(
+            config,
+            pvp.Path("in.mp4"),
+            pvp.Path("out.mp4"),
+        )
+
+        self.assertNotIn("--encoding-preset", cmd)
+        self.assertEqual(
+            cmd[cmd.index("--encoder") + 1],
+            "hevc_videotoolbox",
+        )
+        final_options = cmd[cmd.index("--encoder-options") + 1]
+        self.assertIn(
+            ("-q:v", "70"),
+            pvp.parse_encoder_options(final_options),
+        )
+
+    def test_automatic_and_custom_modes_use_resolved_final_options(self):
+        automatic = replace(
+            make_worker_config(),
+            encoding_preset=None,
+            optimal_encoder_options="-q:v 72",
+        )
+        custom = replace(
+            automatic,
+            encoder="libx264",
+            optimal_encoder_options="-crf 19",
+        )
+
+        self.assertEqual(
+            pvp.resolve_worker_encoding(automatic),
+            ("hevc_videotoolbox", "-q:v 72"),
+        )
+        self.assertEqual(
+            pvp.resolve_worker_encoding(custom),
+            ("libx264", "-crf 19"),
+        )
+
+    def test_pre_fps_uses_automatic_options_without_user_overrides(self):
+        source = Path(pvp.__file__).read_text()
+        start = source.index(
+            "# pre_fps変換が有効な場合（ローカル変数を使用）"
+        )
+        split_block = source[
+            start:source.index("self.stats['total_segments']", start)
+        ]
+
+        self.assertIn(
+            "encoder_options=self.intermediate_encoder_options",
+            split_block,
+        )
+        self.assertNotIn(
+            "encoder_options=self.optimal_encoder_options",
+            split_block,
+        )
 
     def test_uses_lada_apple_preset_when_mps_has_no_custom_encoding(self):
         args = mock.Mock(
