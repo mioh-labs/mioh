@@ -47,6 +47,7 @@ class SegmentCountTests(unittest.TestCase):
     def test_pre_fps_keeps_bitrate_and_uses_quality_prioritized_videotoolbox(self):
         options = (
             "-b:v 12.486M -maxrate 12.486M -bufsize 24.972M "
+            "-pix_fmt yuv420p "
             "-power_efficient 1 -realtime 0 -frames_before 0 "
             "-frames_after 0 -prio_speed 0"
         )
@@ -82,6 +83,7 @@ class SegmentCountTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-realtime") + 1], "0")
         self.assertEqual(cmd[cmd.index("-prio_speed") + 1], "0")
         self.assertEqual(cmd[cmd.index("-spatial_aq") + 1], "1")
+        self.assertNotIn("-pix_fmt", cmd)
         self.assertNotIn("-frames_before", cmd)
         self.assertNotIn("-frames_after", cmd)
         map_values = [cmd[i + 1] for i, item in enumerate(cmd) if item == "-map"]

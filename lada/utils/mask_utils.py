@@ -4,6 +4,7 @@
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from lada.utils import Box, Mask, box_utils
 from lada.utils import image_utils
 
@@ -66,36 +67,32 @@ def get_mask_area(mask: Mask) -> float:
 def smooth_mask(mask: Mask, kernel_size: int) -> Mask:
     return cv2.medianBlur(mask, kernel_size).reshape(mask.shape)
 
-def create_outward_feather_mask(crop_mask: torch.Tensor, feather_pixels: int) -> torch.Tensor:
-    """Return weights that fade outside the segmentation mask only."""
-    mask = crop_mask.squeeze() > 0
-    weights = np.zeros(tuple(mask.shape), dtype=np.float32)
-    if feather_pixels > 0 and mask.any():
-        mask_np = mask.detach().cpu().numpy()
-        distance = cv2.distanceTransform(
-            (~mask_np).astype(np.uint8),
-            cv2.DIST_L2,
-            cv2.DIST_MASK_PRECISE,
-        )
-        weights = np.clip(1.0 - distance / float(feather_pixels), 0.0, 1.0)
-        weights[mask_np] = 0.0
-    return torch.from_numpy(weights).to(device=crop_mask.device)
+def create_blend_mask(crop_mask: torch.Tensor, feather_multiplier: float = 1.0):
+    mask = (crop_mask.squeeze() > 0).to(dtype=crop_mask.dtype)
+    h, w = mask.shape
+    if feather_multiplier <= 0:
+        return mask
 
-
-def create_inner_feather_mask(crop_mask: torch.Tensor, feather_pixels: int) -> torch.Tensor:
-    """Return weights that rise from the mask boundary toward its interior."""
-    mask = crop_mask.squeeze() > 0
-    mask_np = mask.detach().cpu().numpy()
-    if feather_pixels <= 0:
-        weights = mask_np.astype(np.float32)
-    else:
-        distance = cv2.distanceTransform(
-            mask_np.astype(np.uint8),
-            cv2.DIST_L2,
-            cv2.DIST_MASK_PRECISE,
-        )
-        weights = np.clip(distance / float(feather_pixels), 0.0, 1.0)
-    return torch.from_numpy(weights).to(device=crop_mask.device)
+    border_ratio = 0.05
+    h_inner, w_inner = int(h * (1.0 - border_ratio)), int(w * (1.0 - border_ratio))
+    h_outer, w_outer = h - h_inner, w - w_inner
+    border_size = int(round(min(h_outer, w_outer) * feather_multiplier))
+    if border_size < 5:
+        return torch.ones_like(mask)
+    blur_size = border_size
+    if blur_size % 2 == 0:
+        blur_size += 1
+    inner = torch.ones((h_inner, w_inner), device=mask.device, dtype=mask.dtype)
+    pad_top = h_outer // 2
+    pad_bottom = h_outer - pad_top
+    pad_left = w_outer // 2
+    pad_right = w_outer - pad_left
+    blend = F.pad(inner, (pad_left, pad_right, pad_top, pad_bottom), value=0.0)
+    blend = torch.maximum(mask, blend)
+    kernel = torch.tensor(1.0 / (blur_size**2), device=blend.device, dtype=blend.dtype).expand(1, blur_size, blur_size)
+    blend = image_utils.filter2D(blend.unsqueeze(0).unsqueeze(0), kernel).squeeze(0).squeeze(0)
+    assert blend.shape == mask.shape
+    return blend
 
 def apply_random_mask_extensions(mask: Mask) -> Mask:
     value = np.random.choice([0, 0, 1, 1, 2])
