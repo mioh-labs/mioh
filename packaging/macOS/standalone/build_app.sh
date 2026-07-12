@@ -48,6 +48,8 @@ uv pip install \
   --no-deps \
   --reinstall \
   "$ROOT"
+cp "$ROOT/process_video_parallel.py" \
+  "$RESOURCES/runtime/lib/python3.12/site-packages/process_video_parallel.py"
 rm -f "$RESOURCES/runtime/lib/python3.12/site-packages/lada-0.11.0.dist-info/direct_url.json"
 
 mkdir -p "$FFMPEG_CACHE"
@@ -67,8 +69,39 @@ if [[ ! -x "$FFMPEG_CACHE/ffprobe" ]]; then
 fi
 cp "$FFMPEG_CACHE/ffmpeg" "$RESOURCES/bin/ffmpeg"
 cp "$FFMPEG_CACHE/ffprobe" "$RESOURCES/bin/ffprobe"
-ditto "$ROOT/model_weights/lada_mosaic_detection_model_v2.mlpackage" \
-  "$RESOURCES/models/lada_mosaic_detection_model_v2.mlpackage"
+
+MODEL_ASSETS=(
+  lada_mosaic_restoration_model_generic_v1.2.pth
+  basicvsrpp-v1.2-t18-fp16.aimodel
+  basicvsrpp-v1.2-t36-fp16.aimodel
+  basicvsrpp-v1.2-t90-fp16.aimodel
+  lada_mosaic_detection_model_v2.pt
+  lada_mosaic_detection_model_v2.mlpackage
+  lada_mosaic_detection_model_v3.pt
+  lada_mosaic_detection_model_v3.1_fast.pt
+  lada_mosaic_detection_model_v3.1_fast.mlpackage
+  lada_mosaic_detection_model_v3.1_accurate.pt
+  lada_mosaic_detection_model_v3.1_accurate.mlpackage
+  lada_mosaic_detection_model_v4_fast.pt
+  lada_mosaic_detection_model_v4_fast.mlpackage
+  lada_mosaic_detection_model_v4_fast-fp16.aimodel
+  lada_mosaic_detection_model_v4_accurate.pt
+  lada_mosaic_detection_model_v4_accurate.mlpackage
+  RealESRGAN_x2plus.pth
+  RealESRGAN_x4plus.pth
+  RealESRGAN_x4plus_256.mlpackage
+  RealESRGAN_x4plus-256-fp16.aimodel
+  realesr-general-x4v3_256.mlpackage
+  realesr-general-x4v3-256-fp16.aimodel
+  MewZoom-V1-4X-Unet_256.mlpackage
+  MewZoom-V1-4X-Unet_512.mlpackage
+  swinir-real-x4_256.mlpackage
+)
+for asset in "${MODEL_ASSETS[@]}"; do
+  if [[ -e "$ROOT/model_weights/$asset" ]]; then
+    ditto "$ROOT/model_weights/$asset" "$RESOURCES/models/$asset"
+  fi
+done
 
 if [[ ! -d "$COMPILED_MODELS" ]] || ! find "$COMPILED_MODELS" -name '*.aimodelc' -print -quit | grep -q .; then
   mkdir -p "$COMPILED_MODELS"
@@ -83,8 +116,6 @@ fi
 for model in "$COMPILED_MODELS"/*.aimodelc; do
   ditto "$model" "$RESOURCES/models/${model:t}"
 done
-ditto "$ROOT/model_weights/basicvsrpp-v1.2-t90-fp16.aimodel" \
-  "$RESOURCES/models/basicvsrpp-v1.2-t90-fp16.aimodel"
 cp "$ROOT/LICENSE.md" "$RESOURCES/LICENSE.md"
 ditto "$ROOT/LICENSES" "$RESOURCES/LICENSES"
 

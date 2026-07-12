@@ -109,7 +109,9 @@ COREAI_STREAMING_CLIP_LENGTHS = {
     'basicvsrpp-v1.2-coreai-t36': 104,
     'basicvsrpp-v1.2-coreai-t90': 178,
 }
-COREAI_PYTHON = REPO_ROOT / '.venv-coreai' / 'bin' / 'python'
+COREAI_PYTHON = Path(
+    os.environ.get('LADA_COREAI_PYTHON', REPO_ROOT / '.venv-coreai' / 'bin' / 'python')
+)
 COREAI_T36_MODEL_PATH = (
     REPO_ROOT / 'model_weights' / 'basicvsrpp-v1.2-t36-fp16.aimodel'
 )
