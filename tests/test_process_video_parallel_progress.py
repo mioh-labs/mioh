@@ -178,6 +178,38 @@ class ProcessVideoParallelProgressTests(unittest.TestCase):
         self.assertNotIn("Processing video", stdout.getvalue())
         self.assertEqual(result["status"], "success")
 
+    def test_thread_workers_get_distinct_progress_lanes_in_one_process(self):
+        lanes = []
+        for segment, thread_id in [(1, 101), (2, 202)]:
+            progress_queue = queue.Queue()
+            process = mock.Mock()
+            process.stdout = iter(["Processing video: 10%\n"])
+            process.wait.return_value = 0
+            with mock.patch.object(pvp.subprocess, "Popen", return_value=process):
+                with mock.patch.object(pvp, "aggressive_memory_cleanup_for_device"):
+                    with mock.patch.object(pvp.time, "sleep"):
+                        with mock.patch.object(pvp.os, "getpid", return_value=999):
+                            with mock.patch.object(
+                                pvp.threading,
+                                "get_ident",
+                                return_value=thread_id,
+                            ):
+                                pvp.process_segment_worker(
+                                    (
+                                        segment,
+                                        Path(f"input-{segment}.mp4"),
+                                        Path(f"output-{segment}.mp4"),
+                                    ),
+                                    self.worker_config(),
+                                    progress_queue,
+                                )
+            events = []
+            while not progress_queue.empty():
+                events.append(progress_queue.get_nowait())
+            lanes.append(next(event["lane"] for event in events if event["kind"] == "progress"))
+
+        self.assertNotEqual(lanes[0], lanes[1])
+
 
 if __name__ == "__main__":
     unittest.main()
