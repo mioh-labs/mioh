@@ -32,6 +32,8 @@ import json
 import gc
 import time
 import math
+import queue
+import re
 import signal
 import sys
 import atexit
@@ -120,6 +122,124 @@ COREAI_ENHANCER_MODELS = {
     'realesr-general-x4v3-coreai',
     'realesrgan-x4-coreai',
 }
+APP_PROGRESS_PREFIX = "@@LADA_PROGRESS@@"
+_PROGRESS_PERCENT_RE = re.compile(
+    r"(?:Processing video|ビデオの処理中):\s+(\d+(?:\.\d+)?)%"
+)
+
+
+def parse_progress_line(line: str) -> float | None:
+    match = _PROGRESS_PERCENT_RE.search(line)
+    return float(match.group(1)) if match else None
+
+
+class ParallelProgressRenderer:
+    def __init__(
+        self,
+        stream=sys.stdout,
+        app_protocol: bool = False,
+        min_interval: float = 0.25,
+    ):
+        self.stream = stream
+        self.app_protocol = app_protocol
+        self.min_interval = min_interval
+        self.active_lanes: dict[str, dict] = {}
+        self._last_emit: dict[str, float] = {}
+        self._rendered_line_count = 0
+        self._interactive = bool(
+            not app_protocol
+            and hasattr(stream, "isatty")
+            and stream.isatty()
+        )
+
+    def progress(self, event: dict) -> None:
+        lane = str(event["lane"])
+        self.active_lanes[lane] = dict(event)
+        now = time.monotonic()
+        last_emit = self._last_emit.get(lane)
+        if last_emit is not None and now - last_emit < self.min_interval:
+            return
+        self._last_emit[lane] = now
+        if self.app_protocol:
+            self._emit_protocol(event)
+        elif self._interactive:
+            self._redraw()
+        else:
+            self.stream.write(self._display_line(event) + "\n")
+            self.stream.flush()
+
+    def complete(self, lane: str, message: str) -> None:
+        self.active_lanes.pop(lane, None)
+        self._last_emit.pop(lane, None)
+        event = {"kind": "complete", "lane": lane, "text": message}
+        if self.app_protocol:
+            self._emit_protocol(event)
+        elif self._interactive:
+            self._clear_rendered_lines()
+            self.stream.write(message + "\n")
+            self._rendered_line_count = 0
+            self._redraw()
+        else:
+            self.stream.write(message + "\n")
+            self.stream.flush()
+
+    def log(self, message: str) -> None:
+        if self._interactive:
+            self._clear_rendered_lines()
+            self.stream.write(message + "\n")
+            self._rendered_line_count = 0
+            self._redraw()
+        else:
+            self.stream.write(message + "\n")
+            self.stream.flush()
+
+    def close(self) -> None:
+        if self._interactive and self._rendered_line_count:
+            self.stream.write("\n")
+            self.stream.flush()
+        self._rendered_line_count = 0
+
+    def _emit_protocol(self, event: dict) -> None:
+        payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+        self.stream.write(APP_PROGRESS_PREFIX + payload + "\n")
+        self.stream.flush()
+
+    def _display_line(self, event: dict) -> str:
+        segment = event.get("segment", "?")
+        return f"[segment {segment}] {event.get('text', '')}"
+
+    def _clear_rendered_lines(self) -> None:
+        if self._rendered_line_count:
+            self.stream.write(f"\x1b[{self._rendered_line_count}A")
+            for _ in range(self._rendered_line_count):
+                self.stream.write("\r\x1b[2K\n")
+            self.stream.write(f"\x1b[{self._rendered_line_count}A")
+
+    def _redraw(self) -> None:
+        self._clear_rendered_lines()
+        for event in self.active_lanes.values():
+            self.stream.write("\r\x1b[2K" + self._display_line(event) + "\n")
+        self._rendered_line_count = len(self.active_lanes)
+        self.stream.flush()
+
+
+def monitor_progress_events(progress_queue, renderer: ParallelProgressRenderer) -> None:
+    while True:
+        event = progress_queue.get()
+        kind = event.get('kind')
+        try:
+            if kind == 'stop':
+                return
+            if kind == 'progress':
+                renderer.progress(event)
+            elif kind == 'complete':
+                renderer.complete(str(event['lane']), str(event.get('text', '')))
+            elif kind == 'log':
+                renderer.log(str(event.get('text', '')))
+        except Exception:
+            text = str(event.get('text', ''))
+            if text:
+                print(text, flush=True)
 COREAI_V4_FAST_MODEL_PATH = (
     REPO_ROOT / 'model_weights' / 'lada_mosaic_detection_model_v4_fast-fp16.aimodel'
 )
@@ -333,10 +453,11 @@ def aggressive_memory_cleanup_for_device(device: str):
     time.sleep(0.05)
 
 
-def process_segment_worker(segment_info, config: WorkerRuntimeConfig):
+def process_segment_worker(segment_info, config: WorkerRuntimeConfig, progress_queue=None):
     idx, input_path, output_path = segment_info
     input_path = Path(input_path)
     output_path = Path(output_path)
+    lane = f"worker-{os.getpid()}"
 
     with _spawn_semaphore:
         time.sleep(2.0)
@@ -344,6 +465,7 @@ def process_segment_worker(segment_info, config: WorkerRuntimeConfig):
     if output_path.exists() and not config.overwrite:
         return {
             'idx': idx,
+            'lane': lane,
             'output_path': str(output_path),
             'status': 'skipped',
             'elapsed': 0.0,
@@ -352,7 +474,11 @@ def process_segment_worker(segment_info, config: WorkerRuntimeConfig):
 
     start_time = time.time()
     worker_name = f"PID:{os.getpid()}"
-    print(f"[並列処理] セグメント #{idx} 開始 (ワーカー: {worker_name})", flush=True)
+    start_message = f"[並列処理] セグメント #{idx} 開始 (ワーカー: {worker_name})"
+    if progress_queue is None:
+        print(start_message, flush=True)
+    else:
+        progress_queue.put({'kind': 'log', 'text': start_message})
 
     cmd = build_lada_cli_command(config, input_path, output_path)
     env = build_worker_env(config)
@@ -377,21 +503,40 @@ def process_segment_worker(segment_info, config: WorkerRuntimeConfig):
             if not line:
                 continue
             if 'Processing video:' in line:
-                print(f"\r  {line}", end='', flush=True)
+                percent = parse_progress_line(line)
+                event = {
+                    'kind': 'progress',
+                    'lane': lane,
+                    'segment': idx,
+                    'text': line,
+                    'percent': percent,
+                }
+                if progress_queue is None:
+                    print(f"\r  {line}", end='', flush=True)
+                else:
+                    try:
+                        progress_queue.put(event)
+                    except Exception:
+                        print(f"\r  {line}", end='', flush=True)
             else:
                 recent_lines.append(line)
                 if 'error' in line.lower() or 'warning' in line.lower():
-                    print(f"\n  {line}", flush=True)
+                    if progress_queue is None:
+                        print(f"\n  {line}", flush=True)
+                    else:
+                        progress_queue.put({'kind': 'log', 'text': f"  {line}"})
 
         return_code = process.wait()
         if return_code != 0:
             raise subprocess.CalledProcessError(return_code, cmd)
 
-        print()
         elapsed = time.time() - start_time
-        print(f"[並列処理] セグメント #{idx} 完了 ({elapsed:.1f}秒)", flush=True)
+        if progress_queue is None:
+            print()
+            print(f"[並列処理] セグメント #{idx} 完了 ({elapsed:.1f}秒)", flush=True)
         return {
             'idx': idx,
+            'lane': lane,
             'output_path': str(output_path),
             'status': 'success',
             'elapsed': elapsed,
@@ -407,6 +552,7 @@ def process_segment_worker(segment_info, config: WorkerRuntimeConfig):
                 print(f"  | {output_line}", flush=True)
         return {
             'idx': idx,
+            'lane': lane,
             'output_path': None,
             'status': 'error',
             'elapsed': time.time() - start_time,
@@ -416,6 +562,7 @@ def process_segment_worker(segment_info, config: WorkerRuntimeConfig):
         print(f"\n[ERROR] 予期しないエラー: {e}", flush=True)
         return {
             'idx': idx,
+            'lane': lane,
             'output_path': None,
             'status': 'error',
             'elapsed': time.time() - start_time,
@@ -1713,12 +1860,33 @@ class ParallelVideoProcessor:
             # 未処理のセグメントのみを並列処理
             if tasks:
                 worker_config = self._build_worker_runtime_config()
+                progress_manager = None
+                if self.args.executor == "thread":
+                    progress_queue = queue.Queue()
+                else:
+                    progress_manager = mp.get_context("spawn").Manager()
+                    progress_queue = progress_manager.Queue()
+                progress_renderer = ParallelProgressRenderer(
+                    app_protocol=os.environ.get("LADA_APP_PROGRESS") == "1"
+                )
+                progress_monitor = threading.Thread(
+                    target=monitor_progress_events,
+                    args=(progress_queue, progress_renderer),
+                    name="lada-progress-renderer",
+                    daemon=True,
+                )
+                progress_monitor.start()
                 executor = create_parallel_executor(self.args)
                 _set_active_executor(executor)
                 try:
                     # 全タスクを投入
                     future_to_task = {
-                        executor.submit(process_segment_worker, task, worker_config): task
+                        executor.submit(
+                            process_segment_worker,
+                            task,
+                            worker_config,
+                            progress_queue,
+                        ): task
                         for task in tasks
                     }
                     
@@ -1734,6 +1902,7 @@ class ParallelVideoProcessor:
                         try:
                             result = future.result()
                             idx = result['idx']
+                            lane = result['lane']
                             output_path_seg = Path(result['output_path']) if result['output_path'] else None
                             status = result['status']
                             if output_path_seg is not None:
@@ -1761,19 +1930,35 @@ class ParallelVideoProcessor:
                                 progress_msg = (f"🚀 進捗: {progress:5.1f}% [{self.stats['processed'] + self.stats['skipped']:3d}/{self.stats['total_segments']:3d}] "
                                       f"(新規: {self.stats['processed']:2d}, スキップ: {self.stats['skipped']:2d}) "
                                       f"| 推定残り: {eta_str}")
-                                
-                                # 常に改行表示（並列処理では上書きは混乱する）
-                                print(progress_msg, flush=True)
+
+                                completion_message = (
+                                    f"[並列処理] セグメント #{idx} 完了"
+                                    if status != 'error'
+                                    else f"[並列処理] セグメント #{idx} エラー"
+                                )
+                                progress_queue.put({
+                                    'kind': 'complete',
+                                    'lane': lane,
+                                    'text': completion_message,
+                                })
+                                progress_queue.put({'kind': 'log', 'text': progress_msg})
                             if status == 'error':
-                                self.safe_print(f"[並列処理] セグメント #{idx} エラー: {result['error']}")
+                                progress_queue.put({
+                                    'kind': 'log',
+                                    'text': f"[並列処理] セグメント #{idx} エラー: {result['error']}",
+                                })
                             
                         except Exception as e:
-                            self.safe_print(f"\n[エラー] タスク {task[0]} 失敗: {e}")
-                    
-                    print()  # 改行
+                            progress_queue.put({
+                                'kind': 'log',
+                                'text': f"[エラー] タスク {task[0]} 失敗: {e}",
+                            })
                 
                 except KeyboardInterrupt:
-                    print("\n\n🛑 KeyboardInterruptを受信。並列処理を即座に停止します...")
+                    progress_queue.put({
+                        'kind': 'log',
+                        'text': "🛑 KeyboardInterruptを受信。並列処理を即座に停止します...",
+                    })
                     # 即座にシャットダウン（実行中タスクをキャンセル）
                     _shutdown_executor(executor, wait=False, cancel_futures=True)
                     raise
@@ -1782,6 +1967,11 @@ class ParallelVideoProcessor:
                     # 必ずexecutorをクリーンアップ
                     _shutdown_executor(executor, wait=True)
                     _set_active_executor(None)
+                    progress_queue.put({'kind': 'stop'})
+                    progress_monitor.join(timeout=5)
+                    progress_renderer.close()
+                    if progress_manager is not None:
+                        progress_manager.shutdown()
                 
                 # 並列処理完了後、強制的にメモリクリーンアップ
                 print("\n並列処理完了、メモリを解放中...")
