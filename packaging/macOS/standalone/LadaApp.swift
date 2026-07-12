@@ -1,6 +1,17 @@
 import AppKit
 import CoreAI
+import Foundation
 import SwiftUI
+
+private let appProgressPrefix = "@@LADA_PROGRESS@@"
+
+struct AppProgressEvent: Decodable {
+  let kind: String
+  let lane: String
+  let segment: Int?
+  let text: String
+  let percent: Double?
+}
 
 @MainActor
 final class RestorationRunner: ObservableObject {
@@ -76,7 +87,10 @@ final class RestorationRunner: ObservableObject {
   @Published var logMPSMemory = false
 
   private var process: Process?
-  private var outputBuffer = ""
+  private var lineBuffer = ""
+  private var logHistory = ""
+  private var activeProgress: [String: AppProgressEvent] = [:]
+  private var activeProgressOrder: [String] = []
 
   let encodingPresets = [
     "h264-cpu-uhq", "h264-cpu-fast", "h264-apple-gpu-balanced",
@@ -162,6 +176,14 @@ final class RestorationRunner: ObservableObject {
         pipe.fileHandleForReading.readabilityHandler = nil
         Task { @MainActor in
           guard let self else { return }
+          if !self.lineBuffer.isEmpty {
+            let finalLine = self.lineBuffer
+            self.lineBuffer = ""
+            self.consumeLine(finalLine)
+          }
+          self.activeProgress.removeAll()
+          self.activeProgressOrder.removeAll()
+          self.rebuildVisibleLog()
           self.isRunning = false
           self.process = nil
           if completed.terminationStatus == 0 {
@@ -175,7 +197,10 @@ final class RestorationRunner: ObservableObject {
         }
       }
 
-      outputBuffer = ""
+      lineBuffer = ""
+      logHistory = ""
+      activeProgress.removeAll()
+      activeProgressOrder.removeAll()
       log = ""
       progress = 0
       status = "準備中"
@@ -290,6 +315,7 @@ final class RestorationRunner: ObservableObject {
     result["PYTHONWARNINGS"] = "ignore::SyntaxWarning"
     result["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
     result["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
+    result["LADA_APP_PROGRESS"] = "1"
     return result
   }
 
@@ -310,26 +336,97 @@ final class RestorationRunner: ObservableObject {
   }
 
   private func consume(_ text: String) {
-    outputBuffer += text
-    appendLog(text.replacingOccurrences(of: "\r", with: "\n"))
-    let range = NSRange(outputBuffer.startIndex..., in: outputBuffer)
+    let normalized = text
+      .replacingOccurrences(of: "\r\n", with: "\n")
+      .replacingOccurrences(of: "\r", with: "\n")
+    lineBuffer += normalized
+    while let newline = lineBuffer.firstIndex(of: "\n") {
+      let line = String(lineBuffer[..<newline])
+      lineBuffer.removeSubrange(...newline)
+      consumeLine(line)
+    }
+  }
+
+  private func consumeLine(_ line: String) {
+    if line.hasPrefix(appProgressPrefix) {
+      let payload = String(line.dropFirst(appProgressPrefix.count))
+      if let data = payload.data(using: .utf8),
+        let event = try? JSONDecoder().decode(AppProgressEvent.self, from: data),
+        event.kind == "progress" || event.kind == "complete"
+      {
+        consumeProgressEvent(event)
+        return
+      }
+    }
+    appendLog(line + "\n")
+    updateProgress(from: line)
+  }
+
+  private func consumeProgressEvent(_ event: AppProgressEvent) {
+    if event.kind == "progress" {
+      if activeProgress[event.lane] == nil {
+        activeProgressOrder.append(event.lane)
+      }
+      activeProgress[event.lane] = event
+      if let percent = event.percent {
+        setProgress(percent)
+      }
+    } else if event.kind == "complete" {
+      activeProgress.removeValue(forKey: event.lane)
+      activeProgressOrder.removeAll { $0 == event.lane }
+      if !event.text.isEmpty {
+        logHistory += event.text + "\n"
+        trimLogHistory()
+      }
+    }
+    rebuildVisibleLog()
+  }
+
+  private func updateProgress(from text: String) {
+    let range = NSRange(text.startIndex..., in: text)
     let patterns = [#"(?:Processing video|ビデオの処理中):\s+(\d+)%"#, #"進捗:\s+(\d+(?:\.\d+)?)%"#]
     for pattern in patterns {
       let regex = try? NSRegularExpression(pattern: pattern)
-      if let match = regex?.matches(in: outputBuffer, range: range).last,
-        let percentRange = Range(match.range(at: 1), in: outputBuffer),
-        let percent = Double(outputBuffer[percentRange])
+      if let match = regex?.matches(in: text, range: range).last,
+        let percentRange = Range(match.range(at: 1), in: text),
+        let percent = Double(text[percentRange])
       {
-        progress = min(max(percent / 100, 0), 1)
-        status = "処理中 \(Int(percent))%"
+        setProgress(percent)
       }
     }
-    if outputBuffer.count > 40_000 { outputBuffer = String(outputBuffer.suffix(20_000)) }
+  }
+
+  private func setProgress(_ percent: Double) {
+    progress = min(max(percent / 100, 0), 1)
+    status = "処理中 \(Int(percent))%"
   }
 
   private func appendLog(_ text: String) {
-    log += text
-    if log.count > 30_000 { log = String(log.suffix(20_000)) }
+    logHistory += text
+    trimLogHistory()
+    rebuildVisibleLog()
+  }
+
+  private func trimLogHistory() {
+    if logHistory.count > 30_000 {
+      logHistory = String(logHistory.suffix(20_000))
+    }
+  }
+
+  private func rebuildVisibleLog() {
+    let activeLines = activeProgressOrder.compactMap { lane -> String? in
+      guard let event = activeProgress[lane] else { return nil }
+      if let segment = event.segment {
+        return "[segment \(segment)] \(event.text)"
+      }
+      return event.text
+    }
+    if activeLines.isEmpty {
+      log = logHistory
+    } else {
+      let separator = logHistory.isEmpty || logHistory.hasSuffix("\n") ? "" : "\n"
+      log = logHistory + separator + activeLines.joined(separator: "\n")
+    }
   }
 
   private func resourceDirectory() throws -> URL {

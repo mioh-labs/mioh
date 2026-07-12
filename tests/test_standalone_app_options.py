@@ -39,6 +39,16 @@ class StandaloneAppOptionTests(unittest.TestCase):
         script = BUILD_SCRIPT.read_text()
         self.assertIn("process_video_parallel.py", script)
 
+    def test_app_replaces_structured_progress_rows(self):
+        source = APP_SOURCE.read_text()
+
+        self.assertIn('result["LADA_APP_PROGRESS"] = "1"', source)
+        self.assertIn("struct AppProgressEvent: Decodable", source)
+        self.assertIn('"@@LADA_PROGRESS@@"', source)
+        self.assertIn("activeProgress", source)
+        self.assertIn("logHistory", source)
+        self.assertIn("rebuildVisibleLog()", source)
+
 
 if __name__ == "__main__":
     unittest.main()
