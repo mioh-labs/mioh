@@ -45,7 +45,7 @@ Avoid: gradients, shadows, bevels, 3D, decorative objects, watermark, mockup fra
 
 - [ ] **Step 2: Inspect the output**
 
-Verify that `mio` is legible, the `i` dot remains, the `h` shares the `i` stem, and no separate trailing `h` or extra text appears.
+Verify that `m`, the enclosing `h/i` construction, and the final `o` are legible; the complete dotted `i` sits inside the `h`; both outer legs of `h` remain visible; and no extra text appears.
 
 - [ ] **Step 3: Present the preview**
 
