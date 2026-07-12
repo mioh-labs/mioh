@@ -39,6 +39,7 @@ import sys
 import atexit
 import multiprocessing as mp
 from multiprocessing import resource_tracker
+from multiprocessing.managers import SyncManager
 import warnings
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import threading
@@ -240,6 +241,13 @@ def monitor_progress_events(progress_queue, renderer: ParallelProgressRenderer) 
             text = str(event.get('text', ''))
             if text:
                 print(text, flush=True)
+
+
+def create_progress_manager() -> SyncManager:
+    context = mp.get_context("spawn")
+    manager = SyncManager(address=("127.0.0.1", 0), ctx=context)
+    manager.start()
+    return manager
 COREAI_V4_FAST_MODEL_PATH = (
     REPO_ROOT / 'model_weights' / 'lada_mosaic_detection_model_v4_fast-fp16.aimodel'
 )
@@ -1871,7 +1879,7 @@ class ParallelVideoProcessor:
                 if self.args.executor == "thread":
                     progress_queue = queue.Queue()
                 else:
-                    progress_manager = mp.get_context("spawn").Manager()
+                    progress_manager = create_progress_manager()
                     progress_queue = progress_manager.Queue()
                 progress_renderer = ParallelProgressRenderer(
                     app_protocol=os.environ.get("LADA_APP_PROGRESS") == "1"
