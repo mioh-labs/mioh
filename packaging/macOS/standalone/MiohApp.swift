@@ -314,6 +314,7 @@ final class RestorationRunner: ObservableObject {
     result["PYTHONDONTWRITEBYTECODE"] = "1"
     result["PYTHONWARNINGS"] = "ignore::SyntaxWarning"
     result["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+    result["LADA_DEFORM_CONV_BACKEND"] = "mps_deform_conv"
     result["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
     result["LADA_APP_PROGRESS"] = "1"
     return result

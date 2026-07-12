@@ -12,6 +12,8 @@ PYTHON_SOURCE="${PYTHON_SOURCE:A}"
 SITE_PACKAGES="$ROOT/.venv-coreai/lib/python3.12/site-packages"
 COMPILED_MODELS="${COMPILED_MODELS:-$BUILD_DIR/compiled-models}"
 FFMPEG_CACHE="${FFMPEG_CACHE:-$BUILD_DIR/ffmpeg-static}"
+VENDORED_MPS_DEFORM_CONV="$PACKAGE_DIR/vendor/mps-deform-conv-0.2.2"
+MPS_DEFORM_BUILD_SOURCE="$BUILD_DIR/mps-deform-conv-source"
 
 rm -rf "$APP" "$BUILD_DIR/Lada.app"
 rm -f "$BUILD_DIR/Lada-0.11.0-unsigned.dmg"
@@ -49,6 +51,19 @@ uv pip install \
   --no-deps \
   --reinstall \
   "$ROOT"
+rm -rf "$MPS_DEFORM_BUILD_SOURCE"
+ditto "$VENDORED_MPS_DEFORM_CONV" "$MPS_DEFORM_BUILD_SOURCE"
+uv pip install \
+  --python "$RESOURCES/runtime/bin/python3.12" \
+  --break-system-packages \
+  --no-deps \
+  --no-build-isolation \
+  --reinstall \
+  "$MPS_DEFORM_BUILD_SOURCE"
+PYTHONHOME="$RESOURCES/runtime" \
+PYTHONPATH="$RESOURCES/runtime/lib/python3.12/site-packages" \
+  "$RESOURCES/runtime/bin/python3.12" \
+  "$PACKAGE_DIR/verify_mps_deform_conv.py"
 cp "$ROOT/process_video_parallel.py" \
   "$RESOURCES/runtime/lib/python3.12/site-packages/process_video_parallel.py"
 rm -f "$RESOURCES/runtime/lib/python3.12/site-packages/lada-0.11.0.dist-info/direct_url.json"
@@ -119,6 +134,7 @@ for model in "$COMPILED_MODELS"/*.aimodelc; do
 done
 cp "$ROOT/LICENSE.md" "$RESOURCES/LICENSE.md"
 ditto "$ROOT/LICENSES" "$RESOURCES/LICENSES"
+cp "$VENDORED_MPS_DEFORM_CONV/LICENSE" "$RESOURCES/LICENSES/mps-deform-conv.txt"
 
 ICONSET="$BUILD_DIR/AppIcon.iconset"
 rm -rf "$ICONSET"
