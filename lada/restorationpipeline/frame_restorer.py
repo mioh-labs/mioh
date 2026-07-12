@@ -14,7 +14,6 @@ import types
 
 import cv2
 import torch
-import torch.nn.functional as F
 import numpy as np
 
 from lada import LOG_LEVEL
@@ -71,98 +70,6 @@ def apply_restore_smoothing(image: np.ndarray, strength: float, sigma: float = 1
     strength = min(strength, 1.0)
     blurred = cv2.GaussianBlur(image, (0, 0), sigmaX=sigma, sigmaY=sigma)
     return cv2.addWeighted(image, 1.0 - strength, blurred, strength, 0)
-
-
-def get_outward_feather_pixels(frame_height: int, multiplier: float) -> int:
-    """Use a 20 px seam at 1080p and scale it with output resolution."""
-    if multiplier <= 0:
-        return 0
-    return max(1, int(round(20.0 * frame_height / 1080.0 * multiplier)))
-
-
-def get_inner_feather_pixels(frame_height: int, multiplier: float) -> int:
-    """Use a narrow 6 px inward blend at 1080p to hide the mask edge."""
-    if multiplier <= 0:
-        return 0
-    return max(1, int(round(6.0 * frame_height / 1080.0 * multiplier)))
-
-
-def _gaussian_blur_tensor(image: torch.Tensor, sigma: float) -> torch.Tensor:
-    source = image.to(dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
-    height, width = image.shape[:2]
-    radius = min(max(1, int(round(sigma * 3.0))), max(1, min(height, width) - 1))
-    coordinates = torch.arange(-radius, radius + 1, device=image.device, dtype=torch.float32)
-    kernel = torch.exp(-(coordinates ** 2) / (2.0 * sigma ** 2))
-    kernel /= kernel.sum()
-    channels = source.shape[1]
-    horizontal = kernel.view(1, 1, 1, -1).expand(channels, 1, 1, -1)
-    vertical = kernel.view(1, 1, -1, 1).expand(channels, 1, -1, 1)
-    pad_mode = 'reflect' if radius < min(height, width) else 'replicate'
-    source = F.pad(source, (radius, radius, 0, 0), mode=pad_mode)
-    source = F.conv2d(source, horizontal, groups=channels)
-    source = F.pad(source, (0, 0, radius, radius), mode=pad_mode)
-    source = F.conv2d(source, vertical, groups=channels)
-    return source.squeeze(0).permute(1, 2, 0)
-
-
-def composite_restored_region(
-    original,
-    restored,
-    mask,
-    outward_feather_pixels: int,
-    inner_feather_pixels: int = 0,
-):
-    """Blend a narrow inner edge and soften the seam farther outside."""
-    if isinstance(original, torch.Tensor):
-        mask_bool = mask.squeeze() > 0
-        inner = mask_utils.create_inner_feather_mask(
-            mask,
-            inner_feather_pixels,
-        ).to(device=original.device, dtype=torch.float32)
-        original_f = original.to(dtype=torch.float32)
-        restored_f = restored.to(device=original.device, dtype=torch.float32)
-        base = original_f + (restored_f - original_f) * inner.unsqueeze(-1)
-        if outward_feather_pixels <= 0 or not mask_bool.any():
-            if not original.dtype.is_floating_point:
-                base = base.round().clamp(0, 255)
-            return base.to(dtype=original.dtype)
-        sigma = max(0.5, outward_feather_pixels / 3.0)
-        blurred = _gaussian_blur_tensor(base, sigma)
-        feather = mask_utils.create_outward_feather_mask(
-            mask,
-            outward_feather_pixels,
-        ).to(device=original.device, dtype=torch.float32)
-        outside = original_f + (blurred - original_f) * feather.unsqueeze(-1)
-        result = torch.where(mask_bool.unsqueeze(-1), base, outside)
-        if not original.dtype.is_floating_point:
-            result = result.round().clamp(0, 255)
-        return result.to(dtype=original.dtype)
-
-    mask_bool = np.squeeze(mask) > 0
-    inner = mask_utils.create_inner_feather_mask(
-        torch.from_numpy(mask),
-        inner_feather_pixels,
-    ).numpy()
-    original_f = original.astype(np.float32)
-    restored_f = restored.astype(np.float32)
-    base = original_f + (restored_f - original_f) * inner[:, :, None]
-    if outward_feather_pixels <= 0 or not mask_bool.any():
-        if np.issubdtype(original.dtype, np.integer):
-            base = np.rint(base)
-            base = np.clip(base, 0, np.iinfo(original.dtype).max)
-        return base.astype(original.dtype)
-    sigma = max(0.5, outward_feather_pixels / 3.0)
-    blurred = cv2.GaussianBlur(base, (0, 0), sigmaX=sigma, sigmaY=sigma)
-    feather = mask_utils.create_outward_feather_mask(
-        torch.from_numpy(mask),
-        outward_feather_pixels,
-    ).numpy()
-    result = original_f + (blurred - original_f) * feather[:, :, None]
-    result[mask_bool] = base[mask_bool]
-    if np.issubdtype(original.dtype, np.integer):
-        result = np.rint(result)
-        result = np.clip(result, 0, np.iinfo(original.dtype).max)
-    return result.astype(original.dtype)
 
 
 def _normalize_roi_mask(mask: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
@@ -642,38 +549,29 @@ class FrameRestorer:
         Pops starting frame from each restored clip in the process if they actually start at the same frame number as frame.
         """
         is_cpu_input = frame.device.type == 'cpu'
-        feather_pixels = get_outward_feather_pixels(
-            frame.shape[0],
-            self.restore_blend_feather,
-        )
-        inner_feather_pixels = get_inner_feather_pixels(
-            frame.shape[0],
-            self.restore_blend_feather,
-        )
+        target_dtype = torch.float32 if is_cpu_input else self.mosaic_restoration_model.dtype
 
-        def _blend_gpu(clip_img: torch.Tensor, clip_mask: torch.Tensor, orig_clip_box: tuple[int, int, int, int]):
+        def _blend_gpu(blend_mask: torch.Tensor, clip_img: torch.Tensor, orig_clip_box: tuple[int, int, int, int]):
             t, l, b, r = orig_clip_box
             frame_roi = frame[t:b + 1, l:r + 1, :]
-            frame_roi[:] = composite_restored_region(
-                frame_roi,
-                clip_img.to(device=frame_roi.device),
-                clip_mask.to(device=frame_roi.device),
-                feather_pixels,
-                inner_feather_pixels,
-            )
+            roi_f = frame_roi.to(dtype=self.mosaic_restoration_model.dtype)
+            temp = clip_img.to(dtype=self.mosaic_restoration_model.dtype, device=frame_roi.device)
+            temp.sub_(roi_f)
+            temp.mul_(blend_mask.unsqueeze(-1))
+            temp.add_(roi_f)
+            temp.round_().clamp_(0, 255)
+            frame_roi[:] = temp
 
-        def _blend_cpu(clip_img: torch.Tensor, clip_mask: torch.Tensor, orig_clip_box: tuple[int, int, int, int]):
+        def _blend_cpu(blend_mask: torch.Tensor, clip_img: torch.Tensor, orig_clip_box: tuple[int, int, int, int]):
+            blend_mask = blend_mask.cpu().numpy()
+            clip_img = clip_img.cpu().numpy()
             t, l, b, r = orig_clip_box
             frame_roi = frame[t:b + 1, l:r + 1, :].numpy()
-            clip_img_np = clip_img.cpu().numpy() if isinstance(clip_img, torch.Tensor) else clip_img
-            clip_mask_np = clip_mask.cpu().numpy() if isinstance(clip_mask, torch.Tensor) else clip_mask
-            frame_roi[:] = composite_restored_region(
-                frame_roi,
-                clip_img_np,
-                clip_mask_np,
-                feather_pixels,
-                inner_feather_pixels,
-            )
+            temp_buffer = np.empty_like(frame_roi, dtype=np.float32)
+            np.subtract(clip_img, frame_roi, out=temp_buffer, dtype=np.float32)
+            np.multiply(temp_buffer, blend_mask[..., None], out=temp_buffer)
+            np.add(temp_buffer, frame_roi, out=temp_buffer)
+            frame_roi[:] = temp_buffer.astype(np.uint8)
             
         blend = _blend_cpu if is_cpu_input else _blend_gpu
 
@@ -763,7 +661,11 @@ class FrameRestorer:
                         smooth_strength=self.restore_smooth_strength,
                     )
                     clip_img = _apply_mask_to_processed(base_clip_img, clip_img, clip_mask)
-            blend(clip_img, clip_mask, orig_clip_box)
+            blend_mask = mask_utils.create_blend_mask(
+                clip_mask.float(),
+                feather_multiplier=self.restore_blend_feather,
+            ).to(device=clip_img.device, dtype=target_dtype)
+            blend(blend_mask, clip_img, orig_clip_box)
 
     def _restore_clip(self, clip: Clip):
         """

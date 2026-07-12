@@ -943,6 +943,7 @@ def get_pre_fps_encoder_options(encoder_options: str | None) -> list[str]:
         '-realtime',
         '-prio_speed',
         '-spatial_aq',
+        '-pix_fmt',
         '-frames_before',
         '-frames_after',
     }
@@ -2199,7 +2200,7 @@ def build_arg_parser():
     parser.add_argument('--restore-detail-boost', type=float, default=0.0,
                         help='復元ROIの局所ディテール/コントラストを合成前に強める強度（0で無効、例: 0.15）')
     parser.add_argument('--restore-blend-feather', type=float, default=1.0,
-                        help='復元境界のフェザー倍率。1.0は1080pで内側6px・外側20px、解像度比例（0で無効）')
+                        help='復元ROI境界ブレンドのぼかし倍率（1.0で標準、例: 1.0〜1.5）')
     parser.add_argument('--restore-texture-mix', type=float, default=0.0,
                         help='元ROIの中周波テクスチャを復元ROIへ薄く戻す強度（0で無効、例: 0.08）')
     parser.add_argument('--restore-smooth-strength', type=float, default=0.0,
