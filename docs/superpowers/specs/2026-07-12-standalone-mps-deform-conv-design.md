@@ -19,7 +19,7 @@ Installing the upstream 0.2.2 source unchanged is not sufficient. Its native ext
 
 ## Standalone build integration
 
-After copying `.venv-coreai` and installing Lada into the application runtime, `build_app.sh` installs the vendored package with the bundled Python interpreter:
+After copying `.venv-coreai` and installing Lada into the application runtime, `build_app.sh` copies the immutable vendored source into the ignored build directory and installs that staging copy with the bundled Python interpreter. This prevents setuptools build artifacts from modifying the checked-in upstream source:
 
 ```zsh
 uv pip install \
@@ -28,7 +28,7 @@ uv pip install \
   --no-deps \
   --no-build-isolation \
   --reinstall \
-  "$PACKAGE_DIR/vendor/mps-deform-conv-0.2.2"
+  "$BUILD_DIR/mps-deform-conv-source"
 ```
 
 `--no-deps` prevents the package from replacing the bundled Torch build. `--no-build-isolation` ensures the extension compiles against the exact Torch headers and libraries shipped in `mioh.app`.

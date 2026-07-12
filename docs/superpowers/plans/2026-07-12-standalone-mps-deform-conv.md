@@ -151,18 +151,21 @@ Define:
 
 ```zsh
 VENDORED_MPS_DEFORM_CONV="$PACKAGE_DIR/vendor/mps-deform-conv-0.2.2"
+MPS_DEFORM_BUILD_SOURCE="$BUILD_DIR/mps-deform-conv-source"
 ```
 
 After installing Lada itself, add:
 
 ```zsh
+rm -rf "$MPS_DEFORM_BUILD_SOURCE"
+ditto "$VENDORED_MPS_DEFORM_CONV" "$MPS_DEFORM_BUILD_SOURCE"
 uv pip install \
   --python "$RESOURCES/runtime/bin/python3.12" \
   --break-system-packages \
   --no-deps \
   --no-build-isolation \
   --reinstall \
-  "$VENDORED_MPS_DEFORM_CONV"
+  "$MPS_DEFORM_BUILD_SOURCE"
 ```
 
 - [ ] **Step 4: Select it in the GUI environment**
