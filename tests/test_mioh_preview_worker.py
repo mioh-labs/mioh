@@ -1,6 +1,8 @@
 import importlib.util
 import io
 import json
+import shutil
+import subprocess
 import tempfile
 import unittest
 from fractions import Fraction
@@ -107,6 +109,57 @@ class SegmentEncoderTests(unittest.TestCase):
             self.assertEqual(attempts[:2], ["h264_videotoolbox", "libx264"])
             self.assertEqual(encoder.active_codec, "libx264")
             self.assertEqual(encoder.active_options.get("preset"), "ultrafast")
+
+    @unittest.skipUnless(shutil.which("ffprobe"), "ffprobe is required")
+    def test_ffprobe_reads_ordered_independent_segments(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            encoder = self.worker.SegmentEncoder(
+                output_dir=Path(temp_dir),
+                width=64,
+                height=48,
+                fps=Fraction(12, 1),
+                generation=4,
+                preferred_codec="libx264",
+                segment_seconds=2.0,
+            )
+            events = []
+            for index in range(60):
+                frame = np.full((48, 64, 3), index % 255, dtype=np.uint8)
+                events.extend(
+                    encoder.add_frame(frame, pts_ns=index * 1_000_000_000 // 12)
+                )
+            events.extend(encoder.finish())
+
+            self.assertEqual([event["sequence"] for event in events], [0, 1, 2])
+            self.assertEqual(
+                [Path(event["path"]).name for event in events],
+                [
+                    "preview-g4-000000.mp4",
+                    "preview-g4-000001.mp4",
+                    "preview-g4-000002.mp4",
+                ],
+            )
+            for event in events:
+                result = subprocess.run(
+                    [
+                        "ffprobe",
+                        "-v",
+                        "error",
+                        "-select_streams",
+                        "v:0",
+                        "-show_entries",
+                        "stream=codec_name,nb_frames",
+                        "-of",
+                        "json",
+                        event["path"],
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                stream = json.loads(result.stdout)["streams"][0]
+                self.assertEqual(stream["codec_name"], "h264")
+                self.assertGreater(int(stream["nb_frames"]), 0)
 
 
 class PreviewSessionTests(unittest.TestCase):

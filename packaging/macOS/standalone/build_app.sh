@@ -25,7 +25,10 @@ xcrun swiftc \
   -target arm64-apple-macosx26.0 \
   -framework AppKit \
   -framework SwiftUI \
+  -framework AVFoundation \
+  -framework AVKit \
   "$PACKAGE_DIR/MiohApp.swift" \
+  "$PACKAGE_DIR/RealtimePlayer.swift" \
   -o "$CONTENTS/MacOS/mioh"
 xcrun swiftc \
   -O \
@@ -65,6 +68,8 @@ PYTHONPATH="$RESOURCES/runtime/lib/python3.12/site-packages" \
   "$PACKAGE_DIR/verify_mps_deform_conv.py"
 cp "$ROOT/process_video_parallel.py" \
   "$RESOURCES/runtime/lib/python3.12/site-packages/process_video_parallel.py"
+cp "$PACKAGE_DIR/mioh_preview_worker.py" \
+  "$RESOURCES/runtime/lib/python3.12/site-packages/mioh_preview_worker.py"
 rm -f "$RESOURCES/runtime/lib/python3.12/site-packages/lada-0.11.0.dist-info/direct_url.json"
 
 mkdir -p "$FFMPEG_CACHE"

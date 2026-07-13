@@ -153,6 +153,17 @@ class StandaloneAppOptionTests(unittest.TestCase):
         script = BUILD_SCRIPT.read_text()
         self.assertIn("process_video_parallel.py", script)
 
+    def test_app_bundles_realtime_player_and_preview_worker(self):
+        script = BUILD_SCRIPT.read_text()
+
+        self.assertIn('"$PACKAGE_DIR/RealtimePlayer.swift"', script)
+        self.assertIn("-framework AVFoundation", script)
+        self.assertIn("-framework AVKit", script)
+        self.assertIn(
+            '"$RESOURCES/runtime/lib/python3.12/site-packages/mioh_preview_worker.py"',
+            script,
+        )
+
     def test_standalone_app_uses_mioh_icon(self):
         icon = ROOT / "lada" / "gui" / "icons" / "mioh-icon.png"
         script = BUILD_SCRIPT.read_text()
