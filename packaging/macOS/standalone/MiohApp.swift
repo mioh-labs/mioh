@@ -257,6 +257,42 @@ final class RestorationRunner: ObservableObject {
     NSWorkspace.shared.activateFileViewerSelecting([outputURL])
   }
 
+  func previewArguments(resources: URL, outputDirectory: URL) throws -> [String] {
+    normalizeModelSelections()
+    let restoration = try resolvedRestorationModel(in: resources)
+    let detection = try resolvedDetectionModel(in: resources)
+    if roiEnhancer != "none" { try rejectUnsupportedCoreAIModel(roiEnhancerModel) }
+    var args = ["--input", inputURL?.path ?? "", "--output-dir", outputDirectory.path]
+    add(&args, "--device", device)
+    args.append(fp16 ? "--fp16" : "--no-fp16")
+    add(&args, "--restoration-model", restoration)
+    add(&args, "--detection-model", detection)
+    let automaticClipLength: Int
+    switch restorationModel {
+    case "basicvsrpp-v1.2-coreai-t90": automaticClipLength = 178
+    case "basicvsrpp-v1.2-coreai-t36": automaticClipLength = 104
+    case "basicvsrpp-v1.2-coreai": automaticClipLength = 98
+    default: automaticClipLength = 180
+    }
+    add(&args, "--max-clip-length", useMaxClipLength ? maxClipLength : automaticClipLength)
+    if useRestoreMaxFrames { add(&args, "--restore-max-frames", restoreMaxFrames) }
+    add(&args, "--sharpen-strength", sharpenStrength)
+    add(&args, "--detail-boost", detailBoost)
+    add(&args, "--blend-feather", blendFeather)
+    add(&args, "--texture-mix", textureMix)
+    add(&args, "--smooth-strength", smoothStrength)
+    add(&args, "--roi-enhancer", roiEnhancer)
+    addOptional(&args, "--roi-enhancer-model", roiEnhancerModel)
+    add(&args, "--roi-enhancer-scale", roiEnhancerScale)
+    add(&args, "--roi-enhancer-strength", roiEnhancerStrength)
+    add(&args, "--roi-enhancer-tile", roiEnhancerTile)
+    add(&args, "--effect-upscale", effectUpscale)
+    add(&args, "--detection-empty-lookahead", detectionEmptyLookahead)
+    addFlag(&args, "--detect-face-mosaics", detectFaceMosaics)
+    add(&args, "--buffer-limit", 8.0)
+    return args
+  }
+
   private func processingArguments(resources: URL, input: URL, output: URL) throws -> [String] {
     var args = ["--input", input.path, "--output", output.path]
     add(&args, "--temp-dir", tempDirectory)
@@ -359,7 +395,7 @@ final class RestorationRunner: ObservableObject {
     }
   }
 
-  private func environment(resources: URL, python: URL) -> [String: String] {
+  func environment(resources: URL, python: URL) -> [String: String] {
     var result = ProcessInfo.processInfo.environment
     let sitePackages = resources.appendingPathComponent("runtime/lib/python3.12/site-packages")
     result["PYTHONHOME"] = resources.appendingPathComponent("runtime").path
@@ -465,6 +501,10 @@ final class RestorationRunner: ObservableObject {
     status = "処理中 \(Int(percent))%"
   }
 
+  func appendExternalLog(_ text: String) {
+    appendLog(text)
+  }
+
   private func appendLog(_ text: String) {
     logHistory += text
     trimLogHistory()
@@ -493,7 +533,7 @@ final class RestorationRunner: ObservableObject {
     }
   }
 
-  private func resourceDirectory() throws -> URL {
+  func resourceDirectory() throws -> URL {
     guard let resources = Bundle.main.resourceURL else {
       throw RunnerError.missingResource("App resources")
     }
@@ -556,6 +596,7 @@ struct PathSettingRow: View {
 
 struct ContentView: View {
   @StateObject private var runner = RestorationRunner()
+  @StateObject private var player = RealtimePlayerController()
 
   var body: some View {
     VStack(spacing: 0) {
@@ -568,6 +609,8 @@ struct ContentView: View {
         detectionTab.tabItem { Label("検出", systemImage: "viewfinder") }
         encodingTab.tabItem { Label("出力", systemImage: "video") }
         memoryTab.tabItem { Label("メモリ", systemImage: "memorychip") }
+        RealtimePlayerView(controller: player, runner: runner)
+          .tabItem { Label("再生", systemImage: "play.rectangle") }
         logTab.tabItem { Label("ログ", systemImage: "terminal") }
       }
       .padding(.horizontal, 14)
