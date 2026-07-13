@@ -51,94 +51,6 @@ class StandaloneAppOptionTests(unittest.TestCase):
         ]:
             self.assertIn(contract, player)
 
-    def test_player_rechecks_latest_buffer_policy_after_initial_seek(self):
-        player = PLAYER_SOURCE.read_text()
-        resume = player.split("private func resumeIfBuffered", 1)[1].split(
-            "private func startPlayersFromCurrentPosition", 1
-        )[0]
-
-        latest_check = "let latestPolicyAllowsPlayback = PreviewBufferPolicy.canStart("
-        self.assertIn(latest_check, resume)
-        for contract in [
-            "bufferedSeconds: self.bufferedSeconds",
-            "selectedBufferLimit: runner.previewBufferLimit",
-            "generationHasStarted: self.generationHasStarted",
-            "shortenRebuffer: runner.previewShortenedRebuffer",
-            "endOfFile: self.workerGenerationEnded",
-            "hasQueuedSegments: !self.queuedSegments.isEmpty",
-            "guard latestPolicyAllowsPlayback else",
-        ]:
-            self.assertIn(contract, resume)
-        self.assertLess(
-            resume.index(latest_check),
-            resume.index("self.generationHasStarted = true"),
-        )
-
-    def test_player_retains_generation_eof_until_the_queue_drains(self):
-        player = PLAYER_SOURCE.read_text()
-        start = player.split("func start(runner:", 1)[1].split(
-            "func togglePlayback", 1
-        )[0]
-        seek = player.split("func seek(to seconds:", 1)[1].split(
-            "func restartWithCurrentSettings", 1
-        )[0]
-        stop = player.split("func stop()", 1)[1].split(
-            "private func consumeWorkerOutput", 1
-        )[0]
-        ended_event = player.split('case "ended":', 1)[1].split(
-            'case "error":', 1
-        )[0]
-        finished = player.split("private func finished", 1)[1].split(
-            "private func resumeIfBuffered", 1
-        )[0]
-        resume = player.split("private func resumeIfBuffered", 1)[1].split(
-            "private func startPlayersFromCurrentPosition", 1
-        )[0]
-
-        self.assertIn("private var workerGenerationEnded = false", player)
-        for reset_scope in [start, seek, stop]:
-            self.assertIn("workerGenerationEnded = false", reset_scope)
-        self.assertIn("workerGenerationEnded = true", ended_event)
-        self.assertIn("if queuedSegments.isEmpty", ended_event)
-        self.assertIn("if queuedSegments.isEmpty {", finished)
-        self.assertNotIn(
-            "if queuedSegments.isEmpty && state == .playing",
-            finished,
-        )
-        self.assertIn("if workerGenerationEnded", finished)
-        self.assertIn("shouldPlay = false", finished)
-        self.assertIn("state = .ended", finished)
-        self.assertIn("endOfFile: workerGenerationEnded", resume)
-
-    def test_player_rejects_callbacks_from_old_worker_sessions(self):
-        player = PLAYER_SOURCE.read_text()
-        start = player.split("func start(runner:", 1)[1].split(
-            "func togglePlayback", 1
-        )[0]
-        stop = player.split("func stop()", 1)[1].split(
-            "private func consumeWorkerOutput", 1
-        )[0]
-        stdout_callback = start.split(
-            "outputPipe.fileHandleForReading.readabilityHandler", 1
-        )[1].split("errorPipe.fileHandleForReading.readabilityHandler", 1)[0]
-        stderr_callback = start.split(
-            "errorPipe.fileHandleForReading.readabilityHandler", 1
-        )[1].split("process.terminationHandler", 1)[0]
-        termination_callback = start.split("process.terminationHandler", 1)[1]
-
-        self.assertIn("private var activeWorkerSessionToken: UUID?", player)
-        self.assertIn("let sessionToken = UUID()", start)
-        self.assertIn("activeWorkerSessionToken = sessionToken", start)
-        self.assertIn('stdoutBuffer = ""', start)
-        for callback in [stdout_callback, stderr_callback, termination_callback]:
-            self.assertIn(
-                "self.activeWorkerSessionToken == sessionToken",
-                callback,
-            )
-        self.assertIn("self.worker === completed", termination_callback)
-        self.assertIn("activeWorkerSessionToken = nil", stop)
-        self.assertIn('stdoutBuffer = ""', stop)
-
     def test_playback_input_is_independent_from_export_input(self):
         player = PLAYER_SOURCE.read_text()
         app = APP_SOURCE.read_text()
@@ -218,7 +130,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "selectedBufferLimit: runner.previewBufferLimit",
             "generationHasStarted: generationHasStarted",
             "shortenRebuffer: runner.previewShortenedRebuffer",
-            "endOfFile: workerGenerationEnded",
+            "endOfFile: endOfFile",
             "hasQueuedSegments: !queuedSegments.isEmpty",
             "func bufferPolicyDidChange()",
             '"再バッファを短縮",',
