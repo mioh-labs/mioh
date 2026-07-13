@@ -299,7 +299,7 @@ def main():
     if detection_modelfile := ModelFiles.get_detection_model_by_name(args.mosaic_detection_model):
         mosaic_detection_model_path = detection_modelfile.path
     elif os.path.isfile(args.mosaic_detection_model) or (
-            args.mosaic_detection_model.endswith((".mlpackage", ".aimodel"))
+            args.mosaic_detection_model.endswith((".mlpackage", ".mlmodelc", ".aimodel"))
             and os.path.isdir(args.mosaic_detection_model)):
         mosaic_detection_model_path = args.mosaic_detection_model
     else:

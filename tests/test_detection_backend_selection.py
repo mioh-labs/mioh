@@ -49,6 +49,25 @@ class DetectionBackendSelectionTests(unittest.TestCase):
         torch_model.assert_not_called()
         coreml_model.assert_called_once()
 
+    def test_load_models_uses_coreml_backend_for_compiled_model_path(self):
+        with mock.patch("lada.restorationpipeline.Yolo11SegmentationModel") as torch_model:
+            with mock.patch("lada.models.yolo.yolo11_coreml_segmentation_model.Yolo11CoreMLSegmentationModel") as coreml_model:
+                with mock.patch("lada.models.basicvsrpp.inference.load_model") as load_model_mock:
+                    with mock.patch("lada.restorationpipeline.basicvsrpp_mosaic_restorer.BasicvsrppMosaicRestorer") as restorer_mock:
+                        load_model_mock.return_value = object()
+                        restorer_mock.return_value = object()
+                        load_models(
+                            torch.device("mps"),
+                            "basicvsrpp-v1.2",
+                            "restoration.pth",
+                            None,
+                            "detect.mlmodelc",
+                            False,
+                            False,
+                        )
+        torch_model.assert_not_called()
+        coreml_model.assert_called_once()
+
     def test_load_models_uses_coreai_backend_for_aimodel_path(self):
         with mock.patch("lada.restorationpipeline.Yolo11SegmentationModel") as torch_model:
             with mock.patch("lada.models.yolo.yolo11_coreai_segmentation_model.Yolo11CoreAISegmentationModel") as coreai_model:
