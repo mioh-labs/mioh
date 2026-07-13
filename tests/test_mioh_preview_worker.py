@@ -251,6 +251,26 @@ class PreviewSessionTests(unittest.TestCase):
             (Path(temp_dir) / "preview-g7-000000.mp4").unlink()
             self.assertTrue(session.has_buffer_capacity())
 
+    def test_buffer_capacity_excludes_active_encoder_segment(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = self.worker.PreviewSession(
+                self.make_config(),
+                Path(temp_dir),
+                model_loader=lambda _config: object(),
+                restorer_factory=lambda _config, _models: mock.Mock(),
+            )
+            session.generation = 7
+            for sequence in range(3):
+                (Path(temp_dir) / f"preview-g7-{sequence:06d}.mp4").touch()
+            active_path = Path(temp_dir) / "preview-g7-000003.mp4"
+            active_path.touch()
+            session.encoder = SimpleNamespace(segment_path=active_path)
+
+            self.assertTrue(session.has_buffer_capacity())
+
+            session.encoder.segment_path = None
+            self.assertFalse(session.has_buffer_capacity())
+
     def test_set_buffer_limit_emits_applied_value_acknowledgement(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             session = self.worker.PreviewSession(
