@@ -81,6 +81,7 @@ class Yolo11CoreMLSegmentationModelTests(unittest.TestCase):
             compute_units=mock.sentinel.cpu_and_ne,
         )
         self.assertIs(model.model.model, compiled_model)
+        self.assertEqual(model.model.names, {0: "nsfw"})
 
     def test_inference_merges_single_image_outputs(self):
         model, backend = make_model()
