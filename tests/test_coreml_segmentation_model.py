@@ -38,6 +38,32 @@ class Yolo11CoreMLSegmentationModelTests(unittest.TestCase):
         self.assertEqual(model.args.conf, 0.15)
         self.assertEqual(model.args.classes, [0])
 
+    def test_loads_coreml_model_once_with_selected_compute_unit(self):
+        ml_model = mock.Mock(return_value=object())
+        fake_coremltools = mock.Mock()
+        fake_coremltools.ComputeUnit.CPU_AND_NE = mock.sentinel.cpu_and_ne
+        fake_coremltools.models.MLModel = ml_model
+
+        def make_backend(*, model, **_kwargs):
+            backend = mock.Mock()
+            backend.task = "segment"
+            backend.model = fake_coremltools.models.MLModel(model)
+            return backend
+
+        with (
+            mock.patch.dict("sys.modules", {"coremltools": fake_coremltools}),
+            mock.patch(
+                "lada.models.yolo.yolo11_coreml_segmentation_model.AutoBackend",
+                side_effect=make_backend,
+            ),
+        ):
+            Yolo11CoreMLSegmentationModel("detect.mlpackage", torch.device("mps"))
+
+        ml_model.assert_called_once_with(
+            "detect.mlpackage",
+            compute_units=mock.sentinel.cpu_and_ne,
+        )
+
     def test_inference_merges_single_image_outputs(self):
         model, backend = make_model()
         det = torch.zeros(1, 38, 8400)
