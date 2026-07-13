@@ -78,13 +78,14 @@ final class RealtimePlayerController: ObservableObject {
   private var nextSequence = 0
   private var queuedSegments: [PreviewSegment] = []
   private var itemSegments: [ObjectIdentifier: PreviewSegment] = [:]
-  private var notificationTokens: [NSObjectProtocol] = []
+  private var notificationTokens: [ObjectIdentifier: NSObjectProtocol] = [:]
   private var timeObserver: Any?
   private var sessionDirectory: URL?
   private var requestedStartSeconds = 0.0
   private var shouldPlay = true
   private var generationHasStarted = false
   private var generationStartPending = false
+  private var generationSourceSeekCompleted = false
   private var workerGenerationEnded = false
   private weak var runner: RestorationRunner?
 
@@ -97,7 +98,7 @@ final class RealtimePlayerController: ObservableObject {
     if let timeObserver {
       sourcePlayer.removeTimeObserver(timeObserver)
     }
-    for token in notificationTokens {
+    for token in notificationTokens.values {
       NotificationCenter.default.removeObserver(token)
     }
   }
@@ -162,6 +163,7 @@ final class RealtimePlayerController: ObservableObject {
       shouldPlay = true
       generationHasStarted = false
       generationStartPending = false
+      generationSourceSeekCompleted = false
       workerGenerationEnded = false
       state = .loading
       errorMessage = ""
@@ -198,7 +200,7 @@ final class RealtimePlayerController: ObservableObject {
           }
         }
       }
-      installTimeObserver()
+      installTimeObserver(sessionToken: sessionToken)
       try process.run()
     } catch {
       fail(error.localizedDescription)
@@ -240,15 +242,18 @@ final class RealtimePlayerController: ObservableObject {
       position = seconds
       return
     }
+    guard let seekSessionToken = activeWorkerSessionToken else { return }
     shouldPlay = state != .paused
     sourcePlayer.pause()
     restoredPlayer.pause()
     position = min(max(seconds, 0), duration)
     requestedStartSeconds = position
     generation += 1
+    let seekGeneration = generation
     nextSequence = 0
     generationHasStarted = false
-    generationStartPending = false
+    generationStartPending = true
+    generationSourceSeekCompleted = false
     workerGenerationEnded = false
     clearRestoredQueue(deleteFiles: true)
     state = .seeking
@@ -256,7 +261,18 @@ final class RealtimePlayerController: ObservableObject {
       to: CMTime(seconds: position, preferredTimescale: 600),
       toleranceBefore: .zero,
       toleranceAfter: .zero
-    )
+    ) { [weak self] finished in
+      Task { @MainActor in
+        guard let self,
+          self.activeWorkerSessionToken == seekSessionToken,
+          self.generation == seekGeneration
+        else { return }
+        self.generationStartPending = false
+        guard finished else { return }
+        self.generationSourceSeekCompleted = true
+        self.resumeIfBuffered()
+      }
+    }
     sendCommand(["command": "seek", "position_ns": Int64(position * 1_000_000_000)])
   }
 
@@ -289,6 +305,7 @@ final class RealtimePlayerController: ObservableObject {
     shouldPlay = false
     generationHasStarted = false
     generationStartPending = false
+    generationSourceSeekCompleted = false
     workerGenerationEnded = false
     activeWorkerSessionToken = nil
     stdoutBuffer = ""
@@ -369,6 +386,8 @@ final class RealtimePlayerController: ObservableObject {
 
   private func enqueue(_ segment: PreviewSegment) {
     guard segment.sequence == nextSequence else { return }
+    guard let itemSessionToken = activeWorkerSessionToken else { return }
+    let itemGeneration = generation
     nextSequence += 1
     let item = AVPlayerItem(url: segment.url)
     let identifier = ObjectIdentifier(item)
@@ -380,14 +399,24 @@ final class RealtimePlayerController: ObservableObject {
       object: item,
       queue: .main
     ) { [weak self] _ in
-      Task { @MainActor in self?.finished(item: item) }
+      Task { @MainActor in
+        guard let self,
+          self.activeWorkerSessionToken == itemSessionToken,
+          self.generation == itemGeneration
+        else { return }
+        self.finished(item: item)
+      }
     }
-    notificationTokens.append(token)
+    notificationTokens[identifier] = token
     updateBufferedDuration()
   }
 
   private func finished(item: AVPlayerItem) {
-    guard let segment = itemSegments.removeValue(forKey: ObjectIdentifier(item)) else { return }
+    let identifier = ObjectIdentifier(item)
+    if let token = notificationTokens.removeValue(forKey: identifier) {
+      NotificationCenter.default.removeObserver(token)
+    }
+    guard let segment = itemSegments.removeValue(forKey: identifier) else { return }
     try? FileManager.default.removeItem(at: segment.url)
     queuedSegments.removeAll { $0.sequence == segment.sequence }
     updateBufferedDuration()
@@ -429,18 +458,28 @@ final class RealtimePlayerController: ObservableObject {
       startPlayersFromCurrentPosition()
       return
     }
+    if generationSourceSeekCompleted {
+      generationHasStarted = true
+      startPlayersFromCurrentPosition()
+      return
+    }
 
+    guard let startingSessionToken = activeWorkerSessionToken else { return }
     let startingGeneration = generation
     generationStartPending = true
     sourcePlayer.seek(
       to: CMTime(seconds: requestedStartSeconds, preferredTimescale: 600),
       toleranceBefore: .zero,
       toleranceAfter: .zero
-    ) { [weak self] _ in
+    ) { [weak self] finished in
       Task { @MainActor in
-        guard let self else { return }
-        guard self.generation == startingGeneration else { return }
+        guard let self,
+          self.activeWorkerSessionToken == startingSessionToken,
+          self.generation == startingGeneration
+        else { return }
         self.generationStartPending = false
+        guard finished else { return }
+        self.generationSourceSeekCompleted = true
         guard self.shouldPlay else { return }
         guard let runner = self.runner else { return }
         let latestPolicyAllowsPlayback = PreviewBufferPolicy.canStart(
@@ -467,7 +506,7 @@ final class RealtimePlayerController: ObservableObject {
     state = .playing
   }
 
-  private func installTimeObserver() {
+  private func installTimeObserver(sessionToken: UUID) {
     if let timeObserver {
       sourcePlayer.removeTimeObserver(timeObserver)
     }
@@ -475,7 +514,10 @@ final class RealtimePlayerController: ObservableObject {
       forInterval: CMTime(seconds: 0.2, preferredTimescale: 600),
       queue: .main
     ) { [weak self] time in
-      Task { @MainActor in self?.tick(sourceSeconds: time.seconds) }
+      Task { @MainActor in
+        guard let self, self.activeWorkerSessionToken == sessionToken else { return }
+        self.tick(sourceSeconds: time.seconds)
+      }
     }
   }
 
@@ -517,7 +559,7 @@ final class RealtimePlayerController: ObservableObject {
 
   private func clearRestoredQueue(deleteFiles: Bool) {
     restoredPlayer.removeAllItems()
-    for token in notificationTokens { NotificationCenter.default.removeObserver(token) }
+    for token in notificationTokens.values { NotificationCenter.default.removeObserver(token) }
     notificationTokens.removeAll()
     if deleteFiles {
       for segment in queuedSegments { try? FileManager.default.removeItem(at: segment.url) }
