@@ -268,11 +268,7 @@ final class RealtimePlayerController: ObservableObject {
           self.generation == seekGeneration
         else { return }
         self.generationStartPending = false
-        guard finished else {
-          self.state = .buffering
-          self.resumeIfBuffered()
-          return
-        }
+        guard finished else { return }
         self.generationSourceSeekCompleted = true
         self.resumeIfBuffered()
       }
@@ -482,11 +478,7 @@ final class RealtimePlayerController: ObservableObject {
           self.generation == startingGeneration
         else { return }
         self.generationStartPending = false
-        guard finished else {
-          self.state = .buffering
-          self.resumeIfBuffered()
-          return
-        }
+        guard finished else { return }
         self.generationSourceSeekCompleted = true
         guard self.shouldPlay else { return }
         guard let runner = self.runner else { return }
