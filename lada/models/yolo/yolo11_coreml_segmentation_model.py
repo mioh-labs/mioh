@@ -10,6 +10,7 @@ execution lock and restoration keeps the Metal queue to itself.
 """
 
 import logging
+import os
 
 import torch
 from ultralytics.cfg import get_cfg
@@ -57,39 +58,57 @@ class Yolo11CoreMLSegmentationModel(Yolo11SegmentationModel):
         self.args = get_cfg(DEFAULT_CFG, {**custom, **kwargs})
 
         self.device = torch.device("cpu")
-        self.model = AutoBackend(
-            model=model_path,
-            device=self.device,
-            dnn=self.args.dnn,
-            data=self.args.data,
-            fp16=False,
-            verbose=False,
-        )
+        self.model = self._load_backend(model_path)
         task = getattr(self.model, "task", None)
         if task != "segment":
             raise ValueError(f"Expected segment model, got {task!r}")
         self.model.eval()
         self.dtype = torch.float32
-        self._pin_compute_units(model_path)
 
-    def _pin_compute_units(self, model_path: str):
+    def _load_backend(self, model_path: str):
         """
-        Reload the underlying MLModel pinned to CPU+ANE. The default ALL
-        lets Core ML compile a Metal variant, which is flaky for this model
-        (MPSGraph MLIR assertion) and would contend with restoration for the
-        GPU. Override via LADA_COREML_COMPUTE_UNITS (e.g. ALL, CPU_ONLY).
+        Load the underlying MLModel once, pinned to CPU+ANE by default.
+
+        Ultralytics does not expose Core ML compute units through AutoBackend,
+        so temporarily wrap its MLModel constructor. Reloading the model after
+        AutoBackend initialization can block while Core ML tears down the first
+        model package on macOS.
         """
-        import os
         unit_name = os.environ.get("LADA_COREML_COMPUTE_UNITS", "CPU_AND_NE").upper()
-        if unit_name == "ALL":
-            return
         try:
             import coremltools as ct
             unit = getattr(ct.ComputeUnit, unit_name)
-            self.model.model = ct.models.MLModel(model_path, compute_units=unit)
-            logger.info("Core ML detection compute units pinned to %s", unit_name)
         except Exception as e:
-            logger.warning("Could not pin Core ML compute units to %s, keeping default: %s", unit_name, e)
+            logger.warning("Could not select Core ML compute units %s, keeping default: %s", unit_name, e)
+            return AutoBackend(
+                model=model_path,
+                device=self.device,
+                dnn=self.args.dnn,
+                data=self.args.data,
+                fp16=False,
+                verbose=False,
+            )
+
+        original_mlmodel = ct.models.MLModel
+
+        def load_mlmodel_once(*args, **kwargs):
+            kwargs.setdefault("compute_units", unit)
+            return original_mlmodel(*args, **kwargs)
+
+        ct.models.MLModel = load_mlmodel_once
+        try:
+            backend = AutoBackend(
+                model=model_path,
+                device=self.device,
+                dnn=self.args.dnn,
+                data=self.args.data,
+                fp16=False,
+                verbose=False,
+            )
+        finally:
+            ct.models.MLModel = original_mlmodel
+        logger.info("Core ML detection compute units pinned to %s", unit_name)
+        return backend
 
     def preprocess(self, imgs: list[ImageTensor]) -> torch.Tensor:
         imgs = [img if img.device.type == "cpu" else img.cpu() for img in imgs]
