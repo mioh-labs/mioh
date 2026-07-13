@@ -589,11 +589,11 @@ struct ContentView: View {
         }
       }
       Section("合成") {
-        doubleField("シャープ", value: $runner.sharpenStrength)
-        doubleField("ディテール", value: $runner.detailBoost)
-        doubleField("境界フェザー", value: $runner.blendFeather)
-        doubleField("テクスチャ", value: $runner.textureMix)
-        doubleField("スムージング", value: $runner.smoothStrength)
+        doubleSliderField("シャープ", value: $runner.sharpenStrength, range: 0...1, step: 0.05)
+        doubleSliderField("ディテール", value: $runner.detailBoost, range: 0...1, step: 0.05)
+        doubleSliderField("境界フェザー", value: $runner.blendFeather, range: 0...3, step: 0.05)
+        doubleSliderField("テクスチャ", value: $runner.textureMix, range: 0...1, step: 0.01)
+        doubleSliderField("スムージング", value: $runner.smoothStrength, range: 0...1, step: 0.05)
         LabeledContent("エフェクト倍率") { Stepper(value: $runner.effectUpscale, in: 1...4) { Text("\(runner.effectUpscale)x") } }
       }
       Section("ROIエンハンサー") {
@@ -604,9 +604,8 @@ struct ContentView: View {
           .disabled(runner.roiEnhancer == "none")
         LabeledContent("倍率") { Stepper(value: $runner.roiEnhancerScale, in: 1...8) { Text("\(runner.roiEnhancerScale)x") } }
           .disabled(runner.roiEnhancer == "none")
-        doubleField("強度", value: $runner.roiEnhancerStrength).disabled(runner.roiEnhancer == "none")
-        LabeledContent("タイル") { TextField("", value: $runner.roiEnhancerTile, format: .number).frame(width: 110) }
-          .disabled(runner.roiEnhancer == "none")
+        doubleSliderField("強度", value: $runner.roiEnhancerStrength, range: 0...1, step: 0.05).disabled(runner.roiEnhancer == "none")
+        integerSliderField("タイル", value: $runner.roiEnhancerTile, range: 0...1024, step: 32).disabled(runner.roiEnhancer == "none")
       }
     }.formStyle(.grouped)
   }
@@ -707,6 +706,56 @@ struct ContentView: View {
     LabeledContent(title) {
       TextField("", value: value, format: .number.precision(.fractionLength(0...3)))
         .multilineTextAlignment(.trailing).frame(width: 110)
+    }
+  }
+
+  private func doubleSliderField(
+    _ title: String,
+    value: Binding<Double>,
+    range: ClosedRange<Double>,
+    step: Double
+  ) -> some View {
+    let clampedValue = Binding<Double>(
+      get: { min(max(value.wrappedValue, range.lowerBound), range.upperBound) },
+      set: { value.wrappedValue = min(max($0, range.lowerBound), range.upperBound) }
+    )
+    return LabeledContent(title) {
+      HStack(spacing: 12) {
+        Slider(value: clampedValue, in: range, step: step)
+          .frame(minWidth: 220)
+        TextField("", value: clampedValue, format: .number.precision(.fractionLength(0...3)))
+          .multilineTextAlignment(.trailing)
+          .frame(width: 72)
+      }
+    }
+  }
+
+  private func integerSliderField(
+    _ title: String,
+    value: Binding<Int>,
+    range: ClosedRange<Int>,
+    step: Int
+  ) -> some View {
+    let clampedValue = Binding<Int>(
+      get: { min(max(value.wrappedValue, range.lowerBound), range.upperBound) },
+      set: { value.wrappedValue = min(max($0, range.lowerBound), range.upperBound) }
+    )
+    let sliderValue = Binding<Double>(
+      get: { Double(clampedValue.wrappedValue) },
+      set: { clampedValue.wrappedValue = Int($0.rounded()) }
+    )
+    return LabeledContent(title) {
+      HStack(spacing: 12) {
+        Slider(
+          value: sliderValue,
+          in: Double(range.lowerBound)...Double(range.upperBound),
+          step: Double(step)
+        )
+        .frame(minWidth: 220)
+        TextField("", value: clampedValue, format: .number)
+          .multilineTextAlignment(.trailing)
+          .frame(width: 72)
+      }
     }
   }
 
