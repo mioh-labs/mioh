@@ -10,6 +10,50 @@ INFO_PLIST = ROOT / "packaging" / "macOS" / "standalone" / "Info.plist"
 
 
 class StandaloneAppOptionTests(unittest.TestCase):
+    def test_main_app_targets_macos_26_without_linking_coreai(self):
+        source = APP_SOURCE.read_text()
+        build_script = BUILD_SCRIPT.read_text()
+        with INFO_PLIST.open("rb") as handle:
+            info = plistlib.load(handle)
+
+        self.assertEqual(info["LSMinimumSystemVersion"], "26.0")
+        self.assertNotIn("import CoreAI", source)
+        self.assertEqual(build_script.count("-target arm64-apple-macosx26.0"), 1)
+        self.assertEqual(build_script.count("-target arm64-apple-macosx27.0"), 1)
+        self.assertEqual(build_script.count("-framework CoreAI"), 1)
+
+    def test_model_choices_follow_coreai_os_availability(self):
+        source = APP_SOURCE.read_text()
+
+        self.assertIn("struct PlatformCapabilities", source)
+        self.assertIn("operatingSystemVersion.majorVersion >= 27", source)
+        self.assertIn(
+            'supportsCoreAI ? "basicvsrpp-v1.2-coreai-t90" : "basicvsrpp-v1.2"',
+            source,
+        )
+        self.assertIn(
+            'supportsCoreAI ? coreAIRestorationModels + baseRestorationModels : baseRestorationModels',
+            source,
+        )
+        self.assertIn(
+            'supportsCoreAI ? baseDetectionModels + ["v4-fast-coreai"] : baseDetectionModels',
+            source,
+        )
+        self.assertIn("normalizeModelSelections()", source)
+
+    def test_coreai_helper_environment_is_only_exported_when_supported(self):
+        source = APP_SOURCE.read_text()
+
+        self.assertIn("if capabilities.supportsCoreAI", source)
+        self.assertIn('result["LADA_COREAI_SWIFT_RUNNER"]', source)
+
+    def test_parallel_worker_selection_is_forwarded_without_platform_limit(self):
+        source = APP_SOURCE.read_text()
+
+        self.assertIn('add(&args, "--parallel-workers", parallelWorkers)', source)
+        self.assertNotIn("min(parallelWorkers", source)
+        self.assertNotIn("maxParallelWorkers", source)
+
     def test_product_is_named_mioh(self):
         self.assertTrue(APP_SOURCE.is_file(), "MiohApp.swift must be the app entry source")
         source = APP_SOURCE.read_text()
