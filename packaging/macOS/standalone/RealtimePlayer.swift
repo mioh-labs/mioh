@@ -66,6 +66,8 @@ final class RealtimePlayerController: ObservableObject {
 
   let sourcePlayer = AVPlayer()
   let restoredPlayer = AVQueuePlayer()
+  let startupSegmentCount = 3
+  let rebufferSegmentCount = 2
   let driftToleranceSeconds = 0.080
 
   private var worker: Process?
@@ -256,12 +258,6 @@ final class RealtimePlayerController: ObservableObject {
   func setBufferLimit(_ seconds: Double) {
     guard worker != nil else { return }
     sendCommand(["command": "set_buffer_limit", "seconds": seconds])
-    bufferPolicyDidChange()
-  }
-
-  func bufferPolicyDidChange() {
-    guard worker != nil else { return }
-    resumeIfBuffered()
   }
 
   func setMuted(_ value: Bool) {
@@ -382,16 +378,8 @@ final class RealtimePlayerController: ObservableObject {
       startPlayersFromCurrentPosition()
       return
     }
-    guard let runner else { return }
-    let ready = PreviewBufferPolicy.canStart(
-      bufferedSeconds: bufferedSeconds,
-      selectedBufferLimit: runner.previewBufferLimit,
-      generationHasStarted: generationHasStarted,
-      shortenRebuffer: runner.previewShortenedRebuffer,
-      endOfFile: endOfFile,
-      hasQueuedSegments: !queuedSegments.isEmpty
-    )
-    guard ready else {
+    let required = generationHasStarted ? rebufferSegmentCount : startupSegmentCount
+    guard queuedSegments.count >= required || (endOfFile && !queuedSegments.isEmpty) else {
       if state != .loading && state != .seeking { state = .buffering }
       return
     }
@@ -561,18 +549,6 @@ struct RealtimePlayerView: View {
         Text("\(Int(runner.previewBufferLimit))秒")
           .font(.caption.monospacedDigit())
           .frame(width: 48, alignment: .trailing)
-        Toggle(
-          "再バッファを短縮",
-          isOn: Binding(
-            get: { runner.previewShortenedRebuffer },
-            set: { value in
-              runner.previewShortenedRebuffer = value
-              controller.bufferPolicyDidChange()
-            }
-          )
-        )
-        .toggleStyle(.checkbox)
-        .help("再生途中のバッファ切れだけ最大4秒で復帰します")
         Spacer()
       }
 
