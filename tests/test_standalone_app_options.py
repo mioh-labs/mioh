@@ -46,6 +46,10 @@ class StandaloneAppOptionTests(unittest.TestCase):
 
         self.assertIn("if capabilities.supportsCoreAI", source)
         self.assertIn('result["LADA_COREAI_SWIFT_RUNNER"]', source)
+        self.assertIn(
+            "try rejectUnsupportedCoreAIModel(roiEnhancerModel)",
+            source,
+        )
 
     def test_parallel_worker_selection_is_forwarded_without_platform_limit(self):
         source = APP_SOURCE.read_text()
