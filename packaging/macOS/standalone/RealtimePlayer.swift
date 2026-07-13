@@ -73,7 +73,6 @@ final class RealtimePlayerController: ObservableObject {
   private var stdoutPipe: Pipe?
   private var stderrPipe: Pipe?
   private var stdoutBuffer = ""
-  private var activeWorkerSessionToken: UUID?
   private var generation = 0
   private var nextSequence = 0
   private var queuedSegments: [PreviewSegment] = []
@@ -85,7 +84,6 @@ final class RealtimePlayerController: ObservableObject {
   private var shouldPlay = true
   private var generationHasStarted = false
   private var generationStartPending = false
-  private var workerGenerationEnded = false
   private weak var runner: RestorationRunner?
 
   init() {
@@ -136,7 +134,6 @@ final class RealtimePlayerController: ObservableObject {
       let inputPipe = Pipe()
       let outputPipe = Pipe()
       let errorPipe = Pipe()
-      let sessionToken = UUID()
       process.executableURL = python
       process.arguments = [script.path] + (try runner.previewArguments(
         resources: resources,
@@ -153,8 +150,6 @@ final class RealtimePlayerController: ObservableObject {
       workerInput = inputPipe
       stdoutPipe = outputPipe
       stderrPipe = errorPipe
-      activeWorkerSessionToken = sessionToken
-      stdoutBuffer = ""
       sessionDirectory = session
       generation = 0
       nextSequence = 0
@@ -162,7 +157,6 @@ final class RealtimePlayerController: ObservableObject {
       shouldPlay = true
       generationHasStarted = false
       generationStartPending = false
-      workerGenerationEnded = false
       state = .loading
       errorMessage = ""
       sourcePlayer.replaceCurrentItem(with: AVPlayerItem(url: input))
@@ -171,25 +165,16 @@ final class RealtimePlayerController: ObservableObject {
       outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
         let data = handle.availableData
         guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-        Task { @MainActor in
-          guard let self, self.activeWorkerSessionToken == sessionToken else { return }
-          self.consumeWorkerOutput(text)
-        }
+        Task { @MainActor in self?.consumeWorkerOutput(text) }
       }
       errorPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
         let data = handle.availableData
         guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-        Task { @MainActor in
-          guard let self, self.activeWorkerSessionToken == sessionToken else { return }
-          self.runner?.appendExternalLog(text)
-        }
+        Task { @MainActor in self?.runner?.appendExternalLog(text) }
       }
       process.terminationHandler = { [weak self] completed in
         Task { @MainActor in
-          guard let self,
-            self.activeWorkerSessionToken == sessionToken,
-            self.worker === completed
-          else { return }
+          guard let self, self.worker === completed else { return }
           self.stdoutPipe?.fileHandleForReading.readabilityHandler = nil
           self.stderrPipe?.fileHandleForReading.readabilityHandler = nil
           self.worker = nil
@@ -249,7 +234,6 @@ final class RealtimePlayerController: ObservableObject {
     nextSequence = 0
     generationHasStarted = false
     generationStartPending = false
-    workerGenerationEnded = false
     clearRestoredQueue(deleteFiles: true)
     state = .seeking
     sourcePlayer.seek(
@@ -289,9 +273,6 @@ final class RealtimePlayerController: ObservableObject {
     shouldPlay = false
     generationHasStarted = false
     generationStartPending = false
-    workerGenerationEnded = false
-    activeWorkerSessionToken = nil
-    stdoutBuffer = ""
     sourcePlayer.pause()
     restoredPlayer.pause()
     if worker != nil {
@@ -348,14 +329,10 @@ final class RealtimePlayerController: ObservableObject {
       enqueue(segment)
       resumeIfBuffered()
     case "ended":
-      workerGenerationEnded = true
       if queuedSegments.isEmpty {
-        shouldPlay = false
-        sourcePlayer.pause()
-        restoredPlayer.pause()
         state = .ended
       } else {
-        resumeIfBuffered()
+        resumeIfBuffered(endOfFile: true)
       }
     case "error":
       fail([event.message, event.detail].compactMap { $0 }.joined(separator: ": "))
@@ -391,21 +368,14 @@ final class RealtimePlayerController: ObservableObject {
     try? FileManager.default.removeItem(at: segment.url)
     queuedSegments.removeAll { $0.sequence == segment.sequence }
     updateBufferedDuration()
-    if queuedSegments.isEmpty {
-      if workerGenerationEnded {
-        sourcePlayer.pause()
-        restoredPlayer.pause()
-        shouldPlay = false
-        state = .ended
-      } else if state == .playing {
-        sourcePlayer.pause()
-        restoredPlayer.pause()
-        state = .buffering
-      }
+    if queuedSegments.isEmpty && state == .playing {
+      sourcePlayer.pause()
+      restoredPlayer.pause()
+      state = .buffering
     }
   }
 
-  private func resumeIfBuffered() {
+  private func resumeIfBuffered(endOfFile: Bool = false) {
     guard shouldPlay else { return }
     guard state != .playing, !generationStartPending else { return }
     if state == .paused {
@@ -418,7 +388,7 @@ final class RealtimePlayerController: ObservableObject {
       selectedBufferLimit: runner.previewBufferLimit,
       generationHasStarted: generationHasStarted,
       shortenRebuffer: runner.previewShortenedRebuffer,
-      endOfFile: workerGenerationEnded,
+      endOfFile: endOfFile,
       hasQueuedSegments: !queuedSegments.isEmpty
     )
     guard ready else {
@@ -442,19 +412,6 @@ final class RealtimePlayerController: ObservableObject {
         guard self.generation == startingGeneration else { return }
         self.generationStartPending = false
         guard self.shouldPlay else { return }
-        guard let runner = self.runner else { return }
-        let latestPolicyAllowsPlayback = PreviewBufferPolicy.canStart(
-          bufferedSeconds: self.bufferedSeconds,
-          selectedBufferLimit: runner.previewBufferLimit,
-          generationHasStarted: self.generationHasStarted,
-          shortenRebuffer: runner.previewShortenedRebuffer,
-          endOfFile: self.workerGenerationEnded,
-          hasQueuedSegments: !self.queuedSegments.isEmpty
-        )
-        guard latestPolicyAllowsPlayback else {
-          self.state = .buffering
-          return
-        }
         self.generationHasStarted = true
         self.startPlayersFromCurrentPosition()
       }
