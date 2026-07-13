@@ -19,6 +19,8 @@ up to one minute, without interrupting active playback.
 - Starting a preview passes the selected value through `--buffer-limit`.
 - Moving the slider during an active preview sends the existing
   `set_buffer_limit` command to the worker immediately.
+- After applying a live change, the worker returns a `buffer_limit` event with
+  the applied seconds and the app records it in the log.
 - Moving it while idle only changes the value used by the next preview.
 - Changing the limit does not seek, restart, pause, or clear queued segments.
 
@@ -37,5 +39,7 @@ up to one minute, without interrupting active playback.
   `8.0` value.
 - Verify an active controller sends `set_buffer_limit` without restarting the
   preview generation.
+- Verify the worker applies the value and emits the matching `buffer_limit`
+  acknowledgement.
 - Run the complete Python suite, compile both Swift targets, rebuild and sign
   the app, and exercise the slider in the playback tab.

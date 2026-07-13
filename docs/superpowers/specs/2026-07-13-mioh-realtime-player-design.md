@@ -79,6 +79,8 @@ Events are:
 - `segment`: generation, sequence, absolute start/end nanoseconds, and path;
 - `progress`: generation, processed position, and buffered-ahead estimate;
 - `buffer_full`: the configured look-ahead limit has been reached;
+- `buffer_limit`: generation and the applied buffer-limit seconds, emitted after
+  a live `set_buffer_limit` command has updated the worker configuration;
 - `ended`: no more restored frames;
 - `error`: a user-readable message plus a diagnostic detail string.
 
