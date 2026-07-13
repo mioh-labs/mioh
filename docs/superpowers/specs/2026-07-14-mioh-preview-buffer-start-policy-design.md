@@ -27,7 +27,8 @@ controls production capacity, not the playback start threshold.
 - When off, both initial playback and recovery from rebuffering wait for the
   selected number of buffered seconds.
 - When on, initial playback still waits for the selected number of seconds, but
-  recovery from rebuffering resumes after at least 4.0 buffered seconds.
+  recovery from rebuffering resumes after at least the smaller of 4.0 seconds
+  and the selected buffer limit.
 
 ## Playback Policy
 
@@ -36,7 +37,9 @@ has an exact fixed duration.
 
 - Initial playback target: the current buffer-limit value.
 - Rebuffer target with `再バッファを短縮` off: the current buffer-limit value.
-- Rebuffer target with `再バッファを短縮` on: 4.0 seconds.
+- Rebuffer target with `再バッファを短縮` on: the smaller of 4.0 seconds and
+  the selected buffer limit. This prevents a 1-to-3-second worker limit from
+  making the four-second recovery target impossible to reach.
 - A changed slider value becomes the active threshold immediately while the
   player is buffering.
 - Changing the slider during active playback does not pause, seek, restart the
