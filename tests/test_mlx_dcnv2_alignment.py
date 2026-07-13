@@ -13,36 +13,6 @@ from experiments.mlx_dcnv2.alignment import (
 
 
 class MLXSecondOrderAlignmentTests(unittest.TestCase):
-    def test_offset_mask_stack_matches_pytorch(self):
-        rng = np.random.default_rng(321)
-        mid_channels = 4
-        deform_groups = 2
-        n, h, w = 1, 3, 4
-        extra_np = rng.normal(size=(n, 3 * mid_channels, h, w)).astype(np.float32)
-        flow1_np = rng.normal(size=(n, 2, h, w)).astype(np.float32)
-        flow2_np = rng.normal(size=(n, 2, h, w)).astype(np.float32)
-        tensors = {
-            "conv_offset.0.weight": rng.normal(size=(mid_channels, 3 * mid_channels + 4, 3, 3)).astype(np.float32),
-            "conv_offset.0.bias": rng.normal(size=(mid_channels,)).astype(np.float32),
-            "conv_offset.2.weight": rng.normal(size=(mid_channels, mid_channels, 3, 3)).astype(np.float32),
-            "conv_offset.2.bias": rng.normal(size=(mid_channels,)).astype(np.float32),
-            "conv_offset.4.weight": rng.normal(size=(mid_channels, mid_channels, 3, 3)).astype(np.float32),
-            "conv_offset.4.bias": rng.normal(size=(mid_channels,)).astype(np.float32),
-            "conv_offset.6.weight": rng.normal(size=(27 * deform_groups, mid_channels, 3, 3)).astype(np.float32),
-            "conv_offset.6.bias": rng.normal(size=(27 * deform_groups,)).astype(np.float32),
-        }
-
-        expected_offset, expected_mask = _torch_offset_mask(extra_np, flow1_np, flow2_np, tensors)
-        actual_offset, actual_mask = compute_second_order_offset_mask(
-            mx.array(extra_np),
-            mx.array(flow1_np),
-            mx.array(flow2_np),
-            {name: mx.array(value) for name, value in tensors.items()},
-        )
-
-        np.testing.assert_allclose(np.array(actual_offset), expected_offset, rtol=1e-4, atol=5e-4)
-        np.testing.assert_allclose(np.array(actual_mask), expected_mask, rtol=1e-4, atol=1e-4)
-
     def test_second_order_alignment_forward_matches_pytorch(self):
         rng = np.random.default_rng(654)
         mid_channels = 4

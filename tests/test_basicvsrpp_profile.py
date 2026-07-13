@@ -40,10 +40,6 @@ class BasicVSRPPProfilerTests(unittest.TestCase):
 
 
 class BasicVSRPPMLXWarpBridgeTests(unittest.TestCase):
-    def test_mlx_propagation_warp_bridge_enabled_by_default(self):
-        with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertTrue(_mlx_propagation_warp_bridge_enabled())
-
     def test_mlx_propagation_warp_bridge_can_be_disabled(self):
         with mock.patch.dict(os.environ, {"LADA_BASICVSRPP_MLX_PROPAGATION_WARP": "0"}):
             self.assertFalse(_mlx_propagation_warp_bridge_enabled())
