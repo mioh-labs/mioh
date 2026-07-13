@@ -302,6 +302,9 @@ final class RestorationRunner: ObservableObject {
     add(&args, "--restore-smooth-strength", smoothStrength)
     add(&args, "--restore-effect-upscale", effectUpscale)
     add(&args, "--restore-roi-enhancer", roiEnhancer)
+    if roiEnhancer != "none" {
+      try rejectUnsupportedCoreAIModel(roiEnhancerModel)
+    }
     addOptional(&args, "--restore-roi-enhancer-model-path", roiEnhancerModel)
     add(&args, "--restore-roi-enhancer-scale", roiEnhancerScale)
     add(&args, "--restore-roi-enhancer-strength", roiEnhancerStrength)
