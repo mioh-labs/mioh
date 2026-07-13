@@ -40,6 +40,20 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn('RealtimePlayerView(controller: player, runner: runner)', app)
         self.assertIn('.tabItem { Label("再生", systemImage: "play.rectangle") }', app)
 
+    def test_player_starts_each_generation_once_and_resumes_without_seeking(self):
+        player = PLAYER_SOURCE.read_text()
+
+        for contract in [
+            "private var generationHasStarted = false",
+            "private var generationStartPending = false",
+            "guard state != .playing, !generationStartPending else { return }",
+            "generationHasStarted ? rebufferSegmentCount : startupSegmentCount",
+            "private func startPlayersFromCurrentPosition()",
+            "let startingGeneration = generation",
+            "guard self.generation == startingGeneration else { return }",
+        ]:
+            self.assertIn(contract, player)
+
     def test_runner_exposes_current_settings_to_preview_worker(self):
         app = APP_SOURCE.read_text()
 
