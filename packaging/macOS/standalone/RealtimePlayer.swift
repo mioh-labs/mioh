@@ -81,6 +81,8 @@ final class RealtimePlayerController: ObservableObject {
   private var sessionDirectory: URL?
   private var requestedStartSeconds = 0.0
   private var shouldPlay = true
+  private var generationHasStarted = false
+  private var generationStartPending = false
   private weak var runner: RestorationRunner?
 
   init() {
@@ -151,6 +153,8 @@ final class RealtimePlayerController: ObservableObject {
       nextSequence = 0
       requestedStartSeconds = startSeconds
       shouldPlay = true
+      generationHasStarted = false
+      generationStartPending = false
       state = .loading
       errorMessage = ""
       sourcePlayer.replaceCurrentItem(with: AVPlayerItem(url: input))
@@ -211,6 +215,8 @@ final class RealtimePlayerController: ObservableObject {
     requestedStartSeconds = position
     generation += 1
     nextSequence = 0
+    generationHasStarted = false
+    generationStartPending = false
     clearRestoredQueue(deleteFiles: true)
     state = .seeking
     sourcePlayer.seek(
@@ -237,6 +243,8 @@ final class RealtimePlayerController: ObservableObject {
 
   func stop() {
     shouldPlay = false
+    generationHasStarted = false
+    generationStartPending = false
     sourcePlayer.pause()
     restoredPlayer.pause()
     if worker != nil {
@@ -338,24 +346,43 @@ final class RealtimePlayerController: ObservableObject {
 
   private func resumeIfBuffered(endOfFile: Bool = false) {
     guard shouldPlay else { return }
-    let required = state == .buffering && position > requestedStartSeconds
-      ? rebufferSegmentCount : startupSegmentCount
+    guard state != .playing, !generationStartPending else { return }
+    if state == .paused {
+      startPlayersFromCurrentPosition()
+      return
+    }
+    let required = generationHasStarted ? rebufferSegmentCount : startupSegmentCount
     guard queuedSegments.count >= required || (endOfFile && !queuedSegments.isEmpty) else {
       if state != .loading && state != .seeking { state = .buffering }
       return
     }
+    if generationHasStarted {
+      startPlayersFromCurrentPosition()
+      return
+    }
+
+    let startingGeneration = generation
+    generationStartPending = true
     sourcePlayer.seek(
       to: CMTime(seconds: requestedStartSeconds, preferredTimescale: 600),
       toleranceBefore: .zero,
       toleranceAfter: .zero
     ) { [weak self] _ in
       Task { @MainActor in
-        guard let self, self.shouldPlay else { return }
-        self.sourcePlayer.play()
-        self.restoredPlayer.play()
-        self.state = .playing
+        guard let self else { return }
+        guard self.generation == startingGeneration else { return }
+        self.generationStartPending = false
+        guard self.shouldPlay else { return }
+        self.generationHasStarted = true
+        self.startPlayersFromCurrentPosition()
       }
     }
+  }
+
+  private func startPlayersFromCurrentPosition() {
+    sourcePlayer.play()
+    restoredPlayer.play()
+    state = .playing
   }
 
   private func installTimeObserver() {
