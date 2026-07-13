@@ -321,6 +321,32 @@ class StandaloneAppOptionTests(unittest.TestCase):
             )[0]
             self.assertEqual(success_scope.count("generationSourceSeekRetryCount = 0"), 1)
 
+    def test_long_video_source_seeks_use_nonzero_named_tolerance(self):
+        player = PLAYER_SOURCE.read_text()
+        manual_seek = player.split("func seek(to seconds:", 1)[1].split(
+            "func restartWithCurrentSettings", 1
+        )[0].split("sourcePlayer.seek(", 1)[1]
+        buffered_start_seek = player.split("private func resumeIfBuffered", 1)[1].split(
+            "private func startPlayersFromCurrentPosition", 1
+        )[0].split("sourcePlayer.seek(", 1)[1]
+        drift_seek = player.split("private func tick", 1)[1].split(
+            "private func updateBufferedDuration", 1
+        )[0].split("restoredPlayer.seek(", 1)[1]
+
+        self.assertIn("let sourceSeekToleranceSeconds = 0.25", player)
+        self.assertIn(
+            "CMTime(seconds: sourceSeekToleranceSeconds, preferredTimescale: 600)",
+            player,
+        )
+        for source_seek in [manual_seek, buffered_start_seek]:
+            self.assertIn("toleranceBefore: sourceSeekTolerance", source_seek)
+            self.assertIn("toleranceAfter: sourceSeekTolerance", source_seek)
+        self.assertEqual(player.count("toleranceBefore: sourceSeekTolerance"), 2)
+        self.assertEqual(player.count("toleranceAfter: sourceSeekTolerance"), 2)
+        self.assertIn("toleranceBefore: .zero", drift_seek)
+        self.assertIn("toleranceAfter: .zero", drift_seek)
+        self.assertNotIn("sourceSeekTolerance", drift_seek)
+
     def test_all_avplayer_callbacks_are_isolated_to_the_worker_session(self):
         player = PLAYER_SOURCE.read_text()
         start = player.split("func start(runner:", 1)[1].split(
