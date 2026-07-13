@@ -5,11 +5,55 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_SOURCE = ROOT / "packaging" / "macOS" / "standalone" / "MiohApp.swift"
+PLAYER_SOURCE = ROOT / "packaging" / "macOS" / "standalone" / "RealtimePlayer.swift"
 BUILD_SCRIPT = ROOT / "packaging" / "macOS" / "standalone" / "build_app.sh"
 INFO_PLIST = ROOT / "packaging" / "macOS" / "standalone" / "Info.plist"
 
 
 class StandaloneAppOptionTests(unittest.TestCase):
+    def test_native_realtime_player_has_buffered_audio_synced_controls(self):
+        self.assertTrue(PLAYER_SOURCE.is_file())
+        player = PLAYER_SOURCE.read_text()
+        app = APP_SOURCE.read_text()
+
+        expected_player_contracts = [
+            "import AVFoundation",
+            "import AVKit",
+            "enum RealtimePlayerState",
+            "struct PreviewWorkerEvent: Decodable",
+            "final class RealtimePlayerController: ObservableObject",
+            "let sourcePlayer = AVPlayer()",
+            "let restoredPlayer = AVQueuePlayer()",
+            "event.generation == generation",
+            "startupSegmentCount = 3",
+            "rebufferSegmentCount = 2",
+            "driftToleranceSeconds = 0.080",
+            'sendCommand(["command": "seek"',
+            "showOriginal",
+            "struct RealtimePlayerView: View",
+            'Label("再生"',
+            'Label("一時停止"',
+            'Text("バッファ中")',
+        ]
+        for contract in expected_player_contracts:
+            self.assertIn(contract, player)
+        self.assertIn('RealtimePlayerView(controller: player, runner: runner)', app)
+        self.assertIn('.tabItem { Label("再生", systemImage: "play.rectangle") }', app)
+
+    def test_runner_exposes_current_settings_to_preview_worker(self):
+        app = APP_SOURCE.read_text()
+
+        self.assertIn("func previewArguments(resources: URL, outputDirectory: URL)", app)
+        for option in [
+            "--restoration-model", "--detection-model", "--max-clip-length",
+            "--restore-max-frames", "--sharpen-strength", "--detail-boost",
+            "--blend-feather", "--texture-mix", "--smooth-strength",
+            "--roi-enhancer", "--roi-enhancer-model", "--roi-enhancer-scale",
+            "--roi-enhancer-strength", "--roi-enhancer-tile",
+            "--effect-upscale", "--buffer-limit",
+        ]:
+            self.assertIn(option, app)
+
     def test_main_app_targets_macos_26_without_linking_coreai(self):
         source = APP_SOURCE.read_text()
         build_script = BUILD_SCRIPT.read_text()
