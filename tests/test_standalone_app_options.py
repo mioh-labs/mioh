@@ -25,6 +25,8 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "let sourcePlayer = AVPlayer()",
             "let restoredPlayer = AVQueuePlayer()",
             "event.generation == generation",
+            "startupSegmentCount = 3",
+            "rebufferSegmentCount = 2",
             "driftToleranceSeconds = 0.080",
             'sendCommand(["command": "seek"',
             "showOriginal",
@@ -45,6 +47,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "private var generationHasStarted = false",
             "private var generationStartPending = false",
             "guard state != .playing, !generationStartPending else { return }",
+            "generationHasStarted ? rebufferSegmentCount : startupSegmentCount",
             "private func startPlayersFromCurrentPosition()",
             "let startingGeneration = generation",
             "guard self.generation == startingGeneration else { return }",
@@ -118,28 +121,6 @@ class StandaloneAppOptionTests(unittest.TestCase):
             'Text("\\(Int(runner.previewBufferLimit))秒")',
         ]:
             self.assertIn(contract, player)
-
-    def test_player_waits_for_selected_buffer_duration_with_optional_fast_rebuffer(self):
-        app = APP_SOURCE.read_text()
-        player = PLAYER_SOURCE.read_text()
-
-        self.assertIn("@Published var previewShortenedRebuffer = false", app)
-        for contract in [
-            "PreviewBufferPolicy.canStart(",
-            "bufferedSeconds: bufferedSeconds",
-            "selectedBufferLimit: runner.previewBufferLimit",
-            "generationHasStarted: generationHasStarted",
-            "shortenRebuffer: runner.previewShortenedRebuffer",
-            "endOfFile: endOfFile",
-            "hasQueuedSegments: !queuedSegments.isEmpty",
-            "func bufferPolicyDidChange()",
-            '"再バッファを短縮",',
-            ".toggleStyle(.checkbox)",
-            "controller.bufferPolicyDidChange()",
-        ]:
-            self.assertIn(contract, player)
-        self.assertNotIn("startupSegmentCount = 3", player)
-        self.assertNotIn("rebufferSegmentCount = 2", player)
 
     def test_preview_uses_t36_without_changing_t90_export_default(self):
         source = APP_SOURCE.read_text()

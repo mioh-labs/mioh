@@ -118,7 +118,6 @@ final class RestorationRunner: ObservableObject {
   @Published var detectFaceMosaics = false
 
   @Published var previewBufferLimit = 8.0
-  @Published var previewShortenedRebuffer = false
 
   @Published var memoryCleanupInterval = 1
   @Published var cleanupTriggerGB = 4.0
