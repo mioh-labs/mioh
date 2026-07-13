@@ -340,11 +340,13 @@ class PreviewSession:
             1,
             int(math.ceil(self.config.buffer_limit / self.config.segment_seconds)),
         )
+        active_path = getattr(self.encoder, "segment_path", None)
         count = sum(
             1
-            for _ in self.output_dir.glob(
+            for path in self.output_dir.glob(
                 f"preview-g{self.generation}-*.mp4"
             )
+            if path != active_path
         )
         return count < limit
 
