@@ -362,7 +362,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
         for contract in [
             "private var activeSourceSeekRequestToken: UUID?",
             "private let sourceSeekWatchdogNanoseconds: UInt64 = 2_000_000_000",
-            "private let sourceSeekWatchdogEpsilonSeconds = 0.05",
+            "private let sourceSeekWatchdogToleranceSeconds = 1.0",
         ]:
             self.assertIn(contract, player)
         for source_seek in [manual_seek, buffered_start_seek]:
@@ -376,8 +376,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "generation == seekGeneration",
             "generationStartPending",
             "sourcePlayer.currentTime().seconds",
-            "abs(currentSeconds - targetSeconds) <=",
-            "sourceSeekToleranceSeconds + sourceSeekWatchdogEpsilonSeconds",
+            "abs(currentSeconds - targetSeconds) <= sourceSeekWatchdogToleranceSeconds",
             "generationSourceSeekCompleted = true",
             "resumeIfBuffered()",
         ]:

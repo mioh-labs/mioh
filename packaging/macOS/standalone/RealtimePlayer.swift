@@ -69,7 +69,7 @@ final class RealtimePlayerController: ObservableObject {
   let driftToleranceSeconds = 0.080
   let sourceSeekToleranceSeconds = 0.25
   private let sourceSeekWatchdogNanoseconds: UInt64 = 2_000_000_000
-  private let sourceSeekWatchdogEpsilonSeconds = 0.05
+  private let sourceSeekWatchdogToleranceSeconds = 1.0
 
   private var sourceSeekTolerance: CMTime {
     CMTime(seconds: sourceSeekToleranceSeconds, preferredTimescale: 600)
@@ -585,8 +585,7 @@ final class RealtimePlayerController: ObservableObject {
 
     let currentSeconds = sourcePlayer.currentTime().seconds
     guard currentSeconds.isFinite,
-      abs(currentSeconds - targetSeconds) <=
-        sourceSeekToleranceSeconds + sourceSeekWatchdogEpsilonSeconds
+      abs(currentSeconds - targetSeconds) <= sourceSeekWatchdogToleranceSeconds
     else {
       guard generationSourceSeekRetryCount < maximumGenerationSourceSeekRetries else {
         fail("プレビューのシークに繰り返し失敗しました")
