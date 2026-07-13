@@ -1,5 +1,4 @@
 import AppKit
-import CoreAI
 import Foundation
 import SwiftUI
 
@@ -11,6 +10,40 @@ struct AppProgressEvent: Decodable {
   let segment: Int?
   let text: String
   let percent: Double?
+}
+
+struct PlatformCapabilities {
+  let supportsCoreAI: Bool
+
+  init(
+    operatingSystemVersion: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion
+  ) {
+    supportsCoreAI = operatingSystemVersion.majorVersion >= 27
+  }
+
+  var defaultRestorationModel: String {
+    supportsCoreAI ? "basicvsrpp-v1.2-coreai-t90" : "basicvsrpp-v1.2"
+  }
+
+  let baseRestorationModels = ["basicvsrpp-v1.2", "カスタム"]
+  let coreAIRestorationModels = [
+    "basicvsrpp-v1.2-coreai-t90", "basicvsrpp-v1.2-coreai-t36",
+    "basicvsrpp-v1.2-coreai",
+  ]
+
+  var restorationModels: [String] {
+    supportsCoreAI ? coreAIRestorationModels + baseRestorationModels : baseRestorationModels
+  }
+
+  let baseDetectionModels = [
+    "v2-coreml", "v3.1-fast-coreml", "v3.1-accurate-coreml",
+    "v4-fast-coreml", "v4-accurate-coreml", "v2", "v3.1-fast",
+    "v3.1-accurate", "v4-fast", "v4-accurate", "カスタム",
+  ]
+
+  var detectionModels: [String] {
+    supportsCoreAI ? baseDetectionModels + ["v4-fast-coreai"] : baseDetectionModels
+  }
 }
 
 @MainActor
@@ -57,7 +90,7 @@ final class RestorationRunner: ObservableObject {
   @Published var preFPSConversion = false
   @Published var mp4FastStart = false
 
-  @Published var restorationModel = "basicvsrpp-v1.2-coreai-t90"
+  @Published var restorationModel: String
   @Published var customRestorationModel = ""
   @Published var useMaxClipLength = false
   @Published var maxClipLength = 178
@@ -75,7 +108,7 @@ final class RestorationRunner: ObservableObject {
   @Published var roiEnhancerStrength = 0.0
   @Published var roiEnhancerTile = 0
 
-  @Published var detectionModel = "v2-coreml"
+  @Published var detectionModel: String
   @Published var customDetectionModel = ""
   @Published var detectionEmptyLookahead = 10
   @Published var detectFaceMosaics = false
@@ -91,21 +124,20 @@ final class RestorationRunner: ObservableObject {
   private var logHistory = ""
   private var activeProgress: [String: AppProgressEvent] = [:]
   private var activeProgressOrder: [String] = []
+  private let capabilities: PlatformCapabilities
+
+  init(capabilities: PlatformCapabilities = PlatformCapabilities()) {
+    self.capabilities = capabilities
+    restorationModel = capabilities.defaultRestorationModel
+    detectionModel = "v2-coreml"
+  }
 
   let encodingPresets = [
     "h264-cpu-uhq", "h264-cpu-fast", "h264-apple-gpu-balanced",
     "hevc-apple-gpu-balanced", "av1-cpu-uhq",
   ]
-  let restorationModels = [
-    "basicvsrpp-v1.2-coreai-t90", "basicvsrpp-v1.2-coreai-t36",
-    "basicvsrpp-v1.2-coreai", "basicvsrpp-v1.2", "カスタム",
-  ]
-  let detectionModels = [
-    "v2-coreml", "v3.1-fast-coreml", "v3.1-accurate-coreml",
-    "v4-fast-coreml", "v4-accurate-coreml", "v4-fast-coreai",
-    "v2", "v3.1-fast", "v3.1-accurate", "v4-fast",
-    "v4-accurate", "カスタム",
-  ]
+  var restorationModels: [String] { capabilities.restorationModels }
+  var detectionModels: [String] { capabilities.detectionModels }
   let enhancerModels = ["none", "realesrgan", "mewzoom", "swinir"]
 
   var canStart: Bool {
@@ -142,6 +174,7 @@ final class RestorationRunner: ObservableObject {
   func start() {
     guard let inputURL, let outputURL else { return }
     do {
+      normalizeModelSelections()
       let resources = try resourceDirectory()
       let python = resources.appendingPathComponent("runtime/bin/python3.12")
       let processor = resources.appendingPathComponent(
@@ -288,6 +321,7 @@ final class RestorationRunner: ObservableObject {
   private func resolvedRestorationModel(in resources: URL) throws -> String {
     if restorationModel == "カスタム" {
       guard !customRestorationModel.isEmpty else { throw RunnerError.missingValue("復元モデル") }
+      try rejectUnsupportedCoreAIModel(customRestorationModel)
       return customRestorationModel
     }
     return restorationModel
@@ -296,9 +330,30 @@ final class RestorationRunner: ObservableObject {
   private func resolvedDetectionModel(in resources: URL) throws -> String {
     if detectionModel == "カスタム" {
       guard !customDetectionModel.isEmpty else { throw RunnerError.missingValue("検出モデル") }
+      try rejectUnsupportedCoreAIModel(customDetectionModel)
       return customDetectionModel
     }
     return detectionModel
+  }
+
+  private func normalizeModelSelections() {
+    if !restorationModels.contains(restorationModel) {
+      restorationModel = capabilities.defaultRestorationModel
+    }
+    if !detectionModels.contains(detectionModel) {
+      detectionModel = "v2-coreml"
+    }
+  }
+
+  private func rejectUnsupportedCoreAIModel(_ model: String) throws {
+    guard !capabilities.supportsCoreAI else { return }
+    let normalized = model.lowercased()
+    if normalized.contains("coreai")
+      || normalized.hasSuffix(".aimodel")
+      || normalized.hasSuffix(".aimodelc")
+    {
+      throw RunnerError.unsupportedFeature("CoreAIモデルにはmacOS 27以降が必要です")
+    }
   }
 
   private func environment(resources: URL, python: URL) -> [String: String] {
@@ -307,8 +362,13 @@ final class RestorationRunner: ObservableObject {
     result["PYTHONHOME"] = resources.appendingPathComponent("runtime").path
     result["PYTHONPATH"] = sitePackages.path
     result["LADA_MODEL_WEIGHTS_DIR"] = resources.appendingPathComponent("models").path
-    result["LADA_COREAI_PYTHON"] = python.path
-    result["LADA_COREAI_SWIFT_RUNNER"] = resources.appendingPathComponent("bin/lada-coreai-runner").path
+    if capabilities.supportsCoreAI {
+      result["LADA_COREAI_PYTHON"] = python.path
+      result["LADA_COREAI_SWIFT_RUNNER"] = resources.appendingPathComponent("bin/lada-coreai-runner").path
+    } else {
+      result.removeValue(forKey: "LADA_COREAI_PYTHON")
+      result.removeValue(forKey: "LADA_COREAI_SWIFT_RUNNER")
+    }
     result["PATH"] = [resources.appendingPathComponent("bin").path, "/usr/bin", "/bin", "/usr/sbin", "/sbin"].joined(separator: ":")
     result["PYTHONUNBUFFERED"] = "1"
     result["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -441,11 +501,13 @@ final class RestorationRunner: ObservableObject {
 enum RunnerError: LocalizedError {
   case missingResource(String)
   case missingValue(String)
+  case unsupportedFeature(String)
 
   var errorDescription: String? {
     switch self {
     case .missingResource(let name): return "必要なリソースが見つかりません: \(name)"
     case .missingValue(let name): return "値を指定してください: \(name)"
+    case .unsupportedFeature(let message): return message
     }
   }
 }

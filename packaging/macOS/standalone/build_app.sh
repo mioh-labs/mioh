@@ -22,10 +22,9 @@ mkdir -p "$CONTENTS/MacOS" "$RESOURCES/bin" "$RESOURCES/models"
 xcrun swiftc \
   -O \
   -parse-as-library \
-  -target arm64-apple-macosx27.0 \
+  -target arm64-apple-macosx26.0 \
   -framework AppKit \
   -framework SwiftUI \
-  -framework CoreAI \
   "$PACKAGE_DIR/MiohApp.swift" \
   -o "$CONTENTS/MacOS/mioh"
 xcrun swiftc \
