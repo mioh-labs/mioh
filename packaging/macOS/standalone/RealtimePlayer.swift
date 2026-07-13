@@ -86,6 +86,8 @@ final class RealtimePlayerController: ObservableObject {
   private var generationHasStarted = false
   private var generationStartPending = false
   private var generationSourceSeekCompleted = false
+  private let maximumGenerationSourceSeekRetries = 2
+  private var generationSourceSeekRetryCount = 0
   private var workerGenerationEnded = false
   private weak var runner: RestorationRunner?
 
@@ -164,6 +166,7 @@ final class RealtimePlayerController: ObservableObject {
       generationHasStarted = false
       generationStartPending = false
       generationSourceSeekCompleted = false
+      generationSourceSeekRetryCount = 0
       workerGenerationEnded = false
       state = .loading
       errorMessage = ""
@@ -254,6 +257,7 @@ final class RealtimePlayerController: ObservableObject {
     generationHasStarted = false
     generationStartPending = true
     generationSourceSeekCompleted = false
+    generationSourceSeekRetryCount = 0
     workerGenerationEnded = false
     clearRestoredQueue(deleteFiles: true)
     state = .seeking
@@ -268,11 +272,18 @@ final class RealtimePlayerController: ObservableObject {
           self.generation == seekGeneration
         else { return }
         self.generationStartPending = false
+        guard self.shouldPlay, self.state != .failed, self.state != .ended else { return }
         guard finished else {
+          guard self.generationSourceSeekRetryCount < self.maximumGenerationSourceSeekRetries else {
+            self.fail("プレビューのシークに繰り返し失敗しました")
+            return
+          }
+          self.generationSourceSeekRetryCount += 1
           self.state = .buffering
           self.resumeIfBuffered()
           return
         }
+        self.generationSourceSeekRetryCount = 0
         self.generationSourceSeekCompleted = true
         self.resumeIfBuffered()
       }
@@ -310,6 +321,7 @@ final class RealtimePlayerController: ObservableObject {
     generationHasStarted = false
     generationStartPending = false
     generationSourceSeekCompleted = false
+    generationSourceSeekRetryCount = 0
     workerGenerationEnded = false
     activeWorkerSessionToken = nil
     stdoutBuffer = ""
@@ -440,6 +452,7 @@ final class RealtimePlayerController: ObservableObject {
 
   private func resumeIfBuffered() {
     guard shouldPlay else { return }
+    guard state != .failed, state != .ended else { return }
     guard state != .playing, !generationStartPending else { return }
     if state == .paused {
       startPlayersFromCurrentPosition()
@@ -482,11 +495,18 @@ final class RealtimePlayerController: ObservableObject {
           self.generation == startingGeneration
         else { return }
         self.generationStartPending = false
+        guard self.shouldPlay, self.state != .failed, self.state != .ended else { return }
         guard finished else {
+          guard self.generationSourceSeekRetryCount < self.maximumGenerationSourceSeekRetries else {
+            self.fail("プレビューのシークに繰り返し失敗しました")
+            return
+          }
+          self.generationSourceSeekRetryCount += 1
           self.state = .buffering
           self.resumeIfBuffered()
           return
         }
+        self.generationSourceSeekRetryCount = 0
         self.generationSourceSeekCompleted = true
         guard self.shouldPlay else { return }
         guard let runner = self.runner else { return }
@@ -584,6 +604,7 @@ final class RealtimePlayerController: ObservableObject {
   }
 
   private func fail(_ message: String) {
+    shouldPlay = false
     sourcePlayer.pause()
     restoredPlayer.pause()
     errorMessage = message

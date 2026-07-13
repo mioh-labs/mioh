@@ -223,13 +223,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
         )[1].split("private func startPlayersFromCurrentPosition", 1)[0].split(
             ") { [weak self] finished in", 1
         )[1]
-        retry_branch = (
-            "guard finished else {\n"
-            "          self.state = .buffering\n"
-            "          self.resumeIfBuffered()\n"
-            "          return\n"
-            "        }"
-        )
+        retry_branch = "guard finished else {"
 
         for completion in [manual_completion, buffered_start_completion]:
             self.assertIn(retry_branch, completion)
@@ -237,10 +231,95 @@ class StandaloneAppOptionTests(unittest.TestCase):
                 completion.index("self.generationStartPending = false"),
                 completion.index(retry_branch),
             )
-            failure_scope = completion.split("guard finished else {", 1)[1].split(
-                "}", 1
+            failure_scope = completion.split(retry_branch, 1)[1].split(
+                "self.generationSourceSeekRetryCount = 0", 1
             )[0]
+            self.assertIn("self.state = .buffering", failure_scope)
+            self.assertIn("self.resumeIfBuffered()", failure_scope)
             self.assertNotIn("generationSourceSeekCompleted", failure_scope)
+
+    def test_source_seek_completions_preserve_terminal_states(self):
+        player = PLAYER_SOURCE.read_text()
+        manual_completion = player.split("func seek(to seconds:", 1)[1].split(
+            "func restartWithCurrentSettings", 1
+        )[0].split(") { [weak self] finished in", 1)[1]
+        buffered_start_completion = player.split(
+            "private func resumeIfBuffered", 1
+        )[1].split("private func startPlayersFromCurrentPosition", 1)[0].split(
+            ") { [weak self] finished in", 1
+        )[1]
+        resume = player.split("private func resumeIfBuffered", 1)[1].split(
+            "private func startPlayersFromCurrentPosition", 1
+        )[0]
+        fail = player.split("private func fail", 1)[1].split(
+            "struct RealtimePlayerView", 1
+        )[0]
+        terminal_guard = (
+            "guard self.shouldPlay, self.state != .failed, self.state != .ended "
+            "else { return }"
+        )
+
+        for completion in [manual_completion, buffered_start_completion]:
+            self.assertIn(terminal_guard, completion)
+            self.assertLess(
+                completion.index("self.generationStartPending = false"),
+                completion.index(terminal_guard),
+            )
+            self.assertLess(
+                completion.index(terminal_guard),
+                completion.index("guard finished else {"),
+            )
+        self.assertIn("shouldPlay = false", fail)
+        self.assertLess(fail.index("shouldPlay = false"), fail.index("state = .failed"))
+        self.assertIn(
+            "guard state != .failed, state != .ended else { return }",
+            resume,
+        )
+
+    def test_source_seek_retries_are_bounded_per_generation(self):
+        player = PLAYER_SOURCE.read_text()
+        start = player.split("func start(runner:", 1)[1].split(
+            "func togglePlayback", 1
+        )[0]
+        seek = player.split("func seek(to seconds:", 1)[1].split(
+            "func restartWithCurrentSettings", 1
+        )[0]
+        stop = player.split("func stop()", 1)[1].split(
+            "private func consumeWorkerOutput", 1
+        )[0]
+        manual_completion = seek.split(") { [weak self] finished in", 1)[1]
+        buffered_start_completion = player.split(
+            "private func resumeIfBuffered", 1
+        )[1].split("private func startPlayersFromCurrentPosition", 1)[0].split(
+            ") { [weak self] finished in", 1
+        )[1]
+        exhausted_message = "プレビューのシークに繰り返し失敗しました"
+
+        self.assertIn("private let maximumGenerationSourceSeekRetries = 2", player)
+        self.assertIn("private var generationSourceSeekRetryCount = 0", player)
+        for reset_scope in [start, seek, stop]:
+            self.assertIn("generationSourceSeekRetryCount = 0", reset_scope)
+        for completion in [manual_completion, buffered_start_completion]:
+            for contract in [
+                "self.generationSourceSeekRetryCount < "
+                "self.maximumGenerationSourceSeekRetries",
+                "self.generationSourceSeekRetryCount += 1",
+                f'self.fail("{exhausted_message}")',
+                "self.generationSourceSeekRetryCount = 0",
+            ]:
+                self.assertIn(contract, completion)
+            self.assertLess(
+                completion.index("self.generationSourceSeekRetryCount += 1"),
+                completion.index("self.state = .buffering"),
+            )
+            self.assertLess(
+                completion.index("guard finished else {"),
+                completion.index("self.generationSourceSeekRetryCount = 0"),
+            )
+            success_scope = completion.split("guard finished else {", 1)[1].split(
+                "self.generationSourceSeekCompleted = true", 1
+            )[0]
+            self.assertEqual(success_scope.count("generationSourceSeekRetryCount = 0"), 1)
 
     def test_all_avplayer_callbacks_are_isolated_to_the_worker_session(self):
         player = PLAYER_SOURCE.read_text()
