@@ -64,6 +64,24 @@ class Yolo11CoreMLSegmentationModelTests(unittest.TestCase):
             compute_units=mock.sentinel.cpu_and_ne,
         )
 
+    def test_loads_precompiled_coreml_model_without_opening_package(self):
+        compiled_model = mock.Mock()
+        fake_coremltools = mock.Mock()
+        fake_coremltools.ComputeUnit.CPU_AND_NE = mock.sentinel.cpu_and_ne
+        fake_coremltools.models.CompiledMLModel.return_value = compiled_model
+
+        with mock.patch.dict("sys.modules", {"coremltools": fake_coremltools}):
+            model = Yolo11CoreMLSegmentationModel(
+                "detect.mlmodelc",
+                torch.device("mps"),
+            )
+
+        fake_coremltools.models.CompiledMLModel.assert_called_once_with(
+            "detect.mlmodelc",
+            compute_units=mock.sentinel.cpu_and_ne,
+        )
+        self.assertIs(model.model.model, compiled_model)
+
     def test_inference_merges_single_image_outputs(self):
         model, backend = make_model()
         det = torch.zeros(1, 38, 8400)

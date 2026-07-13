@@ -11,6 +11,7 @@ PYTHON_SOURCE="${PYTHON_SOURCE:-$HOME/.local/share/uv/python/cpython-3.12-macos-
 PYTHON_SOURCE="${PYTHON_SOURCE:A}"
 SITE_PACKAGES="$ROOT/.venv-coreai/lib/python3.12/site-packages"
 COMPILED_MODELS="${COMPILED_MODELS:-$BUILD_DIR/compiled-models}"
+COMPILED_COREML_MODELS="${COMPILED_COREML_MODELS:-$BUILD_DIR/compiled-coreml-models}"
 FFMPEG_CACHE="${FFMPEG_CACHE:-$BUILD_DIR/ffmpeg-static}"
 VENDORED_MPS_DEFORM_CONV="$PACKAGE_DIR/vendor/mps-deform-conv-0.2.2"
 MPS_DEFORM_BUILD_SOURCE="$BUILD_DIR/mps-deform-conv-source"
@@ -121,6 +122,25 @@ for asset in "${MODEL_ASSETS[@]}"; do
   if [[ -e "$ROOT/model_weights/$asset" ]]; then
     ditto "$ROOT/model_weights/$asset" "$RESOURCES/models/$asset"
   fi
+done
+
+COREML_DETECTION_ASSETS=(
+  lada_mosaic_detection_model_v2.mlpackage
+  lada_mosaic_detection_model_v3.1_fast.mlpackage
+  lada_mosaic_detection_model_v3.1_accurate.mlpackage
+  lada_mosaic_detection_model_v4_fast.mlpackage
+  lada_mosaic_detection_model_v4_accurate.mlpackage
+)
+mkdir -p "$COMPILED_COREML_MODELS"
+for package in "${COREML_DETECTION_ASSETS[@]}"; do
+  source_model="$ROOT/model_weights/$package"
+  compiled_name="${package:r}.mlmodelc"
+  compiled_model="$COMPILED_COREML_MODELS/$compiled_name"
+  if [[ ! -d "$compiled_model" || "$source_model" -nt "$compiled_model" ]]; then
+    rm -rf "$compiled_model"
+    xcrun coremlcompiler compile "$source_model" "$COMPILED_COREML_MODELS"
+  fi
+  ditto "$compiled_model" "$RESOURCES/models/$compiled_name"
 done
 
 if [[ ! -d "$COMPILED_MODELS" ]] || ! find "$COMPILED_MODELS" -name '*.aimodelc' -print -quit | grep -q .; then

@@ -76,6 +76,12 @@ class StandaloneAppOptionTests(unittest.TestCase):
             app,
         )
 
+    def test_app_precompiles_coreml_detection_models(self):
+        build_script = BUILD_SCRIPT.read_text()
+
+        self.assertIn("xcrun coremlcompiler compile", build_script)
+        self.assertIn('"$RESOURCES/models/$compiled_name"', build_script)
+
     def test_runner_exposes_current_settings_to_preview_worker(self):
         app = APP_SOURCE.read_text()
 

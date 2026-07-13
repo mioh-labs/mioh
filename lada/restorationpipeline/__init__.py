@@ -83,7 +83,7 @@ def load_models(
     if str(mosaic_detection_model_path).endswith((".aimodel", ".aimodelc")):
         from lada.models.yolo.yolo11_coreai_segmentation_model import Yolo11CoreAISegmentationModel
         mosaic_detection_model = Yolo11CoreAISegmentationModel(mosaic_detection_model_path, device, classes=classes, conf=0.15)
-    elif str(mosaic_detection_model_path).endswith(".mlpackage"):
+    elif str(mosaic_detection_model_path).endswith((".mlpackage", ".mlmodelc")):
         from lada.models.yolo.yolo11_coreml_segmentation_model import Yolo11CoreMLSegmentationModel
         mosaic_detection_model = Yolo11CoreMLSegmentationModel(mosaic_detection_model_path, device, classes=classes, conf=0.15)
     else:

@@ -12,7 +12,9 @@ execution lock and restoration keeps the Metal queue to itself.
 import logging
 import os
 
+import numpy as np
 import torch
+from PIL import Image
 from ultralytics.cfg import get_cfg
 from ultralytics.data.augment import LetterBox
 from ultralytics.nn.autobackend import AutoBackend
@@ -40,11 +42,34 @@ class _CoremltoolsTorchVersionWarningFilter(logging.Filter):
 logging.getLogger("coremltools").addFilter(_CoremltoolsTorchVersionWarningFilter())
 
 
+class _CompiledCoreMLBackend:
+    """Small AutoBackend-compatible adapter for a compiled Core ML model."""
+
+    task = "segment"
+
+    def __init__(self, model_path: str, coremltools, compute_unit):
+        self.model = coremltools.models.CompiledMLModel(
+            model_path,
+            compute_units=compute_unit,
+        )
+
+    def eval(self):
+        return self
+
+    def __call__(self, image_batch: torch.Tensor, **_kwargs):
+        image = image_batch[0].permute(1, 2, 0).detach().cpu().numpy()
+        pil_image = Image.fromarray((image * 255).astype("uint8"))
+        outputs = list(self.model.predict({"image": pil_image}).values())
+        if len(outputs) == 2 and outputs[1].ndim != 4:
+            outputs.reverse()
+        return [torch.from_numpy(np.asarray(output)) for output in outputs]
+
+
 class Yolo11CoreMLSegmentationModel(Yolo11SegmentationModel):
     def __init__(self, model_path: str, device=None, imgsz=640, fp16=False, **kwargs):
         model_path = str(model_path)
-        if not model_path.endswith(".mlpackage"):
-            raise ValueError(f"Expected a .mlpackage path, got {model_path!r}")
+        if not model_path.endswith((".mlpackage", ".mlmodelc")):
+            raise ValueError(f"Expected a .mlpackage or .mlmodelc path, got {model_path!r}")
         if device is not None and torch.device(device).type != "cpu":
             logger.info("Core ML detection ignores torch device %s; compute unit is chosen by Core ML", device)
 
@@ -88,6 +113,10 @@ class Yolo11CoreMLSegmentationModel(Yolo11SegmentationModel):
                 fp16=False,
                 verbose=False,
             )
+
+        if model_path.endswith(".mlmodelc"):
+            logger.info("Loading precompiled Core ML detection model with %s", unit_name)
+            return _CompiledCoreMLBackend(model_path, ct, unit)
 
         original_mlmodel = ct.models.MLModel
 
