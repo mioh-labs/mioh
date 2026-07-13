@@ -374,6 +374,11 @@ class PreviewSession:
             if command.seconds is None or command.seconds <= 0:
                 raise ValueError("set_buffer_limit requires positive seconds")
             self.config.buffer_limit = command.seconds
+            emit_event(
+                "buffer_limit",
+                generation=self.generation,
+                seconds=self.config.buffer_limit,
+            )
         return False
 
     def _new_encoder(self):

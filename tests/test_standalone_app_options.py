@@ -111,6 +111,9 @@ class StandaloneAppOptionTests(unittest.TestCase):
         for contract in [
             "func setBufferLimit(_ seconds: Double)",
             '["command": "set_buffer_limit", "seconds": seconds]',
+            "let seconds: Double?",
+            'case "buffer_limit":',
+            'runner?.appendExternalLog("プレビューバッファ上限を適用: \\(Int(seconds))秒\\n")',
             'Text("バッファ上限")',
             "in: 1...60",
             "step: 1",

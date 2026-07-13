@@ -42,6 +42,7 @@ struct PreviewWorkerEvent: Decodable {
   let message: String?
   let detail: String?
   let positionNs: Int64?
+  let seconds: Double?
 }
 
 private struct PreviewSegment {
@@ -331,6 +332,9 @@ final class RealtimePlayerController: ObservableObject {
       }
     case "error":
       fail([event.message, event.detail].compactMap { $0 }.joined(separator: ": "))
+    case "buffer_limit":
+      guard let seconds = event.seconds else { return }
+      runner?.appendExternalLog("プレビューバッファ上限を適用: \(Int(seconds))秒\n")
     default:
       break
     }

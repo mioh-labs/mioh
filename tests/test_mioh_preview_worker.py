@@ -251,6 +251,30 @@ class PreviewSessionTests(unittest.TestCase):
             (Path(temp_dir) / "preview-g7-000000.mp4").unlink()
             self.assertTrue(session.has_buffer_capacity())
 
+    def test_set_buffer_limit_emits_applied_value_acknowledgement(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = self.worker.PreviewSession(
+                self.make_config(),
+                Path(temp_dir),
+                model_loader=lambda _config: object(),
+                restorer_factory=lambda _config, _models: mock.Mock(),
+            )
+            session.generation = 9
+            output = io.StringIO()
+
+            with mock.patch.object(self.worker, "PROTOCOL_STREAM", output):
+                session._apply_command(
+                    self.worker.PreviewCommand.parse(
+                        '{"command":"set_buffer_limit","seconds":30}'
+                    )
+                )
+
+            self.assertEqual(session.config.buffer_limit, 30.0)
+            self.assertEqual(
+                json.loads(output.getvalue()),
+                {"kind": "buffer_limit", "generation": 9, "seconds": 30.0},
+            )
+
     def test_stop_releases_restorer_and_removes_session_directory(self):
         with tempfile.TemporaryDirectory() as parent:
             output_dir = Path(parent) / "preview-session"
