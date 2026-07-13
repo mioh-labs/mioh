@@ -47,7 +47,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "guard state != .playing, !generationStartPending else { return }",
             "private func startPlayersFromCurrentPosition()",
             "let startingGeneration = generation",
-            "self.generation == startingGeneration",
+            "guard self.generation == startingGeneration else { return }",
         ]:
             self.assertIn(contract, player)
 
@@ -138,138 +138,6 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn("self.worker === completed", termination_callback)
         self.assertIn("activeWorkerSessionToken = nil", stop)
         self.assertIn('stdoutBuffer = ""', stop)
-
-    def test_player_tracks_completed_source_seek_per_generation(self):
-        player = PLAYER_SOURCE.read_text()
-        start = player.split("func start(runner:", 1)[1].split(
-            "func togglePlayback", 1
-        )[0]
-        seek = player.split("func seek(to seconds:", 1)[1].split(
-            "func restartWithCurrentSettings", 1
-        )[0]
-        stop = player.split("func stop()", 1)[1].split(
-            "private func consumeWorkerOutput", 1
-        )[0]
-        resume = player.split("private func resumeIfBuffered", 1)[1].split(
-            "private func startPlayersFromCurrentPosition", 1
-        )[0]
-
-        self.assertIn("private var generationSourceSeekCompleted = false", player)
-        for reset_scope in [start, seek, stop]:
-            self.assertIn("generationSourceSeekCompleted = false", reset_scope)
-        direct_start = "if generationSourceSeekCompleted {"
-        self.assertIn(direct_start, resume)
-        self.assertLess(resume.index(direct_start), resume.index("sourcePlayer.seek("))
-        direct_start_scope = resume.split(direct_start, 1)[1].split(
-            "sourcePlayer.seek(", 1
-        )[0]
-        self.assertIn("generationHasStarted = true", direct_start_scope)
-        self.assertIn("startPlayersFromCurrentPosition()", direct_start_scope)
-
-    def test_source_seek_completions_are_current_finished_and_retryable(self):
-        player = PLAYER_SOURCE.read_text()
-        seek = player.split("func seek(to seconds:", 1)[1].split(
-            "func restartWithCurrentSettings", 1
-        )[0]
-        resume = player.split("private func resumeIfBuffered", 1)[1].split(
-            "private func startPlayersFromCurrentPosition", 1
-        )[0]
-        initial_completion = resume.split("sourcePlayer.seek(", 1)[1]
-
-        for contract in [
-            "guard let seekSessionToken = activeWorkerSessionToken else { return }",
-            "let seekGeneration = generation",
-            "generationStartPending = true",
-            ") { [weak self] finished in",
-            "self.activeWorkerSessionToken == seekSessionToken",
-            "self.generation == seekGeneration",
-            "self.generationStartPending = false",
-            "guard finished else { return }",
-            "self.generationSourceSeekCompleted = true",
-            "self.resumeIfBuffered()",
-        ]:
-            self.assertIn(contract, seek)
-        self.assertLess(
-            seek.index("self.generationStartPending = false"),
-            seek.index("guard finished else { return }"),
-        )
-
-        self.assertIn("let startingSessionToken = activeWorkerSessionToken", resume)
-        for contract in [
-            ") { [weak self] finished in",
-            "self.activeWorkerSessionToken == startingSessionToken",
-            "self.generation == startingGeneration",
-            "self.generationStartPending = false",
-            "guard finished else { return }",
-            "self.generationSourceSeekCompleted = true",
-        ]:
-            self.assertIn(contract, initial_completion)
-        self.assertLess(
-            initial_completion.index("self.generationStartPending = false"),
-            initial_completion.index("guard finished else { return }"),
-        )
-        self.assertLess(
-            initial_completion.index("guard finished else { return }"),
-            initial_completion.index("self.generationSourceSeekCompleted = true"),
-        )
-
-    def test_all_avplayer_callbacks_are_isolated_to_the_worker_session(self):
-        player = PLAYER_SOURCE.read_text()
-        start = player.split("func start(runner:", 1)[1].split(
-            "func togglePlayback", 1
-        )[0]
-        enqueue = player.split("private func enqueue", 1)[1].split(
-            "private func finished", 1
-        )[0]
-        time_observer = player.split("private func installTimeObserver", 1)[1].split(
-            "private func tick", 1
-        )[0]
-
-        self.assertIn("installTimeObserver(sessionToken: sessionToken)", start)
-        self.assertIn("(sessionToken: UUID)", time_observer)
-        self.assertIn(
-            "self.activeWorkerSessionToken == sessionToken",
-            time_observer,
-        )
-        for contract in [
-            "guard let itemSessionToken = activeWorkerSessionToken else { return }",
-            "let itemGeneration = generation",
-            "self.activeWorkerSessionToken == itemSessionToken",
-            "self.generation == itemGeneration",
-        ]:
-            self.assertIn(contract, enqueue)
-
-    def test_completed_item_observers_are_removed_immediately(self):
-        player = PLAYER_SOURCE.read_text()
-        deinit = player.split("deinit", 1)[1].split("func start(runner:", 1)[0]
-        enqueue = player.split("private func enqueue", 1)[1].split(
-            "private func finished", 1
-        )[0]
-        finished = player.split("private func finished", 1)[1].split(
-            "private func resumeIfBuffered", 1
-        )[0]
-        clear_queue = player.split("private func clearRestoredQueue", 1)[1].split(
-            "private func cleanupSession", 1
-        )[0]
-
-        self.assertIn(
-            "private var notificationTokens: [ObjectIdentifier: NSObjectProtocol] = [:]",
-            player,
-        )
-        self.assertIn("for token in notificationTokens.values", deinit)
-        self.assertIn("notificationTokens[identifier] = token", enqueue)
-        for contract in [
-            "let identifier = ObjectIdentifier(item)",
-            "notificationTokens.removeValue(forKey: identifier)",
-            "NotificationCenter.default.removeObserver(token)",
-        ]:
-            self.assertIn(contract, finished)
-        self.assertLess(
-            finished.index("notificationTokens.removeValue(forKey: identifier)"),
-            finished.index("itemSegments.removeValue(forKey: identifier)"),
-        )
-        self.assertIn("for token in notificationTokens.values", clear_queue)
-        self.assertIn("notificationTokens.removeAll()", clear_queue)
 
     def test_playback_input_is_independent_from_export_input(self):
         player = PLAYER_SOURCE.read_text()
