@@ -347,6 +347,41 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn("toleranceAfter: .zero", drift_seek)
         self.assertNotIn("sourceSeekTolerance", drift_seek)
 
+    def test_source_seek_watchdog_releases_missing_avplayer_completions(self):
+        player = PLAYER_SOURCE.read_text()
+        manual_seek = player.split("func seek(to seconds:", 1)[1].split(
+            "func restartWithCurrentSettings", 1
+        )[0]
+        buffered_start_seek = player.split("private func resumeIfBuffered", 1)[1].split(
+            "private func startPlayersFromCurrentPosition", 1
+        )[0]
+        watchdog = player.split("private func resolveStalledSourceSeek", 1)[1].split(
+            "private func startPlayersFromCurrentPosition", 1
+        )[0]
+
+        for contract in [
+            "private var activeSourceSeekRequestToken: UUID?",
+            "private let sourceSeekWatchdogNanoseconds: UInt64 = 2_000_000_000",
+            "private let sourceSeekWatchdogToleranceSeconds = 1.0",
+        ]:
+            self.assertIn(contract, player)
+        for source_seek in [manual_seek, buffered_start_seek]:
+            self.assertIn("activeSourceSeekRequestToken =", source_seek)
+            self.assertIn("Task { @MainActor", source_seek)
+            self.assertIn("Task.sleep(nanoseconds: seekWatchdogNanoseconds)", source_seek)
+            self.assertIn("resolveStalledSourceSeek(", source_seek)
+        for contract in [
+            "activeSourceSeekRequestToken == requestToken",
+            "activeWorkerSessionToken == sessionToken",
+            "generation == seekGeneration",
+            "generationStartPending",
+            "sourcePlayer.currentTime().seconds",
+            "abs(currentSeconds - targetSeconds) <= sourceSeekWatchdogToleranceSeconds",
+            "generationSourceSeekCompleted = true",
+            "resumeIfBuffered()",
+        ]:
+            self.assertIn(contract, watchdog)
+
     def test_all_avplayer_callbacks_are_isolated_to_the_worker_session(self):
         player = PLAYER_SOURCE.read_text()
         start = player.split("func start(runner:", 1)[1].split(

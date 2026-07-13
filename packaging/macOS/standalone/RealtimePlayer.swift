@@ -68,6 +68,8 @@ final class RealtimePlayerController: ObservableObject {
   let restoredPlayer = AVQueuePlayer()
   let driftToleranceSeconds = 0.080
   let sourceSeekToleranceSeconds = 0.25
+  private let sourceSeekWatchdogNanoseconds: UInt64 = 2_000_000_000
+  private let sourceSeekWatchdogToleranceSeconds = 1.0
 
   private var sourceSeekTolerance: CMTime {
     CMTime(seconds: sourceSeekToleranceSeconds, preferredTimescale: 600)
@@ -79,6 +81,7 @@ final class RealtimePlayerController: ObservableObject {
   private var stderrPipe: Pipe?
   private var stdoutBuffer = ""
   private var activeWorkerSessionToken: UUID?
+  private var activeSourceSeekRequestToken: UUID?
   private var generation = 0
   private var nextSequence = 0
   private var queuedSegments: [PreviewSegment] = []
@@ -172,6 +175,7 @@ final class RealtimePlayerController: ObservableObject {
       generationStartPending = false
       generationSourceSeekCompleted = false
       generationSourceSeekRetryCount = 0
+      activeSourceSeekRequestToken = nil
       workerGenerationEnded = false
       state = .loading
       errorMessage = ""
@@ -263,6 +267,10 @@ final class RealtimePlayerController: ObservableObject {
     generationStartPending = true
     generationSourceSeekCompleted = false
     generationSourceSeekRetryCount = 0
+    let seekRequestToken = UUID()
+    let seekTargetSeconds = position
+    let seekWatchdogNanoseconds = sourceSeekWatchdogNanoseconds
+    activeSourceSeekRequestToken = seekRequestToken
     workerGenerationEnded = false
     clearRestoredQueue(deleteFiles: true)
     state = .seeking
@@ -274,8 +282,10 @@ final class RealtimePlayerController: ObservableObject {
       Task { @MainActor in
         guard let self,
           self.activeWorkerSessionToken == seekSessionToken,
-          self.generation == seekGeneration
+          self.generation == seekGeneration,
+          self.activeSourceSeekRequestToken == seekRequestToken
         else { return }
+        self.activeSourceSeekRequestToken = nil
         self.generationStartPending = false
         guard self.shouldPlay, self.state != .failed, self.state != .ended else { return }
         guard finished else {
@@ -292,6 +302,15 @@ final class RealtimePlayerController: ObservableObject {
         self.generationSourceSeekCompleted = true
         self.resumeIfBuffered()
       }
+    }
+    Task { @MainActor [weak self] in
+      try? await Task.sleep(nanoseconds: seekWatchdogNanoseconds)
+      self?.resolveStalledSourceSeek(
+        targetSeconds: seekTargetSeconds,
+        sessionToken: seekSessionToken,
+        seekGeneration: seekGeneration,
+        requestToken: seekRequestToken
+      )
     }
     sendCommand(["command": "seek", "position_ns": Int64(position * 1_000_000_000)])
   }
@@ -327,6 +346,7 @@ final class RealtimePlayerController: ObservableObject {
     generationStartPending = false
     generationSourceSeekCompleted = false
     generationSourceSeekRetryCount = 0
+    activeSourceSeekRequestToken = nil
     workerGenerationEnded = false
     activeWorkerSessionToken = nil
     stdoutBuffer = ""
@@ -488,7 +508,11 @@ final class RealtimePlayerController: ObservableObject {
 
     guard let startingSessionToken = activeWorkerSessionToken else { return }
     let startingGeneration = generation
+    let startingSeekRequestToken = UUID()
+    let startingTargetSeconds = requestedStartSeconds
+    let seekWatchdogNanoseconds = sourceSeekWatchdogNanoseconds
     generationStartPending = true
+    activeSourceSeekRequestToken = startingSeekRequestToken
     sourcePlayer.seek(
       to: CMTime(seconds: requestedStartSeconds, preferredTimescale: 600),
       toleranceBefore: sourceSeekTolerance,
@@ -497,8 +521,10 @@ final class RealtimePlayerController: ObservableObject {
       Task { @MainActor in
         guard let self,
           self.activeWorkerSessionToken == startingSessionToken,
-          self.generation == startingGeneration
+          self.generation == startingGeneration,
+          self.activeSourceSeekRequestToken == startingSeekRequestToken
         else { return }
+        self.activeSourceSeekRequestToken = nil
         self.generationStartPending = false
         guard self.shouldPlay, self.state != .failed, self.state != .ended else { return }
         guard finished else {
@@ -531,6 +557,49 @@ final class RealtimePlayerController: ObservableObject {
         self.startPlayersFromCurrentPosition()
       }
     }
+    Task { @MainActor [weak self] in
+      try? await Task.sleep(nanoseconds: seekWatchdogNanoseconds)
+      self?.resolveStalledSourceSeek(
+        targetSeconds: startingTargetSeconds,
+        sessionToken: startingSessionToken,
+        seekGeneration: startingGeneration,
+        requestToken: startingSeekRequestToken
+      )
+    }
+  }
+
+  private func resolveStalledSourceSeek(
+    targetSeconds: Double,
+    sessionToken: UUID,
+    seekGeneration: Int,
+    requestToken: UUID
+  ) {
+    guard activeSourceSeekRequestToken == requestToken,
+      activeWorkerSessionToken == sessionToken,
+      generation == seekGeneration,
+      generationStartPending
+    else { return }
+    activeSourceSeekRequestToken = nil
+    generationStartPending = false
+    guard shouldPlay, state != .failed, state != .ended else { return }
+
+    let currentSeconds = sourcePlayer.currentTime().seconds
+    guard currentSeconds.isFinite,
+      abs(currentSeconds - targetSeconds) <= sourceSeekWatchdogToleranceSeconds
+    else {
+      guard generationSourceSeekRetryCount < maximumGenerationSourceSeekRetries else {
+        fail("プレビューのシークに繰り返し失敗しました")
+        return
+      }
+      generationSourceSeekRetryCount += 1
+      state = .buffering
+      resumeIfBuffered()
+      return
+    }
+
+    generationSourceSeekRetryCount = 0
+    generationSourceSeekCompleted = true
+    resumeIfBuffered()
   }
 
   private func startPlayersFromCurrentPosition() {
