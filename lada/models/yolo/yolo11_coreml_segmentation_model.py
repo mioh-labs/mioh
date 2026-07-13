@@ -9,8 +9,11 @@ tensors stay on CPU, so detection never takes the process-wide MPS
 execution lock and restoration keeps the Metal queue to itself.
 """
 
+import ast
+import json
 import logging
 import os
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -52,6 +55,21 @@ class _CompiledCoreMLBackend:
             model_path,
             compute_units=compute_unit,
         )
+        self.names = self._load_names(model_path)
+
+    @staticmethod
+    def _load_names(model_path: str) -> dict[int, str]:
+        try:
+            metadata = json.loads(
+                (Path(model_path) / "metadata.json").read_text(encoding="utf-8")
+            )
+            encoded_names = metadata[0]["userDefinedMetadata"]["names"]
+            names = ast.literal_eval(encoded_names)
+            if isinstance(names, dict):
+                return {int(key): str(value) for key, value in names.items()}
+        except (OSError, ValueError, SyntaxError, KeyError, IndexError, TypeError):
+            pass
+        return {0: "nsfw"}
 
     def eval(self):
         return self
