@@ -5,14 +5,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import queue
 import shutil
 import sys
+import threading
+import time
 from fractions import Fraction
 from pathlib import Path
 from typing import Callable, TextIO
 
 import av
 import numpy as np
+
+
+PROTOCOL_STREAM = sys.stdout
 
 
 def emit_event(
@@ -22,7 +29,7 @@ def emit_event(
     stream: TextIO | None = None,
     **payload,
 ) -> None:
-    destination = stream or sys.stdout
+    destination = stream or PROTOCOL_STREAM
     destination.write(
         json.dumps(
             {"kind": kind, "generation": generation, **payload},
@@ -194,11 +201,293 @@ class SegmentEncoder:
         self.segment_path = None
 
 
+def _resolve_model(value: str, lookup: Callable, kind: str) -> tuple[str, str]:
+    model = lookup(value)
+    if model is not None:
+        return model.name, model.path
+    path = Path(value)
+    if path.exists():
+        return value, str(path)
+    raise ValueError(f"Unknown {kind} model: {value}")
+
+
+def load_preview_models(config):
+    import torch
+
+    from lada import ModelFiles
+    from lada.restorationpipeline import load_models
+    from lada.utils import video_utils
+
+    restoration_name, restoration_path = _resolve_model(
+        config.restoration_model,
+        ModelFiles.get_restoration_model_by_name,
+        "restoration",
+    )
+    _detection_name, detection_path = _resolve_model(
+        config.detection_model,
+        ModelFiles.get_detection_model_by_name,
+        "detection",
+    )
+    detection, restoration, pad_mode = load_models(
+        torch.device(config.device),
+        restoration_name,
+        restoration_path,
+        None,
+        detection_path,
+        fp16=config.fp16,
+        detect_face_mosaics=config.detect_face_mosaics,
+    )
+    return {
+        "detection": detection,
+        "restoration": restoration,
+        "pad_mode": pad_mode,
+        "restoration_name": restoration_name,
+        "metadata": video_utils.get_video_meta_data(config.input),
+    }
+
+
+def create_preview_restorer(config, models):
+    from lada import ModelFiles
+    from lada.restorationpipeline.frame_restorer import FrameRestorer
+
+    enhancer_path = config.roi_enhancer_model or None
+    if enhancer_path:
+        enhancer_model = ModelFiles.get_enhancer_model_by_name(enhancer_path)
+        if enhancer_model is not None:
+            enhancer_path = enhancer_model.path
+    return FrameRestorer(
+        config.device,
+        config.input,
+        config.max_clip_length,
+        models["restoration_name"],
+        models["detection"],
+        models["restoration"],
+        models["pad_mode"],
+        False,
+        restore_sharpen_strength=config.sharpen_strength,
+        restore_detail_boost=config.detail_boost,
+        restore_blend_feather=config.blend_feather,
+        restore_texture_mix=config.texture_mix,
+        restore_smooth_strength=config.smooth_strength,
+        restore_roi_enhancer=config.roi_enhancer,
+        restore_roi_enhancer_model_path=enhancer_path,
+        restore_roi_enhancer_scale=config.roi_enhancer_scale,
+        restore_roi_enhancer_strength=config.roi_enhancer_strength,
+        restore_roi_enhancer_tile=config.roi_enhancer_tile,
+        restore_effect_upscale=config.effect_upscale,
+        fp16_enabled=config.fp16,
+        mosaic_detection_empty_lookahead=config.detection_empty_lookahead,
+        restore_max_frames=config.restore_max_frames,
+    )
+
+
+class PreviewSession:
+    def __init__(
+        self,
+        config,
+        output_dir: Path,
+        *,
+        model_loader: Callable = load_preview_models,
+        restorer_factory: Callable = create_preview_restorer,
+        encoder_factory: Callable = SegmentEncoder,
+    ) -> None:
+        self.config = config
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.model_loader = model_loader
+        self.restorer_factory = restorer_factory
+        self.encoder_factory = encoder_factory
+        self.models = None
+        self.restorer = None
+        self.encoder = None
+        self.generation = 0
+        self.stopped = False
+        self.commands: queue.Queue[PreviewCommand] = queue.Queue()
+        self.control_thread: threading.Thread | None = None
+        self._buffer_full_reported = False
+
+    def _load_models_once(self):
+        if self.models is None:
+            self.models = self.model_loader(self.config)
+        return self.models
+
+    def _stop_restorer(self) -> None:
+        if self.restorer is not None:
+            self.restorer.stop()
+            self.restorer = None
+        if self.encoder is not None:
+            self.encoder.discard()
+            self.encoder = None
+
+    def _delete_segments(self) -> None:
+        for path in self.output_dir.glob("preview-g*-*.mp4"):
+            path.unlink(missing_ok=True)
+
+    def start_generation(self, start_ns: int) -> None:
+        models = self._load_models_once()
+        self._stop_restorer()
+        self._delete_segments()
+        self.restorer = self.restorer_factory(self.config, models)
+        self.restorer.start(start_ns=start_ns)
+        self._buffer_full_reported = False
+
+    def seek(self, position_ns: int) -> None:
+        self.generation += 1
+        self.start_generation(position_ns)
+
+    def has_buffer_capacity(self) -> bool:
+        limit = max(
+            1,
+            int(math.ceil(self.config.buffer_limit / self.config.segment_seconds)),
+        )
+        count = sum(
+            1
+            for _ in self.output_dir.glob(
+                f"preview-g{self.generation}-*.mp4"
+            )
+        )
+        return count < limit
+
+    def _read_commands(self, stream: TextIO) -> None:
+        for line in stream:
+            try:
+                self.commands.put(PreviewCommand.parse(line))
+            except Exception as exc:
+                print(f"Ignoring invalid preview command: {exc}", file=sys.stderr)
+
+    def _next_command(self) -> PreviewCommand | None:
+        try:
+            return self.commands.get_nowait()
+        except queue.Empty:
+            return None
+
+    def _apply_command(self, command: PreviewCommand) -> bool:
+        if command.command == "stop":
+            self.stopped = True
+            return True
+        if command.command == "seek":
+            if command.position_ns is None:
+                raise ValueError("seek requires position_ns")
+            self.seek(command.position_ns)
+            return True
+        if command.command == "set_buffer_limit":
+            if command.seconds is None or command.seconds <= 0:
+                raise ValueError("set_buffer_limit requires positive seconds")
+            self.config.buffer_limit = command.seconds
+        return False
+
+    def _new_encoder(self):
+        metadata = self.models["metadata"]
+        return self.encoder_factory(
+            output_dir=self.output_dir,
+            width=metadata.video_width,
+            height=metadata.video_height,
+            fps=metadata.video_fps_exact,
+            generation=self.generation,
+            preferred_codec="h264_videotoolbox",
+            segment_seconds=self.config.segment_seconds,
+        )
+
+    def run(self, start_ns: int = 0, control_stream: TextIO | None = None) -> None:
+        from lada.utils.threading_utils import EOF_MARKER, STOP_MARKER, ErrorMarker
+
+        self._load_models_once()
+        metadata = self.models["metadata"]
+        emit_event(
+            "ready",
+            generation=self.generation,
+            duration=metadata.duration,
+            fps=float(metadata.video_fps_exact),
+            width=metadata.video_width,
+            height=metadata.video_height,
+        )
+        if control_stream is not None:
+            self.control_thread = threading.Thread(
+                target=self._read_commands,
+                args=(control_stream,),
+                name="mioh-preview-control",
+                daemon=True,
+            )
+            self.control_thread.start()
+        self.start_generation(start_ns)
+        self.encoder = self._new_encoder()
+
+        while not self.stopped:
+            command = self._next_command()
+            if command is not None:
+                generation_changed = self._apply_command(command)
+                if self.stopped:
+                    break
+                if generation_changed:
+                    self.encoder = self._new_encoder()
+                    emit_event("progress", generation=self.generation, position_ns=command.position_ns or 0)
+                continue
+
+            if not self.has_buffer_capacity():
+                if not self._buffer_full_reported:
+                    emit_event("buffer_full", generation=self.generation)
+                    self._buffer_full_reported = True
+                time.sleep(0.05)
+                continue
+            self._buffer_full_reported = False
+
+            try:
+                result = self.restorer.get_frame_restoration_queue().get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if result is STOP_MARKER:
+                continue
+            if result is EOF_MARKER:
+                for event in self.encoder.finish():
+                    emit_event(**event)
+                emit_event("ended", generation=self.generation)
+                break
+            if isinstance(result, ErrorMarker):
+                raise RuntimeError(str(result))
+
+            frame, pts = result
+            if hasattr(frame, "detach"):
+                frame = frame.detach().cpu().numpy()
+            pts_ns = int(
+                Fraction(pts) * metadata.time_base * 1_000_000_000
+            )
+            for event in self.encoder.add_frame(frame, pts_ns):
+                emit_event(**event)
+                emit_event("progress", generation=self.generation, position_ns=event["end_ns"])
+
+    def stop(self, *, remove_output: bool) -> None:
+        self.stopped = True
+        self._stop_restorer()
+        if remove_output:
+            shutil.rmtree(self.output_dir, ignore_errors=True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="mioh restored preview worker")
     parser.add_argument("--input", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--start-ns", type=int, default=0)
+    parser.add_argument("--device", default="mps")
+    parser.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--restoration-model", required=True)
+    parser.add_argument("--detection-model", required=True)
+    parser.add_argument("--max-clip-length", type=int, default=180)
+    parser.add_argument("--restore-max-frames", type=int)
+    parser.add_argument("--detect-face-mosaics", action="store_true")
+    parser.add_argument("--detection-empty-lookahead", type=int, default=10)
+    parser.add_argument("--sharpen-strength", type=float, default=0.0)
+    parser.add_argument("--detail-boost", type=float, default=0.0)
+    parser.add_argument("--blend-feather", type=float, default=1.0)
+    parser.add_argument("--texture-mix", type=float, default=0.0)
+    parser.add_argument("--smooth-strength", type=float, default=0.0)
+    parser.add_argument("--roi-enhancer", default="none")
+    parser.add_argument("--roi-enhancer-model", default="")
+    parser.add_argument("--roi-enhancer-scale", type=int, default=4)
+    parser.add_argument("--roi-enhancer-strength", type=float, default=0.0)
+    parser.add_argument("--roi-enhancer-tile", type=int, default=0)
+    parser.add_argument("--effect-upscale", type=int, default=1)
+    parser.add_argument("--segment-seconds", type=float, default=2.0)
+    parser.add_argument("--buffer-limit", type=float, default=8.0)
     return parser
 
 
@@ -206,14 +495,23 @@ def main() -> int:
     args = build_parser().parse_args()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    emit_event(
-        "error",
-        generation=0,
-        message="Preview session is not initialized",
-        detail="Persistent restoration session is unavailable",
-    )
-    shutil.rmtree(output_dir, ignore_errors=True)
-    return 1
+    global PROTOCOL_STREAM
+    PROTOCOL_STREAM = sys.stdout
+    sys.stdout = sys.stderr
+    session = PreviewSession(args, output_dir)
+    try:
+        session.run(args.start_ns, control_stream=sys.stdin)
+        return 0
+    except Exception as exc:
+        emit_event(
+            "error",
+            generation=session.generation,
+            message="リアルタイムプレビューを開始できませんでした",
+            detail=str(exc),
+        )
+        return 1
+    finally:
+        session.stop(remove_output=False)
 
 
 if __name__ == "__main__":
