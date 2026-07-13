@@ -29,7 +29,6 @@ xcrun swiftc \
   -framework AVFoundation \
   -framework AVKit \
   "$PACKAGE_DIR/MiohApp.swift" \
-  "$PACKAGE_DIR/PreviewBufferPolicy.swift" \
   "$PACKAGE_DIR/RealtimePlayer.swift" \
   -o "$CONTENTS/MacOS/mioh"
 xcrun swiftc \

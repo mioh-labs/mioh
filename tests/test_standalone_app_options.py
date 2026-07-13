@@ -240,7 +240,6 @@ class StandaloneAppOptionTests(unittest.TestCase):
     def test_app_bundles_realtime_player_and_preview_worker(self):
         script = BUILD_SCRIPT.read_text()
 
-        self.assertIn('"$PACKAGE_DIR/PreviewBufferPolicy.swift"', script)
         self.assertIn('"$PACKAGE_DIR/RealtimePlayer.swift"', script)
         self.assertIn("-framework AVFoundation", script)
         self.assertIn("-framework AVKit", script)
