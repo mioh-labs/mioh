@@ -64,4 +64,3 @@ Model selection must be normalized immediately before starting a process. If pre
 Static contract tests will verify the deployment targets, plist minimum version, absence of a CoreAI link from the GUI executable, retention of the macOS 27 helper, conditional model lists/defaults, safe selection normalization, and unchanged `--parallel-workers` forwarding.
 
 The final verification will compile the GUI for `arm64-apple-macosx26.0`, inspect its Mach-O deployment version and linked frameworks, compile the helper for macOS 27, and run the full Python test suite.
-
