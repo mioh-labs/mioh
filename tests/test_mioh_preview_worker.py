@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from fractions import Fraction
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import av
@@ -106,6 +107,114 @@ class SegmentEncoderTests(unittest.TestCase):
             self.assertEqual(attempts[:2], ["h264_videotoolbox", "libx264"])
             self.assertEqual(encoder.active_codec, "libx264")
             self.assertEqual(encoder.active_options.get("preset"), "ultrafast")
+
+
+class PreviewSessionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.worker = load_worker_module()
+
+    def make_config(self):
+        return SimpleNamespace(
+            input="input.mp4",
+            device="mps",
+            fp16=True,
+            restoration_model="basicvsrpp-v1.2",
+            detection_model="v2-coreml",
+            max_clip_length=180,
+            restore_max_frames=None,
+            detect_face_mosaics=False,
+            detection_empty_lookahead=10,
+            sharpen_strength=0.0,
+            detail_boost=0.0,
+            blend_feather=1.0,
+            texture_mix=0.0,
+            smooth_strength=0.0,
+            roi_enhancer="none",
+            roi_enhancer_model="",
+            roi_enhancer_scale=4,
+            roi_enhancer_strength=0.0,
+            roi_enhancer_tile=0,
+            effect_upscale=1,
+            segment_seconds=2.0,
+            buffer_limit=8.0,
+        )
+
+    def test_seek_reuses_loaded_models_and_restarts_only_frame_restorer(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            loaded_models = object()
+            loader = mock.Mock(return_value=loaded_models)
+            restorers = []
+
+            class FakeRestorer:
+                def __init__(self):
+                    self.starts = []
+                    self.stopped = False
+
+                def start(self, start_ns=0):
+                    self.starts.append(start_ns)
+
+                def stop(self):
+                    self.stopped = True
+
+            def factory(config, models):
+                self.assertIs(models, loaded_models)
+                restorer = FakeRestorer()
+                restorers.append(restorer)
+                return restorer
+
+            session = self.worker.PreviewSession(
+                self.make_config(),
+                Path(temp_dir),
+                model_loader=loader,
+                restorer_factory=factory,
+            )
+            session.start_generation(0)
+            stale_path = Path(temp_dir) / "preview-g0-000000.mp4"
+            stale_path.touch()
+
+            session.seek(42_000_000_000)
+
+            loader.assert_called_once()
+            self.assertEqual(len(restorers), 2)
+            self.assertTrue(restorers[0].stopped)
+            self.assertEqual(restorers[1].starts, [42_000_000_000])
+            self.assertEqual(session.generation, 1)
+            self.assertFalse(stale_path.exists())
+
+    def test_buffer_capacity_is_bounded_to_four_two_second_segments(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = self.worker.PreviewSession(
+                self.make_config(),
+                Path(temp_dir),
+                model_loader=lambda _config: object(),
+                restorer_factory=lambda _config, _models: mock.Mock(),
+            )
+            session.generation = 7
+            for sequence in range(4):
+                (Path(temp_dir) / f"preview-g7-{sequence:06d}.mp4").touch()
+
+            self.assertFalse(session.has_buffer_capacity())
+            (Path(temp_dir) / "preview-g7-000000.mp4").unlink()
+            self.assertTrue(session.has_buffer_capacity())
+
+    def test_stop_releases_restorer_and_removes_session_directory(self):
+        with tempfile.TemporaryDirectory() as parent:
+            output_dir = Path(parent) / "preview-session"
+            output_dir.mkdir()
+            restorer = mock.Mock()
+            session = self.worker.PreviewSession(
+                self.make_config(),
+                output_dir,
+                model_loader=lambda _config: object(),
+                restorer_factory=lambda _config, _models: restorer,
+            )
+            session.start_generation(0)
+
+            session.stop(remove_output=True)
+
+            restorer.stop.assert_called_once()
+            self.assertFalse(output_dir.exists())
 
 
 if __name__ == "__main__":
