@@ -99,6 +99,26 @@ class StandaloneAppOptionTests(unittest.TestCase):
         ]:
             self.assertIn(option, app)
 
+    def test_preview_buffer_slider_supports_one_minute_and_live_updates(self):
+        app = APP_SOURCE.read_text()
+        player = PLAYER_SOURCE.read_text()
+
+        for contract in [
+            "@Published var previewBufferLimit = 8.0",
+            'add(&args, "--buffer-limit", previewBufferLimit)',
+        ]:
+            self.assertIn(contract, app)
+        for contract in [
+            "func setBufferLimit(_ seconds: Double)",
+            '["command": "set_buffer_limit", "seconds": seconds]',
+            'Text("バッファ上限")',
+            "in: 1...60",
+            "step: 1",
+            "controller.setBufferLimit(value)",
+            'Text("\\(Int(runner.previewBufferLimit))秒")',
+        ]:
+            self.assertIn(contract, player)
+
     def test_preview_uses_t36_without_changing_t90_export_default(self):
         source = APP_SOURCE.read_text()
 

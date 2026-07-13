@@ -254,6 +254,11 @@ final class RealtimePlayerController: ObservableObject {
     sourcePlayer.volume = muted ? 0 : Float(volume)
   }
 
+  func setBufferLimit(_ seconds: Double) {
+    guard worker != nil else { return }
+    sendCommand(["command": "set_buffer_limit", "seconds": seconds])
+  }
+
   func setMuted(_ value: Bool) {
     muted = value
     sourcePlayer.volume = value ? 0 : Float(volume)
@@ -521,6 +526,26 @@ struct RealtimePlayerView: View {
         )
         Text(time(controller.duration))
           .font(.caption.monospacedDigit()).frame(width: 68)
+      }
+
+      HStack(spacing: 12) {
+        Text("バッファ上限")
+        Slider(
+          value: Binding(
+            get: { runner.previewBufferLimit },
+            set: { value in
+              runner.previewBufferLimit = value
+              controller.setBufferLimit(value)
+            }
+          ),
+          in: 1...60,
+          step: 1
+        )
+        .frame(maxWidth: 320)
+        Text("\(Int(runner.previewBufferLimit))秒")
+          .font(.caption.monospacedDigit())
+          .frame(width: 48, alignment: .trailing)
+        Spacer()
       }
 
       HStack(spacing: 12) {

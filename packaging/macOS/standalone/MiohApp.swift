@@ -117,6 +117,8 @@ final class RestorationRunner: ObservableObject {
   @Published var detectionEmptyLookahead = 10
   @Published var detectFaceMosaics = false
 
+  @Published var previewBufferLimit = 8.0
+
   @Published var memoryCleanupInterval = 1
   @Published var cleanupTriggerGB = 4.0
   @Published var useMPSMemoryFraction = true
@@ -292,7 +294,7 @@ final class RestorationRunner: ObservableObject {
     add(&args, "--effect-upscale", effectUpscale)
     add(&args, "--detection-empty-lookahead", detectionEmptyLookahead)
     addFlag(&args, "--detect-face-mosaics", detectFaceMosaics)
-    add(&args, "--buffer-limit", 8.0)
+    add(&args, "--buffer-limit", previewBufferLimit)
     return args
   }
 
