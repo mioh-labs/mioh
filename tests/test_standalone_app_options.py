@@ -92,6 +92,39 @@ class StandaloneAppOptionTests(unittest.TestCase):
             1,
         )
 
+    def test_restoration_effects_use_slider_number_rows(self):
+        source = APP_SOURCE.read_text()
+        expected_slider_rows = [
+            'doubleSliderField("シャープ", value: $runner.sharpenStrength, range: 0...1, step: 0.05)',
+            'doubleSliderField("ディテール", value: $runner.detailBoost, range: 0...1, step: 0.05)',
+            'doubleSliderField("境界フェザー", value: $runner.blendFeather, range: 0...3, step: 0.05)',
+            'doubleSliderField("テクスチャ", value: $runner.textureMix, range: 0...1, step: 0.01)',
+            'doubleSliderField("スムージング", value: $runner.smoothStrength, range: 0...1, step: 0.05)',
+            'doubleSliderField("強度", value: $runner.roiEnhancerStrength, range: 0...1, step: 0.05)',
+            'integerSliderField("タイル", value: $runner.roiEnhancerTile, range: 0...1024, step: 32)',
+        ]
+
+        self.assertIn("private func doubleSliderField", source)
+        self.assertIn("private func integerSliderField", source)
+        for row in expected_slider_rows:
+            self.assertIn(row, source)
+        self.assertIn(
+            'LabeledContent("エフェクト倍率") { Stepper(value: $runner.effectUpscale, in: 1...4)',
+            source,
+        )
+        self.assertIn(
+            'LabeledContent("倍率") { Stepper(value: $runner.roiEnhancerScale, in: 1...8)',
+            source,
+        )
+        self.assertIn(
+            'doubleSliderField("強度", value: $runner.roiEnhancerStrength, range: 0...1, step: 0.05).disabled(runner.roiEnhancer == "none")',
+            source,
+        )
+        self.assertIn(
+            'integerSliderField("タイル", value: $runner.roiEnhancerTile, range: 0...1024, step: 32).disabled(runner.roiEnhancer == "none")',
+            source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
