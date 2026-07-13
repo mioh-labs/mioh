@@ -67,11 +67,6 @@ final class RealtimePlayerController: ObservableObject {
   let sourcePlayer = AVPlayer()
   let restoredPlayer = AVQueuePlayer()
   let driftToleranceSeconds = 0.080
-  let sourceSeekToleranceSeconds = 0.25
-
-  private var sourceSeekTolerance: CMTime {
-    CMTime(seconds: sourceSeekToleranceSeconds, preferredTimescale: 600)
-  }
 
   private var worker: Process?
   private var workerInput: Pipe?
@@ -268,8 +263,8 @@ final class RealtimePlayerController: ObservableObject {
     state = .seeking
     sourcePlayer.seek(
       to: CMTime(seconds: position, preferredTimescale: 600),
-      toleranceBefore: sourceSeekTolerance,
-      toleranceAfter: sourceSeekTolerance
+      toleranceBefore: .zero,
+      toleranceAfter: .zero
     ) { [weak self] finished in
       Task { @MainActor in
         guard let self,
@@ -491,8 +486,8 @@ final class RealtimePlayerController: ObservableObject {
     generationStartPending = true
     sourcePlayer.seek(
       to: CMTime(seconds: requestedStartSeconds, preferredTimescale: 600),
-      toleranceBefore: sourceSeekTolerance,
-      toleranceAfter: sourceSeekTolerance
+      toleranceBefore: .zero,
+      toleranceAfter: .zero
     ) { [weak self] finished in
       Task { @MainActor in
         guard let self,
