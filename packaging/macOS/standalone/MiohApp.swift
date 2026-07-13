@@ -25,6 +25,10 @@ struct PlatformCapabilities {
     supportsCoreAI ? "basicvsrpp-v1.2-coreai-t90" : "basicvsrpp-v1.2"
   }
 
+  var previewRestorationModel: String {
+    supportsCoreAI ? "basicvsrpp-v1.2-coreai-t36" : "basicvsrpp-v1.2"
+  }
+
   let baseRestorationModels = ["basicvsrpp-v1.2", "カスタム"]
   let coreAIRestorationModels = [
     "basicvsrpp-v1.2-coreai-t90", "basicvsrpp-v1.2-coreai-t36",
@@ -259,19 +263,18 @@ final class RestorationRunner: ObservableObject {
 
   func previewArguments(resources: URL, outputDirectory: URL) throws -> [String] {
     normalizeModelSelections()
-    let restoration = try resolvedRestorationModel(in: resources)
+    let previewModel = capabilities.previewRestorationModel
+    try rejectUnsupportedCoreAIModel(previewModel)
     let detection = try resolvedDetectionModel(in: resources)
     if roiEnhancer != "none" { try rejectUnsupportedCoreAIModel(roiEnhancerModel) }
     var args = ["--input", inputURL?.path ?? "", "--output-dir", outputDirectory.path]
     add(&args, "--device", device)
     args.append(fp16 ? "--fp16" : "--no-fp16")
-    add(&args, "--restoration-model", restoration)
+    add(&args, "--restoration-model", previewModel)
     add(&args, "--detection-model", detection)
     let automaticClipLength: Int
-    switch restorationModel {
-    case "basicvsrpp-v1.2-coreai-t90": automaticClipLength = 178
+    switch previewModel {
     case "basicvsrpp-v1.2-coreai-t36": automaticClipLength = 104
-    case "basicvsrpp-v1.2-coreai": automaticClipLength = 98
     default: automaticClipLength = 180
     }
     add(&args, "--max-clip-length", useMaxClipLength ? maxClipLength : automaticClipLength)
