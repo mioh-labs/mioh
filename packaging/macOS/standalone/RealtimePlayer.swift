@@ -1,3 +1,4 @@
+import AppKit
 import AVFoundation
 import AVKit
 import Foundation
@@ -53,6 +54,7 @@ private struct PreviewSegment {
 @MainActor
 final class RealtimePlayerController: ObservableObject {
   @Published var state: RealtimePlayerState = .idle
+  @Published var previewInputURL: URL?
   @Published var position = 0.0
   @Published var duration = 0.0
   @Published var bufferedSeconds = 0.0
@@ -101,8 +103,8 @@ final class RealtimePlayerController: ObservableObject {
 
   func start(runner: RestorationRunner, at startSeconds: Double = 0) {
     stop()
-    guard let input = runner.inputURL else {
-      fail("基本タブで入力動画を選択してください")
+    guard let input = previewInputURL else {
+      fail("再生タブで入力動画を選択してください")
       return
     }
     do {
@@ -136,7 +138,8 @@ final class RealtimePlayerController: ObservableObject {
       process.executableURL = python
       process.arguments = [script.path] + (try runner.previewArguments(
         resources: resources,
-        outputDirectory: session
+        outputDirectory: session,
+        input: input
       )) + ["--start-ns", String(Int64(startSeconds * 1_000_000_000))]
       process.environment = runner.environment(resources: resources, python: python)
       process.standardInput = inputPipe
@@ -201,6 +204,21 @@ final class RealtimePlayerController: ObservableObject {
     } else if state == .idle || state == .ended || state == .failed, let runner {
       start(runner: runner, at: position)
     }
+  }
+
+  func choosePreviewInput() {
+    let panel = NSOpenPanel()
+    panel.title = "再生動画を選択"
+    panel.canChooseFiles = true
+    panel.canChooseDirectories = false
+    panel.allowsMultipleSelection = false
+    guard panel.runModal() == .OK, let url = panel.url else { return }
+    stop()
+    previewInputURL = url
+    position = 0
+    duration = 0
+    errorMessage = ""
+    sourcePlayer.replaceCurrentItem(with: AVPlayerItem(url: url))
   }
 
   func seek(to seconds: Double) {
@@ -467,6 +485,8 @@ struct RealtimePlayerView: View {
 
   var body: some View {
     VStack(spacing: 12) {
+      PathRow(title: "再生動画", icon: "film", url: controller.previewInputURL, action: controller.choosePreviewInput)
+
       ZStack {
         Color.black
         VideoPlayer(player: controller.sourcePlayer)
@@ -506,7 +526,7 @@ struct RealtimePlayerView: View {
       HStack(spacing: 12) {
         if controller.state == .idle || controller.state == .ended || controller.state == .failed {
           Button { controller.start(runner: runner) } label: { Label("再生", systemImage: "play.fill") }
-            .buttonStyle(.borderedProminent).disabled(runner.inputURL == nil)
+            .buttonStyle(.borderedProminent).disabled(controller.previewInputURL == nil)
         } else if controller.state == .playing {
           Button(action: controller.togglePlayback) { Label("一時停止", systemImage: "pause.fill") }
         } else {

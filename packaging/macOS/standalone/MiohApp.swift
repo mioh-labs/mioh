@@ -261,13 +261,13 @@ final class RestorationRunner: ObservableObject {
     NSWorkspace.shared.activateFileViewerSelecting([outputURL])
   }
 
-  func previewArguments(resources: URL, outputDirectory: URL) throws -> [String] {
+  func previewArguments(resources: URL, outputDirectory: URL, input: URL) throws -> [String] {
     normalizeModelSelections()
     let previewModel = capabilities.previewRestorationModel
     try rejectUnsupportedCoreAIModel(previewModel)
     let detection = try resolvedDetectionModel(in: resources)
     if roiEnhancer != "none" { try rejectUnsupportedCoreAIModel(roiEnhancerModel) }
-    var args = ["--input", inputURL?.path ?? "", "--output-dir", outputDirectory.path]
+    var args = ["--input", input.path, "--output-dir", outputDirectory.path]
     add(&args, "--device", device)
     args.append(fp16 ? "--fp16" : "--no-fp16")
     add(&args, "--restoration-model", previewModel)

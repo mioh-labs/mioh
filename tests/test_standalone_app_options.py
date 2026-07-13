@@ -54,10 +54,35 @@ class StandaloneAppOptionTests(unittest.TestCase):
         ]:
             self.assertIn(contract, player)
 
+    def test_playback_input_is_independent_from_export_input(self):
+        player = PLAYER_SOURCE.read_text()
+        app = APP_SOURCE.read_text()
+
+        for contract in [
+            "@Published var previewInputURL: URL?",
+            "func choosePreviewInput()",
+            "guard let input = previewInputURL",
+            'PathRow(title: "再生動画"',
+            "controller.previewInputURL == nil",
+        ]:
+            self.assertIn(contract, player)
+        self.assertNotIn("guard let input = runner.inputURL", player)
+        self.assertIn(
+            "func previewArguments(resources: URL, outputDirectory: URL, input: URL)",
+            app,
+        )
+        self.assertIn(
+            'var args = ["--input", input.path, "--output-dir", outputDirectory.path]',
+            app,
+        )
+
     def test_runner_exposes_current_settings_to_preview_worker(self):
         app = APP_SOURCE.read_text()
 
-        self.assertIn("func previewArguments(resources: URL, outputDirectory: URL)", app)
+        self.assertIn(
+            "func previewArguments(resources: URL, outputDirectory: URL, input: URL)",
+            app,
+        )
         for option in [
             "--restoration-model", "--detection-model", "--max-clip-length",
             "--restore-max-frames", "--sharpen-strength", "--detail-boost",
