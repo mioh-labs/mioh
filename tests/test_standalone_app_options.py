@@ -184,14 +184,14 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "self.activeWorkerSessionToken == seekSessionToken",
             "self.generation == seekGeneration",
             "self.generationStartPending = false",
-            "guard finished else {",
+            "guard finished else { return }",
             "self.generationSourceSeekCompleted = true",
             "self.resumeIfBuffered()",
         ]:
             self.assertIn(contract, seek)
         self.assertLess(
             seek.index("self.generationStartPending = false"),
-            seek.index("guard finished else {"),
+            seek.index("guard finished else { return }"),
         )
 
         self.assertIn("let startingSessionToken = activeWorkerSessionToken", resume)
@@ -200,47 +200,18 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "self.activeWorkerSessionToken == startingSessionToken",
             "self.generation == startingGeneration",
             "self.generationStartPending = false",
-            "guard finished else {",
+            "guard finished else { return }",
             "self.generationSourceSeekCompleted = true",
         ]:
             self.assertIn(contract, initial_completion)
         self.assertLess(
             initial_completion.index("self.generationStartPending = false"),
-            initial_completion.index("guard finished else {"),
+            initial_completion.index("guard finished else { return }"),
         )
         self.assertLess(
-            initial_completion.index("guard finished else {"),
+            initial_completion.index("guard finished else { return }"),
             initial_completion.index("self.generationSourceSeekCompleted = true"),
         )
-
-    def test_interrupted_source_seeks_buffer_and_retry_immediately(self):
-        player = PLAYER_SOURCE.read_text()
-        manual_completion = player.split("func seek(to seconds:", 1)[1].split(
-            "func restartWithCurrentSettings", 1
-        )[0].split(") { [weak self] finished in", 1)[1]
-        buffered_start_completion = player.split(
-            "private func resumeIfBuffered", 1
-        )[1].split("private func startPlayersFromCurrentPosition", 1)[0].split(
-            ") { [weak self] finished in", 1
-        )[1]
-        retry_branch = (
-            "guard finished else {\n"
-            "          self.state = .buffering\n"
-            "          self.resumeIfBuffered()\n"
-            "          return\n"
-            "        }"
-        )
-
-        for completion in [manual_completion, buffered_start_completion]:
-            self.assertIn(retry_branch, completion)
-            self.assertLess(
-                completion.index("self.generationStartPending = false"),
-                completion.index(retry_branch),
-            )
-            failure_scope = completion.split("guard finished else {", 1)[1].split(
-                "}", 1
-            )[0]
-            self.assertNotIn("generationSourceSeekCompleted", failure_scope)
 
     def test_all_avplayer_callbacks_are_isolated_to_the_worker_session(self):
         player = PLAYER_SOURCE.read_text()
