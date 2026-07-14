@@ -52,7 +52,7 @@ class CompiledCoreAIRuntime:
         inputs: tuple[TensorSpec, ...],
         outputs: tuple[TensorSpec, ...],
         runner_path: str | None = None,
-        process_factory: Callable[..., subprocess.Popen] = subprocess.Popen,
+        process_factory: Callable[..., subprocess.Popen] | None = None,
     ):
         self.model_path = Path(model_path)
         if not self.model_path.is_dir():
@@ -65,7 +65,7 @@ class CompiledCoreAIRuntime:
         self.inputs = tuple(inputs)
         self.outputs = tuple(outputs)
         self.runner_path = runner_path
-        self._process_factory = process_factory
+        self._process_factory = process_factory or subprocess.Popen
         self._lock = threading.Lock()
         self._process: subprocess.Popen | None = None
         self._mapping: mmap.mmap | None = None
