@@ -1,11 +1,15 @@
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
 
 from lada import ModelFiles
+from lada.coreai.compiled_runtime import TensorSpec
 from lada.models.yolo.yolo11_coreai_segmentation_model import (
+    CoreAISegmentationRuntime,
     Yolo11CoreAISegmentationModel,
 )
 
@@ -23,6 +27,39 @@ class RecordingRuntime:
 
 
 class Yolo11CoreAISegmentationModelTests(unittest.TestCase):
+    def test_compiled_detection_uses_swift_tensor_contract(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "detect.h17s.aimodelc"
+            model_path.mkdir()
+            with mock.patch(
+                "lada.models.yolo.yolo11_coreai_segmentation_model."
+                "CompiledCoreAIRuntime"
+            ) as compiled:
+                runtime = CoreAISegmentationRuntime(model_path)
+                runtime._ensure_loaded()
+                runtime.close()
+
+        compiled.assert_called_once_with(
+            model_path,
+            inputs=(TensorSpec("image", (1, 3, 640, 640)),),
+            outputs=(
+                TensorSpec("candidates", (1, 38, 8400)),
+                TensorSpec("prototypes", (1, 32, 160, 160)),
+            ),
+        )
+
+    def test_detection_model_accepts_compiled_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "detect.h17s.aimodelc"
+            model_path.mkdir()
+            model = Yolo11CoreAISegmentationModel(
+                model_path,
+                torch.device("cpu"),
+                runtime=RecordingRuntime(),
+            )
+
+        self.assertIsNotNone(model.runtime)
+
     def test_v4_fast_coreai_is_registered(self):
         models = {
             model.name: model.path
