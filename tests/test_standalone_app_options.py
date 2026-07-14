@@ -229,6 +229,16 @@ class StandaloneAppOptionTests(unittest.TestCase):
             self.assertIn(source, script)
             self.assertNotIn(source, regular_assets)
 
+    def test_build_runs_all_coreai_smoke_tests_before_signing(self):
+        script = BUILD_SCRIPT.read_text()
+
+        verifier = script.index('"$PACKAGE_DIR/verify_coreai_models.py"')
+        signing = script.index('codesign --force --deep --sign - "$APP"')
+        self.assertLess(verifier, signing)
+        self.assertIn('LADA_COREAI_ARCHITECTURE="$COREAI_ARCHITECTURE"', script)
+        self.assertIn('LADA_MODEL_WEIGHTS_DIR="$RESOURCES/models"', script)
+        self.assertIn('LADA_COREAI_SWIFT_RUNNER="$RESOURCES/bin/lada-coreai-runner"', script)
+
     def test_parallel_worker_selection_is_forwarded_without_platform_limit(self):
         source = APP_SOURCE.read_text()
 
