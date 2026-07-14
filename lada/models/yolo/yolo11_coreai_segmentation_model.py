@@ -19,6 +19,7 @@ from ultralytics.utils import DEFAULT_CFG
 from ultralytics.utils.checks import check_imgsz
 
 from lada.coreai.compiled_runtime import CompiledCoreAIRuntime, TensorSpec
+from lada.coreai.source_runtime import load_source_model
 from lada.models.yolo.yolo11_segmentation_model import Yolo11SegmentationModel
 from lada.utils import ImageTensor
 
@@ -48,15 +49,12 @@ class CoreAISegmentationRuntime:
             return
         if self._function is not None:
             return
-        try:
-            from coreai.runtime import AIModel
-        except ImportError as exc:
-            raise RuntimeError(
-                "Core AI mosaic detection requires the isolated coreai-torch environment"
-            ) from exc
-
         self._runner = asyncio.Runner()
-        self._model = self._runner.run(AIModel.load(self.model_path))
+        self._model = load_source_model(
+            self._runner,
+            self.model_path,
+            purpose="モザイク検出",
+        )
         self._function = self._model.load_function("main")
 
     def __call__(self, image: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
