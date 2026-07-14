@@ -13,6 +13,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from lada.coreai.compiled_runtime import CompiledCoreAIRuntime, TensorSpec
+
 
 class CoreAIEnhancerRuntime:
     def __init__(self, model_path: Path, imgsz: int = 256, scale: int = 4):
@@ -24,9 +26,25 @@ class CoreAIEnhancerRuntime:
         self._runner: asyncio.Runner | None = None
         self._model = None
         self._function = None
+        self._compiled_runtime: CompiledCoreAIRuntime | None = None
         self._lock = threading.Lock()
 
     def _ensure_loaded(self) -> None:
+        if self.model_path.suffix == ".aimodelc":
+            if self._compiled_runtime is None:
+                self._compiled_runtime = CompiledCoreAIRuntime(
+                    self.model_path,
+                    inputs=(
+                        TensorSpec("image", (1, 3, self.imgsz, self.imgsz)),
+                    ),
+                    outputs=(
+                        TensorSpec(
+                            "enhanced",
+                            (1, 3, self.imgsz * self.scale, self.imgsz * self.scale),
+                        ),
+                    ),
+                )
+            return
         if self._function is not None:
             return
         try:
@@ -49,14 +67,17 @@ class CoreAIEnhancerRuntime:
             )
         with self._lock:
             self._ensure_loaded()
-            assert self._runner is not None and self._function is not None
-            from coreai.runtime import NDArray
+            if self._compiled_runtime is not None:
+                output = self._compiled_runtime.infer({"image": image})["enhanced"]
+            else:
+                assert self._runner is not None and self._function is not None
+                from coreai.runtime import NDArray
 
-            async def infer() -> np.ndarray:
-                outputs = await self._function({"image": NDArray(image)})
-                return outputs["enhanced"].numpy().copy()
+                async def infer() -> np.ndarray:
+                    outputs = await self._function({"image": NDArray(image)})
+                    return outputs["enhanced"].numpy().copy()
 
-            output = self._runner.run(infer())
+                output = self._runner.run(infer())
         expected_output = (1, 3, self.imgsz * self.scale, self.imgsz * self.scale)
         if output.shape != expected_output:
             raise ValueError(
@@ -68,11 +89,15 @@ class CoreAIEnhancerRuntime:
     def close(self) -> None:
         with self._lock:
             runner = self._runner
+            compiled_runtime = self._compiled_runtime
             self._runner = None
             self._model = None
             self._function = None
+            self._compiled_runtime = None
             if runner is not None:
                 runner.close()
+            if compiled_runtime is not None:
+                compiled_runtime.close()
 
     def __del__(self):
         try:
