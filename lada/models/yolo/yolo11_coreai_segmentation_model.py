@@ -18,6 +18,7 @@ from ultralytics.data.augment import LetterBox
 from ultralytics.utils import DEFAULT_CFG
 from ultralytics.utils.checks import check_imgsz
 
+from lada.coreai.compiled_runtime import CompiledCoreAIRuntime, TensorSpec
 from lada.models.yolo.yolo11_segmentation_model import Yolo11SegmentationModel
 from lada.utils import ImageTensor
 
@@ -30,9 +31,21 @@ class CoreAISegmentationRuntime:
         self._runner: asyncio.Runner | None = None
         self._model = None
         self._function = None
+        self._compiled_runtime: CompiledCoreAIRuntime | None = None
         self._lock = threading.Lock()
 
     def _ensure_loaded(self) -> None:
+        if self.model_path.suffix == ".aimodelc":
+            if self._compiled_runtime is None:
+                self._compiled_runtime = CompiledCoreAIRuntime(
+                    self.model_path,
+                    inputs=(TensorSpec("image", (1, 3, 640, 640)),),
+                    outputs=(
+                        TensorSpec("candidates", (1, 38, 8400)),
+                        TensorSpec("prototypes", (1, 32, 160, 160)),
+                    ),
+                )
+            return
         if self._function is not None:
             return
         try:
@@ -54,6 +67,9 @@ class CoreAISegmentationRuntime:
 
         with self._lock:
             self._ensure_loaded()
+            if self._compiled_runtime is not None:
+                outputs = self._compiled_runtime.infer({"image": image})
+                return outputs["candidates"], outputs["prototypes"]
             assert self._runner is not None and self._function is not None
             from coreai.runtime import NDArray
 
@@ -65,6 +81,25 @@ class CoreAISegmentationRuntime:
                 )
 
             return self._runner.run(infer())
+
+    def close(self) -> None:
+        with self._lock:
+            runner = self._runner
+            compiled_runtime = self._compiled_runtime
+            self._runner = None
+            self._model = None
+            self._function = None
+            self._compiled_runtime = None
+            if runner is not None:
+                runner.close()
+            if compiled_runtime is not None:
+                compiled_runtime.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 class Yolo11CoreAISegmentationModel(Yolo11SegmentationModel):
@@ -79,8 +114,10 @@ class Yolo11CoreAISegmentationModel(Yolo11SegmentationModel):
     ):
         del device, fp16
         model_path = Path(model_path)
-        if model_path.suffix != ".aimodel":
-            raise ValueError(f"Expected an .aimodel path, got {str(model_path)!r}")
+        if model_path.suffix not in {".aimodel", ".aimodelc"}:
+            raise ValueError(
+                f"Expected an .aimodel or .aimodelc path, got {str(model_path)!r}"
+            )
 
         self.stride = 32
         self.imgsz = check_imgsz(imgsz, stride=self.stride, min_dim=2)
