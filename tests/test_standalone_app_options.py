@@ -11,6 +11,14 @@ INFO_PLIST = ROOT / "packaging" / "macOS" / "standalone" / "Info.plist"
 COREAI_RUNNER_SOURCE = (
     ROOT / "packaging" / "macOS" / "standalone" / "CoreAIRunner.swift"
 )
+EXPECTED_SIX_COREAI_SOURCES = (
+    "basicvsrpp-v1.2-t18-fp16.aimodel",
+    "basicvsrpp-v1.2-t36-fp16.aimodel",
+    "basicvsrpp-v1.2-t90-fp16.aimodel",
+    "lada_mosaic_detection_model_v4_fast-fp16.aimodel",
+    "RealESRGAN_x4plus-256-fp16.aimodel",
+    "realesr-general-x4v3-256-fp16.aimodel",
+)
 
 
 class StandaloneAppOptionTests(unittest.TestCase):
@@ -197,6 +205,29 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "try rejectUnsupportedCoreAIModel(roiEnhancerModel)",
             source,
         )
+
+    def test_app_exports_m5_pro_coreai_architecture(self):
+        source = APP_SOURCE.read_text()
+
+        self.assertIn('result["LADA_COREAI_ARCHITECTURE"] = "h17s"', source)
+        self.assertIn(
+            'result.removeValue(forKey: "LADA_COREAI_ARCHITECTURE")', source
+        )
+
+    def test_build_targets_only_m5_pro_coreai_specialization(self):
+        script = BUILD_SCRIPT.read_text()
+
+        self.assertIn(
+            'COREAI_ARCHITECTURE="${COREAI_ARCHITECTURE:-h17s}"', script
+        )
+        self.assertIn('--architecture "$COREAI_ARCHITECTURE"', script)
+        self.assertIn('! -name "*.$COREAI_ARCHITECTURE.aimodelc"', script)
+        self.assertNotIn('for model in "$COMPILED_MODELS"/*.aimodelc', script)
+        self.assertNotIn("basicvsrpp-v1.2-t36-b2-fp16.aimodel", script)
+        regular_assets = script.split("MODEL_ASSETS=(", 1)[1].split(")", 1)[0]
+        for source in EXPECTED_SIX_COREAI_SOURCES:
+            self.assertIn(source, script)
+            self.assertNotIn(source, regular_assets)
 
     def test_parallel_worker_selection_is_forwarded_without_platform_limit(self):
         source = APP_SOURCE.read_text()
