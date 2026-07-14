@@ -6,11 +6,6 @@
 from __future__ import annotations
 
 import asyncio
-import mmap
-import os
-import shutil
-import subprocess
-import tempfile
 import threading
 from collections import deque
 from collections.abc import Callable, Iterable
@@ -20,6 +15,7 @@ import numpy as np
 import psutil
 import torch
 
+from lada.coreai.compiled_runtime import CompiledCoreAIRuntime, TensorSpec
 from lada.restorationpipeline.basicvsrpp_mosaic_restorer import (
     BasicvsrppMosaicRestorer,
 )
@@ -56,16 +52,18 @@ class CoreAIModelRuntime:
         self._runner: asyncio.Runner | None = None
         self._model = None
         self._function = None
-        self._process: subprocess.Popen | None = None
-        self._shared_memory_file = None
-        self._shared_memory: mmap.mmap | None = None
-        self._shared_memory_path: Path | None = None
-        self._slot_size = frame_count * 3 * 256 * 256 * 2
+        self._compiled_runtime: CompiledCoreAIRuntime | None = None
         self._lock = threading.Lock()
 
     def _ensure_loaded(self) -> None:
         if self._backend == "swift":
-            self._ensure_swift_runner()
+            if self._compiled_runtime is None:
+                shape = (1, self.frame_count, 3, 256, 256)
+                self._compiled_runtime = CompiledCoreAIRuntime(
+                    self.model_path,
+                    inputs=(TensorSpec("frames", shape),),
+                    outputs=(TensorSpec("restored", shape),),
+                )
             return
         if self._function is not None:
             return
@@ -79,136 +77,6 @@ class CoreAIModelRuntime:
         self._runner = asyncio.Runner()
         self._model = self._runner.run(AIModel.load(self.model_path))
         self._function = self._model.load_function("main")
-
-    def _ensure_swift_runner(self) -> None:
-        if self._process is not None:
-            return
-        runner_path = os.environ.get("LADA_COREAI_SWIFT_RUNNER") or shutil.which(
-            "lada-coreai-runner"
-        )
-        if not runner_path:
-            raise RuntimeError(
-                "compiled Core AI models require the lada-coreai-runner executable"
-            )
-        shared_file = tempfile.NamedTemporaryFile(
-            prefix="lada-coreai-", suffix=".bin", delete=False
-        )
-        shared_file.truncate(self._slot_size * self.max_inflight)
-        shared_file.flush()
-        shared_memory = mmap.mmap(
-            shared_file.fileno(), self._slot_size * self.max_inflight
-        )
-        shared_path = Path(shared_file.name)
-        try:
-            process = subprocess.Popen(
-                [
-                    runner_path,
-                    str(self.model_path.resolve()),
-                    str(self.frame_count),
-                    str(shared_path),
-                    str(self.max_inflight),
-                ],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=0,
-            )
-        except Exception:
-            shared_memory.close()
-            shared_file.close()
-            shared_path.unlink(missing_ok=True)
-            raise
-        self._shared_memory_file = shared_file
-        self._shared_memory = shared_memory
-        self._shared_memory_path = shared_path
-        self._process = process
-
-    @staticmethod
-    def _read_exact(stream, byte_count: int) -> bytes:
-        chunks = []
-        remaining = byte_count
-        while remaining:
-            chunk = stream.read(remaining)
-            if not chunk:
-                raise EOFError("Core AI Swift runner closed its output")
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return b"".join(chunks)
-
-    def _infer_swift_many(
-        self, inputs: Iterable[torch.Tensor]
-    ) -> list[torch.Tensor]:
-        assert self._process is not None
-        assert self._process.stdin is not None and self._process.stdout is not None
-        assert self._shared_memory is not None
-        available_slots = deque(range(self.max_inflight))
-        pending: dict[int, tuple[int, tuple[int, ...], int]] = {}
-        output_tensors: list[torch.Tensor | None] = []
-
-        def submit(input_tensor: torch.Tensor, index: int) -> None:
-            self._validate_input(input_tensor)
-            input_array = input_tensor.detach().cpu().contiguous().numpy()
-            payload = input_array.tobytes()
-            if len(payload) > self._slot_size:
-                raise ValueError(
-                    f"Core AI input requires {len(payload)} bytes; "
-                    f"shared-memory slot has {self._slot_size}"
-                )
-            slot = available_slots.popleft()
-            offset = slot * self._slot_size
-            self._shared_memory.seek(offset)
-            self._shared_memory.write(payload)
-            self._process.stdin.write(bytes((slot,)))
-            pending[slot] = (index, tuple(input_array.shape), len(payload))
-
-        def receive() -> None:
-            try:
-                slot = self._read_exact(self._process.stdout, 1)[0]
-            except (EOFError, OSError) as exc:
-                error = ""
-                if (
-                    self._process.stderr is not None
-                    and self._process.poll() is not None
-                ):
-                    error = self._process.stderr.read().decode(
-                        "utf-8", errors="replace"
-                    )
-                raise RuntimeError(error.strip() or str(exc)) from exc
-            if slot == 254:
-                self._process.terminate()
-                self._process.wait(timeout=5)
-                error = "Core AI Swift runner failed"
-                if self._process.stderr is not None:
-                    detail = self._process.stderr.read().decode(
-                        "utf-8", errors="replace"
-                    ).strip()
-                    if detail:
-                        error = detail
-                raise RuntimeError(error)
-            if slot not in pending:
-                raise RuntimeError(f"unexpected Core AI completion slot: {slot}")
-            index, shape, byte_count = pending.pop(slot)
-            self._shared_memory.seek(slot * self._slot_size)
-            output = np.frombuffer(
-                self._shared_memory.read(byte_count), dtype=np.float16
-            ).reshape(shape)
-            output_tensors[index] = torch.from_numpy(output.copy())
-            available_slots.append(slot)
-
-        for input_tensor in inputs:
-            if not available_slots:
-                self._process.stdin.flush()
-                receive()
-            index = len(output_tensors)
-            output_tensors.append(None)
-            submit(input_tensor, index)
-        self._process.stdin.flush()
-        while pending:
-            receive()
-
-        if any(output is None for output in output_tensors):
-            raise RuntimeError("Core AI Swift runner did not return every output")
-        return [output for output in output_tensors if output is not None]
 
     def _validate_input(self, inputs: torch.Tensor) -> None:
         if inputs.shape[1] != self.frame_count:
@@ -228,7 +96,23 @@ class CoreAIModelRuntime:
         with self._lock:
             self._ensure_loaded()
             if self._backend == "swift":
-                return self._infer_swift_many(inputs)
+                assert self._compiled_runtime is not None
+                result = []
+                for input_tensor in inputs:
+                    self._validate_input(input_tensor)
+                    input_array = (
+                        input_tensor.detach().cpu().contiguous().numpy()
+                    )
+                    output = self._compiled_runtime.infer(
+                        {"frames": input_array}
+                    )["restored"]
+                    if output.shape != input_array.shape:
+                        raise ValueError(
+                            f"unexpected Core AI output shape {output.shape}; "
+                            f"expected {input_array.shape}"
+                        )
+                    result.append(torch.from_numpy(output.copy()))
+                return result
             assert self._runner is not None and self._function is not None
             from coreai.runtime import NDArray
             effective_max_inflight = self._effective_max_inflight()
@@ -272,32 +156,15 @@ class CoreAIModelRuntime:
     def close(self) -> None:
         with self._lock:
             runner = self._runner
-            process = self._process
-            shared_memory = self._shared_memory
-            shared_file = self._shared_memory_file
-            shared_path = self._shared_memory_path
+            compiled_runtime = self._compiled_runtime
             self._runner = None
             self._model = None
             self._function = None
-            self._process = None
-            self._shared_memory = None
-            self._shared_memory_file = None
+            self._compiled_runtime = None
             if runner is not None:
                 runner.close()
-            if process is not None:
-                try:
-                    if process.stdin is not None:
-                        process.stdin.write(b"\xff")
-                        process.stdin.flush()
-                    process.wait(timeout=5)
-                except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
-                    process.terminate()
-            if shared_memory is not None:
-                shared_memory.close()
-            if shared_file is not None:
-                shared_file.close()
-            if shared_path is not None:
-                shared_path.unlink(missing_ok=True)
+            if compiled_runtime is not None:
+                compiled_runtime.close()
 
     def __del__(self):
         try:

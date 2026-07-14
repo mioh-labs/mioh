@@ -2,8 +2,6 @@
 # SPDX-License-Identifier: AGPL-3.0
 
 import asyncio
-import io
-import os
 import sys
 import tempfile
 import types
@@ -14,6 +12,7 @@ from unittest import mock
 import torch
 
 from lada import ModelFiles
+from lada.coreai.compiled_runtime import TensorSpec
 from lada.cli import main as cli_main
 import lada.restorationpipeline as restorationpipeline
 from lada.restorationpipeline.basicvsrpp_coreai_restorer import (
@@ -86,44 +85,40 @@ class FakeRunner:
         self.closed = True
 
 
-class FakeBridgeProcess:
-    def __init__(self, completed_slots: bytes):
-        self.stdin = io.BytesIO()
-        self.stdout = io.BytesIO(completed_slots)
-        self.stderr = io.BytesIO()
-        self.returncode = None
-
-    def poll(self):
-        return self.returncode
-
-    def terminate(self):
-        self.returncode = -15
-
-    def wait(self, timeout=None):
-        self.returncode = 0
-        return 0
-
-
 class CoreAIBasicVSRPPRestorerTests(unittest.TestCase):
+    def test_compiled_basicvsr_uses_generic_tensor_contract(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "model-t36.h17s.aimodelc"
+            model_path.mkdir()
+            with mock.patch(
+                "lada.restorationpipeline.basicvsrpp_coreai_restorer."
+                "CompiledCoreAIRuntime"
+            ) as compiled:
+                runtime = CoreAIModelRuntime(model_path, frame_count=36)
+                runtime._ensure_loaded()
+                runtime.close()
+
+        compiled.assert_called_once_with(
+            model_path,
+            inputs=(TensorSpec("frames", (1, 36, 3, 256, 256)),),
+            outputs=(TensorSpec("restored", (1, 36, 3, 256, 256)),),
+        )
+
     def test_compiled_model_uses_persistent_swift_runner(self):
         inputs = [
             torch.full((1, 18, 3, 2, 2), value, dtype=torch.float16)
             for value in (1, 2)
         ]
-        process = FakeBridgeProcess(b"\x00\x00")
         with tempfile.TemporaryDirectory() as temp_dir:
             model_path = Path(temp_dir) / "model-t18.aimodelc"
             model_path.mkdir()
-            with (
-                mock.patch.dict(
-                    os.environ,
-                    {"LADA_COREAI_SWIFT_RUNNER": "/fake/lada-coreai-runner"},
-                ),
-                mock.patch(
-                    "subprocess.Popen",
-                    return_value=process,
-                ) as popen,
-            ):
+            with mock.patch(
+                "lada.restorationpipeline.basicvsrpp_coreai_restorer."
+                "CompiledCoreAIRuntime"
+            ) as compiled:
+                compiled.return_value.infer.side_effect = [
+                    {"restored": item.numpy().copy()} for item in inputs
+                ]
                 runtime = CoreAIModelRuntime(model_path, frame_count=18)
                 self.assertEqual(getattr(runtime, "_backend", None), "swift")
                 self.assertEqual(
@@ -131,28 +126,14 @@ class CoreAIBasicVSRPPRestorerTests(unittest.TestCase):
                 )
                 self.assertEqual(runtime.max_inflight, 1)
                 outputs = runtime.infer_many(inputs)
-                shared_memory_path = runtime._shared_memory_path
                 runtime.close()
 
-        popen.assert_called_once()
-        command = popen.call_args.args[0]
-        self.assertEqual(
-            command[:3],
-            [
-                "/fake/lada-coreai-runner",
-                str(model_path.resolve()),
-                "18",
-            ],
-        )
-        self.assertEqual(command[3], str(shared_memory_path))
-        self.assertEqual(command[4], "1")
+        self.assertEqual(compiled.return_value.infer.call_count, 2)
+        compiled.return_value.close.assert_called_once_with()
         self.assertEqual(
             [output.tolist() for output in outputs],
             [input_tensor.tolist() for input_tensor in inputs],
         )
-        request = process.stdin.getvalue()
-        self.assertEqual(request, b"\x00\x00\xff")
-        self.assertFalse(shared_memory_path.exists())
 
     def test_runtime_close_releases_asyncio_runner_and_loaded_model(self):
         with tempfile.TemporaryDirectory() as temp_dir:
