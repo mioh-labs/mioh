@@ -215,6 +215,15 @@ chmod +x "$CONTENTS/MacOS/mioh" "$RESOURCES/runtime/bin/python3.12" \
   "$RESOURCES/bin/ffmpeg" "$RESOURCES/bin/ffprobe" \
   "$RESOURCES/bin/lada-coreai-runner"
 
+PYTHONHOME="$RESOURCES/runtime" \
+PYTHONPATH="$RESOURCES/runtime/lib/python3.12/site-packages" \
+LADA_MODEL_WEIGHTS_DIR="$RESOURCES/models" \
+LADA_COREAI_ARCHITECTURE="$COREAI_ARCHITECTURE" \
+LADA_COREAI_SWIFT_RUNNER="$RESOURCES/bin/lada-coreai-runner" \
+  "$RESOURCES/runtime/bin/python3.12" \
+  "$PACKAGE_DIR/verify_coreai_models.py" \
+  --resources "$RESOURCES"
+
 find "$RESOURCES/runtime" -type d -name '__pycache__' -prune -exec rm -rf {} +
 find "$RESOURCES/runtime" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
 
