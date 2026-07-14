@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Lada Authors
 # SPDX-License-Identifier: AGPL-3.0
 
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -9,7 +10,11 @@ import numpy as np
 import torch
 
 from lada import ModelFiles
-from lada.restorationpipeline.coreai_roi_enhancer import CoreAIROIEnhancer
+from lada.coreai.compiled_runtime import TensorSpec
+from lada.restorationpipeline.coreai_roi_enhancer import (
+    CoreAIEnhancerRuntime,
+    CoreAIROIEnhancer,
+)
 from scripts.apple import export_realesrgan_coreai as rrdb_exporter
 from scripts.apple import export_srvgg_coreai as exporter
 
@@ -60,6 +65,24 @@ class SRVGGCoreAIExportTests(unittest.TestCase):
 
 
 class CoreAIROIEnhancerTests(unittest.TestCase):
+    def test_compiled_enhancer_uses_swift_tensor_contract(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "enhancer.h17s.aimodelc"
+            model_path.mkdir()
+            with mock.patch(
+                "lada.restorationpipeline.coreai_roi_enhancer."
+                "CompiledCoreAIRuntime"
+            ) as compiled:
+                runtime = CoreAIEnhancerRuntime(model_path, imgsz=256, scale=4)
+                runtime._ensure_loaded()
+                runtime.close()
+
+        compiled.assert_called_once_with(
+            model_path,
+            inputs=(TensorSpec("image", (1, 3, 256, 256)),),
+            outputs=(TensorSpec("enhanced", (1, 3, 1024, 1024)),),
+        )
+
     def test_registered_name_resolves_to_coreai_asset(self):
         with mock.patch("lada.os.path.exists", return_value=True):
             model = ModelFiles.get_enhancer_model_by_name(
