@@ -4,7 +4,18 @@ set -euo pipefail
 ROOT="${0:A:h:h:h:h}"
 PACKAGE_DIR="$ROOT/packaging/macos/standalone"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build/macos-standalone}"
-APP="$BUILD_DIR/mioh.app"
+COREAI_DISTRIBUTION="${COREAI_DISTRIBUTION:-dedicated}"
+APP_BASENAME="${APP_BASENAME:-mioh}"
+DMG_BASENAME="${DMG_BASENAME:-mioh-0.11.0-unsigned}"
+case "$COREAI_DISTRIBUTION" in
+  dedicated|portable) ;;
+  *)
+    print -u2 "Unsupported COREAI_DISTRIBUTION: $COREAI_DISTRIBUTION"
+    exit 2
+    ;;
+esac
+APP="$BUILD_DIR/$APP_BASENAME.app"
+DMG="$BUILD_DIR/$DMG_BASENAME.dmg"
 CONTENTS="$APP/Contents"
 RESOURCES="$CONTENTS/Resources"
 PYTHON_SOURCE="${PYTHON_SOURCE:-$HOME/.local/share/uv/python/cpython-3.12-macos-aarch64-none}"
@@ -18,8 +29,14 @@ VENDORED_MPS_DEFORM_CONV="$PACKAGE_DIR/vendor/mps-deform-conv-0.2.2"
 MPS_DEFORM_BUILD_SOURCE="$BUILD_DIR/mps-deform-conv-source"
 
 rm -rf "$APP" "$BUILD_DIR/Lada.app"
-rm -f "$BUILD_DIR/Lada-0.11.0-unsigned.dmg"
+rm -f "$DMG" "$BUILD_DIR/Lada-0.11.0-unsigned.dmg"
 mkdir -p "$CONTENTS/MacOS" "$RESOURCES/bin" "$RESOURCES/models"
+
+typeset -a APP_SWIFT_FLAGS
+APP_SWIFT_FLAGS=()
+if [[ "$COREAI_DISTRIBUTION" == "portable" ]]; then
+  APP_SWIFT_FLAGS+=(-D MIOH_PORTABLE_COREAI)
+fi
 
 xcrun swiftc \
   -O \
@@ -29,6 +46,7 @@ xcrun swiftc \
   -framework SwiftUI \
   -framework AVFoundation \
   -framework AVKit \
+  "${APP_SWIFT_FLAGS[@]}" \
   "$PACKAGE_DIR/MiohApp.swift" \
   "$PACKAGE_DIR/RealtimePlayer.swift" \
   -o "$CONTENTS/MacOS/mioh"
@@ -146,6 +164,7 @@ COREAI_MODEL_ASSETS=(
   RealESRGAN_x4plus-256-fp16.aimodel
   realesr-general-x4v3-256-fp16.aimodel
 )
+if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
 mkdir -p "$COMPILED_MODELS"
 find "$COMPILED_MODELS" -maxdepth 1 -type d -name '*.aimodelc' \
   ! -name "*.$COREAI_ARCHITECTURE.aimodelc" -exec rm -rf {} +
@@ -193,6 +212,16 @@ PY
   rm -f "$inspect_file"
   ditto "$compiled_model" "$RESOURCES/models/$compiled_name"
 done
+else
+  for asset in "${COREAI_MODEL_ASSETS[@]}"; do
+    source_model="$ROOT/model_weights/$asset"
+    if [[ ! -d "$source_model" ]]; then
+      print -u2 "Missing portable Core AI model: $source_model"
+      exit 1
+    fi
+    ditto "$source_model" "$RESOURCES/models/$asset"
+  done
+fi
 cp "$ROOT/LICENSE.md" "$RESOURCES/LICENSE.md"
 ditto "$ROOT/LICENSES" "$RESOURCES/LICENSES"
 cp "$VENDORED_MPS_DEFORM_CONV/LICENSE" "$RESOURCES/LICENSES/mps-deform-conv.txt"
@@ -215,21 +244,35 @@ chmod +x "$CONTENTS/MacOS/mioh" "$RESOURCES/runtime/bin/python3.12" \
   "$RESOURCES/bin/ffmpeg" "$RESOURCES/bin/ffprobe" \
   "$RESOURCES/bin/lada-coreai-runner"
 
-PYTHONHOME="$RESOURCES/runtime" \
-PYTHONPATH="$RESOURCES/runtime/lib/python3.12/site-packages" \
-LADA_MODEL_WEIGHTS_DIR="$RESOURCES/models" \
-LADA_COREAI_ARCHITECTURE="$COREAI_ARCHITECTURE" \
-LADA_COREAI_SWIFT_RUNNER="$RESOURCES/bin/lada-coreai-runner" \
-  "$RESOURCES/runtime/bin/python3.12" \
-  "$PACKAGE_DIR/verify_coreai_models.py" \
-  --resources "$RESOURCES"
+if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
+  PYTHONHOME="$RESOURCES/runtime" \
+  PYTHONPATH="$RESOURCES/runtime/lib/python3.12/site-packages" \
+  LADA_MODEL_WEIGHTS_DIR="$RESOURCES/models" \
+  LADA_COREAI_ARCHITECTURE="$COREAI_ARCHITECTURE" \
+  LADA_COREAI_SWIFT_RUNNER="$RESOURCES/bin/lada-coreai-runner" \
+    "$RESOURCES/runtime/bin/python3.12" \
+    "$PACKAGE_DIR/verify_coreai_models.py" \
+    --resources "$RESOURCES" \
+    --distribution "$COREAI_DISTRIBUTION" \
+    --architecture "$COREAI_ARCHITECTURE"
+else
+  env -u LADA_COREAI_ARCHITECTURE -u LADA_COREAI_SWIFT_RUNNER \
+    PYTHONHOME="$RESOURCES/runtime" \
+    PYTHONPATH="$RESOURCES/runtime/lib/python3.12/site-packages" \
+    LADA_MODEL_WEIGHTS_DIR="$RESOURCES/models" \
+    "$RESOURCES/runtime/bin/python3.12" \
+    "$PACKAGE_DIR/verify_coreai_models.py" \
+    --resources "$RESOURCES" \
+    --distribution "$COREAI_DISTRIBUTION" \
+    --architecture "$COREAI_ARCHITECTURE" \
+    --smoke-model basicvsrpp-v1.2-coreai
+fi
 
 find "$RESOURCES/runtime" -type d -name '__pycache__' -prune -exec rm -rf {} +
 find "$RESOURCES/runtime" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
 
 codesign --force --deep --sign - "$APP"
 
-DMG="$BUILD_DIR/mioh-0.11.0-unsigned.dmg"
 DMG_ROOT="$BUILD_DIR/dmg-root"
 rm -f "$DMG"
 rm -rf "$DMG_ROOT"
