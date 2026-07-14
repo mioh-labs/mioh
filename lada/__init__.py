@@ -79,14 +79,29 @@ def _coreml_detection_path(filename: str) -> str:
     compiled_path = os.path.splitext(package_path)[0] + '.mlmodelc'
     return compiled_path if os.path.isdir(compiled_path) else package_path
 
+
+def _coreai_model_path(filename: str) -> str:
+    source_path = os.path.join(MODEL_WEIGHTS_DIR, filename)
+    architecture = os.environ.get("LADA_COREAI_ARCHITECTURE")
+    if architecture:
+        stem = os.path.splitext(filename)[0]
+        compiled_path = os.path.join(
+            MODEL_WEIGHTS_DIR,
+            f"{stem}.{architecture}.aimodelc",
+        )
+        if os.path.isdir(compiled_path):
+            return compiled_path
+    return source_path
+
+
 class ModelFiles:
     _WELL_KNOWN_RESTORATION_MODELS = [
         ModelFile('basicvsrpp-v1.0', None, os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_restoration_model_generic.pth')),
         ModelFile('basicvsrpp-v1.1', None, os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_restoration_model_generic_v1.1.pth')),
         ModelFile('basicvsrpp-v1.2', _("Latest Lada restoration model. Recommended"), os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_restoration_model_generic_v1.2.pth')),
-        ModelFile('basicvsrpp-v1.2-coreai', _("BasicVSR++ v1.2 on Core AI with Metal 4 kernels"), os.path.join(MODEL_WEIGHTS_DIR, 'basicvsrpp-v1.2-t18-fp16.aimodel')),
-        ModelFile('basicvsrpp-v1.2-coreai-t36', _("BasicVSR++ v1.2 fixed-T36 on Core AI with Metal 4 kernels"), os.path.join(MODEL_WEIGHTS_DIR, 'basicvsrpp-v1.2-t36-fp16.aimodel')),
-        ModelFile('basicvsrpp-v1.2-coreai-t90', _("BasicVSR++ v1.2 fixed-T90 on Core AI with Metal 4 kernels"), os.path.join(MODEL_WEIGHTS_DIR, 'basicvsrpp-v1.2-t90-fp16.aimodel')),
+        ModelFile('basicvsrpp-v1.2-coreai', _("BasicVSR++ v1.2 on Core AI with Metal 4 kernels"), _coreai_model_path('basicvsrpp-v1.2-t18-fp16.aimodel')),
+        ModelFile('basicvsrpp-v1.2-coreai-t36', _("BasicVSR++ v1.2 fixed-T36 on Core AI with Metal 4 kernels"), _coreai_model_path('basicvsrpp-v1.2-t36-fp16.aimodel')),
+        ModelFile('basicvsrpp-v1.2-coreai-t90', _("BasicVSR++ v1.2 fixed-T90 on Core AI with Metal 4 kernels"), _coreai_model_path('basicvsrpp-v1.2-t90-fp16.aimodel')),
         ModelFile('deepmosaics', _("Restoration model from abandoned DeepMosaics project"), os.path.join(MODEL_WEIGHTS_DIR, '3rd_party', 'clean_youknow_video.pth')),
     ]
     _WELL_KNOWN_DETECTION_MODELS = [
@@ -97,7 +112,7 @@ class ModelFiles:
         ModelFile('v4-fast', _("Fast and efficient. Recommended"), os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_detection_model_v4_fast.pt')),
         ModelFile('v4-accurate', _("Can be slightly more accurate than v4-fast but slower"), os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_detection_model_v4_accurate.pt')),
         ModelFile('v4-fast-coreml', _("v4-fast running on Apple Neural Engine via Core ML"), _coreml_detection_path('lada_mosaic_detection_model_v4_fast.mlpackage')),
-        ModelFile('v4-fast-coreai', _("v4-fast FP16 running with Core AI"), os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_detection_model_v4_fast-fp16.aimodel')),
+        ModelFile('v4-fast-coreai', _("v4-fast FP16 running with Core AI"), _coreai_model_path('lada_mosaic_detection_model_v4_fast-fp16.aimodel')),
         ModelFile('v4-accurate-coreml', _("v4-accurate running on Apple Neural Engine via Core ML"), _coreml_detection_path('lada_mosaic_detection_model_v4_accurate.mlpackage')),
         ModelFile('v3.1-fast-coreml', _("v3.1-fast running on Apple Neural Engine via Core ML"), _coreml_detection_path('lada_mosaic_detection_model_v3.1_fast.mlpackage')),
         ModelFile('v3.1-accurate-coreml', _("v3.1-accurate running on Apple Neural Engine via Core ML"), _coreml_detection_path('lada_mosaic_detection_model_v3.1_accurate.mlpackage')),
@@ -107,9 +122,9 @@ class ModelFiles:
         ModelFile('realesrgan-x2', _("Real-ESRGAN 2x upscaler (PyTorch)"), os.path.join(MODEL_WEIGHTS_DIR, 'RealESRGAN_x2plus.pth')),
         ModelFile('realesrgan-x4', _("Real-ESRGAN 4x upscaler (PyTorch)"), os.path.join(MODEL_WEIGHTS_DIR, 'RealESRGAN_x4plus.pth')),
         ModelFile('realesrgan-x4-coreml', _("Real-ESRGAN 4x on Apple Neural Engine via Core ML"), os.path.join(MODEL_WEIGHTS_DIR, 'RealESRGAN_x4plus_256.mlpackage')),
-        ModelFile('realesrgan-x4-coreai', _("Real-ESRGAN 4x FP16 on Core AI"), os.path.join(MODEL_WEIGHTS_DIR, 'RealESRGAN_x4plus-256-fp16.aimodel')),
+        ModelFile('realesrgan-x4-coreai', _("Real-ESRGAN 4x FP16 on Core AI"), _coreai_model_path('RealESRGAN_x4plus-256-fp16.aimodel')),
         ModelFile('realesr-general-x4v3-coreml', _("Real-ESRGAN compact 4x (tiny, real-world restoration) on Apple Neural Engine via Core ML"), os.path.join(MODEL_WEIGHTS_DIR, 'realesr-general-x4v3_256.mlpackage')),
-        ModelFile('realesr-general-x4v3-coreai', _("Real-ESRGAN compact 4x FP16 on Core AI"), os.path.join(MODEL_WEIGHTS_DIR, 'realesr-general-x4v3-256-fp16.aimodel')),
+        ModelFile('realesr-general-x4v3-coreai', _("Real-ESRGAN compact 4x FP16 on Core AI"), _coreai_model_path('realesr-general-x4v3-256-fp16.aimodel')),
         ModelFile('swinir-x4-coreml', _("SwinIR real-world 4x on Apple Neural Engine via Core ML"), os.path.join(MODEL_WEIGHTS_DIR, 'swinir-real-x4_256.mlpackage')),
         ModelFile('swinir-real-x4-coreml', _("SwinIR real-world 4x on Apple Neural Engine via Core ML"), os.path.join(MODEL_WEIGHTS_DIR, 'swinir-real-x4_256.mlpackage')),
         ModelFile('mewzoom-x4-coreml', _("MewZoom 4x on Apple Neural Engine via Core ML"), os.path.join(MODEL_WEIGHTS_DIR, 'MewZoom-V1-4X-Unet_256.mlpackage')),

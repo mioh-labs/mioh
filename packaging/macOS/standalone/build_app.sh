@@ -11,6 +11,7 @@ PYTHON_SOURCE="${PYTHON_SOURCE:-$HOME/.local/share/uv/python/cpython-3.12-macos-
 PYTHON_SOURCE="${PYTHON_SOURCE:A}"
 SITE_PACKAGES="$ROOT/.venv-coreai/lib/python3.12/site-packages"
 COMPILED_MODELS="${COMPILED_MODELS:-$BUILD_DIR/compiled-models}"
+COREAI_ARCHITECTURE="${COREAI_ARCHITECTURE:-h17s}"
 COMPILED_COREML_MODELS="${COMPILED_COREML_MODELS:-$BUILD_DIR/compiled-coreml-models}"
 FFMPEG_CACHE="${FFMPEG_CACHE:-$BUILD_DIR/ffmpeg-static}"
 VENDORED_MPS_DEFORM_CONV="$PACKAGE_DIR/vendor/mps-deform-conv-0.2.2"
@@ -93,9 +94,6 @@ cp "$FFMPEG_CACHE/ffprobe" "$RESOURCES/bin/ffprobe"
 
 MODEL_ASSETS=(
   lada_mosaic_restoration_model_generic_v1.2.pth
-  basicvsrpp-v1.2-t18-fp16.aimodel
-  basicvsrpp-v1.2-t36-fp16.aimodel
-  basicvsrpp-v1.2-t90-fp16.aimodel
   lada_mosaic_detection_model_v2.pt
   lada_mosaic_detection_model_v2.mlpackage
   lada_mosaic_detection_model_v3.pt
@@ -105,15 +103,12 @@ MODEL_ASSETS=(
   lada_mosaic_detection_model_v3.1_accurate.mlpackage
   lada_mosaic_detection_model_v4_fast.pt
   lada_mosaic_detection_model_v4_fast.mlpackage
-  lada_mosaic_detection_model_v4_fast-fp16.aimodel
   lada_mosaic_detection_model_v4_accurate.pt
   lada_mosaic_detection_model_v4_accurate.mlpackage
   RealESRGAN_x2plus.pth
   RealESRGAN_x4plus.pth
   RealESRGAN_x4plus_256.mlpackage
-  RealESRGAN_x4plus-256-fp16.aimodel
   realesr-general-x4v3_256.mlpackage
-  realesr-general-x4v3-256-fp16.aimodel
   MewZoom-V1-4X-Unet_256.mlpackage
   MewZoom-V1-4X-Unet_512.mlpackage
   swinir-real-x4_256.mlpackage
@@ -143,18 +138,60 @@ for package in "${COREML_DETECTION_ASSETS[@]}"; do
   ditto "$compiled_model" "$RESOURCES/models/$compiled_name"
 done
 
-if [[ ! -d "$COMPILED_MODELS" ]] || ! find "$COMPILED_MODELS" -name '*.aimodelc' -print -quit | grep -q .; then
-  mkdir -p "$COMPILED_MODELS"
-  xcrun coreai-build compile \
-    "$ROOT/model_weights/basicvsrpp-v1.2-t90-fp16.aimodel" \
-    --output "$COMPILED_MODELS" \
-    --platform macOS \
-    --min-deployment-version 27.0 \
-    --preferred-compute gpu
-fi
+COREAI_MODEL_ASSETS=(
+  basicvsrpp-v1.2-t18-fp16.aimodel
+  basicvsrpp-v1.2-t36-fp16.aimodel
+  basicvsrpp-v1.2-t90-fp16.aimodel
+  lada_mosaic_detection_model_v4_fast-fp16.aimodel
+  RealESRGAN_x4plus-256-fp16.aimodel
+  realesr-general-x4v3-256-fp16.aimodel
+)
+mkdir -p "$COMPILED_MODELS"
+find "$COMPILED_MODELS" -maxdepth 1 -type d -name '*.aimodelc' \
+  ! -name "*.$COREAI_ARCHITECTURE.aimodelc" -exec rm -rf {} +
 
-for model in "$COMPILED_MODELS"/*.aimodelc; do
-  ditto "$model" "$RESOURCES/models/${model:t}"
+typeset -A expected_coreai_models
+for asset in "${COREAI_MODEL_ASSETS[@]}"; do
+  compiled_name="${asset:r}.$COREAI_ARCHITECTURE.aimodelc"
+  expected_coreai_models[$compiled_name]=1
+done
+for model in "$COMPILED_MODELS"/*.$COREAI_ARCHITECTURE.aimodelc(N); do
+  if [[ -z "${expected_coreai_models[${model:t}]-}" ]]; then
+    rm -rf "$model"
+  fi
+done
+
+for asset in "${COREAI_MODEL_ASSETS[@]}"; do
+  source_model="$ROOT/model_weights/$asset"
+  compiled_name="${asset:r}.$COREAI_ARCHITECTURE.aimodelc"
+  compiled_model="$COMPILED_MODELS/$compiled_name"
+  if [[ ! -d "$compiled_model" || "$source_model" -nt "$compiled_model" ]]; then
+    rm -rf "$compiled_model"
+    xcrun coreai-build compile \
+      "$source_model" \
+      --output "$COMPILED_MODELS" \
+      --platform macOS \
+      --min-deployment-version 27.0 \
+      --preferred-compute gpu \
+      --architecture "$COREAI_ARCHITECTURE"
+  fi
+
+  inspect_file="$BUILD_DIR/${compiled_name}.inspect.json"
+  xcrun coreai-build inspect "$compiled_model" --json > "$inspect_file"
+  "$RESOURCES/runtime/bin/python3.12" - "$inspect_file" "$COREAI_ARCHITECTURE" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    details = json.load(handle)
+architecture = sys.argv[2]
+if architecture not in details.get("supportedArchitectures", []):
+    raise SystemExit(f"compiled model does not support {architecture}: {sys.argv[1]}")
+if architecture == "h17s" and "M5 Pro" not in details.get("supportedChips", []):
+    raise SystemExit(f"h17s model is not specialized for M5 Pro: {sys.argv[1]}")
+PY
+  rm -f "$inspect_file"
+  ditto "$compiled_model" "$RESOURCES/models/$compiled_name"
 done
 cp "$ROOT/LICENSE.md" "$RESOURCES/LICENSE.md"
 ditto "$ROOT/LICENSES" "$RESOURCES/LICENSES"

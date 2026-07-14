@@ -409,9 +409,11 @@ final class RestorationRunner: ObservableObject {
     if capabilities.supportsCoreAI {
       result["LADA_COREAI_PYTHON"] = python.path
       result["LADA_COREAI_SWIFT_RUNNER"] = resources.appendingPathComponent("bin/lada-coreai-runner").path
+      result["LADA_COREAI_ARCHITECTURE"] = "h17s"
     } else {
       result.removeValue(forKey: "LADA_COREAI_PYTHON")
       result.removeValue(forKey: "LADA_COREAI_SWIFT_RUNNER")
+      result.removeValue(forKey: "LADA_COREAI_ARCHITECTURE")
     }
     result["PATH"] = [resources.appendingPathComponent("bin").path, "/usr/bin", "/bin", "/usr/sbin", "/sbin"].joined(separator: ":")
     result["PYTHONUNBUFFERED"] = "1"
