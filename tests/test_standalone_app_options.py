@@ -256,6 +256,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertTrue(UNIVERSAL_BUILD_SCRIPT.is_file())
         script = UNIVERSAL_BUILD_SCRIPT.read_text()
 
+        self.assertIn('ROOT="${PACKAGE_DIR:h:h:h}"', script)
         self.assertIn('COREAI_DISTRIBUTION="portable"', script)
         self.assertIn('build/macos-standalone-universal', script)
         self.assertIn('APP_BASENAME="mioh-universal"', script)

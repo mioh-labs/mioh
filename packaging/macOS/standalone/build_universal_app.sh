@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PACKAGE_DIR="${0:A:h}"
-ROOT="${PACKAGE_DIR:h:h:h:h}"
+ROOT="${PACKAGE_DIR:h:h:h}"
 
 export COREAI_DISTRIBUTION="portable"
 export BUILD_DIR="${BUILD_DIR:-$ROOT/build/macos-standalone-universal}"
