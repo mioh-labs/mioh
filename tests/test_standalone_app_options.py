@@ -7,6 +7,9 @@ ROOT = Path(__file__).resolve().parents[1]
 APP_SOURCE = ROOT / "packaging" / "macOS" / "standalone" / "MiohApp.swift"
 PLAYER_SOURCE = ROOT / "packaging" / "macOS" / "standalone" / "RealtimePlayer.swift"
 BUILD_SCRIPT = ROOT / "packaging" / "macOS" / "standalone" / "build_app.sh"
+UNIVERSAL_BUILD_SCRIPT = (
+    ROOT / "packaging" / "macOS" / "standalone" / "build_universal_app.sh"
+)
 INFO_PLIST = ROOT / "packaging" / "macOS" / "standalone" / "Info.plist"
 COREAI_RUNNER_SOURCE = (
     ROOT / "packaging" / "macOS" / "standalone" / "CoreAIRunner.swift"
@@ -239,6 +242,34 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn('LADA_MODEL_WEIGHTS_DIR="$RESOURCES/models"', script)
         self.assertIn('LADA_COREAI_SWIFT_RUNNER="$RESOURCES/bin/lada-coreai-runner"', script)
 
+    def test_build_supports_dedicated_and_portable_coreai_distributions(self):
+        script = BUILD_SCRIPT.read_text()
+
+        self.assertIn('COREAI_DISTRIBUTION="${COREAI_DISTRIBUTION:-dedicated}"', script)
+        self.assertIn('dedicated|portable)', script)
+        self.assertIn('if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]', script)
+        self.assertIn('ditto "$source_model" "$RESOURCES/models/$asset"', script)
+        self.assertIn('--distribution "$COREAI_DISTRIBUTION"', script)
+        self.assertIn('--smoke-model basicvsrpp-v1.2-coreai', script)
+
+    def test_universal_build_wrapper_uses_isolated_artifact_paths(self):
+        self.assertTrue(UNIVERSAL_BUILD_SCRIPT.is_file())
+        script = UNIVERSAL_BUILD_SCRIPT.read_text()
+
+        self.assertIn('COREAI_DISTRIBUTION="portable"', script)
+        self.assertIn('build/macos-standalone-universal', script)
+        self.assertIn('APP_BASENAME="mioh-universal"', script)
+        self.assertIn('DMG_BASENAME="mioh-universal-0.11.0-unsigned"', script)
+        self.assertIn('exec "$PACKAGE_DIR/build_app.sh"', script)
+
+    def test_portable_swift_build_omits_architecture_override(self):
+        source = APP_SOURCE.read_text()
+        script = BUILD_SCRIPT.read_text()
+
+        self.assertIn("#if MIOH_PORTABLE_COREAI", source)
+        self.assertIn('result.removeValue(forKey: "LADA_COREAI_ARCHITECTURE")', source)
+        self.assertIn("-D MIOH_PORTABLE_COREAI", script)
+
     def test_parallel_worker_selection_is_forwarded_without_platform_limit(self):
         source = APP_SOURCE.read_text()
 
@@ -260,9 +291,14 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertEqual(info["CFBundleName"], "mioh")
         self.assertEqual(info["CFBundleExecutable"], "mioh")
         self.assertEqual(info["CFBundleIdentifier"], "com.okatti.lada.coreai")
-        self.assertIn('APP="$BUILD_DIR/mioh.app"', build_script)
+        self.assertIn('APP_BASENAME="${APP_BASENAME:-mioh}"', build_script)
+        self.assertIn('APP="$BUILD_DIR/$APP_BASENAME.app"', build_script)
         self.assertIn('-o "$CONTENTS/MacOS/mioh"', build_script)
-        self.assertIn('DMG="$BUILD_DIR/mioh-0.11.0-unsigned.dmg"', build_script)
+        self.assertIn(
+            'DMG_BASENAME="${DMG_BASENAME:-mioh-0.11.0-unsigned}"',
+            build_script,
+        )
+        self.assertIn('DMG="$BUILD_DIR/$DMG_BASENAME.dmg"', build_script)
         self.assertIn('--volumeName "mioh"', build_script)
         self.assertIn('ditto "$APP" "$DMG_ROOT/mioh.app"', build_script)
 

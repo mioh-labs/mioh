@@ -409,7 +409,11 @@ final class RestorationRunner: ObservableObject {
     if capabilities.supportsCoreAI {
       result["LADA_COREAI_PYTHON"] = python.path
       result["LADA_COREAI_SWIFT_RUNNER"] = resources.appendingPathComponent("bin/lada-coreai-runner").path
+#if MIOH_PORTABLE_COREAI
+      result.removeValue(forKey: "LADA_COREAI_ARCHITECTURE")
+#else
       result["LADA_COREAI_ARCHITECTURE"] = "h17s"
+#endif
     } else {
       result.removeValue(forKey: "LADA_COREAI_PYTHON")
       result.removeValue(forKey: "LADA_COREAI_SWIFT_RUNNER")
