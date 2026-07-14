@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 
 from lada.coreai.compiled_runtime import CompiledCoreAIRuntime, TensorSpec
+from lada.coreai.source_runtime import load_source_model
 
 
 class CoreAIEnhancerRuntime:
@@ -47,15 +48,12 @@ class CoreAIEnhancerRuntime:
             return
         if self._function is not None:
             return
-        try:
-            from coreai.runtime import AIModel
-        except ImportError as exc:
-            raise RuntimeError(
-                "Core AI ROI enhancement requires the isolated coreai-torch "
-                "environment"
-            ) from exc
         self._runner = asyncio.Runner()
-        self._model = self._runner.run(AIModel.load(self.model_path))
+        self._model = load_source_model(
+            self._runner,
+            self.model_path,
+            purpose="ROIエンハンサー",
+        )
         self._function = self._model.load_function("main")
 
     def __call__(self, image: np.ndarray) -> np.ndarray:
