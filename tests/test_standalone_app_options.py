@@ -8,9 +8,28 @@ APP_SOURCE = ROOT / "packaging" / "macOS" / "standalone" / "MiohApp.swift"
 PLAYER_SOURCE = ROOT / "packaging" / "macOS" / "standalone" / "RealtimePlayer.swift"
 BUILD_SCRIPT = ROOT / "packaging" / "macOS" / "standalone" / "build_app.sh"
 INFO_PLIST = ROOT / "packaging" / "macOS" / "standalone" / "Info.plist"
+COREAI_RUNNER_SOURCE = (
+    ROOT / "packaging" / "macOS" / "standalone" / "CoreAIRunner.swift"
+)
 
 
 class StandaloneAppOptionTests(unittest.TestCase):
+    def test_coreai_runner_is_descriptor_driven(self):
+        source = COREAI_RUNNER_SOURCE.read_text()
+
+        for contract in [
+            "struct TensorDescriptor: Decodable",
+            "struct RunnerDescriptor: Decodable",
+            "descriptor.slotCount",
+            "descriptor.slotStride",
+            "for input in descriptor.inputs",
+            "for output in descriptor.outputs",
+            'model.loadFunction(named: descriptor.function)',
+            "CommandLine.arguments.count == 4",
+        ]:
+            self.assertIn(contract, source)
+        self.assertNotIn('missingOutput("restored")', source)
+
     def test_native_realtime_player_has_buffered_audio_synced_controls(self):
         self.assertTrue(PLAYER_SOURCE.is_file())
         player = PLAYER_SOURCE.read_text()
