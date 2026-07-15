@@ -41,12 +41,158 @@ struct PlatformCapabilities {
 
   let baseDetectionModels = [
     "v2-coreml", "v3.1-fast-coreml", "v3.1-accurate-coreml",
-    "v4-fast-coreml", "v4-accurate-coreml", "v2", "v3.1-fast",
-    "v3.1-accurate", "v4-fast", "v4-accurate", "カスタム",
+    "v4-fast-coreml", "v4-accurate-coreml", "vr-v2-accurate-coreml", "カスタム",
   ]
 
   var detectionModels: [String] {
     supportsCoreAI ? baseDetectionModels + ["v4-fast-coreai"] : baseDetectionModels
+  }
+}
+
+struct MiohUserDefaultsSnapshot: Codable {
+  var inputPath: String?
+  var outputPath: String?
+  var tempDirectory: String
+  var ffmpegTempDirectory: String
+  var ladaTempDirectory: String
+  var overwrite: Bool
+
+  var parallelWorkers: Int
+  var executor: String
+  var useSegmentCount: Bool
+  var segmentCount: Int
+  var segmentDuration: Int
+  var mergeEncoder: String
+  var deleteSegments: Bool
+  var keepTemp: Bool
+  var forceSplit: Bool
+
+  var device: String
+  var fp16: Bool
+  var autoOptimize: Bool
+
+  var encodingMode: String
+  var encodingPreset: String
+  var encoder: String
+  var encoderOptions: String
+  var bitrateMultiplier: Double
+  var useQuality: Bool
+  var quality: Int
+  var useQMin: Bool
+  var qmin: Int
+  var useQMax: Bool
+  var qmax: Int
+  var useFPS: Bool
+  var fps: Int
+  var preFPSConversion: Bool
+  var mp4FastStart: Bool
+
+  var restorationModel: String
+  var customRestorationModel: String
+  var useMaxClipLength: Bool
+  var maxClipLength: Int
+  var useRestoreMaxFrames: Bool
+  var restoreMaxFrames: Int
+  var restoreTemporalOverlap: Int?
+  var restoreCrossfade: Bool?
+  var sharpenStrength: Double
+  var detailBoost: Double
+  var blendFeather: Double
+  var textureMix: Double
+  var smoothStrength: Double
+  var effectUpscale: Int
+  var roiEnhancer: String
+  var roiEnhancerModel: String
+  var roiEnhancerScale: Int
+  var roiEnhancerStrength: Double
+  var roiEnhancerTile: Int
+
+  var detectionModel: String
+  var customDetectionModel: String
+  var detectionEmptyLookahead: Int
+  var detectFaceMosaics: Bool
+
+  var previewBufferLimit: Double
+  var previewProjectionMode: String?
+  var previewVideoLayout: String?
+  var previewEye: String?
+  var previewCameraFOV: Double?
+
+  var memoryCleanupInterval: Int
+  var cleanupTriggerGB: Double
+  var useMPSMemoryFraction: Bool
+  var mpsMemoryFraction: Double
+  var logMPSMemory: Bool
+
+  static func factory(capabilities: PlatformCapabilities) -> MiohUserDefaultsSnapshot {
+    MiohUserDefaultsSnapshot(
+      inputPath: nil,
+      outputPath: nil,
+      tempDirectory: "/tmp",
+      ffmpegTempDirectory: "",
+      ladaTempDirectory: "",
+      overwrite: false,
+      parallelWorkers: 1,
+      executor: "process",
+      useSegmentCount: true,
+      segmentCount: 4,
+      segmentDuration: 60,
+      mergeEncoder: "copy",
+      deleteSegments: false,
+      keepTemp: true,
+      forceSplit: false,
+      device: "mps",
+      fp16: true,
+      autoOptimize: true,
+      encodingMode: "preset",
+      encodingPreset: "hevc-apple-gpu-balanced",
+      encoder: "hevc_videotoolbox",
+      encoderOptions: "",
+      bitrateMultiplier: 3.0,
+      useQuality: false,
+      quality: 70,
+      useQMin: false,
+      qmin: 10,
+      useQMax: false,
+      qmax: 30,
+      useFPS: false,
+      fps: 30,
+      preFPSConversion: false,
+      mp4FastStart: false,
+      restorationModel: capabilities.defaultRestorationModel,
+      customRestorationModel: "",
+      useMaxClipLength: false,
+      maxClipLength: 178,
+      useRestoreMaxFrames: false,
+      restoreMaxFrames: -1,
+      restoreTemporalOverlap: 8,
+      restoreCrossfade: true,
+      sharpenStrength: 0.0,
+      detailBoost: 0.0,
+      blendFeather: 1.0,
+      textureMix: 0.0,
+      smoothStrength: 0.0,
+      effectUpscale: 1,
+      roiEnhancer: "none",
+      roiEnhancerModel: "",
+      roiEnhancerScale: 4,
+      roiEnhancerStrength: 0.0,
+      roiEnhancerTile: 0,
+      detectionModel: "v2-coreml",
+      customDetectionModel: "",
+      detectionEmptyLookahead: 10,
+      detectFaceMosaics: false,
+      previewBufferLimit: 8.0,
+      previewProjectionMode: "通常",
+      previewVideoLayout: "SBS 左右",
+      previewEye: "左目",
+      previewCameraFOV: 60,
+      memoryCleanupInterval: 1,
+      cleanupTriggerGB: 4.0,
+      useMPSMemoryFraction: true,
+      mpsMemoryFraction: 0.46,
+      logMPSMemory: false
+    )
   }
 }
 
@@ -58,6 +204,7 @@ final class RestorationRunner: ObservableObject {
   @Published var status = "待機中"
   @Published var log = ""
   @Published var isRunning = false
+  @Published var defaultsStatus = "未保存"
 
   @Published var tempDirectory = "/tmp"
   @Published var ffmpegTempDirectory = ""
@@ -100,6 +247,8 @@ final class RestorationRunner: ObservableObject {
   @Published var maxClipLength = 178
   @Published var useRestoreMaxFrames = false
   @Published var restoreMaxFrames = -1
+  @Published var restoreTemporalOverlap = 8
+  @Published var restoreCrossfade = true
   @Published var sharpenStrength = 0.0
   @Published var detailBoost = 0.0
   @Published var blendFeather = 1.0
@@ -118,6 +267,10 @@ final class RestorationRunner: ObservableObject {
   @Published var detectFaceMosaics = false
 
   @Published var previewBufferLimit = 8.0
+  @Published var previewProjectionMode = "通常"
+  @Published var previewVideoLayout = "SBS 左右"
+  @Published var previewEye = "左目"
+  @Published var previewCameraFOV = 60.0
 
   @Published var memoryCleanupInterval = 1
   @Published var cleanupTriggerGB = 4.0
@@ -131,11 +284,13 @@ final class RestorationRunner: ObservableObject {
   private var activeProgress: [String: AppProgressEvent] = [:]
   private var activeProgressOrder: [String] = []
   private let capabilities: PlatformCapabilities
+  private let defaultsKey = "mioh.userProcessingDefaults.v1"
 
   init(capabilities: PlatformCapabilities = PlatformCapabilities()) {
     self.capabilities = capabilities
     restorationModel = capabilities.defaultRestorationModel
     detectionModel = "v2-coreml"
+    loadSavedDefaultsOnLaunch()
   }
 
   let encodingPresets = [
@@ -144,7 +299,7 @@ final class RestorationRunner: ObservableObject {
   ]
   var restorationModels: [String] { capabilities.restorationModels }
   var detectionModels: [String] { capabilities.detectionModels }
-  let enhancerModels = ["none", "realesrgan", "mewzoom", "swinir"]
+  let enhancerModels = ["none", "realesrgan", "mewzoom", "swinir", "spandrel"]
 
   var canStart: Bool {
     inputURL != nil && outputURL != nil && !isRunning
@@ -263,6 +418,199 @@ final class RestorationRunner: ObservableObject {
     NSWorkspace.shared.activateFileViewerSelecting([outputURL])
   }
 
+  func saveCurrentDefaults() {
+    do {
+      let snapshot = currentDefaultsSnapshot()
+      let data = try JSONEncoder().encode(snapshot)
+      UserDefaults.standard.set(data, forKey: defaultsKey)
+      defaultsStatus = "保存しました"
+    } catch {
+      defaultsStatus = "保存に失敗: \(error.localizedDescription)"
+    }
+  }
+
+  func loadSavedDefaults() {
+    guard let data = UserDefaults.standard.data(forKey: defaultsKey) else {
+      defaultsStatus = "保存済みデフォルトはありません"
+      return
+    }
+    do {
+      let snapshot = try JSONDecoder().decode(MiohUserDefaultsSnapshot.self, from: data)
+      apply(defaults: snapshot)
+      defaultsStatus = "保存済みデフォルトを読み込みました"
+    } catch {
+      defaultsStatus = "読み込みに失敗: \(error.localizedDescription)"
+    }
+  }
+
+  func resetDefaultsToFactory() {
+    UserDefaults.standard.removeObject(forKey: defaultsKey)
+    apply(defaults: .factory(capabilities: capabilities))
+    defaultsStatus = "初期値に戻しました"
+  }
+
+  private func loadSavedDefaultsOnLaunch() {
+    guard let data = UserDefaults.standard.data(forKey: defaultsKey),
+      let snapshot = try? JSONDecoder().decode(MiohUserDefaultsSnapshot.self, from: data)
+    else { return }
+    apply(defaults: snapshot)
+    defaultsStatus = "保存済みデフォルトを適用済み"
+  }
+
+  private func currentDefaultsSnapshot() -> MiohUserDefaultsSnapshot {
+    MiohUserDefaultsSnapshot(
+      inputPath: inputURL?.path,
+      outputPath: outputURL?.path,
+      tempDirectory: tempDirectory,
+      ffmpegTempDirectory: ffmpegTempDirectory,
+      ladaTempDirectory: ladaTempDirectory,
+      overwrite: overwrite,
+      parallelWorkers: parallelWorkers,
+      executor: executor,
+      useSegmentCount: useSegmentCount,
+      segmentCount: segmentCount,
+      segmentDuration: segmentDuration,
+      mergeEncoder: mergeEncoder,
+      deleteSegments: deleteSegments,
+      keepTemp: keepTemp,
+      forceSplit: forceSplit,
+      device: device,
+      fp16: fp16,
+      autoOptimize: autoOptimize,
+      encodingMode: encodingMode,
+      encodingPreset: encodingPreset,
+      encoder: encoder,
+      encoderOptions: encoderOptions,
+      bitrateMultiplier: bitrateMultiplier,
+      useQuality: useQuality,
+      quality: quality,
+      useQMin: useQMin,
+      qmin: qmin,
+      useQMax: useQMax,
+      qmax: qmax,
+      useFPS: useFPS,
+      fps: fps,
+      preFPSConversion: preFPSConversion,
+      mp4FastStart: mp4FastStart,
+      restorationModel: restorationModel,
+      customRestorationModel: customRestorationModel,
+      useMaxClipLength: useMaxClipLength,
+      maxClipLength: maxClipLength,
+      useRestoreMaxFrames: useRestoreMaxFrames,
+      restoreMaxFrames: restoreMaxFrames,
+      restoreTemporalOverlap: restoreTemporalOverlap,
+      restoreCrossfade: restoreCrossfade,
+      sharpenStrength: sharpenStrength,
+      detailBoost: detailBoost,
+      blendFeather: blendFeather,
+      textureMix: textureMix,
+      smoothStrength: smoothStrength,
+      effectUpscale: effectUpscale,
+      roiEnhancer: roiEnhancer,
+      roiEnhancerModel: roiEnhancerModel,
+      roiEnhancerScale: roiEnhancerScale,
+      roiEnhancerStrength: roiEnhancerStrength,
+      roiEnhancerTile: roiEnhancerTile,
+      detectionModel: detectionModel,
+      customDetectionModel: customDetectionModel,
+      detectionEmptyLookahead: detectionEmptyLookahead,
+      detectFaceMosaics: detectFaceMosaics,
+      previewBufferLimit: previewBufferLimit,
+      previewProjectionMode: previewProjectionMode,
+      previewVideoLayout: previewVideoLayout,
+      previewEye: previewEye,
+      previewCameraFOV: previewCameraFOV,
+      memoryCleanupInterval: memoryCleanupInterval,
+      cleanupTriggerGB: cleanupTriggerGB,
+      useMPSMemoryFraction: useMPSMemoryFraction,
+      mpsMemoryFraction: mpsMemoryFraction,
+      logMPSMemory: logMPSMemory
+    )
+  }
+
+  private func apply(defaults snapshot: MiohUserDefaultsSnapshot) {
+    inputURL = snapshot.inputPath.flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
+    outputURL = snapshot.outputPath.flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
+    tempDirectory = snapshot.tempDirectory
+    ffmpegTempDirectory = snapshot.ffmpegTempDirectory
+    ladaTempDirectory = snapshot.ladaTempDirectory
+    overwrite = snapshot.overwrite
+
+    parallelWorkers = min(max(snapshot.parallelWorkers, 1), 16)
+    executor = ["process", "thread"].contains(snapshot.executor) ? snapshot.executor : "process"
+    useSegmentCount = snapshot.useSegmentCount
+    segmentCount = min(max(snapshot.segmentCount, 1), 128)
+    segmentDuration = min(max(snapshot.segmentDuration, 10), 3600)
+    mergeEncoder = snapshot.mergeEncoder
+    deleteSegments = snapshot.deleteSegments
+    keepTemp = snapshot.keepTemp
+    forceSplit = snapshot.forceSplit
+
+    device = snapshot.device
+    fp16 = snapshot.fp16
+    autoOptimize = snapshot.autoOptimize
+
+    encodingMode = ["auto", "preset", "custom"].contains(snapshot.encodingMode) ? snapshot.encodingMode : "preset"
+    encodingPreset = encodingPresets.contains(snapshot.encodingPreset) ? snapshot.encodingPreset : "hevc-apple-gpu-balanced"
+    encoder = snapshot.encoder
+    encoderOptions = snapshot.encoderOptions
+    bitrateMultiplier = snapshot.bitrateMultiplier
+    useQuality = snapshot.useQuality
+    quality = min(max(snapshot.quality, 0), 100)
+    useQMin = snapshot.useQMin
+    qmin = min(max(snapshot.qmin, 0), 51)
+    useQMax = snapshot.useQMax
+    qmax = min(max(snapshot.qmax, 0), 51)
+    useFPS = snapshot.useFPS
+    fps = min(max(snapshot.fps, 1), 240)
+    preFPSConversion = snapshot.preFPSConversion
+    mp4FastStart = snapshot.mp4FastStart
+
+    restorationModel = restorationModels.contains(snapshot.restorationModel) ? snapshot.restorationModel : capabilities.defaultRestorationModel
+    customRestorationModel = snapshot.customRestorationModel
+    useMaxClipLength = snapshot.useMaxClipLength
+    maxClipLength = min(max(snapshot.maxClipLength, 1), 3600)
+    useRestoreMaxFrames = snapshot.useRestoreMaxFrames
+    restoreMaxFrames = snapshot.restoreMaxFrames
+    restoreTemporalOverlap = min(max(snapshot.restoreTemporalOverlap ?? 8, 0), 120)
+    restoreCrossfade = snapshot.restoreCrossfade ?? true
+    sharpenStrength = min(max(snapshot.sharpenStrength, 0), 1)
+    detailBoost = min(max(snapshot.detailBoost, 0), 1)
+    blendFeather = min(max(snapshot.blendFeather, 0), 3)
+    textureMix = min(max(snapshot.textureMix, 0), 1)
+    smoothStrength = min(max(snapshot.smoothStrength, 0), 1)
+    effectUpscale = min(max(snapshot.effectUpscale, 1), 4)
+    roiEnhancer = enhancerModels.contains(snapshot.roiEnhancer) ? snapshot.roiEnhancer : "none"
+    roiEnhancerModel = snapshot.roiEnhancerModel
+    roiEnhancerScale = min(max(snapshot.roiEnhancerScale, 1), 8)
+    roiEnhancerStrength = min(max(snapshot.roiEnhancerStrength, 0), 1)
+    roiEnhancerTile = min(max(snapshot.roiEnhancerTile, 0), 1024)
+
+    detectionModel = detectionModels.contains(snapshot.detectionModel) ? snapshot.detectionModel : "v2-coreml"
+    customDetectionModel = snapshot.customDetectionModel
+    detectionEmptyLookahead = min(max(snapshot.detectionEmptyLookahead, 0), 300)
+    detectFaceMosaics = snapshot.detectFaceMosaics
+
+    previewBufferLimit = min(max(snapshot.previewBufferLimit, 1), 60)
+    previewProjectionMode = ["通常", "VR180", "360"].contains(snapshot.previewProjectionMode ?? "")
+      ? snapshot.previewProjectionMode!
+      : "通常"
+    previewVideoLayout = ["Mono", "SBS 左右", "上下"].contains(snapshot.previewVideoLayout ?? "")
+      ? snapshot.previewVideoLayout!
+      : "SBS 左右"
+    previewEye = ["左目", "右目"].contains(snapshot.previewEye ?? "")
+      ? snapshot.previewEye!
+      : "左目"
+    previewCameraFOV = min(max(snapshot.previewCameraFOV ?? 60, 45), 105)
+
+    memoryCleanupInterval = min(max(snapshot.memoryCleanupInterval, 1), 100)
+    cleanupTriggerGB = snapshot.cleanupTriggerGB
+    useMPSMemoryFraction = snapshot.useMPSMemoryFraction
+    mpsMemoryFraction = snapshot.mpsMemoryFraction
+    logMPSMemory = snapshot.logMPSMemory
+    normalizeModelSelections()
+  }
+
   func previewArguments(resources: URL, outputDirectory: URL, input: URL) throws -> [String] {
     normalizeModelSelections()
     let previewModel = capabilities.previewRestorationModel
@@ -281,6 +629,8 @@ final class RestorationRunner: ObservableObject {
     }
     add(&args, "--max-clip-length", useMaxClipLength ? maxClipLength : automaticClipLength)
     if useRestoreMaxFrames { add(&args, "--restore-max-frames", restoreMaxFrames) }
+    add(&args, "--restore-temporal-overlap", restoreTemporalOverlap)
+    args.append(restoreCrossfade ? "--enable-crossfade" : "--disable-crossfade")
     add(&args, "--sharpen-strength", sharpenStrength)
     add(&args, "--detail-boost", detailBoost)
     add(&args, "--blend-feather", blendFeather)
@@ -336,6 +686,8 @@ final class RestorationRunner: ObservableObject {
     add(&args, "--mosaic-restoration-model", restoration)
     if useMaxClipLength { add(&args, "--max-clip-length", maxClipLength) }
     if useRestoreMaxFrames { add(&args, "--restore-max-frames", restoreMaxFrames) }
+    add(&args, "--restore-temporal-overlap", restoreTemporalOverlap)
+    args.append(restoreCrossfade ? "--enable-crossfade" : "--disable-crossfade")
     add(&args, "--restore-sharpen-strength", sharpenStrength)
     add(&args, "--restore-detail-boost", detailBoost)
     add(&args, "--restore-blend-feather", blendFeather)
@@ -387,6 +739,11 @@ final class RestorationRunner: ObservableObject {
     if !detectionModels.contains(detectionModel) {
       detectionModel = "v2-coreml"
     }
+    if roiEnhancer == "spandrel" && roiEnhancerModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      roiEnhancerModel = capabilities.supportsCoreAI
+        ? "nomos-webphoto-realplksr-x4-coreai"
+        : "nomos-webphoto-realplksr-x4-coreml"
+    }
   }
 
   private func rejectUnsupportedCoreAIModel(_ model: String) throws {
@@ -407,7 +764,6 @@ final class RestorationRunner: ObservableObject {
     result["PYTHONPATH"] = sitePackages.path
     result["LADA_MODEL_WEIGHTS_DIR"] = resources.appendingPathComponent("models").path
     if capabilities.supportsCoreAI {
-      result["LADA_COREAI_PYTHON"] = python.path
       result["LADA_COREAI_SWIFT_RUNNER"] = resources.appendingPathComponent("bin/lada-coreai-runner").path
 #if MIOH_PORTABLE_COREAI
       result.removeValue(forKey: "LADA_COREAI_ARCHITECTURE")
@@ -620,6 +976,7 @@ struct ContentView: View {
         detectionTab.tabItem { Label("検出", systemImage: "viewfinder") }
         encodingTab.tabItem { Label("出力", systemImage: "video") }
         memoryTab.tabItem { Label("メモリ", systemImage: "memorychip") }
+        settingsTab.tabItem { Label("設定", systemImage: "gearshape") }
         RealtimePlayerView(controller: player, runner: runner)
           .tabItem { Label("再生", systemImage: "play.rectangle") }
         logTab.tabItem { Label("ログ", systemImage: "terminal") }
@@ -706,6 +1063,12 @@ struct ContentView: View {
         if runner.useRestoreMaxFrames {
           LabeledContent("復元チャンク数") { TextField("", value: $runner.restoreMaxFrames, format: .number).frame(width: 110) }
         }
+        LabeledContent("Temporal overlap") {
+          Stepper(value: $runner.restoreTemporalOverlap, in: 0...120) {
+            Text("\(runner.restoreTemporalOverlap)")
+          }
+        }
+        Toggle("クロスフェードを有効化", isOn: $runner.restoreCrossfade)
       }
       Section("合成") {
         doubleSliderField("シャープ", value: $runner.sharpenStrength, range: 0...1, step: 0.05)
@@ -795,6 +1158,36 @@ struct ContentView: View {
         Toggle("MPSメモリ比率を指定", isOn: $runner.useMPSMemoryFraction)
         if runner.useMPSMemoryFraction { doubleField("MPSメモリ比率", value: $runner.mpsMemoryFraction) }
         Toggle("MPSメモリ統計を記録", isOn: $runner.logMPSMemory)
+      }
+    }.formStyle(.grouped)
+  }
+
+  private var settingsTab: some View {
+    Form {
+      Section("ユーザーデフォルト") {
+        Text("現在の各タブの値を、このMacユーザーのmiohデフォルトとして保存します。次回起動時に自動で適用されます。")
+          .font(.callout)
+          .foregroundStyle(.secondary)
+        HStack(spacing: 12) {
+          Button(action: runner.saveCurrentDefaults) {
+            Label("現在の設定をデフォルトに保存", systemImage: "square.and.arrow.down")
+          }
+          .buttonStyle(.borderedProminent)
+          Button(action: runner.loadSavedDefaults) {
+            Label("保存済みデフォルトを読み込み", systemImage: "arrow.clockwise")
+          }
+          Button(role: .destructive, action: runner.resetDefaultsToFactory) {
+            Label("初期値に戻す", systemImage: "trash")
+          }
+        }
+        Text(runner.defaultsStatus)
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      }
+      Section("保存対象") {
+        Text("入力/出力、一時フォルダ、分割、復元、検出、出力、メモリ、再生バッファまで保存します。ログ、進捗、実行中状態は保存しません。")
+          .font(.caption)
+          .foregroundStyle(.secondary)
       }
     }.formStyle(.grouped)
   }

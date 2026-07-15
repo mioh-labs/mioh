@@ -147,6 +147,17 @@ class ProcessVideoParallelShutdownTests(unittest.TestCase):
             [*pvp.lada_cli_command_prefix(), "--list-mosaic-detection-models"],
         )
 
+    def test_list_roi_enhancer_models_builds_lada_cli_passthrough(self):
+        parser = pvp.build_arg_parser()
+        args = parser.parse_args(["--list-roi-enhancer-models"])
+
+        cmd = pvp.build_lada_cli_list_command(args)
+
+        self.assertEqual(
+            cmd,
+            [*pvp.lada_cli_command_prefix(), "--list-roi-enhancer-models"],
+        )
+
     def test_list_encoder_options_builds_lada_cli_passthrough_with_value(self):
         parser = pvp.build_arg_parser()
         args = parser.parse_args(["--list-encoder-options", "hevc_videotoolbox"])

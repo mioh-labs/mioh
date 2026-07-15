@@ -278,6 +278,8 @@ def create_preview_restorer(config, models):
         fp16_enabled=config.fp16,
         mosaic_detection_empty_lookahead=config.detection_empty_lookahead,
         restore_max_frames=config.restore_max_frames,
+        restore_temporal_overlap=config.restore_temporal_overlap,
+        restore_crossfade=config.restore_crossfade,
     )
 
 
@@ -478,6 +480,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--detection-model", required=True)
     parser.add_argument("--max-clip-length", type=int, default=180)
     parser.add_argument("--restore-max-frames", type=int)
+    parser.add_argument("--restore-temporal-overlap", type=int, default=8)
+    parser.add_argument("--enable-crossfade", dest="restore_crossfade", action="store_true", default=True)
+    parser.add_argument("--disable-crossfade", dest="restore_crossfade", action="store_false")
     parser.add_argument("--detect-face-mosaics", action="store_true")
     parser.add_argument("--detection-empty-lookahead", type=int, default=10)
     parser.add_argument("--sharpen-strength", type=float, default=0.0)

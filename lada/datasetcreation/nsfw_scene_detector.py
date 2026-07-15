@@ -27,15 +27,16 @@ logging.basicConfig(level=LOG_LEVEL)
 
 @dataclass
 class FileProcessingOptions:
-    input_dir: str
+    input_dir: str | tuple[pathlib.Path, ...]
     output_dir: pathlib.Path
     start_index: int
     stride_length: int
-    scene_min_length: int
-    scene_max_length: int
+    scene_min_length: float
+    scene_max_length: float
     scene_max_memory: int
     random_extend_masks: bool
     skip4k: bool
+    scene_continuity_iou: float = 0.2
 
 @dataclass
 class NsfwFrame:
@@ -57,6 +58,21 @@ class NsfwFrame:
     @property
     def box(self) -> Box:
         return convert_yolo_box(self._box, self.frame.shape)
+
+
+def box_iou(box_a: Box, box_b: Box) -> float:
+    """Return IoU for boxes represented as top, left, bottom, right."""
+    top = max(box_a[0], box_b[0])
+    left = max(box_a[1], box_b[1])
+    bottom = min(box_a[2], box_b[2])
+    right = min(box_a[3], box_b[3])
+    intersection_height = max(0, bottom - top + 1)
+    intersection_width = max(0, right - left + 1)
+    intersection = intersection_height * intersection_width
+    area_a = max(0, box_a[2] - box_a[0] + 1) * max(0, box_a[3] - box_a[1] + 1)
+    area_b = max(0, box_b[2] - box_b[0] + 1) * max(0, box_b[3] - box_b[1] + 1)
+    union = area_a + area_b - intersection
+    return intersection / union if union else 0.0
 
 
 class Scene:
@@ -82,7 +98,21 @@ class Scene:
     def max_length_reached(self):
         return len(self) >= self.scene_max_length
 
+    def continues_with(self, nsfw_frame: NsfwFrame, min_iou: float) -> bool:
+        if not self._tmp_data or self.frame_end + 1 != nsfw_frame.frame_number:
+            return False
+        same_tracking_id = (
+            self.id is not None
+            and nsfw_frame.object_id is not None
+            and self.id == nsfw_frame.object_id
+        )
+        if same_tracking_id:
+            return True
+        return box_iou(self._tmp_data[-1].box, nsfw_frame.box) >= min_iou
+
     def add_frame(self, nsfw_frame: NsfwFrame):
+        if self.max_length_reached():
+            raise ValueError("cannot add a frame to a complete scene")
         if self.frame_start is None:
             self.frame_start = nsfw_frame.frame_number
             self.frame_end = nsfw_frame.frame_number
@@ -90,8 +120,7 @@ class Scene:
         else:
             assert nsfw_frame.frame_number == self.frame_end + 1
             self.frame_end = nsfw_frame.frame_number
-            if not self.max_length_reached():
-                self._tmp_data.append(nsfw_frame)
+            self._tmp_data.append(nsfw_frame)
 
     def complete(self):
         worker_count = 6
@@ -440,9 +469,16 @@ class NsfwDetector:
                         logger.debug("NsfwDetector: frame detector worker: frame_queue producer unblocked")
                     if self.stop_requested:
                         break
-                yolo_box, yolo_mask = choose_biggest_detection(results, tracking_mode=True)
+                # Keep detections without a ByteTrack ID as candidates. Scene
+                # continuity is decided below using both tracking ID and box IoU.
+                yolo_box, yolo_mask = choose_biggest_detection(results, tracking_mode=False)
                 object_detected = yolo_box is not None
-                nsfw_frame = NsfwFrame(video_metadata, frame_num, False, results.orig_img, yolo_box, yolo_mask, object_detected, int(yolo_box.id.item()) if object_detected else None)
+                tracking_id = (
+                    int(yolo_box.id.item())
+                    if object_detected and yolo_box.id is not None
+                    else None
+                )
+                nsfw_frame = NsfwFrame(video_metadata, frame_num, False, results.orig_img, yolo_box, yolo_mask, object_detected, tracking_id)
             if nsfw_frame and not self.stop_requested:
                 nsfw_frame.last_frame = True
                 self.frame_queue.put(nsfw_frame)
@@ -483,7 +519,7 @@ class NsfwDetector:
                     scene = Scene(nsfw_frame.video_metadata, nsfw_frame.object_id, self.scene_min_length, self.scene_max_length)
                     scene.add_frame(nsfw_frame)
                 else:
-                    if scene.id == nsfw_frame.object_id and scene.frame_end + 1 == nsfw_frame.frame_number:
+                    if scene.continues_with(nsfw_frame, self.file_processing_options.scene_continuity_iou) and not scene.max_length_reached():
                         scene.add_frame(nsfw_frame)
                     else:
                         completed_scene = self._process_completed_scene(scene)

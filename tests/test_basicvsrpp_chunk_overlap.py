@@ -27,6 +27,26 @@ class BasicVSRPPChunkOverlapTests(unittest.TestCase):
         values = [int(frame[0, 0, 0]) for frame in restored]
         self.assertEqual(values, [0, 0, 30, 60, 90, 90])
 
+    def test_temporal_overlap_can_be_configured(self):
+        model = ChunkOffsetModel()
+        restorer = BasicvsrppMosaicRestorer(model, torch.device("cpu"), fp16=False)
+        video = [torch.zeros((4, 4, 3), dtype=torch.uint8) for _ in range(6)]
+
+        restored = restorer.restore(video, max_frames=4, temporal_overlap=1)
+
+        values = [int(frame[0, 0, 0]) for frame in restored]
+        self.assertEqual(values, [0, 0, 0, 45, 90, 90])
+
+    def test_crossfade_can_be_disabled(self):
+        model = ChunkOffsetModel()
+        restorer = BasicvsrppMosaicRestorer(model, torch.device("cpu"), fp16=False)
+        video = [torch.zeros((4, 4, 3), dtype=torch.uint8) for _ in range(6)]
+
+        restored = restorer.restore(video, max_frames=4, enable_crossfade=False)
+
+        values = [int(frame[0, 0, 0]) for frame in restored]
+        self.assertEqual(values, [0, 0, 45, 45, 90, 90])
+
 
 if __name__ == "__main__":
     unittest.main()

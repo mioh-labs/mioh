@@ -77,6 +77,12 @@ roi-enhancer-torch = [
     "realesrgan>=0.3.0",
     "basicsr>=1.4.2",
 ]
+# Generic PyTorch loader for community super-resolution models used by the
+# CLI-only Nomos ROI enhancer backend. This is intentionally separate from
+# the macOS app dependency set.
+roi-enhancer-spandrel = [
+    "spandrel>=0.4.2,<1",
+]
 apple-mlx = [
     "mlx==0.31.2; sys_platform == 'darwin' and (platform_machine == 'arm64' or platform_machine == 'aarch64')",
 ]

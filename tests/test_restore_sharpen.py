@@ -270,6 +270,22 @@ class RestoreSharpenTests(unittest.TestCase):
         self.assertEqual(args.restore_roi_enhancer_scale, 4)
         self.assertEqual(args.restore_roi_enhancer_strength, 0.25)
 
+    def test_lada_cli_accepts_spandrel_roi_enhancer(self):
+        parser = setup_argparser()
+
+        args = parser.parse_args([
+            "--input", "in.mp4",
+            "--restore-roi-enhancer", "spandrel",
+            "--restore-roi-enhancer-model-path", "nomos-webphoto-realplksr-x4",
+            "--restore-roi-enhancer-scale", "4",
+            "--restore-roi-enhancer-strength", "0.25",
+        ])
+
+        self.assertEqual(args.restore_roi_enhancer, "spandrel")
+        self.assertEqual(args.restore_roi_enhancer_model_path, "nomos-webphoto-realplksr-x4")
+        self.assertEqual(args.restore_roi_enhancer_scale, 4)
+        self.assertEqual(args.restore_roi_enhancer_strength, 0.25)
+
     def test_parallel_command_passes_restore_sharpen_strength(self):
         config = pvp.WorkerRuntimeConfig(
             device="mps",

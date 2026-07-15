@@ -14,13 +14,14 @@ INFO_PLIST = ROOT / "packaging" / "macOS" / "standalone" / "Info.plist"
 COREAI_RUNNER_SOURCE = (
     ROOT / "packaging" / "macOS" / "standalone" / "CoreAIRunner.swift"
 )
-EXPECTED_SIX_COREAI_SOURCES = (
+EXPECTED_SEVEN_COREAI_SOURCES = (
     "basicvsrpp-v1.2-t18-fp16.aimodel",
     "basicvsrpp-v1.2-t36-fp16.aimodel",
     "basicvsrpp-v1.2-t90-fp16.aimodel",
     "lada_mosaic_detection_model_v4_fast-fp16.aimodel",
     "RealESRGAN_x4plus-256-fp16.aimodel",
     "realesr-general-x4v3-256-fp16.aimodel",
+    "4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel",
 )
 
 
@@ -60,10 +61,11 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "driftToleranceSeconds = 0.080",
             'sendCommand(["command": "seek"',
             "showOriginal",
+            "sourceOnlyPlayback",
             "struct RealtimePlayerView: View",
             'Label("再生"',
             'Label("一時停止"',
-            'Text("バッファ中")',
+            "Text(controller.processingOverlayLabel)",
         ]
         for contract in expected_player_contracts:
             self.assertIn(contract, player)
@@ -111,6 +113,12 @@ class StandaloneAppOptionTests(unittest.TestCase):
 
         self.assertIn("xcrun coremlcompiler compile", build_script)
         self.assertIn('"$RESOURCES/models/$compiled_name"', build_script)
+        self.assertIn("lada_mosaic_detection_model_vr_v2_accurate.mlpackage", build_script)
+        regular_assets = build_script.split("MODEL_ASSETS=(", 1)[1].split(")", 1)[0]
+        self.assertNotIn("lada_mosaic_detection_model_v2.pt", regular_assets)
+        self.assertNotIn("lada_mosaic_detection_model_v4_fast.pt", regular_assets)
+        self.assertNotIn("lada_mosaic_detection_model_vr_v2_accurate.pt", regular_assets)
+        self.assertNotIn("lada_mosaic_detection_model_v4_fast.mlpackage", regular_assets)
 
     def test_runner_exposes_current_settings_to_preview_worker(self):
         app = APP_SOURCE.read_text()
@@ -121,13 +129,139 @@ class StandaloneAppOptionTests(unittest.TestCase):
         )
         for option in [
             "--restoration-model", "--detection-model", "--max-clip-length",
-            "--restore-max-frames", "--sharpen-strength", "--detail-boost",
+            "--restore-max-frames", "--restore-temporal-overlap",
+            "--enable-crossfade", "--disable-crossfade",
+            "--sharpen-strength", "--detail-boost",
             "--blend-feather", "--texture-mix", "--smooth-strength",
             "--roi-enhancer", "--roi-enhancer-model", "--roi-enhancer-scale",
             "--roi-enhancer-strength", "--roi-enhancer-tile",
             "--effect-upscale", "--buffer-limit",
         ]:
             self.assertIn(option, app)
+
+    def test_app_has_user_default_settings_panel(self):
+        source = APP_SOURCE.read_text()
+
+        for contract in [
+            "struct MiohUserDefaultsSnapshot: Codable",
+            'private let defaultsKey = "mioh.userProcessingDefaults.v1"',
+            "func saveCurrentDefaults()",
+            "func loadSavedDefaults()",
+            "func resetDefaultsToFactory()",
+            "private func loadSavedDefaultsOnLaunch()",
+            "private func currentDefaultsSnapshot() -> MiohUserDefaultsSnapshot",
+            "private func apply(defaults snapshot: MiohUserDefaultsSnapshot)",
+            "UserDefaults.standard.set(data, forKey: defaultsKey)",
+            "UserDefaults.standard.data(forKey: defaultsKey)",
+            "UserDefaults.standard.removeObject(forKey: defaultsKey)",
+            'settingsTab.tabItem { Label("設定", systemImage: "gearshape") }',
+            'Section("ユーザーデフォルト")',
+            'Label("現在の設定をデフォルトに保存", systemImage: "square.and.arrow.down")',
+            'Label("保存済みデフォルトを読み込み", systemImage: "arrow.clockwise")',
+            'Label("初期値に戻す", systemImage: "trash")',
+            "入力/出力、一時フォルダ、分割、復元、検出、出力、メモリ、再生バッファまで保存します",
+        ]:
+            self.assertIn(contract, source)
+
+        self.assertIn("var previewBufferLimit: Double", source)
+        self.assertIn("var previewProjectionMode: String?", source)
+        self.assertIn("var previewVideoLayout: String?", source)
+        self.assertIn("var previewEye: String?", source)
+        self.assertIn("var previewCameraFOV: Double?", source)
+        self.assertIn("var encoderOptions: String", source)
+        self.assertIn("var roiEnhancerStrength: Double", source)
+        self.assertIn("var mpsMemoryFraction: Double", source)
+        self.assertIn("var restoreTemporalOverlap: Int?", source)
+        self.assertIn("var restoreCrossfade: Bool?", source)
+        self.assertIn("restoreTemporalOverlap = min(max(snapshot.restoreTemporalOverlap ?? 8, 0), 120)", source)
+        self.assertIn("restoreCrossfade = snapshot.restoreCrossfade ?? true", source)
+        self.assertIn('previewProjectionMode = ["通常", "VR180", "360"].contains(snapshot.previewProjectionMode ?? "")', source)
+        self.assertIn('previewVideoLayout = ["Mono", "SBS 左右", "上下"].contains(snapshot.previewVideoLayout ?? "")', source)
+        self.assertIn('previewEye = ["左目", "右目"].contains(snapshot.previewEye ?? "")', source)
+        self.assertIn("previewCameraFOV = min(max(snapshot.previewCameraFOV ?? 60, 45), 105)", source)
+        self.assertNotIn("var log: String", source.split("struct MiohUserDefaultsSnapshot: Codable", 1)[1].split("@MainActor", 1)[0])
+        self.assertNotIn("var progress: Double", source.split("struct MiohUserDefaultsSnapshot: Codable", 1)[1].split("@MainActor", 1)[0])
+
+    def test_realtime_player_can_use_vrviewer_projection_controls(self):
+        player = PLAYER_SOURCE.read_text()
+        app = APP_SOURCE.read_text()
+
+        for contract in [
+            "import SceneKit",
+            "import SpriteKit",
+            "enum PreviewProjectionMode: String, CaseIterable, Identifiable",
+            'case vr180 = "VR180"',
+            'case sphere360 = "360"',
+            "enum PreviewVideoLayout: String, CaseIterable, Identifiable",
+            'case sbs = "SBS 左右"',
+            'case topBottom = "上下"',
+            "enum PreviewEye: String, CaseIterable, Identifiable",
+            "PreviewProjectionGeometry.makeSphere",
+            "static func uvWindow(layout: PreviewVideoLayout, eye: PreviewEye) -> CGRect",
+            "struct VRPreviewSceneView: NSViewRepresentable",
+            "final class Coordinator: NSObject",
+            "SKVideoNode(avPlayer: player)",
+            "videoNode.geometry?.firstMaterial?.diffuse.contents = skScene",
+            "NSPanGestureRecognizer",
+            "NSMagnificationGestureRecognizer",
+            'runner.previewProjectionMode == "通常"',
+            "VRPreviewSceneView(",
+            "private func prepareSourcePlayerItem(input: URL) async throws -> PreparedSourcePlayerItem",
+            "try await source.load(.isPlayable)",
+            "private final class HEV1VirtualResourceLoader: NSObject, AVAssetResourceLoaderDelegate",
+            "private static func findHEV1Offsets(in url: URL, fileSize: UInt64) throws -> [UInt64]",
+            'string: "mioh-hev1://\\(UUID().uuidString.lowercased())/video.mp4"',
+            "information.contentType = AVFileType.mp4.rawValue",
+            "information.isByteRangeAccessSupported = true",
+            "dataRequest.respond(with: patch(sourceData, startingAt: cursor))",
+            "let resourceLoader = try HEV1VirtualResourceLoader(sourceURL: input)",
+            "guard try await compatibleAsset.load(.isPlayable)",
+            "private func startSourceOnlyPlayback(",
+            'sourceOnlyPlayback = runner.previewProjectionMode != "通常"',
+            '"VR再生: 復元モデルを読み込まず、元動画を直接再生します\\n"',
+            '"VR再生: 全編remuxを行わず、AVFoundation互換の仮想コンテナを使用します\\n"',
+            "item.preferredForwardBufferDuration",
+            "private func installSourcePlaybackObservers(item: AVPlayerItem, generation: Int)",
+            "private func updateSourcePlaybackState(item: AVPlayerItem, generation: Int)",
+            "sourcePlayer.reasonForWaitingToPlay",
+            "controller.sourceOnlyPlayback || controller.showOriginal",
+            "var shouldShowProcessingOverlay: Bool",
+            "var processingOverlayLabel: String",
+            "var statusLabel: String",
+            "Text(controller.processingOverlayLabel)",
+            'Picker("表示", selection: $runner.previewProjectionMode)',
+            'Picker("形式", selection: $runner.previewVideoLayout)',
+            'Picker("目", selection: $runner.previewEye)',
+            'Text("視野角")',
+        ]:
+            self.assertIn(contract, player)
+
+        for removed_blocking_remux_contract in [
+            "prepareSourcePlaybackURL",
+            "shouldRemuxHEVCForAVFoundation",
+            '"-tag:v", "hvc1"',
+            "waitUntilExit()",
+            "AVMutableComposition",
+        ]:
+            self.assertNotIn(removed_blocking_remux_contract, player)
+
+        for contract in [
+            '@Published var previewProjectionMode = "通常"',
+            '@Published var previewVideoLayout = "SBS 左右"',
+            '@Published var previewEye = "左目"',
+            "@Published var previewCameraFOV = 60.0",
+            'previewProjectionMode: "通常"',
+            'previewVideoLayout: "SBS 左右"',
+            'previewEye: "左目"',
+            "previewCameraFOV: 60",
+        ]:
+            self.assertIn(contract, app)
+
+    def test_realtime_player_build_links_scenekit(self):
+        script = BUILD_SCRIPT.read_text()
+
+        for framework in ["SceneKit", "SpriteKit"]:
+            self.assertIn(f"-framework {framework}", script)
 
     def test_preview_buffer_slider_supports_one_minute_and_live_updates(self):
         app = APP_SOURCE.read_text()
@@ -197,12 +331,18 @@ class StandaloneAppOptionTests(unittest.TestCase):
             'supportsCoreAI ? baseDetectionModels + ["v4-fast-coreai"] : baseDetectionModels',
             source,
         )
+        self.assertIn('"vr-v2-accurate-coreml"', source)
+        base_models = source.split("let baseDetectionModels = [", 1)[1].split("]", 1)[0]
+        self.assertNotIn('"v2"', base_models)
+        self.assertNotIn('"v4-fast"', base_models)
+        self.assertNotIn('"vr-v2-accurate"', base_models)
         self.assertIn("normalizeModelSelections()", source)
 
     def test_coreai_helper_environment_is_only_exported_when_supported(self):
         source = APP_SOURCE.read_text()
 
         self.assertIn("if capabilities.supportsCoreAI", source)
+        self.assertNotIn('result["LADA_COREAI_PYTHON"]', source)
         self.assertIn('result["LADA_COREAI_SWIFT_RUNNER"]', source)
         self.assertIn(
             "try rejectUnsupportedCoreAIModel(roiEnhancerModel)",
@@ -228,7 +368,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertNotIn('for model in "$COMPILED_MODELS"/*.aimodelc', script)
         self.assertNotIn("basicvsrpp-v1.2-t36-b2-fp16.aimodel", script)
         regular_assets = script.split("MODEL_ASSETS=(", 1)[1].split(")", 1)[0]
-        for source in EXPECTED_SIX_COREAI_SOURCES:
+        for source in EXPECTED_SEVEN_COREAI_SOURCES:
             self.assertIn(source, script)
             self.assertNotIn(source, regular_assets)
 
@@ -251,6 +391,33 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn('ditto "$source_model" "$RESOURCES/models/$asset"', script)
         self.assertIn('--distribution "$COREAI_DISTRIBUTION"', script)
         self.assertIn('--smoke-model basicvsrpp-v1.2-coreai', script)
+
+    def test_build_prunes_packaging_only_runtime_files(self):
+        script = BUILD_SCRIPT.read_text()
+
+        for contract in [
+            '"$RESOURCES/runtime/bin/pip"',
+            '"$RESOURCES/runtime/lib/python3.12/site-packages/pip"',
+            '"$RESOURCES/runtime/lib/python3.12/site-packages/setuptools"',
+            '"$RESOURCES/runtime/lib/python3.12/site-packages/tests"',
+            '"$RESOURCES/runtime/lib/python3.12/site-packages/yapftests"',
+        ]:
+            self.assertIn(contract, script)
+
+    def test_mioh_keeps_only_one_mewzoom_coreml_asset(self):
+        script = BUILD_SCRIPT.read_text()
+        regular_assets = script.split("MODEL_ASSETS=(", 1)[1].split(")", 1)[0]
+
+        self.assertIn("MewZoom-V1-4X-Unet_256.mlpackage", regular_assets)
+        self.assertNotIn("MewZoom-V1-4X-Unet_512.mlpackage", regular_assets)
+
+    def test_build_uses_single_standalone_python_environment(self):
+        script = BUILD_SCRIPT.read_text()
+
+        self.assertIn("LADA_STANDALONE_PYTHON_ENV", script)
+        self.assertIn("$ROOT/.venv-coreai", script)
+        self.assertNotIn('if [[ -d "$ROOT/.venv" ]]', script)
+        self.assertNotIn('$ROOT/.venv/lib/python3.12/site-packages', script)
 
     def test_universal_build_wrapper_uses_isolated_artifact_paths(self):
         self.assertTrue(UNIVERSAL_BUILD_SCRIPT.is_file())
@@ -300,8 +467,8 @@ class StandaloneAppOptionTests(unittest.TestCase):
             build_script,
         )
         self.assertIn('DMG="$BUILD_DIR/$DMG_BASENAME.dmg"', build_script)
-        self.assertIn('--volumeName "mioh"', build_script)
-        self.assertIn('ditto "$APP" "$DMG_ROOT/mioh.app"', build_script)
+        self.assertIn('--volumeName "$APP_BASENAME"', build_script)
+        self.assertIn('ditto "$APP" "$DMG_ROOT/$APP_BASENAME.app"', build_script)
 
     def test_gui_exposes_all_processing_options(self):
         source = APP_SOURCE.read_text()
@@ -315,6 +482,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "--qmax", "--fps", "--pre-fps-conversion", "--mp4-fast-start",
             "--auto-optimize", "--no-auto-optimize", "--mosaic-restoration-model",
             "--max-clip-length", "--restore-max-frames",
+            "--restore-temporal-overlap", "--enable-crossfade", "--disable-crossfade",
             "--restore-sharpen-strength", "--restore-detail-boost",
             "--restore-blend-feather", "--restore-texture-mix",
             "--restore-smooth-strength", "--restore-effect-upscale",
@@ -329,6 +497,20 @@ class StandaloneAppOptionTests(unittest.TestCase):
 
         missing = sorted(option for option in expected_options if option not in source)
         self.assertEqual(missing, [])
+
+    def test_gui_exposes_temporal_overlap_controls(self):
+        source = APP_SOURCE.read_text()
+
+        for contract in [
+            "@Published var restoreTemporalOverlap = 8",
+            "@Published var restoreCrossfade = true",
+            'LabeledContent("Temporal overlap")',
+            'Stepper(value: $runner.restoreTemporalOverlap, in: 0...120)',
+            'Toggle("クロスフェードを有効化", isOn: $runner.restoreCrossfade)',
+            'add(&args, "--restore-temporal-overlap", restoreTemporalOverlap)',
+            'args.append(restoreCrossfade ? "--enable-crossfade" : "--disable-crossfade")',
+        ]:
+            self.assertIn(contract, source)
 
     def test_app_bundles_parallel_processor(self):
         script = BUILD_SCRIPT.read_text()
@@ -408,6 +590,21 @@ class StandaloneAppOptionTests(unittest.TestCase):
             'integerSliderField("タイル", value: $runner.roiEnhancerTile, range: 0...1024, step: 32).disabled(runner.roiEnhancer == "none")',
             source,
         )
+
+    def test_spandrel_realplksr_coreai_is_available_in_mioh(self):
+        source = APP_SOURCE.read_text()
+        script = BUILD_SCRIPT.read_text()
+        verifier = (
+            ROOT / "packaging" / "macOS" / "standalone" / "verify_coreai_models.py"
+        ).read_text()
+
+        self.assertIn('let enhancerModels = ["none", "realesrgan", "mewzoom", "swinir", "spandrel"]', source)
+        self.assertIn('"nomos-webphoto-realplksr-x4-coreai"', source)
+        self.assertIn('"nomos-webphoto-realplksr-x4-coreml"', source)
+        self.assertIn("4xNomosWebPhoto_RealPLKSR_256.mlpackage", script)
+        self.assertIn("4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel", script)
+        self.assertIn('"nomos-webphoto-realplksr-x4-coreai"', verifier)
+        self.assertIn('"4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel"', verifier)
 
 
 if __name__ == "__main__":

@@ -48,6 +48,19 @@ class PreviewProtocolTests(unittest.TestCase):
         self.assertEqual(command.command, "seek")
         self.assertEqual(command.position_ns, 42_000_000_000)
 
+    def test_preview_parser_accepts_temporal_overlap(self):
+        args = self.worker.build_parser().parse_args([
+            "--input", "in.mp4",
+            "--output-dir", "out",
+            "--restoration-model", "basicvsrpp-v1.2",
+            "--detection-model", "v2-coreml",
+            "--restore-temporal-overlap", "15",
+            "--disable-crossfade",
+        ])
+
+        self.assertEqual(args.restore_temporal_overlap, 15)
+        self.assertFalse(args.restore_crossfade)
+
 
 class SegmentEncoderTests(unittest.TestCase):
     @classmethod

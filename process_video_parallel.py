@@ -87,6 +87,8 @@ class WorkerRuntimeConfig:
     lada_temp_dir: str | None
     overwrite: bool
     restore_max_frames: int | None = None
+    restore_temporal_overlap: int = 8
+    restore_crossfade: bool = True
     mosaic_detection_empty_lookahead: int = 0
     restore_sharpen_strength: float = 0.0
     restore_detail_boost: float = 0.0
@@ -113,14 +115,17 @@ COREAI_STREAMING_CLIP_LENGTHS = {
     'basicvsrpp-v1.2-coreai-t36': 104,
     'basicvsrpp-v1.2-coreai-t90': 178,
 }
-COREAI_PYTHON = Path(
-    os.environ.get('LADA_COREAI_PYTHON', REPO_ROOT / '.venv-coreai' / 'bin' / 'python')
+COREAI_PYTHON = (
+    Path(os.environ['LADA_COREAI_PYTHON'])
+    if os.environ.get('LADA_COREAI_PYTHON')
+    else None
 )
 COREAI_T36_MODEL_PATH = (
     REPO_ROOT / 'model_weights' / 'basicvsrpp-v1.2-t36-fp16.aimodel'
 )
 COREAI_DETECTION_MODELS = {'v4-fast-coreai'}
 COREAI_ENHANCER_MODELS = {
+    'nomos-webphoto-realplksr-x4-coreai',
     'realesr-general-x4v3-coreai',
     'realesrgan-x4-coreai',
 }
@@ -254,12 +259,25 @@ COREAI_V4_FAST_MODEL_PATH = (
 )
 
 
+def coreai_runtime_available() -> bool:
+    if COREAI_PYTHON is not None:
+        return COREAI_PYTHON.is_file()
+    swift_runner = os.environ.get('LADA_COREAI_SWIFT_RUNNER')
+    if swift_runner and Path(swift_runner).is_file():
+        return True
+    try:
+        import coreai.runtime  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
 def get_default_mosaic_restoration_model() -> str:
     return 'basicvsrpp-v1.2'
 
 
 def get_default_mosaic_detection_model() -> str:
-    if COREAI_PYTHON.is_file() and COREAI_V4_FAST_MODEL_PATH.is_dir():
+    if coreai_runtime_available() and COREAI_V4_FAST_MODEL_PATH.is_dir():
         return 'v4-fast-coreai'
     return 'v4-fast'
 
@@ -299,16 +317,15 @@ def lada_cli_command_prefix(
     script. A `lada-cli` on PATH resolves through the editable install and
     would run a different checkout when this wrapper lives in a worktree.
     """
-    interpreter = (
-        COREAI_PYTHON
-        if mosaic_restoration_model in COREAI_RESTORATION_MODELS
+    uses_coreai = (
+        mosaic_restoration_model in COREAI_RESTORATION_MODELS
         or str(mosaic_restoration_model).endswith(('.aimodel', '.aimodelc'))
         or mosaic_detection_model in COREAI_DETECTION_MODELS
         or str(mosaic_detection_model).endswith(('.aimodel', '.aimodelc'))
         or roi_enhancer_model in COREAI_ENHANCER_MODELS
         or str(roi_enhancer_model).endswith(('.aimodel', '.aimodelc'))
-        else Path(sys.executable)
     )
+    interpreter = COREAI_PYTHON if uses_coreai and COREAI_PYTHON else Path(sys.executable)
     return [str(interpreter), '-m', 'lada.cli.main']
 
 
@@ -404,6 +421,8 @@ def build_lada_cli_command(config: WorkerRuntimeConfig, input_video: Path, outpu
     cmd.extend(['--max-clip-length', str(config.max_clip_length)])
     if config.restore_max_frames is not None:
         cmd.extend(['--restore-max-frames', str(config.restore_max_frames)])
+    cmd.extend(['--restore-temporal-overlap', str(config.restore_temporal_overlap)])
+    cmd.append('--enable-crossfade' if config.restore_crossfade else '--disable-crossfade')
     if config.restore_sharpen_strength > 0:
         cmd.extend(['--restore-sharpen-strength', str(config.restore_sharpen_strength)])
     if config.restore_detail_boost > 0:
@@ -456,6 +475,7 @@ def build_lada_cli_list_command(args) -> list[str] | None:
         "list_encoders",
         "list_mosaic_restoration_models",
         "list_mosaic_detection_models",
+        "list_roi_enhancer_models",
     ]
     for attr in list_flags:
         if getattr(args, attr, False):
@@ -1492,6 +1512,8 @@ class ParallelVideoProcessor:
             mosaic_restoration_model=self.args.mosaic_restoration_model,
             max_clip_length=self.args.max_clip_length,
             restore_max_frames=self.args.restore_max_frames,
+            restore_temporal_overlap=self.args.restore_temporal_overlap,
+            restore_crossfade=self.args.restore_crossfade,
             mosaic_detection_model=self.args.mosaic_detection_model,
             detect_face_mosaics=self.args.detect_face_mosaics,
             lada_temp_dir=str(self.args.lada_temp_dir) if getattr(self.args, 'lada_temp_dir', None) else None,
@@ -2354,6 +2376,8 @@ def build_arg_parser():
     # モザイク設定
     parser.add_argument('--list-mosaic-restoration-models', action='store_true',
                         help='lada-cli の復元モデル一覧を表示')
+    parser.add_argument('--list-roi-enhancer-models', action='store_true',
+                        help='lada-cli のROIエンハンサーモデル一覧を表示')
     default_restoration_model = get_default_mosaic_restoration_model()
     parser.add_argument('--mosaic-restoration-model', default=default_restoration_model,
                         help=f'復元モデル名または重みパス（デフォルト: {default_restoration_model}）')
@@ -2361,6 +2385,12 @@ def build_arg_parser():
                         help='復元モデルへ渡す最大フレーム数。未指定時はCore AI T18=98、T36=104、T90=178、その他=180')
     parser.add_argument('--restore-max-frames', type=int, default=None,
                         help='BasicVSR++復元チャンク数の上書き。未指定はMPS自動調整、-1は分割なし、正の値は固定チャンク')
+    parser.add_argument('--restore-temporal-overlap', type=int, default=8,
+                        help='BasicVSR++復元チャンク境界の重なりフレーム数。8〜20が目安（デフォルト: 8）')
+    parser.add_argument('--enable-crossfade', dest='restore_crossfade', action='store_true', default=True,
+                        help='temporal overlap部分をクロスフェード合成する（デフォルト: 有効）')
+    parser.add_argument('--disable-crossfade', dest='restore_crossfade', action='store_false',
+                        help='temporal overlap部分のクロスフェードを無効化')
     parser.add_argument('--restore-sharpen-strength', type=float, default=0.0,
                         help='復元ROIを合成前にunsharp maskでシャープ化する強度（0で無効、例: 0.3）')
     parser.add_argument('--restore-detail-boost', type=float, default=0.0,
@@ -2373,17 +2403,17 @@ def build_arg_parser():
                         help='texture/detail/sharpen後の復元ROIを合成前に滑らかにする強度（0で無効、例: 0.10〜0.25）')
     parser.add_argument('--restore-effect-upscale', type=int, default=1,
                         help='texture/detail/sharpenをOpenCVで拡大後に適用して戻す倍率（1で無効、例: 2）')
-    parser.add_argument('--restore-roi-enhancer', choices=('none', 'realesrgan', 'mewzoom', 'swinir'), default='none',
+    parser.add_argument('--restore-roi-enhancer', choices=('none', 'realesrgan', 'mewzoom', 'swinir', 'spandrel'), default='none',
                         help='復元ROIに追加の高画質化処理をかける。モデルは指定時のみロード（デフォルト: none）')
     parser.add_argument('--restore-roi-enhancer-model-path',
-                        help='エンハンサーモデル。登録名（realesrgan-x2/x4, realesrgan-x4-coreml, mewzoom-x4-coreml）、'
-                             'model_weights内のファイル名、またはパス。省略時は <enhancer>-x4-coreml に自動解決')
+                        help='エンハンサーモデル。登録名、model_weights内のファイル名、またはパス。'
+                             'spandrel省略時は nomos-webphoto-realplksr-x4 に自動解決')
     parser.add_argument('--restore-roi-enhancer-scale', type=int, default=2,
                         help='エンハンサーの倍率。処理後はROIサイズへ戻して合成（デフォルト: 2）')
     parser.add_argument('--restore-roi-enhancer-strength', type=float, default=0.0,
                         help='エンハンサー結果を復元ROIへ混ぜる強度（0で無効、例: 0.25）')
     parser.add_argument('--restore-roi-enhancer-tile', type=int, default=0,
-                        help='PyTorch版Real-ESRGANのtileサイズ。0で無効。Core ML版では未使用（デフォルト: 0）')
+                        help='PyTorch版Real-ESRGAN/Spandrelのtileサイズ。0で無効。Core ML版では未使用（デフォルト: 0）')
     default_detection_model = get_default_mosaic_detection_model()
     parser.add_argument('--mosaic-detection-model', default=default_detection_model,
                         help=f'検出モデル名または重みパス（デフォルト: {default_detection_model}）')
@@ -2454,6 +2484,9 @@ def main():
     if args.max_clip_length < 1:
         print("エラー: --max-clip-length は1以上である必要があります")
         return
+    if args.restore_temporal_overlap < 0:
+        print("エラー: --restore-temporal-overlap は0以上である必要があります")
+        return
     if args.segment_count is not None and args.segment_count < 1:
         print("エラー: --segment-count は1以上である必要があります")
         return
@@ -2484,7 +2517,7 @@ def main():
     if args.restore_effect_upscale < 1:
         print("エラー: --restore-effect-upscale は1以上である必要があります")
         return
-    # model-path省略時はlada-cli側で <enhancer>-x4-coreml に既定解決される
+    # model-path省略時はlada-cli側でバックエンド別の既定モデルに解決される
     if args.restore_roi_enhancer_scale < 1:
         print("エラー: --restore-roi-enhancer-scale は1以上である必要があります")
         return
@@ -2514,6 +2547,8 @@ def main():
     print(f"選択デバイス: {args.device}")
     print(f"並列処理数: {args.parallel_workers}")
     print(f"復元Clip長: {args.max_clip_length}フレーム")
+    print(f"Temporal overlap: {args.restore_temporal_overlap}フレーム")
+    print(f"Crossfade: {'有効' if args.restore_crossfade else '無効'}")
     if args.device == 'mps':
         effective_mps_fraction = get_effective_mps_memory_fraction(args)
         if effective_mps_fraction is not None:

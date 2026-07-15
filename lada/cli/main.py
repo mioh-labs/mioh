@@ -108,21 +108,25 @@ def setup_argparser() -> argparse.ArgumentParser:
 
     group_restoration = parser.add_argument_group(_('Mosaic Restoration'))
     group_restoration.add_argument('--list-mosaic-restoration-models', action='store_true', help=_("List available restoration models found in model weights directory and exit (default location is './model_weights' if not overwritten by environment variable LADA_MODEL_WEIGHTS_DIR)"))
+    group_restoration.add_argument('--list-roi-enhancer-models', action='store_true', help=_("List available ROI enhancer models found in the model weights directory and exit"))
     group_restoration.add_argument('--mosaic-restoration-model', type=str, default='basicvsrpp-v1.2', help=_('Name of detection model or path to model weights file. Use "--list-mosaic-restoration-models" to see what\'s available. (default: %(default)s)'))
     group_restoration.add_argument('--mosaic-restoration-config-path', type=str, default=None, help=_("Path to restoration model configuration file. You'll not have to set this unless you're training your own custom models"))
     group_restoration.add_argument('--max-clip-length', type=int, default=180, help=_('Maximum number of frames for restoration. Higher values improve temporal stability. Lower values reduce memory footprint. If set too low flickering could appear (default: %(default)s)'))
     group_restoration.add_argument('--restore-max-frames', type=int, default=None, help=_('Override BasicVSR++ restore chunk size. Omit for Apple Silicon adaptive chunking, use -1 to disable chunking, or a positive value to force a fixed chunk size.'))
+    group_restoration.add_argument('--restore-temporal-overlap', type=int, default=8, help=_('Number of overlapping frames between BasicVSR++ restore chunks. 8-20 can reduce boundary flicker; values above 20 usually have little extra effect. (default: %(default)s)'))
+    group_restoration.add_argument('--enable-crossfade', dest='restore_crossfade', action='store_true', default=True, help=_('Enable crossfade blending across temporal overlap frames. (default: enabled)'))
+    group_restoration.add_argument('--disable-crossfade', dest='restore_crossfade', action='store_false', help=_('Disable crossfade blending across temporal overlap frames.'))
     group_restoration.add_argument('--restore-sharpen-strength', type=float, default=0.0, help=_('Apply unsharp masking to restored mosaic regions before compositing. 0 disables it. Start with 0.2-0.4 for testing. (default: %(default)s)'))
     group_restoration.add_argument('--restore-detail-boost', type=float, default=0.0, help=_('Boost local detail/contrast in restored mosaic regions before compositing. 0 disables it. Start with 0.1-0.2 for testing. (default: %(default)s)'))
     group_restoration.add_argument('--restore-blend-feather', type=float, default=1.0, help=_('Multiplier for restored mosaic region blend feathering. 1 keeps the default mask feather. Larger values soften boundaries more. (default: %(default)s)'))
     group_restoration.add_argument('--restore-texture-mix', type=float, default=0.0, help=_('Mix mid-frequency texture from the source ROI into restored mosaic regions. 0 disables it. Start with 0.05-0.10 for testing. (default: %(default)s)'))
     group_restoration.add_argument('--restore-smooth-strength', type=float, default=0.0, help=_('Smooth restored mosaic regions after texture/detail/sharpen effects before compositing. 0 disables it. Start with 0.10-0.25. (default: %(default)s)'))
     group_restoration.add_argument('--restore-effect-upscale', type=int, default=1, help=_('Upscale restored mosaic mask areas before applying texture/detail/sharpen effects, then resize back before compositing. 1 disables it; use 2 for OpenCV 2x processing. (default: %(default)s)'))
-    group_restoration.add_argument('--restore-roi-enhancer', choices=('none', 'realesrgan', 'mewzoom', 'swinir'), default='none', help=_('Optional ROI enhancer applied to restored mosaic regions before compositing. The model is loaded only when selected. (default: %(default)s)'))
-    group_restoration.add_argument('--restore-roi-enhancer-model-path', type=str, default=None, help=_('Enhancer model: a well-known name, a filename in the model weights dir, or a path. Defaults to <enhancer>-x4-coreml when omitted.'))
+    group_restoration.add_argument('--restore-roi-enhancer', choices=('none', 'realesrgan', 'mewzoom', 'swinir', 'spandrel'), default='none', help=_('Optional ROI enhancer applied to restored mosaic regions before compositing. Use spandrel for Nomos/other supported community safetensors models. The model is loaded only when selected. (default: %(default)s)'))
+    group_restoration.add_argument('--restore-roi-enhancer-model-path', type=str, default=None, help=_('Enhancer model: a well-known name, a filename in the model weights dir, or a path. Spandrel defaults to nomos-webphoto-realplksr-x4; other backends default to <enhancer>-x4-coreml.'))
     group_restoration.add_argument('--restore-roi-enhancer-scale', type=int, default=2, help=_('Enhancer output scale. The result is resized back to the ROI before compositing. (default: %(default)s)'))
     group_restoration.add_argument('--restore-roi-enhancer-strength', type=float, default=0.0, help=_('Blend strength for the ROI enhancer output. 0 disables enhancer application even if configured. Start with 0.15-0.30. (default: %(default)s)'))
-    group_restoration.add_argument('--restore-roi-enhancer-tile', type=int, default=0, help=_('Tile size for the PyTorch Real-ESRGAN backend. 0 disables tiling. Not used by Core ML enhancers. (default: %(default)s)'))
+    group_restoration.add_argument('--restore-roi-enhancer-tile', type=int, default=0, help=_('Tile size for PyTorch Real-ESRGAN/Spandrel backends. 0 disables tiling. Not used by Core ML enhancers. (default: %(default)s)'))
 
     group_detection = parser.add_argument_group(_('Mosaic Detection'))
     group_detection.add_argument('--mosaic-detection-model', type=str, default='v4-fast', help=_('Name of detection model or path to model weights file. Use "--list-mosaic-detection-models" to see what\'s available. (default: %(default)s)'))
@@ -142,7 +146,9 @@ def process_video_file(input_path: str, output_path: str, temp_dir_path: str, de
                        restore_roi_enhancer_tile: int = 0, restore_effect_upscale: int = 1,
                        fp16_enabled: bool = False,
                        mosaic_detection_empty_lookahead: int = 0,
-                       restore_max_frames: int | None = None):
+                       restore_max_frames: int | None = None,
+                       restore_temporal_overlap: int = 8,
+                       restore_crossfade: bool = True):
     video_metadata = get_video_meta_data(input_path)
 
     frame_restorer = FrameRestorer(device, input_path, max_clip_length, mosaic_restoration_model_name,
@@ -160,7 +166,9 @@ def process_video_file(input_path: str, output_path: str, temp_dir_path: str, de
                  restore_effect_upscale=restore_effect_upscale,
                  fp16_enabled=fp16_enabled,
                  mosaic_detection_empty_lookahead=mosaic_detection_empty_lookahead,
-                 restore_max_frames=restore_max_frames)
+                 restore_max_frames=restore_max_frames,
+                 restore_temporal_overlap=restore_temporal_overlap,
+                 restore_crossfade=restore_crossfade)
     success = True
     video_tmp_file_output_path = os.path.join(temp_dir_path, f"{os.path.basename(os.path.splitext(output_path)[0])}.tmp{os.path.splitext(output_path)[1]}")
     pathlib.Path(output_path).parent.mkdir(exist_ok=True, parents=True)
@@ -212,6 +220,9 @@ def main():
     if args.list_mosaic_restoration_models:
         utils.dump_available_restoration_models()
         sys.exit(0)
+    if args.list_roi_enhancer_models:
+        utils.dump_available_roi_enhancer_models()
+        sys.exit(0)
     if args.list_devices:
         utils.dump_torch_devices()
         sys.exit(0)
@@ -253,9 +264,17 @@ def main():
     if args.restore_effect_upscale < 1:
         print(_("Invalid restore effect upscale. Value must be 1 or greater."))
         sys.exit(1)
+    if args.restore_temporal_overlap < 0:
+        print(_("Invalid restore temporal overlap. Value must be 0 or greater."))
+        sys.exit(1)
     if args.restore_roi_enhancer != "none" and not args.restore_roi_enhancer_model_path:
-        # default to the Core ML x4 export of the selected enhancer
-        default_name = f"{args.restore_roi_enhancer}-x4-coreml"
+        # The quality-first photographic Nomos model is the Spandrel default.
+        # Existing backends keep their historical Core ML naming convention.
+        default_name = (
+            "nomos-webphoto-realplksr-x4"
+            if args.restore_roi_enhancer == "spandrel"
+            else f"{args.restore_roi_enhancer}-x4-coreml"
+        )
         if enhancer_modelfile := ModelFiles.get_enhancer_model_by_name(default_name):
             args.restore_roi_enhancer_model_path = enhancer_modelfile.path
         else:
@@ -388,7 +407,9 @@ def main():
                                restore_effect_upscale=args.restore_effect_upscale,
                                fp16_enabled=args.fp16,
                                mosaic_detection_empty_lookahead=args.mosaic_detection_empty_lookahead,
-                               restore_max_frames=args.restore_max_frames)
+                               restore_max_frames=args.restore_max_frames,
+                               restore_temporal_overlap=args.restore_temporal_overlap,
+                               restore_crossfade=args.restore_crossfade)
         except KeyboardInterrupt:
             print(_("Received Ctrl-C, stopping restoration."))
             break

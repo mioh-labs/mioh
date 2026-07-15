@@ -7,7 +7,6 @@ import queue
 from pathlib import Path
 from time import sleep
 
-from lada.models.dover.evaluate import VideoQualityEvaluator
 from lada.datasetcreation.detectors.mosaic_detector import MosaicDetector
 from lada.datasetcreation.nsfw_scene_detector import NsfwDetector, FileProcessingOptions
 from lada.datasetcreation.nsfw_scene_processor import SceneProcessingOptions, SceneProcessor
@@ -15,13 +14,15 @@ from lada.datasetcreation.detectors.nudenet_nsfw_detector import NudeNetNsfwDete
 from lada.utils.threading_utils import wait_until_completed, clean_up_completed_futures
 from lada.datasetcreation.detectors.watermark_detector import WatermarkDetector
 from lada.models.yolo.yolo import Yolo
+from lada.utils import video_utils
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser("Create mosaic restoration dataset")
     parser.add_argument('--workers', type=int, default=2, help="Set number of multiprocessing workers")
 
     input = parser.add_argument_group('Input')
-    input.add_argument('--input', type=Path, help="path to a video file or a directory containing NSFW videos")
+    input.add_argument('--input', type=Path, nargs='+', required=True,
+                       help="one or more video files/directories containing uncensored source videos")
     input.add_argument('--start-index', type=int, default=0, help="Can be used to continue a previous run. Note the index number next to last processed file name")
     input.add_argument('--stride-length', default=0, type=int, help="skip frames in between long videos to prevent sampling too many scenes from a single file. value is in seconds")
     input.add_argument('--skip-4k', default=True, action=argparse.BooleanOptionalAction, help="skip videos of 4K resolution or higher. Processing those will use a lot of RAM")
@@ -49,11 +50,13 @@ def parse_args():
     nsfw_detection.add_argument('--model-device', type=str, default="cuda", help="device to run the YOLO model on. E.g. 'cuda' or 'cuda:0'")
 
     scene_duration_filter = parser.add_argument_group('Scene duration filter')
-    scene_duration_filter.add_argument('--scene-min-length', type=int, default=2.,
+    scene_duration_filter.add_argument('--scene-min-length', type=float, default=0.5,
                         help="minimal length of a scene in number of frames in order to be detected (in seconds)")
-    scene_duration_filter.add_argument('--scene-max-length', type=int, default=8,
+    scene_duration_filter.add_argument('--scene-max-length', type=float, default=8,
                         help="maximum length of a scene in number of frames. Scenes longer than that will be cut (in seconds)")
     scene_duration_filter.add_argument('--scene-max-memory', default=6144, type=int, help="limits maximum scene length based on approximate memory consumption of the scene. Value should be given in Megabytes (MB)")
+    scene_duration_filter.add_argument('--scene-continuity-iou', type=float, default=0.2,
+                        help="continue a scene across tracker-ID changes when adjacent boxes have at least this IoU (default: 0.2)")
 
     video_quality_evaluation = parser.add_argument_group('Scene video quality evaluation')
     video_quality_evaluation.add_argument('--add-video-quality-metadata', default=True, action=argparse.BooleanOptionalAction, help="If enabled will evaluate video quality and add its results to metadata")
@@ -86,8 +89,27 @@ def parse_args():
     censor_detection.add_argument('--censor-model-path', type=str, default="model_weights/lada_mosaic_detection_model_v2.pt",
                         help="path to censor detection model")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if not 0 <= args.scene_continuity_iou <= 1:
+        parser.error("--scene-continuity-iou must be between 0 and 1")
+    if args.scene_min_length <= 0:
+        parser.error("--scene-min-length must be greater than 0")
+    if args.scene_max_length <= 0:
+        parser.error("--scene-max-length must be greater than 0")
     return args
+
+
+def collect_video_files(input_paths: list[Path]) -> list[Path]:
+    """Collect video files recursively from one or more inputs without duplicates."""
+    files_by_path: dict[str, Path] = {}
+    for input_path in input_paths:
+        candidates = input_path.rglob("*") if input_path.is_dir() else [input_path]
+        for candidate in candidates:
+            if not candidate.is_file() or not video_utils.is_video_file(candidate):
+                continue
+            absolute_path = candidate.absolute()
+            files_by_path[str(absolute_path)] = absolute_path
+    return [files_by_path[key] for key in sorted(files_by_path)]
 
 def main():
     args = parse_args()
@@ -100,20 +122,25 @@ def main():
 
     nsfw_detection_model = Yolo(args.model)
 
-    video_quality_evaluator = VideoQualityEvaluator(device=args.video_quality_model_device) if args.add_video_quality_metadata or args.enable_video_quality_filter else None
+    video_quality_evaluator = None
+    if args.add_video_quality_metadata or args.enable_video_quality_filter:
+        from lada.models.dover.evaluate import VideoQualityEvaluator
+        video_quality_evaluator = VideoQualityEvaluator(device=args.video_quality_model_device)
     watermark_detector = WatermarkDetector(Yolo(args.watermark_model_path), device=args.model_device) if args.add_watermark_metadata or args.enable_watermark_filter else None
     nudenet_nsfw_detector = NudeNetNsfwDetector(Yolo(args.nudenet_nsfw_model_path), device=args.model_device) if args.add_nudenet_nsfw_metadata or args.enable_nudenet_nsfw_filter else None
     censor_detector = MosaicDetector(Yolo(args.censor_model_path), device=args.model_device) if args.add_censor_metadata or args.enable_censor_filter else None
 
     output_dir = args.output_root
     if not output_dir.exists():
-        output_dir.mkdir()
-    input_path = args.input
-    video_files = input_path.glob("*") if input_path.is_dir() else [input_path]
-    video_files = [file for file in video_files if file.exists()]
+        output_dir.mkdir(parents=True)
+    input_paths = args.input
+    video_files = collect_video_files(input_paths)
+    if not video_files:
+        raise FileNotFoundError(f"No supported video files found in: {', '.join(map(str, input_paths))}")
+    print(f"Found {len(video_files)} input video files")
 
     file_queue = queue.Queue()
-    file_processing_options = FileProcessingOptions(input_dir=input_path,
+    file_processing_options = FileProcessingOptions(input_dir=tuple(input_paths),
                                                     output_dir=output_dir,
                                                     start_index=args.start_index,
                                                     stride_length=args.stride_length,
@@ -121,7 +148,8 @@ def main():
                                                     scene_max_memory=args.scene_max_memory,
                                                     scene_min_length=args.scene_min_length,
                                                     random_extend_masks=True,
-                                                    skip4k=args.skip_4k)
+                                                    skip4k=args.skip_4k,
+                                                    scene_continuity_iou=args.scene_continuity_iou)
 
     scene_processing_options = SceneProcessingOptions(output_dir=output_dir,
                                                   save_flat=args.flat,

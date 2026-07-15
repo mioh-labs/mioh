@@ -20,7 +20,14 @@ CONTENTS="$APP/Contents"
 RESOURCES="$CONTENTS/Resources"
 PYTHON_SOURCE="${PYTHON_SOURCE:-$HOME/.local/share/uv/python/cpython-3.12-macos-aarch64-none}"
 PYTHON_SOURCE="${PYTHON_SOURCE:A}"
-SITE_PACKAGES="$ROOT/.venv-coreai/lib/python3.12/site-packages"
+LADA_STANDALONE_PYTHON_ENV="${LADA_STANDALONE_PYTHON_ENV:-${LADA_STANDALONE_VENV:-$ROOT/.venv-coreai}}"
+LADA_STANDALONE_PYTHON_ENV="${LADA_STANDALONE_PYTHON_ENV:A}"
+SITE_PACKAGES="${SITE_PACKAGES:-$LADA_STANDALONE_PYTHON_ENV/lib/python3.12/site-packages}"
+if [[ ! -d "$SITE_PACKAGES" ]]; then
+  print -u2 "Missing site-packages for standalone build: $SITE_PACKAGES"
+  print -u2 "Set LADA_STANDALONE_PYTHON_ENV to the single Python environment to package."
+  exit 1
+fi
 COMPILED_MODELS="${COMPILED_MODELS:-$BUILD_DIR/compiled-models}"
 COREAI_ARCHITECTURE="${COREAI_ARCHITECTURE:-h17s}"
 COMPILED_COREML_MODELS="${COMPILED_COREML_MODELS:-$BUILD_DIR/compiled-coreml-models}"
@@ -46,6 +53,8 @@ xcrun swiftc \
   -framework SwiftUI \
   -framework AVFoundation \
   -framework AVKit \
+  -framework SceneKit \
+  -framework SpriteKit \
   "${APP_SWIFT_FLAGS[@]}" \
   "$PACKAGE_DIR/MiohApp.swift" \
   "$PACKAGE_DIR/RealtimePlayer.swift" \
@@ -112,24 +121,13 @@ cp "$FFMPEG_CACHE/ffprobe" "$RESOURCES/bin/ffprobe"
 
 MODEL_ASSETS=(
   lada_mosaic_restoration_model_generic_v1.2.pth
-  lada_mosaic_detection_model_v2.pt
-  lada_mosaic_detection_model_v2.mlpackage
-  lada_mosaic_detection_model_v3.pt
-  lada_mosaic_detection_model_v3.1_fast.pt
-  lada_mosaic_detection_model_v3.1_fast.mlpackage
-  lada_mosaic_detection_model_v3.1_accurate.pt
-  lada_mosaic_detection_model_v3.1_accurate.mlpackage
-  lada_mosaic_detection_model_v4_fast.pt
-  lada_mosaic_detection_model_v4_fast.mlpackage
-  lada_mosaic_detection_model_v4_accurate.pt
-  lada_mosaic_detection_model_v4_accurate.mlpackage
   RealESRGAN_x2plus.pth
   RealESRGAN_x4plus.pth
   RealESRGAN_x4plus_256.mlpackage
   realesr-general-x4v3_256.mlpackage
   MewZoom-V1-4X-Unet_256.mlpackage
-  MewZoom-V1-4X-Unet_512.mlpackage
   swinir-real-x4_256.mlpackage
+  4xNomosWebPhoto_RealPLKSR_256.mlpackage
 )
 for asset in "${MODEL_ASSETS[@]}"; do
   if [[ -e "$ROOT/model_weights/$asset" ]]; then
@@ -143,6 +141,7 @@ COREML_DETECTION_ASSETS=(
   lada_mosaic_detection_model_v3.1_accurate.mlpackage
   lada_mosaic_detection_model_v4_fast.mlpackage
   lada_mosaic_detection_model_v4_accurate.mlpackage
+  lada_mosaic_detection_model_vr_v2_accurate.mlpackage
 )
 mkdir -p "$COMPILED_COREML_MODELS"
 for package in "${COREML_DETECTION_ASSETS[@]}"; do
@@ -163,6 +162,7 @@ COREAI_MODEL_ASSETS=(
   lada_mosaic_detection_model_v4_fast-fp16.aimodel
   RealESRGAN_x4plus-256-fp16.aimodel
   realesr-general-x4v3-256-fp16.aimodel
+  4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel
 )
 if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
 mkdir -p "$COMPILED_MODELS"
@@ -270,6 +270,19 @@ fi
 
 find "$RESOURCES/runtime" -type d -name '__pycache__' -prune -exec rm -rf {} +
 find "$RESOURCES/runtime" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+rm -rf \
+  "$RESOURCES/runtime/bin/pip" \
+  "$RESOURCES/runtime/bin/pip3" \
+  "$RESOURCES/runtime/bin/pip3.12" \
+  "$RESOURCES/runtime/lib/python3.12/site-packages/pip" \
+  "$RESOURCES/runtime/lib/python3.12/site-packages"/pip-*.dist-info(N) \
+  "$RESOURCES/runtime/lib/python3.12/site-packages/setuptools" \
+  "$RESOURCES/runtime/lib/python3.12/site-packages"/setuptools-*.dist-info(N) \
+  "$RESOURCES/runtime/lib/python3.12/site-packages/wheel" \
+  "$RESOURCES/runtime/lib/python3.12/site-packages"/wheel-*.dist-info(N) \
+  "$RESOURCES/runtime/lib/python3.12/site-packages/tests" \
+  "$RESOURCES/runtime/lib/python3.12/site-packages/test" \
+  "$RESOURCES/runtime/lib/python3.12/site-packages/yapftests"
 
 codesign --force --deep --sign - "$APP"
 
@@ -277,10 +290,10 @@ DMG_ROOT="$BUILD_DIR/dmg-root"
 rm -f "$DMG"
 rm -rf "$DMG_ROOT"
 mkdir -p "$DMG_ROOT"
-ditto "$APP" "$DMG_ROOT/mioh.app"
+ditto "$APP" "$DMG_ROOT/$APP_BASENAME.app"
 ln -s /Applications "$DMG_ROOT/Applications"
 diskutil image create from \
-  --volumeName "mioh" \
+  --volumeName "$APP_BASENAME" \
   --format UDZO \
   "$DMG_ROOT" \
   "$DMG"
