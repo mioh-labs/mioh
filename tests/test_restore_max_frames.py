@@ -43,6 +43,21 @@ class RestoreMaxFramesTests(unittest.TestCase):
 
         self.assertIn("--restore-max-frames", cmd)
         self.assertIn("-1", cmd)
+        self.assertIn("--restore-temporal-overlap", cmd)
+        self.assertIn("8", cmd)
+        self.assertIn("--enable-crossfade", cmd)
+
+    def test_lada_cli_accepts_temporal_overlap_and_crossfade_toggle(self):
+        parser = setup_argparser()
+
+        args = parser.parse_args([
+            "--input", "in.mp4",
+            "--restore-temporal-overlap", "15",
+            "--disable-crossfade",
+        ])
+
+        self.assertEqual(args.restore_temporal_overlap, 15)
+        self.assertFalse(args.restore_crossfade)
 
     def test_explicit_restore_max_frames_overrides_mps_adaptive_chunking(self):
         restorer = FrameRestorer.__new__(FrameRestorer)
@@ -60,18 +75,25 @@ class RestoreMaxFramesTests(unittest.TestCase):
         model = BasicvsrppMosaicRestorer(object(), torch.device("cpu"), fp16=False)
         seen = []
 
-        def fake_restore(images, max_frames=-1):
-            seen.append(max_frames)
+        def fake_restore(
+            images,
+            max_frames=-1,
+            temporal_overlap=8,
+            enable_crossfade=True,
+        ):
+            seen.append((max_frames, temporal_overlap, enable_crossfade))
             return images
 
         model.restore = fake_restore
         restorer.mosaic_restoration_model = model
+        restorer.restore_temporal_overlap = 15
+        restorer.restore_crossfade = False
 
         frames = [torch.zeros((2, 2, 3), dtype=torch.uint8)]
         restored = restorer._restore_clip_frames(frames)
 
         self.assertIs(restored, frames)
-        self.assertEqual(seen, [-1])
+        self.assertEqual(seen, [(-1, 15, False)])
 
 
 if __name__ == "__main__":

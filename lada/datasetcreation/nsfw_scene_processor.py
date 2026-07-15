@@ -4,7 +4,7 @@
 import pathlib
 import concurrent.futures as concurrent_futures
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, TYPE_CHECKING
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -15,7 +15,6 @@ from lada.models.basicvsrpp.mosaic_video_dataset import create_degradation_pipel
 from lada.utils import mask_utils, Pad, Mask, Image
 from lada.datasetcreation import restoration_dataset_metadata
 from lada.utils import video_utils, image_utils
-from lada.models.dover.evaluate import VideoQualityEvaluator
 from lada.utils.image_utils import pad_image
 from lada.datasetcreation.detectors.mosaic_detector import MosaicDetector
 from lada.utils.mosaic_utils import get_random_parameter, addmosaic_base, get_mosaic_block_size_v1, \
@@ -23,6 +22,9 @@ from lada.utils.mosaic_utils import get_random_parameter, addmosaic_base, get_mo
 from lada.datasetcreation.nsfw_scene_detector import Scene, CroppedScene
 from lada.datasetcreation.detectors.nudenet_nsfw_detector import NudeNetNsfwDetector
 from lada.utils.threading_utils import wait_until_completed
+
+if TYPE_CHECKING:
+    from lada.models.dover.evaluate import VideoQualityEvaluator
 from lada.datasetcreation.detectors.watermark_detector import WatermarkDetector
 
 
@@ -344,7 +346,7 @@ class DatasetItem:
         return io_futures
 
 class SceneProcessor:
-    def __init__(self, video_quality_evaluator: VideoQualityEvaluator, watermark_detector: WatermarkDetector, nudenet_nsfw_detector: NudeNetNsfwDetector, censoring_detector: MosaicDetector):
+    def __init__(self, video_quality_evaluator: "VideoQualityEvaluator | None", watermark_detector: WatermarkDetector, nudenet_nsfw_detector: NudeNetNsfwDetector, censoring_detector: MosaicDetector):
         self.video_quality_evaluator = video_quality_evaluator
         self.watermark_detector = watermark_detector
         self.nudenet_nsfw_detector = nudenet_nsfw_detector

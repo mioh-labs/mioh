@@ -23,6 +23,7 @@ EXPECTED_MODELS = {
     "lada_mosaic_detection_model_v4_fast-fp16.h17s.aimodelc",
     "RealESRGAN_x4plus-256-fp16.h17s.aimodelc",
     "realesr-general-x4v3-256-fp16.h17s.aimodelc",
+    "4xNomosWebPhoto_RealPLKSR-256-fp16.h17s.aimodelc",
 }
 
 EXPECTED_PORTABLE_MODELS = {
@@ -32,6 +33,7 @@ EXPECTED_PORTABLE_MODELS = {
     "lada_mosaic_detection_model_v4_fast-fp16.aimodel",
     "RealESRGAN_x4plus-256-fp16.aimodel",
     "realesr-general-x4v3-256-fp16.aimodel",
+    "4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel",
 }
 
 
@@ -52,7 +54,7 @@ def test_verifier_rejects_source_models(tmp_path):
         verifier.verify_asset_set(tmp_path)
 
 
-def test_verifier_manifest_is_exactly_the_six_m5_pro_models():
+def test_verifier_manifest_is_exactly_the_seven_m5_pro_models():
     assert verifier.EXPECTED_MODEL_ASSETS == EXPECTED_MODELS
     assert set(verifier.MODEL_CONTRACTS) == {
         "basicvsrpp-v1.2-coreai",
@@ -61,6 +63,7 @@ def test_verifier_manifest_is_exactly_the_six_m5_pro_models():
         "v4-fast-coreai",
         "realesrgan-x4-coreai",
         "realesr-general-x4v3-coreai",
+        "nomos-webphoto-realplksr-x4-coreai",
     }
 
 
@@ -91,7 +94,7 @@ def test_portable_verifier_rejects_compiled_model(tmp_path):
         verifier.verify_asset_set(tmp_path, distribution="portable")
 
 
-def test_distribution_manifest_maps_same_six_models_to_each_format():
+def test_distribution_manifest_maps_same_seven_models_to_each_format():
     assert verifier.expected_model_assets("dedicated", "h17s") == EXPECTED_MODELS
     assert verifier.expected_model_assets("portable", "h17s") == EXPECTED_PORTABLE_MODELS
 
@@ -102,7 +105,7 @@ def test_distribution_manifest_rejects_unknown_mode():
 
 
 @pytest.mark.parametrize("distribution", ["dedicated", "portable"])
-def test_verifier_resolves_all_six_models_for_distribution(
+def test_verifier_resolves_all_seven_models_for_distribution(
     tmp_path, monkeypatch, distribution
 ):
     resources = tmp_path / "Resources"

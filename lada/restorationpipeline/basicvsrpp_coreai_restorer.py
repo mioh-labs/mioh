@@ -250,9 +250,20 @@ class CoreAIBasicvsrppMosaicRestorer(BasicvsrppMosaicRestorer):
         self.model_path = model_path
         self.frame_count = frame_count
 
-    def restore(self, video, max_frames=-1):
+    def restore(
+        self,
+        video,
+        max_frames=-1,
+        temporal_overlap: int = 8,
+        enable_crossfade: bool = True,
+    ):
         del max_frames
-        return self._restore_unlocked(video, max_frames=self.frame_count)
+        return self._restore_unlocked(
+            video,
+            max_frames=self.frame_count,
+            temporal_overlap=temporal_overlap,
+            enable_crossfade=enable_crossfade,
+        )
 
     def _run_model_chunks(self, chunks: list[torch.Tensor]) -> list[torch.Tensor]:
         return self.model.infer_many(chunks)

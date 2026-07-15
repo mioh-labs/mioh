@@ -135,10 +135,10 @@ def _install_torchvision_functional_tensor_compat():
 def create_realesrgan_enhancer(model_path: str, scale: int = 2, tile: int = 0, fp16: bool = False, device=None):
     if not model_path:
         raise ValueError("--restore-roi-enhancer-model-path is required when --restore-roi-enhancer realesrgan is used")
-    if str(model_path).endswith(".aimodel"):
+    if str(model_path).endswith((".aimodel", ".aimodelc")):
         from lada.restorationpipeline.coreai_roi_enhancer import CoreAIROIEnhancer
         return CoreAIROIEnhancer(model_path, scale=scale)
-    if str(model_path).endswith(".mlpackage"):
+    if str(model_path).endswith((".mlpackage", ".mlmodelc")):
         from lada.restorationpipeline.coreml_roi_enhancer import CoreMLROIEnhancer
         return CoreMLROIEnhancer(model_path)
     _install_torchvision_functional_tensor_compat()
@@ -162,6 +162,19 @@ def create_realesrgan_enhancer(model_path: str, scale: int = 2, tile: int = 0, f
         device=device,
         gpu_id=gpu_id,
     )
+
+
+def create_spandrel_enhancer(model_path: str, scale: int = 4, tile: int = 0, fp16: bool = False, device=None):
+    if not model_path:
+        raise ValueError("--restore-roi-enhancer-model-path is required when --restore-roi-enhancer spandrel is used")
+    if str(model_path).endswith((".aimodel", ".aimodelc")):
+        from lada.restorationpipeline.coreai_roi_enhancer import CoreAIROIEnhancer
+        return CoreAIROIEnhancer(model_path, scale=scale)
+    if str(model_path).endswith((".mlpackage", ".mlmodelc")):
+        from lada.restorationpipeline.coreml_roi_enhancer import CoreMLROIEnhancer
+        return CoreMLROIEnhancer(model_path)
+    from lada.restorationpipeline.spandrel_roi_enhancer import SpandrelROIEnhancer
+    return SpandrelROIEnhancer(model_path, device=device, fp16=fp16, tile=tile)
 
 
 def apply_restore_roi_enhancer(
@@ -317,7 +330,9 @@ class FrameRestorer:
                  restore_effect_upscale: int = 1,
                  fp16_enabled: bool = False,
                  mosaic_detection_empty_lookahead: int = 0,
-                 restore_max_frames: int | None = None):
+                 restore_max_frames: int | None = None,
+                 restore_temporal_overlap: int = 8,
+                 restore_crossfade: bool = True):
         self.device = torch.device(device)
         self.mosaic_restoration_model_name = mosaic_restoration_model_name
         self.max_clip_length = max_clip_length
@@ -338,17 +353,28 @@ class FrameRestorer:
         self.restore_roi_enhancer_strength = restore_roi_enhancer_strength
         self.restore_effect_upscale = restore_effect_upscale
         self.restore_max_frames = restore_max_frames
+        self.restore_temporal_overlap = restore_temporal_overlap
+        self.restore_crossfade = restore_crossfade
         self.restore_roi_enhancer = None
-        if restore_roi_enhancer in ("realesrgan", "mewzoom", "swinir"):
+        if restore_roi_enhancer in ("realesrgan", "mewzoom", "swinir", "spandrel"):
             if restore_roi_enhancer in ("mewzoom", "swinir") and not str(restore_roi_enhancer_model_path).endswith(".mlpackage"):
                 raise ValueError(f"{restore_roi_enhancer} enhancer requires a Core ML .mlpackage model")
-            self.restore_roi_enhancer = create_realesrgan_enhancer(
-                restore_roi_enhancer_model_path,
-                scale=restore_roi_enhancer_scale,
-                tile=restore_roi_enhancer_tile,
-                fp16=fp16_enabled,
-                device=self.device,
-            )
+            if restore_roi_enhancer == "spandrel":
+                self.restore_roi_enhancer = create_spandrel_enhancer(
+                    restore_roi_enhancer_model_path,
+                    scale=restore_roi_enhancer_scale,
+                    tile=restore_roi_enhancer_tile,
+                    fp16=fp16_enabled,
+                    device=self.device,
+                )
+            else:
+                self.restore_roi_enhancer = create_realesrgan_enhancer(
+                    restore_roi_enhancer_model_path,
+                    scale=restore_roi_enhancer_scale,
+                    tile=restore_roi_enhancer_tile,
+                    fp16=fp16_enabled,
+                    device=self.device,
+                )
         elif restore_roi_enhancer != "none":
             raise ValueError(f"Unsupported restore ROI enhancer: {restore_roi_enhancer}")
         self.mosaic_detection_empty_lookahead = mosaic_detection_empty_lookahead
@@ -538,7 +564,12 @@ class FrameRestorer:
 
                 self._adaptive_restore_chunk_frames = max(1, min(self.max_clip_length, target))
                 restore_max_frames = self._adaptive_restore_chunk_frames
-            restored_clip_images = self.mosaic_restoration_model.restore(images, max_frames=restore_max_frames)
+            restored_clip_images = self.mosaic_restoration_model.restore(
+                images,
+                max_frames=restore_max_frames,
+                temporal_overlap=self.restore_temporal_overlap,
+                enable_crossfade=self.restore_crossfade,
+            )
         else:
             raise NotImplementedError()
         return restored_clip_images

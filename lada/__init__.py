@@ -111,9 +111,11 @@ class ModelFiles:
         ModelFile('v3.1-accurate', None, os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_detection_model_v3.1_accurate.pt')),
         ModelFile('v4-fast', _("Fast and efficient. Recommended"), os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_detection_model_v4_fast.pt')),
         ModelFile('v4-accurate', _("Can be slightly more accurate than v4-fast but slower"), os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_detection_model_v4_accurate.pt')),
+        ModelFile('vr-v2-accurate', _("VR-focused accurate mosaic detector"), os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_detection_model_vr_v2_accurate.pt')),
         ModelFile('v4-fast-coreml', _("v4-fast running on Apple Neural Engine via Core ML"), _coreml_detection_path('lada_mosaic_detection_model_v4_fast.mlpackage')),
         ModelFile('v4-fast-coreai', _("v4-fast FP16 running with Core AI"), _coreai_model_path('lada_mosaic_detection_model_v4_fast-fp16.aimodel')),
         ModelFile('v4-accurate-coreml', _("v4-accurate running on Apple Neural Engine via Core ML"), _coreml_detection_path('lada_mosaic_detection_model_v4_accurate.mlpackage')),
+        ModelFile('vr-v2-accurate-coreml', _("VR-focused accurate mosaic detector via Core ML"), _coreml_detection_path('lada_mosaic_detection_model_vr_v2_accurate.mlpackage')),
         ModelFile('v3.1-fast-coreml', _("v3.1-fast running on Apple Neural Engine via Core ML"), _coreml_detection_path('lada_mosaic_detection_model_v3.1_fast.mlpackage')),
         ModelFile('v3.1-accurate-coreml', _("v3.1-accurate running on Apple Neural Engine via Core ML"), _coreml_detection_path('lada_mosaic_detection_model_v3.1_accurate.mlpackage')),
         ModelFile('v2-coreml', _("v2 running on Apple Neural Engine via Core ML"), _coreml_detection_path('lada_mosaic_detection_model_v2.mlpackage')),
@@ -129,6 +131,11 @@ class ModelFiles:
         ModelFile('swinir-real-x4-coreml', _("SwinIR real-world 4x on Apple Neural Engine via Core ML"), os.path.join(MODEL_WEIGHTS_DIR, 'swinir-real-x4_256.mlpackage')),
         ModelFile('mewzoom-x4-coreml', _("MewZoom 4x on Apple Neural Engine via Core ML"), os.path.join(MODEL_WEIGHTS_DIR, 'MewZoom-V1-4X-Unet_256.mlpackage')),
         ModelFile('mewzoom-x4-coreml-512', _("MewZoom 4x 512px on Apple Neural Engine via Core ML"), os.path.join(MODEL_WEIGHTS_DIR, 'MewZoom-V1-4X-Unet_512.mlpackage')),
+        ModelFile('nomos-webphoto-realplksr-x4', _("Nomos WebPhoto RealPLKSR 4x (photography restoration, Spandrel)"), os.path.join(MODEL_WEIGHTS_DIR, '4xNomosWebPhoto_RealPLKSR.safetensors')),
+        ModelFile('nomos-webphoto-realplksr-x4-coreml', _("Nomos WebPhoto RealPLKSR 4x on Apple Neural Engine via Core ML"), os.path.join(MODEL_WEIGHTS_DIR, '4xNomosWebPhoto_RealPLKSR_256.mlpackage')),
+        ModelFile('nomos-webphoto-realplksr-x4-coreai', _("Nomos WebPhoto RealPLKSR 4x FP16 on Core AI"), _coreai_model_path('4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel')),
+        ModelFile('nomos-uni-span-x4', _("Nomos Uni SPAN 4x (fast universal restoration, Spandrel)"), os.path.join(MODEL_WEIGHTS_DIR, '4xNomosUni_span_multijpg.safetensors')),
+        ModelFile('nomos-uni-compact-x2', _("Nomos Uni Compact 2x (lightweight universal restoration, Spandrel)"), os.path.join(MODEL_WEIGHTS_DIR, '2xNomosUni_compact_multijpg.safetensors')),
     ]
 
     @staticmethod

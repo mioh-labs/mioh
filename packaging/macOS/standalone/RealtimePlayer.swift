@@ -2,7 +2,32 @@ import AppKit
 import AVFoundation
 import AVKit
 import Foundation
+import SceneKit
+import SpriteKit
 import SwiftUI
+
+enum PreviewProjectionMode: String, CaseIterable, Identifiable {
+  case normal = "通常"
+  case vr180 = "VR180"
+  case sphere360 = "360"
+
+  var id: String { rawValue }
+}
+
+enum PreviewVideoLayout: String, CaseIterable, Identifiable {
+  case mono = "Mono"
+  case sbs = "SBS 左右"
+  case topBottom = "上下"
+
+  var id: String { rawValue }
+}
+
+enum PreviewEye: String, CaseIterable, Identifiable {
+  case left = "左目"
+  case right = "右目"
+
+  var id: String { rawValue }
+}
 
 enum RealtimePlayerState: String {
   case idle
@@ -17,7 +42,7 @@ enum RealtimePlayerState: String {
   var label: String {
     switch self {
     case .idle: return "待機中"
-    case .loading: return "モデルを読み込み中"
+    case .loading: return "読み込み中"
     case .buffering: return "バッファ中"
     case .playing: return "再生中"
     case .paused: return "一時停止"
@@ -52,6 +77,387 @@ private struct PreviewSegment {
   let url: URL
 }
 
+private struct PreparedSourcePlayerItem {
+  let item: AVPlayerItem
+  let duration: Double
+  let resourceLoader: HEV1VirtualResourceLoader?
+
+  var usesVirtualContainer: Bool { resourceLoader != nil }
+}
+
+private enum SourcePlaybackError: LocalizedError {
+  case missingHEV1SampleEntry
+  case incompatibleVirtualContainer
+  case invalidFileSize
+
+  var errorDescription: String? {
+    switch self {
+    case .missingHEV1SampleEntry:
+      return "AVFoundation互換にできるHEV1トラックが見つかりません"
+    case .incompatibleVirtualContainer:
+      return "この動画はAVFoundationで再生できません"
+    case .invalidFileSize:
+      return "動画ファイルの大きさを取得できません"
+    }
+  }
+}
+
+private final class HEV1VirtualResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
+  private static let replacement: [UInt8] = [0x68, 0x76, 0x63, 0x31] // hvc1
+  private static let readChunkSize = 2 * 1024 * 1024
+
+  let sourceURL: URL
+  let fileSize: UInt64
+  let patchOffsets: [UInt64]
+  let queue = DispatchQueue(label: "com.okatti.mioh.hev1-resource-loader", qos: .userInitiated)
+
+  init(sourceURL: URL) throws {
+    self.sourceURL = sourceURL
+    let attributes = try FileManager.default.attributesOfItem(atPath: sourceURL.path)
+    guard let size = attributes[.size] as? NSNumber else {
+      throw SourcePlaybackError.invalidFileSize
+    }
+    fileSize = size.uint64Value
+    patchOffsets = try Self.findHEV1Offsets(in: sourceURL, fileSize: fileSize)
+    guard !patchOffsets.isEmpty else { throw SourcePlaybackError.missingHEV1SampleEntry }
+    super.init()
+  }
+
+  func makeAsset() -> AVURLAsset {
+    let virtualURL = URL(
+      string: "mioh-hev1://\(UUID().uuidString.lowercased())/video.mp4"
+    )!
+    let asset = AVURLAsset(url: virtualURL)
+    asset.resourceLoader.setDelegate(self, queue: queue)
+    return asset
+  }
+
+  func resourceLoader(
+    _ resourceLoader: AVAssetResourceLoader,
+    shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest
+  ) -> Bool {
+    do {
+      if let information = loadingRequest.contentInformationRequest {
+        information.contentType = AVFileType.mp4.rawValue
+        information.contentLength = Int64(fileSize)
+        information.isByteRangeAccessSupported = true
+      }
+      if let dataRequest = loadingRequest.dataRequest {
+        try respond(to: dataRequest, loadingRequest: loadingRequest)
+      }
+      if !loadingRequest.isCancelled {
+        loadingRequest.finishLoading()
+      }
+    } catch {
+      if !loadingRequest.isCancelled {
+        loadingRequest.finishLoading(with: error)
+      }
+    }
+    return true
+  }
+
+  private func respond(
+    to dataRequest: AVAssetResourceLoadingDataRequest,
+    loadingRequest: AVAssetResourceLoadingRequest
+  ) throws {
+    let requestedOffset = max(Int64(0), dataRequest.requestedOffset)
+    let currentOffset = max(requestedOffset, dataRequest.currentOffset)
+    var cursor = UInt64(currentOffset)
+    let end: UInt64
+    if dataRequest.requestsAllDataToEndOfResource {
+      end = fileSize
+    } else {
+      let length = UInt64(max(0, dataRequest.requestedLength))
+      let start = UInt64(requestedOffset)
+      let (sum, overflow) = start.addingReportingOverflow(length)
+      end = overflow ? fileSize : min(fileSize, sum)
+    }
+    guard cursor < end else { return }
+
+    let handle = try FileHandle(forReadingFrom: sourceURL)
+    defer { try? handle.close() }
+    while cursor < end && !loadingRequest.isCancelled {
+      let count = Int(min(UInt64(Self.readChunkSize), end - cursor))
+      try handle.seek(toOffset: cursor)
+      guard let sourceData = try handle.read(upToCount: count), !sourceData.isEmpty else {
+        throw CocoaError(.fileReadUnknown)
+      }
+      dataRequest.respond(with: patch(sourceData, startingAt: cursor))
+      cursor += UInt64(sourceData.count)
+    }
+  }
+
+  private func patch(_ data: Data, startingAt start: UInt64) -> Data {
+    var bytes = [UInt8](data)
+    let end = start + UInt64(bytes.count)
+    for patchOffset in patchOffsets where patchOffset < end && patchOffset + 4 > start {
+      for byteIndex in 0..<4 {
+        let absoluteOffset = patchOffset + UInt64(byteIndex)
+        guard absoluteOffset >= start, absoluteOffset < end else { continue }
+        bytes[Int(absoluteOffset - start)] = Self.replacement[byteIndex]
+      }
+    }
+    return Data(bytes)
+  }
+
+  private static func findHEV1Offsets(in url: URL, fileSize: UInt64) throws -> [UInt64] {
+    let handle = try FileHandle(forReadingFrom: url)
+    defer { try? handle.close() }
+    var offset: UInt64 = 0
+    while offset + 8 <= fileSize {
+      try handle.seek(toOffset: offset)
+      guard let header = try handle.read(upToCount: 16), header.count >= 8 else { break }
+      var atomSize = readUInt32BE(header, at: 0)
+      var headerSize: UInt64 = 8
+      if atomSize == 1 {
+        guard header.count >= 16 else { break }
+        atomSize = readUInt64BE(header, at: 8)
+        headerSize = 16
+      } else if atomSize == 0 {
+        atomSize = fileSize - offset
+      }
+      guard atomSize >= headerSize, atomSize <= fileSize - offset else { break }
+      let type = String(data: header[4..<8], encoding: .ascii) ?? ""
+      if type == "moov" {
+        guard atomSize <= 256 * 1024 * 1024 else {
+          throw SourcePlaybackError.incompatibleVirtualContainer
+        }
+        try handle.seek(toOffset: offset)
+        guard let moov = try handle.read(upToCount: Int(atomSize)) else { return [] }
+        let bytes = [UInt8](moov)
+        guard bytes.count >= 4 else { return [] }
+        var result: [UInt64] = []
+        for index in 0...(bytes.count - 4)
+        where bytes[index] == 0x68 && bytes[index + 1] == 0x65
+          && bytes[index + 2] == 0x76 && bytes[index + 3] == 0x31
+        {
+          result.append(offset + UInt64(index))
+        }
+        return result
+      }
+      offset += atomSize
+    }
+    return []
+  }
+
+  private static func readUInt32BE(_ data: Data, at offset: Int) -> UInt64 {
+    data[offset..<(offset + 4)].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+  }
+
+  private static func readUInt64BE(_ data: Data, at offset: Int) -> UInt64 {
+    data[offset..<(offset + 8)].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+  }
+}
+
+private enum PreviewProjectionGeometry {
+  static func makeSphere(
+    projection: PreviewProjectionMode,
+    layout: PreviewVideoLayout,
+    eye: PreviewEye
+  ) -> SCNGeometry {
+    let horizontalSegments = projection == .sphere360 ? 128 : 72
+    let verticalSegments = 72
+    let phiStart = projection == .sphere360 ? -Double.pi : Double.pi / 2
+    let phiLength = projection == .sphere360 ? Double.pi * 2 : Double.pi
+    let uv = uvWindow(layout: layout, eye: eye)
+    let radius = 20.0
+
+    var vertices: [SCNVector3] = []
+    var texcoords: [CGPoint] = []
+    var indices: [Int32] = []
+
+    for y in 0...verticalSegments {
+      let v = Double(y) / Double(verticalSegments)
+      let theta = v * Double.pi
+      for x in 0...horizontalSegments {
+        let u = Double(x) / Double(horizontalSegments)
+        let phi = phiStart + u * phiLength
+        vertices.append(
+          SCNVector3(
+            radius * sin(theta) * sin(phi),
+            radius * cos(theta),
+            radius * sin(theta) * cos(phi)
+          )
+        )
+        texcoords.append(CGPoint(x: uv.minX + uv.width * u, y: uv.minY + uv.height * v))
+      }
+    }
+
+    let stride = horizontalSegments + 1
+    for y in 0..<verticalSegments {
+      for x in 0..<horizontalSegments {
+        let a = Int32(y * stride + x)
+        let b = Int32(y * stride + x + 1)
+        let c = Int32((y + 1) * stride + x)
+        let d = Int32((y + 1) * stride + x + 1)
+        indices.append(contentsOf: [a, c, b, b, c, d])
+      }
+    }
+
+    return SCNGeometry(
+      sources: [
+        SCNGeometrySource(vertices: vertices),
+        SCNGeometrySource(textureCoordinates: texcoords),
+      ],
+      elements: [SCNGeometryElement(indices: indices, primitiveType: .triangles)]
+    )
+  }
+
+  static func uvWindow(layout: PreviewVideoLayout, eye: PreviewEye) -> CGRect {
+    switch layout {
+    case .mono:
+      return CGRect(x: 0, y: 0, width: 1, height: 1)
+    case .sbs:
+      return CGRect(x: eye == .right ? 0.5 : 0, y: 0, width: 0.5, height: 1)
+    case .topBottom:
+      return CGRect(x: 0, y: eye == .right ? 0 : 0.5, width: 1, height: 0.5)
+    }
+  }
+}
+
+struct VRPreviewSceneView: NSViewRepresentable {
+  let player: AVPlayer
+  let playerItem: AVPlayerItem?
+  let projection: PreviewProjectionMode
+  let layout: PreviewVideoLayout
+  let eye: PreviewEye
+  let cameraFOV: Double
+
+  func makeCoordinator() -> Coordinator {
+    Coordinator()
+  }
+
+  func makeNSView(context: Context) -> SCNView {
+    context.coordinator.makeView()
+  }
+
+  func updateNSView(_ nsView: SCNView, context: Context) {
+    context.coordinator.update(
+      player: player,
+      playerItem: playerItem,
+      projection: projection,
+      layout: layout,
+      eye: eye,
+      cameraFOV: cameraFOV
+    )
+  }
+
+  final class Coordinator: NSObject {
+    private let scene = SCNScene()
+    private let cameraNode = SCNNode()
+    private let videoNode = SCNNode()
+    private weak var displayedItem: AVPlayerItem?
+    private var videoScene: SKScene?
+    private var spriteVideoNode: SKVideoNode?
+    private var currentProjection: PreviewProjectionMode = .vr180
+    private var currentLayout: PreviewVideoLayout = .sbs
+    private var currentEye: PreviewEye = .left
+    private var yaw: CGFloat = 0
+    private var pitch: CGFloat = 0
+
+    func makeView() -> SCNView {
+      let view = SCNView(
+        frame: .zero,
+        options: [SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue]
+      )
+      view.scene = scene
+      view.backgroundColor = NSColor.black
+      view.allowsCameraControl = false
+      view.rendersContinuously = true
+      view.isPlaying = true
+      view.preferredFramesPerSecond = 60
+
+      cameraNode.camera = SCNCamera()
+      cameraNode.camera?.fieldOfView = 60
+      cameraNode.position = SCNVector3(0, 0, 0)
+      scene.rootNode.addChildNode(cameraNode)
+      scene.rootNode.addChildNode(videoNode)
+
+      let pan = NSPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+      view.addGestureRecognizer(pan)
+      let magnify = NSMagnificationGestureRecognizer(target: self, action: #selector(handleMagnify(_:)))
+      view.addGestureRecognizer(magnify)
+      rebuildGeometry()
+      return view
+    }
+
+    func update(
+      player: AVPlayer,
+      playerItem: AVPlayerItem?,
+      projection: PreviewProjectionMode,
+      layout: PreviewVideoLayout,
+      eye: PreviewEye,
+      cameraFOV: Double
+    ) {
+      let geometryChanged = projection != currentProjection || layout != currentLayout || eye != currentEye
+      currentProjection = projection
+      currentLayout = layout
+      currentEye = eye
+      cameraNode.camera?.fieldOfView = min(max(cameraFOV, 45), 105)
+      if geometryChanged {
+        rebuildGeometry()
+      }
+      attachVideoSceneIfNeeded(player: player, item: playerItem)
+    }
+
+    private func rebuildGeometry() {
+      videoNode.geometry = PreviewProjectionGeometry.makeSphere(
+        projection: currentProjection,
+        layout: currentLayout,
+        eye: currentEye
+      )
+      let material = SCNMaterial()
+      material.isDoubleSided = true
+      material.lightingModel = .constant
+      material.diffuse.contents = NSColor.black
+      material.diffuse.minificationFilter = .linear
+      material.diffuse.magnificationFilter = .linear
+      material.diffuse.mipFilter = .none
+      videoNode.geometry?.materials = [material]
+      if let videoScene {
+        material.diffuse.contents = videoScene
+      }
+    }
+
+    private func attachVideoSceneIfNeeded(player: AVPlayer, item: AVPlayerItem?) {
+      guard displayedItem !== item else { return }
+      displayedItem = item
+      spriteVideoNode?.removeFromParent()
+      spriteVideoNode = nil
+      videoScene = nil
+      videoNode.geometry?.firstMaterial?.diffuse.contents = NSColor.black
+      guard item != nil else { return }
+      let skScene = SKScene(size: CGSize(width: 2048, height: 1024))
+      skScene.backgroundColor = .black
+      skScene.scaleMode = .aspectFill
+      let skVideoNode = SKVideoNode(avPlayer: player)
+      skVideoNode.position = CGPoint(x: skScene.size.width / 2, y: skScene.size.height / 2)
+      skVideoNode.size = skScene.size
+      // SpriteKit and SceneKit use opposite vertical texture origins.
+      skVideoNode.yScale = -1
+      skScene.addChild(skVideoNode)
+      videoScene = skScene
+      spriteVideoNode = skVideoNode
+      videoNode.geometry?.firstMaterial?.diffuse.contents = skScene
+    }
+
+    @objc private func handlePan(_ gesture: NSPanGestureRecognizer) {
+      let translation = gesture.translation(in: gesture.view)
+      gesture.setTranslation(.zero, in: gesture.view)
+      yaw -= translation.x * 0.006
+      pitch -= translation.y * 0.006
+      pitch = max(-CGFloat.pi / 2 + 0.01, min(CGFloat.pi / 2 - 0.01, pitch))
+      cameraNode.eulerAngles = SCNVector3(pitch, yaw, 0)
+    }
+
+    @objc private func handleMagnify(_ gesture: NSMagnificationGestureRecognizer) {
+      guard let camera = cameraNode.camera else { return }
+      camera.fieldOfView = max(45, min(105, camera.fieldOfView - Double(gesture.magnification) * 18))
+      gesture.magnification = 0
+    }
+  }
+}
+
 @MainActor
 final class RealtimePlayerController: ObservableObject {
   @Published var state: RealtimePlayerState = .idle
@@ -63,6 +469,8 @@ final class RealtimePlayerController: ObservableObject {
   @Published var volume = 1.0
   @Published var muted = false
   @Published var errorMessage = ""
+  @Published var playbackDetail = ""
+  @Published var sourceOnlyPlayback = false
 
   let sourcePlayer = AVPlayer()
   let restoredPlayer = AVQueuePlayer()
@@ -81,6 +489,9 @@ final class RealtimePlayerController: ObservableObject {
   private var itemSegments: [ObjectIdentifier: PreviewSegment] = [:]
   private var notificationTokens: [NSObjectProtocol] = []
   private var timeObserver: Any?
+  private var sourceItemStatusObservation: NSKeyValueObservation?
+  private var sourceTimeControlObservation: NSKeyValueObservation?
+  private var sourceResourceLoader: HEV1VirtualResourceLoader?
   private var sessionDirectory: URL?
   private var requestedStartSeconds = 0.0
   private var shouldPlay = true
@@ -94,6 +505,8 @@ final class RealtimePlayerController: ObservableObject {
   }
 
   deinit {
+    sourceItemStatusObservation?.invalidate()
+    sourceTimeControlObservation?.invalidate()
     if let timeObserver {
       sourcePlayer.removeTimeObserver(timeObserver)
     }
@@ -110,17 +523,6 @@ final class RealtimePlayerController: ObservableObject {
     }
     do {
       let resources = try runner.resourceDirectory()
-      let python = resources.appendingPathComponent("runtime/bin/python3.12")
-      let script = resources.appendingPathComponent(
-        "runtime/lib/python3.12/site-packages/mioh_preview_worker.py"
-      )
-      guard FileManager.default.isExecutableFile(atPath: python.path) else {
-        throw RunnerError.missingResource("Python runtime")
-      }
-      guard FileManager.default.fileExists(atPath: script.path) else {
-        throw RunnerError.missingResource("Realtime preview worker")
-      }
-
       let tempRoot: URL
       if runner.ladaTempDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
         tempRoot = FileManager.default.temporaryDirectory
@@ -131,6 +533,40 @@ final class RealtimePlayerController: ObservableObject {
         "mioh-preview-\(UUID().uuidString)", isDirectory: true
       )
       try FileManager.default.createDirectory(at: session, withIntermediateDirectories: true)
+
+      self.runner = runner
+      sessionDirectory = session
+      generation += 1
+      let startingGeneration = generation
+      nextSequence = 0
+      requestedStartSeconds = startSeconds
+      shouldPlay = true
+      generationHasStarted = false
+      generationStartPending = false
+      sourceOnlyPlayback = runner.previewProjectionMode != "通常"
+      state = .loading
+      errorMessage = ""
+      playbackDetail = sourceOnlyPlayback ? "VR動画のコンテナを確認中" : ""
+
+      if sourceOnlyPlayback {
+        startSourceOnlyPlayback(
+          input: input,
+          generation: startingGeneration,
+          startSeconds: startSeconds
+        )
+        return
+      }
+
+      let python = resources.appendingPathComponent("runtime/bin/python3.12")
+      let script = resources.appendingPathComponent(
+        "runtime/lib/python3.12/site-packages/mioh_preview_worker.py"
+      )
+      guard FileManager.default.isExecutableFile(atPath: python.path) else {
+        throw RunnerError.missingResource("Python runtime")
+      }
+      guard FileManager.default.fileExists(atPath: script.path) else {
+        throw RunnerError.missingResource("Realtime preview worker")
+      }
 
       let process = Process()
       let inputPipe = Pipe()
@@ -147,49 +583,113 @@ final class RealtimePlayerController: ObservableObject {
       process.standardOutput = outputPipe
       process.standardError = errorPipe
 
-      self.runner = runner
-      worker = process
-      workerInput = inputPipe
-      stdoutPipe = outputPipe
-      stderrPipe = errorPipe
-      sessionDirectory = session
-      generation = 0
-      nextSequence = 0
-      requestedStartSeconds = startSeconds
-      shouldPlay = true
-      generationHasStarted = false
-      generationStartPending = false
-      state = .loading
-      errorMessage = ""
-      sourcePlayer.replaceCurrentItem(with: AVPlayerItem(url: input))
-      sourcePlayer.volume = muted ? 0 : Float(volume)
+      Task { @MainActor [self] in
+        let prepared: PreparedSourcePlayerItem
+        do {
+          prepared = try await self.prepareSourcePlayerItem(input: input)
+        } catch {
+          guard self.generation == startingGeneration else { return }
+          self.fail("元動画を開けません: \(error.localizedDescription)")
+          self.cleanupSession()
+          return
+        }
+        guard self.generation == startingGeneration, self.state == .loading || self.state == .buffering else {
+          return
+        }
+        self.worker = process
+        self.workerInput = inputPipe
+        self.stdoutPipe = outputPipe
+        self.stderrPipe = errorPipe
+        self.sourceResourceLoader = prepared.resourceLoader
+        self.sourcePlayer.replaceCurrentItem(with: prepared.item)
+        self.sourcePlayer.volume = self.muted ? 0 : Float(self.volume)
+        if prepared.usesVirtualContainer {
+          self.runner?.appendExternalLog(
+            "再生: AVFoundation互換の仮想コンテナを使用します（ファイル変換なし）\n"
+          )
+        }
 
-      outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-        let data = handle.availableData
-        guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-        Task { @MainActor in self?.consumeWorkerOutput(text) }
-      }
-      errorPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-        let data = handle.availableData
-        guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-        Task { @MainActor in self?.runner?.appendExternalLog(text) }
-      }
-      process.terminationHandler = { [weak self] completed in
-        Task { @MainActor in
-          guard let self, self.worker === completed else { return }
-          self.stdoutPipe?.fileHandleForReading.readabilityHandler = nil
-          self.stderrPipe?.fileHandleForReading.readabilityHandler = nil
-          self.worker = nil
-          if completed.terminationStatus != 0 && self.state != .idle {
-            self.fail("プレビューワーカーが終了しました")
+        outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+          let data = handle.availableData
+          guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+          Task { @MainActor in self?.consumeWorkerOutput(text) }
+        }
+        errorPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+          let data = handle.availableData
+          guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+          Task { @MainActor in self?.runner?.appendExternalLog(text) }
+        }
+        process.terminationHandler = { [weak self] completed in
+          Task { @MainActor in
+            guard let self, self.worker === completed else { return }
+            self.stdoutPipe?.fileHandleForReading.readabilityHandler = nil
+            self.stderrPipe?.fileHandleForReading.readabilityHandler = nil
+            self.worker = nil
+            if completed.terminationStatus != 0 && self.state != .idle {
+              self.fail("プレビューワーカーが終了しました")
+            }
           }
         }
+        self.installTimeObserver()
+        do {
+          try process.run()
+        } catch {
+          self.fail(error.localizedDescription)
+          self.cleanupSession()
+        }
       }
-      installTimeObserver()
-      try process.run()
     } catch {
       fail(error.localizedDescription)
       cleanupSession()
+    }
+  }
+
+  private func startSourceOnlyPlayback(
+    input: URL,
+    generation startingGeneration: Int,
+    startSeconds: Double
+  ) {
+    Task { @MainActor [self] in
+      let prepared: PreparedSourcePlayerItem
+      do {
+        prepared = try await self.prepareSourcePlayerItem(input: input)
+      } catch {
+        guard self.generation == startingGeneration, self.sourceOnlyPlayback else { return }
+        self.fail("VR動画を開けません: \(error.localizedDescription)")
+        self.cleanupSession()
+        return
+      }
+      guard self.generation == startingGeneration, self.sourceOnlyPlayback else { return }
+      let item = prepared.item
+      item.preferredForwardBufferDuration = max(1, self.runner?.previewBufferLimit ?? 8)
+      self.sourceResourceLoader = prepared.resourceLoader
+      self.sourcePlayer.replaceCurrentItem(with: item)
+      self.sourcePlayer.volume = self.muted ? 0 : Float(self.volume)
+      self.bufferedSeconds = 0
+      self.duration = prepared.duration
+      self.installTimeObserver()
+      self.installSourcePlaybackObservers(item: item, generation: startingGeneration)
+      self.runner?.appendExternalLog("VR再生: 復元モデルを読み込まず、元動画を直接再生します\n")
+      if prepared.usesVirtualContainer {
+        self.runner?.appendExternalLog(
+          "VR再生: 全編remuxを行わず、AVFoundation互換の仮想コンテナを使用します\n"
+        )
+      }
+      self.state = .buffering
+      if startSeconds > 0 {
+        self.sourcePlayer.seek(
+          to: CMTime(seconds: startSeconds, preferredTimescale: 600),
+          toleranceBefore: .zero,
+          toleranceAfter: .zero
+        ) { [weak self] _ in
+          Task { @MainActor in
+            guard let self, self.generation == startingGeneration, self.sourceOnlyPlayback else { return }
+            self.sourcePlayer.play()
+          }
+        }
+      } else {
+        self.sourcePlayer.play()
+      }
     }
   }
 
@@ -201,7 +701,12 @@ final class RealtimePlayerController: ObservableObject {
       state = .paused
     } else if state == .paused || state == .buffering {
       shouldPlay = true
-      resumeIfBuffered()
+      if sourceOnlyPlayback {
+        sourcePlayer.play()
+        state = .playing
+      } else {
+        resumeIfBuffered()
+      }
     } else if state == .idle || state == .ended || state == .failed, let runner {
       start(runner: runner, at: position)
     }
@@ -219,10 +724,34 @@ final class RealtimePlayerController: ObservableObject {
     position = 0
     duration = 0
     errorMessage = ""
-    sourcePlayer.replaceCurrentItem(with: AVPlayerItem(url: url))
+    playbackDetail = ""
+    sourcePlayer.replaceCurrentItem(with: nil)
   }
 
   func seek(to seconds: Double) {
+    if sourceOnlyPlayback {
+      position = min(max(seconds, 0), max(duration, 0.01))
+      let startingGeneration = generation
+      let resumeAfterSeek = state != .paused
+      shouldPlay = resumeAfterSeek
+      state = .seeking
+      sourcePlayer.seek(
+        to: CMTime(seconds: position, preferredTimescale: 600),
+        toleranceBefore: .zero,
+        toleranceAfter: .zero
+      ) { [weak self] _ in
+        Task { @MainActor in
+          guard let self, self.generation == startingGeneration, self.sourceOnlyPlayback else { return }
+          if resumeAfterSeek {
+            self.state = .buffering
+            self.sourcePlayer.play()
+          } else {
+            self.state = .paused
+          }
+        }
+      }
+      return
+    }
     guard worker != nil else {
       position = seconds
       return
@@ -256,6 +785,10 @@ final class RealtimePlayerController: ObservableObject {
   }
 
   func setBufferLimit(_ seconds: Double) {
+    if sourceOnlyPlayback {
+      sourcePlayer.currentItem?.preferredForwardBufferDuration = max(1, seconds)
+      return
+    }
     guard worker != nil else { return }
     sendCommand(["command": "set_buffer_limit", "seconds": seconds])
   }
@@ -266,10 +799,18 @@ final class RealtimePlayerController: ObservableObject {
   }
 
   func stop() {
+    generation += 1
+    sourceItemStatusObservation?.invalidate()
+    sourceItemStatusObservation = nil
+    sourceTimeControlObservation?.invalidate()
+    sourceTimeControlObservation = nil
+    sourceOnlyPlayback = false
     shouldPlay = false
     generationHasStarted = false
     generationStartPending = false
     sourcePlayer.pause()
+    sourcePlayer.replaceCurrentItem(with: nil)
+    sourceResourceLoader = nil
     restoredPlayer.pause()
     if worker != nil {
       sendCommand(["command": "stop"])
@@ -285,6 +826,37 @@ final class RealtimePlayerController: ObservableObject {
     cleanupSession()
     state = .idle
     bufferedSeconds = 0
+    playbackDetail = ""
+  }
+
+  private func prepareSourcePlayerItem(input: URL) async throws -> PreparedSourcePlayerItem {
+    let source = AVURLAsset(url: input)
+    let durationTime = try await source.load(.duration)
+    let durationSeconds = CMTimeGetSeconds(durationTime)
+    let duration = durationSeconds.isFinite ? max(0, durationSeconds) : 0
+
+    if try await source.load(.isPlayable) {
+      return PreparedSourcePlayerItem(
+        item: AVPlayerItem(asset: source),
+        duration: duration,
+        resourceLoader: nil
+      )
+    }
+
+    // HEV1 8K files may contain perfectly decodable samples while AVFoundation
+    // rejects the MP4 sample-entry identifier.  The resource loader exposes the
+    // original file byte-for-byte except for hev1 -> hvc1 inside the moov atom.
+    // This preserves random access without modifying, copying, or remuxing the file.
+    let resourceLoader = try HEV1VirtualResourceLoader(sourceURL: input)
+    let compatibleAsset = resourceLoader.makeAsset()
+    guard try await compatibleAsset.load(.isPlayable) else {
+      throw SourcePlaybackError.incompatibleVirtualContainer
+    }
+    return PreparedSourcePlayerItem(
+      item: AVPlayerItem(asset: compatibleAsset),
+      duration: duration,
+      resourceLoader: resourceLoader
+    )
   }
 
   private func consumeWorkerOutput(_ text: String) {
@@ -412,6 +984,91 @@ final class RealtimePlayerController: ObservableObject {
     state = .playing
   }
 
+  private func installSourcePlaybackObservers(item: AVPlayerItem, generation: Int) {
+    sourceItemStatusObservation?.invalidate()
+    sourceTimeControlObservation?.invalidate()
+
+    sourceItemStatusObservation = item.observe(\.status, options: [.initial, .new]) {
+      [weak self, weak item] _, _ in
+      Task { @MainActor in
+        guard let self, let item else { return }
+        self.updateSourcePlaybackState(item: item, generation: generation)
+      }
+    }
+    sourceTimeControlObservation = sourcePlayer.observe(
+      \.timeControlStatus,
+      options: [.initial, .new]
+    ) { [weak self, weak item] _, _ in
+      Task { @MainActor in
+        guard let self, let item else { return }
+        self.updateSourcePlaybackState(item: item, generation: generation)
+      }
+    }
+
+    let token = NotificationCenter.default.addObserver(
+      forName: .AVPlayerItemDidPlayToEndTime,
+      object: item,
+      queue: .main
+    ) { [weak self] _ in
+      Task { @MainActor in
+        guard let self, self.generation == generation, self.sourceOnlyPlayback else { return }
+        self.shouldPlay = false
+        self.state = .ended
+      }
+    }
+    notificationTokens.append(token)
+  }
+
+  private func updateSourcePlaybackState(item: AVPlayerItem, generation: Int) {
+    guard self.generation == generation, sourceOnlyPlayback, sourcePlayer.currentItem === item else {
+      return
+    }
+    guard state != .seeking && state != .ended && state != .failed else { return }
+    switch item.status {
+    case .failed:
+      fail("VR再生に失敗しました: \(item.error?.localizedDescription ?? "不明なAVPlayerエラー")")
+    case .unknown:
+      playbackDetail = "VR動画を開いています"
+      state = .loading
+    case .readyToPlay:
+      guard shouldPlay else {
+        playbackDetail = ""
+        state = .paused
+        return
+      }
+      switch sourcePlayer.timeControlStatus {
+      case .playing:
+        playbackDetail = ""
+        state = .playing
+      case .waitingToPlayAtSpecifiedRate:
+        playbackDetail = sourceWaitingDescription()
+        state = .buffering
+      case .paused:
+        playbackDetail = "VRデコーダの開始待ち"
+        state = .buffering
+      @unknown default:
+        playbackDetail = "VR動画をバッファ中"
+        state = .buffering
+      }
+    @unknown default:
+      playbackDetail = "VR動画を開いています"
+      state = .loading
+    }
+  }
+
+  private func sourceWaitingDescription() -> String {
+    switch sourcePlayer.reasonForWaitingToPlay {
+    case .evaluatingBufferingRate:
+      return "VR動画の読込速度を確認中"
+    case .toMinimizeStalls:
+      return "VR動画をバッファ中"
+    case .noItemToPlay:
+      return "VR動画を開いています"
+    default:
+      return "VRデコーダの開始待ち"
+    }
+  }
+
   private func installTimeObserver() {
     if let timeObserver {
       sourcePlayer.removeTimeObserver(timeObserver)
@@ -427,6 +1084,10 @@ final class RealtimePlayerController: ObservableObject {
   private func tick(sourceSeconds: Double) {
     guard sourceSeconds.isFinite else { return }
     position = sourceSeconds
+    if sourceOnlyPlayback {
+      updateSourceBufferedDuration()
+      return
+    }
     updateBufferedDuration()
     guard state == .playing,
       let active = queuedSegments.first,
@@ -441,6 +1102,22 @@ final class RealtimePlayerController: ObservableObject {
         toleranceAfter: .zero
       )
     }
+  }
+
+  private func updateSourceBufferedDuration() {
+    guard let item = sourcePlayer.currentItem else {
+      bufferedSeconds = 0
+      return
+    }
+    var furthestEnd = position
+    for value in item.loadedTimeRanges {
+      let range = value.timeRangeValue
+      let start = CMTimeGetSeconds(range.start)
+      let end = CMTimeGetSeconds(CMTimeRangeGetEnd(range))
+      guard start.isFinite, end.isFinite, start <= position + 0.25 else { continue }
+      furthestEnd = max(furthestEnd, end)
+    }
+    bufferedSeconds = max(0, furthestEnd - position)
   }
 
   private func updateBufferedDuration() {
@@ -479,9 +1156,14 @@ final class RealtimePlayerController: ObservableObject {
   }
 
   private func fail(_ message: String) {
+    sourceItemStatusObservation?.invalidate()
+    sourceItemStatusObservation = nil
+    sourceTimeControlObservation?.invalidate()
+    sourceTimeControlObservation = nil
     sourcePlayer.pause()
     restoredPlayer.pause()
     errorMessage = message
+    playbackDetail = ""
     state = .failed
     runner?.appendExternalLog("Realtime preview: \(message)\n")
   }
@@ -498,14 +1180,29 @@ struct RealtimePlayerView: View {
 
       ZStack {
         Color.black
-        VideoPlayer(player: controller.sourcePlayer)
-          .opacity(controller.showOriginal ? 1 : 0.001)
-        VideoPlayer(player: controller.restoredPlayer)
-          .opacity(controller.showOriginal ? 0.001 : 1)
-        if controller.state == .loading || controller.state == .buffering || controller.state == .seeking {
+        if runner.previewProjectionMode == "通常" {
+          VideoPlayer(player: controller.sourcePlayer)
+            .opacity(controller.showOriginal ? 1 : 0.001)
+          VideoPlayer(player: controller.restoredPlayer)
+            .opacity(controller.showOriginal ? 0.001 : 1)
+        } else {
+          VRPreviewSceneView(
+            player: controller.sourceOnlyPlayback || controller.showOriginal
+              ? controller.sourcePlayer
+              : controller.restoredPlayer,
+            playerItem: controller.sourceOnlyPlayback || controller.showOriginal
+              ? controller.sourcePlayer.currentItem
+              : controller.restoredPlayer.currentItem,
+            projection: PreviewProjectionMode(rawValue: runner.previewProjectionMode) ?? .vr180,
+            layout: PreviewVideoLayout(rawValue: runner.previewVideoLayout) ?? .sbs,
+            eye: PreviewEye(rawValue: runner.previewEye) ?? .left,
+            cameraFOV: runner.previewCameraFOV
+          )
+        }
+        if controller.shouldShowProcessingOverlay {
           VStack(spacing: 8) {
             ProgressView()
-            Text("バッファ中")
+            Text(controller.processingOverlayLabel)
           }
           .padding(18)
           .background(.black.opacity(0.65), in: RoundedRectangle(cornerRadius: 10))
@@ -553,6 +1250,34 @@ struct RealtimePlayerView: View {
       }
 
       HStack(spacing: 12) {
+        Picker("表示", selection: $runner.previewProjectionMode) {
+          ForEach(PreviewProjectionMode.allCases) { mode in
+            Text(mode.rawValue).tag(mode.rawValue)
+          }
+        }
+        .frame(width: 150)
+        Picker("形式", selection: $runner.previewVideoLayout) {
+          ForEach(PreviewVideoLayout.allCases) { layout in
+            Text(layout.rawValue).tag(layout.rawValue)
+          }
+        }
+        .frame(width: 140)
+        Picker("目", selection: $runner.previewEye) {
+          ForEach(PreviewEye.allCases) { eye in
+            Text(eye.rawValue).tag(eye.rawValue)
+          }
+        }
+        .frame(width: 110)
+        Text("視野角")
+        Slider(value: $runner.previewCameraFOV, in: 45...105, step: 1)
+          .frame(maxWidth: 220)
+        Text("\(Int(runner.previewCameraFOV))°")
+          .font(.caption.monospacedDigit())
+          .frame(width: 44, alignment: .trailing)
+        Spacer()
+      }
+
+      HStack(spacing: 12) {
         if controller.state == .idle || controller.state == .ended || controller.state == .failed {
           Button { controller.start(runner: runner) } label: { Label("再生", systemImage: "play.fill") }
             .buttonStyle(.borderedProminent).disabled(controller.previewInputURL == nil)
@@ -582,7 +1307,7 @@ struct RealtimePlayerView: View {
       if !controller.errorMessage.isEmpty {
         Text(controller.errorMessage).foregroundStyle(.red).font(.caption)
       } else {
-        Text(controller.state.label).font(.caption).foregroundStyle(.secondary)
+        Text(controller.statusLabel).font(.caption).foregroundStyle(.secondary)
       }
     }
     .padding(.vertical, 12)
@@ -592,5 +1317,31 @@ struct RealtimePlayerView: View {
     guard seconds.isFinite else { return "00:00" }
     let value = max(0, Int(seconds))
     return String(format: "%02d:%02d", value / 60, value % 60)
+  }
+}
+
+private extension RealtimePlayerController {
+  var shouldShowProcessingOverlay: Bool {
+    if sourceOnlyPlayback {
+      return state == .loading || state == .buffering || state == .seeking
+    }
+    return state == .loading || state == .buffering || state == .seeking
+  }
+
+  var processingOverlayLabel: String {
+    if !sourceOnlyPlayback { return "バッファ中" }
+    if state == .seeking { return "シーク中" }
+    return playbackDetail.isEmpty ? "VR動画を準備中" : playbackDetail
+  }
+
+  var statusLabel: String {
+    if sourceOnlyPlayback {
+      switch state {
+      case .loading, .buffering:
+        return playbackDetail.isEmpty ? "VR動画を準備中" : playbackDetail
+      default: return state.label
+      }
+    }
+    return state.label
   }
 }

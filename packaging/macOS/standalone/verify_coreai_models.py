@@ -21,6 +21,7 @@ EXPECTED_MODEL_ASSETS = {
     "lada_mosaic_detection_model_v4_fast-fp16.h17s.aimodelc",
     "RealESRGAN_x4plus-256-fp16.h17s.aimodelc",
     "realesr-general-x4v3-256-fp16.h17s.aimodelc",
+    "4xNomosWebPhoto_RealPLKSR-256-fp16.h17s.aimodelc",
 }
 
 EXPECTED_SOURCE_MODEL_ASSETS = {
@@ -30,6 +31,7 @@ EXPECTED_SOURCE_MODEL_ASSETS = {
     "lada_mosaic_detection_model_v4_fast-fp16.aimodel",
     "RealESRGAN_x4plus-256-fp16.aimodel",
     "realesr-general-x4v3-256-fp16.aimodel",
+    "4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel",
 }
 
 MODEL_CONTRACTS = {
@@ -59,6 +61,10 @@ MODEL_CONTRACTS = {
     "realesr-general-x4v3-coreai": {
         "kind": "enhancer",
         "asset": "realesr-general-x4v3-256-fp16.aimodel",
+    },
+    "nomos-webphoto-realplksr-x4-coreai": {
+        "kind": "enhancer",
+        "asset": "4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel",
     },
 }
 

@@ -10,13 +10,35 @@ class BasicvsrppMosaicRestorer:
         self.device: torch.device = torch.device(device)
         self.dtype = torch.float16 if fp16 else torch.float32
 
-    def restore(self, video: list[ImageTensor], max_frames=-1) -> list[ImageTensor]:
+    def restore(
+        self,
+        video: list[ImageTensor],
+        max_frames=-1,
+        temporal_overlap: int = 8,
+        enable_crossfade: bool = True,
+    ) -> list[ImageTensor]:
         if self.device.type == 'mps':
             with serialized_mps_execution():
-                return self._restore_unlocked(video, max_frames=max_frames)
-        return self._restore_unlocked(video, max_frames=max_frames)
+                return self._restore_unlocked(
+                    video,
+                    max_frames=max_frames,
+                    temporal_overlap=temporal_overlap,
+                    enable_crossfade=enable_crossfade,
+                )
+        return self._restore_unlocked(
+            video,
+            max_frames=max_frames,
+            temporal_overlap=temporal_overlap,
+            enable_crossfade=enable_crossfade,
+        )
 
-    def _restore_unlocked(self, video: list[ImageTensor], max_frames=-1) -> list[ImageTensor]:
+    def _restore_unlocked(
+        self,
+        video: list[ImageTensor],
+        max_frames=-1,
+        temporal_overlap: int = 8,
+        enable_crossfade: bool = True,
+    ) -> list[ImageTensor]:
         input_frame_count = len(video)
         input_frame_shape = video[0].shape
         with torch.inference_mode():
@@ -24,7 +46,12 @@ class BasicvsrppMosaicRestorer:
             inference_view = torch.stack([x.permute(2, 0, 1) for x in video], dim=0).to(device=self.device).to(dtype=self.dtype).div_(255.0).unsqueeze(0)
 
             if max_frames > 0:
-                result = self._restore_chunked_with_overlap(inference_view, max_frames)
+                result = self._restore_chunked_with_overlap(
+                    inference_view,
+                    max_frames,
+                    temporal_overlap=temporal_overlap,
+                    enable_crossfade=enable_crossfade,
+                )
             else:
                 result = self.model(inputs=inference_view)
 
@@ -41,12 +68,18 @@ class BasicvsrppMosaicRestorer:
     def _run_model_chunks(self, chunks: list[torch.Tensor]) -> list[torch.Tensor]:
         return [self.model(inputs=chunk) for chunk in chunks]
 
-    def _restore_chunked_with_overlap(self, inference_view: torch.Tensor, max_frames: int) -> torch.Tensor:
+    def _restore_chunked_with_overlap(
+        self,
+        inference_view: torch.Tensor,
+        max_frames: int,
+        temporal_overlap: int = 8,
+        enable_crossfade: bool = True,
+    ) -> torch.Tensor:
         frame_count = inference_view.shape[1]
         if frame_count <= max_frames:
             return self.model(inputs=inference_view)
 
-        overlap = min(2, max_frames // 2, frame_count - 1)
+        overlap = min(max(0, temporal_overlap), max_frames // 2, frame_count - 1)
         if overlap <= 0:
             chunks = [
                 inference_view[:, start:start + max_frames]
@@ -89,10 +122,10 @@ class BasicvsrppMosaicRestorer:
                 weight_accum = torch.zeros((output.shape[0], frame_count, 1, 1, 1), dtype=output.dtype, device=output.device)
 
             weights = torch.ones((output.shape[1],), dtype=output.dtype, device=output.device)
-            if chunk_index > 0:
+            if enable_crossfade and chunk_index > 0:
                 ramp = torch.arange(1, min(overlap, output.shape[1]) + 1, dtype=output.dtype, device=output.device) / (overlap + 1)
                 weights[: ramp.numel()] = ramp
-            if end < frame_count:
+            if enable_crossfade and end < frame_count:
                 ramp_len = min(overlap, output.shape[1])
                 ramp = torch.arange(ramp_len, 0, -1, dtype=output.dtype, device=output.device) / (overlap + 1)
                 weights[-ramp_len:] = torch.minimum(weights[-ramp_len:], ramp)

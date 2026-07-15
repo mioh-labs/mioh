@@ -157,6 +157,17 @@ def dump_available_restoration_models():
             table.append([modelfile.name, modelfile.description if modelfile.description else "", modelfile.path])
         _dump_table(table)
 
+def dump_available_roi_enhancer_models():
+    modelfiles = ModelFiles.get_enhancer_models()
+    print(_("Available ROI enhancer models:"))
+    if len(modelfiles) == 0:
+        print(f"{COL_SEP}{_("None!")}")
+    else:
+        table = [[_("Name"), _("Description"), _("Path")]]
+        for modelfile in modelfiles:
+            table.append([modelfile.name, modelfile.description if modelfile.description else "", modelfile.path])
+        _dump_table(table)
+
 def dump_available_encoding_presets():
     print(_("Available encoding presets:"))
     encoding_presets = video_utils.get_encoding_presets()

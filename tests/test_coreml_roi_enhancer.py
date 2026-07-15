@@ -86,6 +86,22 @@ class ExportSwinIRArgsTests(unittest.TestCase):
         self.assertEqual(args.arch, "medium")
 
 
+class ExportSpandrelArgsTests(unittest.TestCase):
+    def test_coreml_defaults(self):
+        from scripts.apple import export_spandrel_coreml as mod
+        args = mod.parse_args([])
+        self.assertEqual(str(args.model), "model_weights/4xNomosWebPhoto_RealPLKSR.safetensors")
+        self.assertEqual(str(args.output_dir), "model_weights")
+        self.assertEqual(args.imgsz, 256)
+
+    def test_coreai_defaults(self):
+        from scripts.apple import export_spandrel_coreai as mod
+        args = mod.parse_args([])
+        self.assertEqual(str(args.model), "model_weights/4xNomosWebPhoto_RealPLKSR.safetensors")
+        self.assertEqual(str(args.output), "model_weights/4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel")
+        self.assertEqual(args.imgsz, 256)
+
+
 class MetadataGuardTests(unittest.TestCase):
     def test_accepts_any_lada_enhancer_metadata(self):
         with mock.patch("coremltools.models.MLModel", return_value=make_fake_mlmodel({
@@ -113,6 +129,16 @@ class EnhancerNameResolutionTests(unittest.TestCase):
             self.assertTrue(mf.path.endswith("swinir-real-x4_256.mlpackage"))
             mf = lada.ModelFiles.get_enhancer_model_by_name("swinir-real-x4-coreml")
             self.assertTrue(mf.path.endswith("swinir-real-x4_256.mlpackage"))
+            mf = lada.ModelFiles.get_enhancer_model_by_name("nomos-webphoto-realplksr-x4")
+            self.assertTrue(mf.path.endswith("4xNomosWebPhoto_RealPLKSR.safetensors"))
+            mf = lada.ModelFiles.get_enhancer_model_by_name("nomos-webphoto-realplksr-x4-coreml")
+            self.assertTrue(mf.path.endswith("4xNomosWebPhoto_RealPLKSR_256.mlpackage"))
+            mf = lada.ModelFiles.get_enhancer_model_by_name("nomos-webphoto-realplksr-x4-coreai")
+            self.assertTrue(mf.path.endswith("4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel"))
+            mf = lada.ModelFiles.get_enhancer_model_by_name("nomos-uni-span-x4")
+            self.assertTrue(mf.path.endswith("4xNomosUni_span_multijpg.safetensors"))
+            mf = lada.ModelFiles.get_enhancer_model_by_name("nomos-uni-compact-x2")
+            self.assertTrue(mf.path.endswith("2xNomosUni_compact_multijpg.safetensors"))
 
     def test_unknown_name_returns_none(self):
         import lada

@@ -3,11 +3,28 @@ from unittest import mock
 
 import torch
 
+from lada import ModelFiles
 from lada.cli.main import setup_argparser
 from lada.restorationpipeline import load_models
 
 
 class DetectionBackendSelectionTests(unittest.TestCase):
+    def test_vr_detection_models_are_registered(self):
+        vr_model = ModelFiles.get_detection_model_by_name("vr-v2-accurate")
+        vr_coreml_model = ModelFiles.get_detection_model_by_name("vr-v2-accurate-coreml")
+
+        self.assertIsNotNone(vr_model)
+        self.assertIsNotNone(vr_coreml_model)
+        self.assertTrue(vr_model.path.endswith("lada_mosaic_detection_model_vr_v2_accurate.pt"))
+        self.assertTrue(
+            vr_coreml_model.path.endswith(
+                (
+                    "lada_mosaic_detection_model_vr_v2_accurate.mlpackage",
+                    "lada_mosaic_detection_model_vr_v2_accurate.mlmodelc",
+                )
+            )
+        )
+
     def test_cli_does_not_expose_detection_backend_argument(self):
         parser = setup_argparser()
         args = parser.parse_args(["--input", "in.mp4"])
