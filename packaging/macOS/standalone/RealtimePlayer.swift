@@ -849,9 +849,6 @@ final class RealtimePlayerController: ObservableObject {
     // This preserves random access without modifying, copying, or remuxing the file.
     let resourceLoader = try HEV1VirtualResourceLoader(sourceURL: input)
     let compatibleAsset = resourceLoader.makeAsset()
-    guard try await compatibleAsset.load(.isPlayable) else {
-      throw SourcePlaybackError.incompatibleVirtualContainer
-    }
     return PreparedSourcePlayerItem(
       item: AVPlayerItem(asset: compatibleAsset),
       duration: duration,
