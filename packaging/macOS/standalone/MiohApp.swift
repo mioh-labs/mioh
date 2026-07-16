@@ -26,7 +26,7 @@ struct PlatformCapabilities {
   }
 
   var previewRestorationModel: String {
-    supportsCoreAI ? "basicvsrpp-v1.2-coreai-t36" : "basicvsrpp-v1.2"
+    supportsCoreAI ? "basicvsrpp-v1.2-coreai" : "basicvsrpp-v1.2"
   }
 
   let baseRestorationModels = ["basicvsrpp-v1.2", "カスタム"]
@@ -624,7 +624,9 @@ final class RestorationRunner: ObservableObject {
     add(&args, "--detection-model", detection)
     let automaticClipLength: Int
     switch previewModel {
+    case "basicvsrpp-v1.2-coreai": automaticClipLength = 98
     case "basicvsrpp-v1.2-coreai-t36": automaticClipLength = 104
+    case "basicvsrpp-v1.2-coreai-t90": automaticClipLength = 178
     default: automaticClipLength = 180
     }
     add(&args, "--max-clip-length", useMaxClipLength ? maxClipLength : automaticClipLength)

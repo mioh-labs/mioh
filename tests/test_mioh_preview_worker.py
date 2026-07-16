@@ -54,10 +54,12 @@ class PreviewProtocolTests(unittest.TestCase):
             "--output-dir", "out",
             "--restoration-model", "basicvsrpp-v1.2",
             "--detection-model", "v2-coreml",
+            "--generation", "12",
             "--restore-temporal-overlap", "15",
             "--disable-crossfade",
         ])
 
+        self.assertEqual(args.generation, 12)
         self.assertEqual(args.restore_temporal_overlap, 15)
         self.assertFalse(args.restore_crossfade)
 
@@ -247,6 +249,18 @@ class PreviewSessionTests(unittest.TestCase):
             self.assertEqual(restorers[1].starts, [42_000_000_000])
             self.assertEqual(session.generation, 1)
             self.assertFalse(stale_path.exists())
+
+    def test_initial_generation_stays_in_sync_with_controller(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = self.worker.PreviewSession(
+                self.make_config(),
+                Path(temp_dir),
+                initial_generation=12,
+                model_loader=lambda _config: object(),
+                restorer_factory=lambda _config, _models: mock.Mock(),
+            )
+
+            self.assertEqual(session.generation, 12)
 
     def test_buffer_capacity_is_bounded_to_four_two_second_segments(self):
         with tempfile.TemporaryDirectory() as temp_dir:
