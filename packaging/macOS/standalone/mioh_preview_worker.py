@@ -289,6 +289,7 @@ class PreviewSession:
         config,
         output_dir: Path,
         *,
+        initial_generation: int = 0,
         model_loader: Callable = load_preview_models,
         restorer_factory: Callable = create_preview_restorer,
         encoder_factory: Callable = SegmentEncoder,
@@ -302,7 +303,7 @@ class PreviewSession:
         self.models = None
         self.restorer = None
         self.encoder = None
-        self.generation = 0
+        self.generation = initial_generation
         self.stopped = False
         self.commands: queue.Queue[PreviewCommand] = queue.Queue()
         self.control_thread: threading.Thread | None = None
@@ -474,6 +475,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--start-ns", type=int, default=0)
+    parser.add_argument("--generation", type=int, default=0)
     parser.add_argument("--device", default="mps")
     parser.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--restoration-model", required=True)
@@ -508,7 +510,11 @@ def main() -> int:
     global PROTOCOL_STREAM
     PROTOCOL_STREAM = sys.stdout
     sys.stdout = sys.stderr
-    session = PreviewSession(args, output_dir)
+    session = PreviewSession(
+        args,
+        output_dir,
+        initial_generation=args.generation,
+    )
     try:
         session.run(args.start_ns, control_stream=sys.stdin)
         return 0

@@ -60,6 +60,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "rebufferSegmentCount = 2",
             "driftToleranceSeconds = 0.080",
             'sendCommand(["command": "seek"',
+            '"--generation", String(startingGeneration)',
             "showOriginal",
             "sourceOnlyPlayback",
             "struct RealtimePlayerView: View",
@@ -287,17 +288,21 @@ class StandaloneAppOptionTests(unittest.TestCase):
         ]:
             self.assertIn(contract, player)
 
-    def test_preview_uses_t36_without_changing_t90_export_default(self):
+    def test_preview_uses_t18_without_changing_t90_export_default(self):
         source = APP_SOURCE.read_text()
 
         self.assertIn("var previewRestorationModel: String", source)
         self.assertIn(
-            'supportsCoreAI ? "basicvsrpp-v1.2-coreai-t36" : "basicvsrpp-v1.2"',
+            'supportsCoreAI ? "basicvsrpp-v1.2-coreai" : "basicvsrpp-v1.2"',
             source,
         )
         self.assertIn("let previewModel = capabilities.previewRestorationModel", source)
         self.assertIn('add(&args, "--restoration-model", previewModel)', source)
         self.assertIn("switch previewModel", source)
+        self.assertIn(
+            'case "basicvsrpp-v1.2-coreai": automaticClipLength = 98',
+            source,
+        )
         self.assertIn(
             'supportsCoreAI ? "basicvsrpp-v1.2-coreai-t90" : "basicvsrpp-v1.2"',
             source,

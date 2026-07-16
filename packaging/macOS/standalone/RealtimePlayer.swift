@@ -577,7 +577,10 @@ final class RealtimePlayerController: ObservableObject {
         resources: resources,
         outputDirectory: session,
         input: input
-      )) + ["--start-ns", String(Int64(startSeconds * 1_000_000_000))]
+      )) + [
+        "--start-ns", String(Int64(startSeconds * 1_000_000_000)),
+        "--generation", String(startingGeneration),
+      ]
       process.environment = runner.environment(resources: resources, python: python)
       process.standardInput = inputPipe
       process.standardOutput = outputPipe
