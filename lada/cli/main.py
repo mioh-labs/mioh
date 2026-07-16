@@ -49,8 +49,18 @@ from lada.utils.video_utils import get_video_meta_data, VideoWriter, get_default
 def is_restoration_model_path(model_path: str) -> bool:
     path = pathlib.Path(model_path)
     return path.is_file() or (
-        path.suffix in {".aimodel", ".aimodelc"} and path.is_dir()
+        path.suffix in {".aimodel", ".aimodelc", ".mlpackage", ".mlmodelc"}
+        and path.is_dir()
     )
+
+
+def infer_restoration_model_name(model_path: str) -> str:
+    filename = pathlib.Path(model_path).name.lower()
+    if filename.startswith("mioh-restorer"):
+        return "mioh-restorer-v1-prototype"
+    if filename.endswith((".aimodel", ".aimodelc")):
+        return "basicvsrpp-coreai"
+    return "basicvsrpp"
 
 
 def setup_argparser() -> argparse.ArgumentParser:
@@ -330,12 +340,9 @@ def main():
         mosaic_restoration_model_path = restoration_modelfile.path
     elif is_restoration_model_path(args.mosaic_restoration_model):
         mosaic_restoration_model_path = args.mosaic_restoration_model
-        if args.mosaic_restoration_model.endswith(".aimodel"):
-            mosaic_restoration_model_name = "basicvsrpp-coreai"
-        else:
-            # Assume custom weight files are BasicVSR++. DeepMosaics custom
-            # paths are not supported.
-            mosaic_restoration_model_name = "basicvsrpp"
+        mosaic_restoration_model_name = infer_restoration_model_name(
+            args.mosaic_restoration_model
+        )
     else:
         print(_("Invalid mosaic restoration model"))
         sys.exit(1)

@@ -129,7 +129,7 @@ class OptimizedFrameRestorer(FrameRestorer):
             self.optimization_manager.initialize_optimization()
         return self.optimization_manager
     
-    def _restore_clip_frames(self, images):
+    def _restore_clip_frames(self, images, masks=None):
         """Override clip restoration with smart optimization"""
         start_time = time.time()
         
@@ -216,10 +216,10 @@ class OptimizedFrameRestorer(FrameRestorer):
         try:
             if should_optimize:
                 # For optimized cases, some parameters may need tuning
-                restored_images = super()._restore_clip_frames(images)
+                restored_images = super()._restore_clip_frames(images, masks)
             else:
                 # Standard processing
-                restored_images = super()._restore_clip_frames(images)
+                restored_images = super()._restore_clip_frames(images, masks)
             
             # Record performance
             processing_time = time.time() - start_time

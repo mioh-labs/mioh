@@ -316,6 +316,17 @@ def calculate_optimal_queue_size_mb(device: torch.device, video_resolution: tupl
     
     return base_memory_mb
 
+
+def _restoration_clip_size(model_name: str, restoration_model) -> int:
+    """Return the square ROI size required by the selected restorer."""
+    if model_name.startswith("mioh-restorer"):
+        runtime = getattr(restoration_model, "runtime", None)
+        image_size = getattr(runtime, "image_size", None)
+        if not isinstance(image_size, int) or image_size <= 0:
+            raise ValueError("MiohRestorer runtime must declare a positive image_size")
+        return image_size
+    return 256
+
 class FrameRestorer:
     def __init__(self, device, video_file, max_clip_length, mosaic_restoration_model_name,
                  mosaic_detection_model: Yolo11SegmentationModel, mosaic_restoration_model, preferred_pad_mode,
@@ -339,6 +350,10 @@ class FrameRestorer:
         self.video_meta_data = video_utils.get_video_meta_data(video_file)
         self.mosaic_detection_model = mosaic_detection_model
         self.mosaic_restoration_model = mosaic_restoration_model
+        self.restoration_clip_size = _restoration_clip_size(
+            mosaic_restoration_model_name,
+            mosaic_restoration_model,
+        )
         self.preferred_pad_mode = preferred_pad_mode
         self.start_ns = 0
         self.start_frame = 0
@@ -393,11 +408,17 @@ class FrameRestorer:
         self.frame_restoration_queue = PipelineQueue(name="frame_restoration_queue", maxsize=max_frames_in_frame_restoration_queue)
 
         # limit queue size for clips
-        max_clips_in_mosaic_clips_queue = max(1, queue_size_bytes // (self.max_clip_length * 256 * 256 * 4)) # 4 = 3 color channels + mask
+        clip_bytes = (
+            self.max_clip_length
+            * self.restoration_clip_size
+            * self.restoration_clip_size
+            * 4
+        )  # 4 = 3 color channels + mask
+        max_clips_in_mosaic_clips_queue = max(1, queue_size_bytes // clip_bytes)
         self.mosaic_clip_queue = PipelineQueue(name="mosaic_clip_queue", maxsize=max_clips_in_mosaic_clips_queue)
 
         # limit queue size for restored clips
-        max_clips_in_restored_clips_queue = max(1, queue_size_bytes // (self.max_clip_length * 256 * 256 * 4)) # 4 = 3 color channels + mask
+        max_clips_in_restored_clips_queue = max(1, queue_size_bytes // clip_bytes)
         self.restored_clip_queue = PipelineQueue(name="restored_clip_queue", maxsize=max_clips_in_restored_clips_queue)
 
         # no queue size limit needed, elements are tiny
@@ -408,6 +429,7 @@ class FrameRestorer:
                                               mosaic_clip_queue=self.mosaic_clip_queue,
                                               device=self.device,
                                               max_clip_length=self.max_clip_length,
+                                              clip_size=self.restoration_clip_size,
                                               pad_mode=self.preferred_pad_mode,
                                               batch_size=self._mps_adaptive_profile.get("detect_batch_init", 4),
                                               empty_lookahead_frames=self.mosaic_detection_empty_lookahead,
@@ -530,7 +552,11 @@ class FrameRestorer:
                 frame_feeder_queue/wait-time-put: {self.mosaic_detector.frame_feeder_queue.stats[f"{self.mosaic_detector.frame_feeder_queue.name}_wait_time_put"]:.0f}
                 frame_feeder_queue/max-qsize: {self.mosaic_detector.frame_feeder_queue.stats[f"{self.mosaic_detector.frame_feeder_queue.name}_max_size"]}/{self.mosaic_detector.frame_feeder_queue.maxsize}"""))
 
-    def _restore_clip_frames(self, images: list[ImageTensor]):
+    def _restore_clip_frames(
+        self,
+        images: list[ImageTensor],
+        masks: list[ImageTensor] | None = None,
+    ):
         if self.mosaic_restoration_model_name.startswith("deepmosaics"):
             from lada.restorationpipeline.deepmosaics_mosaic_restorer import DeepmosaicsMosaicRestorer
             assert isinstance(self.mosaic_restoration_model, DeepmosaicsMosaicRestorer)
@@ -569,6 +595,15 @@ class FrameRestorer:
                 max_frames=restore_max_frames,
                 temporal_overlap=self.restore_temporal_overlap,
                 enable_crossfade=self.restore_crossfade,
+            )
+        elif self.mosaic_restoration_model_name.startswith("mioh-restorer"):
+            from lada.restorationpipeline.mioh_restorer import MiohMosaicRestorer
+
+            assert isinstance(self.mosaic_restoration_model, MiohMosaicRestorer)
+            restored_clip_images = self.mosaic_restoration_model.restore(
+                images,
+                masks=masks,
+                bidirectional=False,
             )
         else:
             raise NotImplementedError()
@@ -706,7 +741,7 @@ class FrameRestorer:
         if self.mosaic_detection:
             restored_clip_images = visualization_utils.draw_mosaic_detections(clip)
         else:
-            restored_clip_images = self._restore_clip_frames(clip.frames)
+            restored_clip_images = self._restore_clip_frames(clip.frames, clip.masks)
         assert len(restored_clip_images) == len(clip.frames)
 
         for i in range(len(restored_clip_images)):
