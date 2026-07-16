@@ -215,7 +215,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "information.isByteRangeAccessSupported = true",
             "dataRequest.respond(with: patch(sourceData, startingAt: cursor))",
             "let resourceLoader = try HEV1VirtualResourceLoader(sourceURL: input)",
-            "guard try await compatibleAsset.load(.isPlayable)",
+            "AVPlayerItem(asset: compatibleAsset)",
             "private func startSourceOnlyPlayback(",
             'sourceOnlyPlayback = runner.previewProjectionMode != "通常"',
             '"VR再生: 復元モデルを読み込まず、元動画を直接再生します\\n"',
@@ -242,6 +242,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
             '"-tag:v", "hvc1"',
             "waitUntilExit()",
             "AVMutableComposition",
+            "guard try await compatibleAsset.load(.isPlayable)",
         ]:
             self.assertNotIn(removed_blocking_remux_contract, player)
 
@@ -561,7 +562,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
     def test_restoration_effects_use_slider_number_rows(self):
         source = APP_SOURCE.read_text()
         expected_slider_rows = [
-            'doubleSliderField("シャープ", value: $runner.sharpenStrength, range: 0...1, step: 0.05)',
+            'doubleSliderField("シャープ", value: $runner.sharpenStrength, range: 0...2, step: 0.05)',
             'doubleSliderField("ディテール", value: $runner.detailBoost, range: 0...1, step: 0.05)',
             'doubleSliderField("境界フェザー", value: $runner.blendFeather, range: 0...3, step: 0.05)',
             'doubleSliderField("テクスチャ", value: $runner.textureMix, range: 0...1, step: 0.01)',

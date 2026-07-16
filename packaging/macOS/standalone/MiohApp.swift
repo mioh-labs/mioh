@@ -1071,7 +1071,7 @@ struct ContentView: View {
         Toggle("クロスフェードを有効化", isOn: $runner.restoreCrossfade)
       }
       Section("合成") {
-        doubleSliderField("シャープ", value: $runner.sharpenStrength, range: 0...1, step: 0.05)
+        doubleSliderField("シャープ", value: $runner.sharpenStrength, range: 0...2, step: 0.05)
         doubleSliderField("ディテール", value: $runner.detailBoost, range: 0...1, step: 0.05)
         doubleSliderField("境界フェザー", value: $runner.blendFeather, range: 0...3, step: 0.05)
         doubleSliderField("テクスチャ", value: $runner.textureMix, range: 0...1, step: 0.01)
