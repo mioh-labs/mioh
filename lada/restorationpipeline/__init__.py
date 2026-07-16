@@ -29,6 +29,28 @@ def load_restoration_model(
     config_path: str | None,
     fp16: bool,
 ):
+    if model_name.startswith("mioh-restorer"):
+        from lada.restorationpipeline.mioh_restorer import (
+            CoreAIMiohRestorerRuntime,
+            CoreMLMiohRestorerRuntime,
+            MiohMosaicRestorer,
+            load_torch_mioh_restorer_runtime,
+        )
+
+        path = Path(model_path)
+        if model_path.endswith((".aimodel", ".aimodelc")):
+            runtime = CoreAIMiohRestorerRuntime(path)
+        elif model_path.endswith((".mlpackage", ".mlmodelc")):
+            runtime = CoreMLMiohRestorerRuntime(path)
+        elif model_path.endswith(".pth"):
+            runtime = load_torch_mioh_restorer_runtime(
+                path,
+                device=device,
+                fp16=fp16,
+            )
+        else:
+            raise ValueError(f"Unsupported MiohRestorer model asset: {model_path}")
+        return MiohMosaicRestorer(runtime), "zero"
     if model_path.endswith((".aimodel", ".aimodelc")):
         from lada.restorationpipeline.basicvsrpp_coreai_restorer import (
             CoreAIBasicvsrppMosaicRestorer,
