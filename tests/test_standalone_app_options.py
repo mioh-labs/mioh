@@ -189,7 +189,8 @@ class StandaloneAppOptionTests(unittest.TestCase):
 
         for contract in [
             "import SceneKit",
-            "import SpriteKit",
+            "import Metal",
+            "import CoreVideo",
             "enum PreviewProjectionMode: String, CaseIterable, Identifiable",
             'case vr180 = "VR180"',
             'case sphere360 = "360"',
@@ -201,21 +202,26 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "static func uvWindow(layout: PreviewVideoLayout, eye: PreviewEye) -> CGRect",
             "struct VRPreviewSceneView: NSViewRepresentable",
             "final class Coordinator: NSObject",
-            "SKVideoNode(avPlayer: player)",
-            "videoNode.geometry?.firstMaterial?.diffuse.contents = skScene",
+            "AVPlayerItemVideoOutput(pixelBufferAttributes: attributes)",
+            "CVMetalTextureCacheCreateTextureFromImage",
+            "CVMetalTextureGetTexture(videoTexture)",
+            "videoNode.geometry?.firstMaterial?.diffuse.contents = metalTexture",
+            "final class Coordinator: NSObject, SCNSceneRendererDelegate",
             "NSPanGestureRecognizer",
             "NSMagnificationGestureRecognizer",
             'runner.previewProjectionMode == "通常"',
             "VRPreviewSceneView(",
             "private func prepareSourcePlayerItem(input: URL) async throws -> PreparedSourcePlayerItem",
             "try await source.load(.isPlayable)",
-            "private final class HEV1VirtualResourceLoader: NSObject, AVAssetResourceLoaderDelegate",
+            "import Network",
+            "private final class HEV1LoopbackServer",
             "private static func findHEV1Offsets(in url: URL, fileSize: UInt64) throws -> [UInt64]",
-            'string: "mioh-hev1://\\(UUID().uuidString.lowercased())/video.mp4"',
-            "information.contentType = AVFileType.mp4.rawValue",
-            "information.isByteRangeAccessSupported = true",
-            "dataRequest.respond(with: patch(sourceData, startingAt: cursor))",
-            "let resourceLoader = try HEV1VirtualResourceLoader(sourceURL: input)",
+            'URL(string: "http://127.0.0.1:',
+            'header += "Accept-Ranges: bytes\\r\\n"',
+            'header += "Content-Range: bytes \\(start)-\\(end)/\\(fileSize)\\r\\n"',
+            "private func parseRangeHeader(_ line: String) -> ClosedRange<UInt64>?",
+            "content: patch(sourceData, startingAt: cursor)",
+            "let resourceLoader = try HEV1LoopbackServer(sourceURL: input)",
             "AVPlayerItem(asset: compatibleAsset)",
             "private func startSourceOnlyPlayback(",
             'sourceOnlyPlayback = runner.previewProjectionMode != "通常"',
@@ -244,6 +250,9 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "waitUntilExit()",
             "AVMutableComposition",
             "guard try await compatibleAsset.load(.isPlayable)",
+            "AVAssetResourceLoaderDelegate",
+            "requestsAllDataToEndOfResource",
+            'string: "mioh-hev1://',
         ]:
             self.assertNotIn(removed_blocking_remux_contract, player)
 
@@ -261,9 +270,13 @@ class StandaloneAppOptionTests(unittest.TestCase):
 
     def test_realtime_player_build_links_scenekit(self):
         script = BUILD_SCRIPT.read_text()
+        player = PLAYER_SOURCE.read_text()
 
-        for framework in ["SceneKit", "SpriteKit"]:
+        for framework in ["SceneKit", "Metal"]:
             self.assertIn(f"-framework {framework}", script)
+        self.assertNotIn("-framework SpriteKit", script)
+        self.assertNotIn("import SpriteKit", player)
+        self.assertNotIn("SKVideoNode", player)
 
     def test_preview_buffer_slider_supports_one_minute_and_live_updates(self):
         app = APP_SOURCE.read_text()
@@ -528,10 +541,16 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn('"$PACKAGE_DIR/RealtimePlayer.swift"', script)
         self.assertIn("-framework AVFoundation", script)
         self.assertIn("-framework AVKit", script)
+        self.assertIn("-framework Network", script)
         self.assertIn(
             '"$RESOURCES/runtime/lib/python3.12/site-packages/mioh_preview_worker.py"',
             script,
         )
+
+    def test_app_allows_loopback_video_streaming(self):
+        info = INFO_PLIST.read_text()
+        self.assertIn("<key>NSAppTransportSecurity</key>", info)
+        self.assertIn("<key>NSAllowsLocalNetworking</key>", info)
 
     def test_standalone_app_uses_mioh_icon(self):
         icon = ROOT / "lada" / "gui" / "icons" / "mioh-icon.png"

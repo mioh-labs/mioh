@@ -1,9 +1,12 @@
 import AppKit
 import AVFoundation
 import AVKit
+import CoreVideo
 import Foundation
+import Metal
+import Network
+import QuartzCore
 import SceneKit
-import SpriteKit
 import SwiftUI
 
 enum PreviewProjectionMode: String, CaseIterable, Identifiable {
@@ -80,7 +83,7 @@ private struct PreviewSegment {
 private struct PreparedSourcePlayerItem {
   let item: AVPlayerItem
   let duration: Double
-  let resourceLoader: HEV1VirtualResourceLoader?
+  let resourceLoader: HEV1LoopbackServer?
 
   var usesVirtualContainer: Bool { resourceLoader != nil }
 }
@@ -89,6 +92,7 @@ private enum SourcePlaybackError: LocalizedError {
   case missingHEV1SampleEntry
   case incompatibleVirtualContainer
   case invalidFileSize
+  case loopbackServerFailed
 
   var errorDescription: String? {
     switch self {
@@ -98,18 +102,29 @@ private enum SourcePlaybackError: LocalizedError {
       return "この動画はAVFoundationで再生できません"
     case .invalidFileSize:
       return "動画ファイルの大きさを取得できません"
+    case .loopbackServerFailed:
+      return "AVFoundation互換ストリーミングを開始できません"
     }
   }
 }
 
-private final class HEV1VirtualResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
+/// Exposes a local HEV1 MP4 through an HTTP byte-range endpoint while replacing
+/// only the sample-entry identifier in the moov atom.  AVFoundation treats a
+/// custom URL resource loader as one all-data request for some large MP4 files;
+/// that makes it wait for multi-gigabyte files and time out before inspection.
+/// HTTP range semantics let AVFoundation request only the moov atom and samples
+/// required for the current playback position.
+private final class HEV1LoopbackServer {
   private static let replacement: [UInt8] = [0x68, 0x76, 0x63, 0x31] // hvc1
   private static let readChunkSize = 2 * 1024 * 1024
+  private static let maximumRequestHeaderSize = 64 * 1024
 
   let sourceURL: URL
   let fileSize: UInt64
   let patchOffsets: [UInt64]
-  let queue = DispatchQueue(label: "com.okatti.mioh.hev1-resource-loader", qos: .userInitiated)
+  private let listener: NWListener
+  private let queue = DispatchQueue(label: "com.okatti.mioh.hev1-loopback", qos: .userInitiated)
+  private var port: NWEndpoint.Port?
 
   init(sourceURL: URL) throws {
     self.sourceURL = sourceURL
@@ -120,70 +135,214 @@ private final class HEV1VirtualResourceLoader: NSObject, AVAssetResourceLoaderDe
     fileSize = size.uint64Value
     patchOffsets = try Self.findHEV1Offsets(in: sourceURL, fileSize: fileSize)
     guard !patchOffsets.isEmpty else { throw SourcePlaybackError.missingHEV1SampleEntry }
-    super.init()
+    let parameters = NWParameters.tcp
+    parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
+    listener = try NWListener(using: parameters)
+
+    let ready = DispatchSemaphore(value: 0)
+    let startupLock = NSLock()
+    var startupError: Error?
+    var startupFinished = false
+    listener.stateUpdateHandler = { [weak listener] state in
+      switch state {
+      case .ready:
+        startupLock.lock()
+        if !startupFinished {
+          startupFinished = true
+          ready.signal()
+        }
+        startupLock.unlock()
+      case .failed(let error):
+        startupLock.lock()
+        startupError = error
+        if !startupFinished {
+          startupFinished = true
+          ready.signal()
+        }
+        startupLock.unlock()
+      case .cancelled:
+        _ = listener
+      default:
+        break
+      }
+    }
+    listener.newConnectionHandler = { [weak self] connection in
+      self?.accept(connection)
+    }
+    listener.start(queue: queue)
+    guard ready.wait(timeout: .now() + 5) == .success else {
+      listener.cancel()
+      throw SourcePlaybackError.loopbackServerFailed
+    }
+    if startupError != nil {
+      listener.cancel()
+      throw SourcePlaybackError.loopbackServerFailed
+    }
+    guard let selectedPort = listener.port else {
+      listener.cancel()
+      throw SourcePlaybackError.loopbackServerFailed
+    }
+    port = selectedPort
+  }
+
+  deinit {
+    listener.cancel()
   }
 
   func makeAsset() -> AVURLAsset {
-    let virtualURL = URL(
-      string: "mioh-hev1://\(UUID().uuidString.lowercased())/video.mp4"
-    )!
-    let asset = AVURLAsset(url: virtualURL)
-    asset.resourceLoader.setDelegate(self, queue: queue)
-    return asset
+    let virtualURL = URL(string: "http://127.0.0.1:\(port!.rawValue)/video.mp4")!
+    return AVURLAsset(url: virtualURL)
   }
 
-  func resourceLoader(
-    _ resourceLoader: AVAssetResourceLoader,
-    shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest
-  ) -> Bool {
+  private func accept(_ connection: NWConnection) {
+    connection.stateUpdateHandler = { state in
+      if case .failed = state { connection.cancel() }
+    }
+    connection.start(queue: queue)
+    receiveRequest(on: connection, accumulated: Data())
+  }
+
+  private func receiveRequest(on connection: NWConnection, accumulated: Data) {
+    connection.receive(minimumIncompleteLength: 1, maximumLength: 16 * 1024) {
+      [weak self] data, _, isComplete, error in
+      guard let self else {
+        connection.cancel()
+        return
+      }
+      var request = accumulated
+      if let data { request.append(data) }
+      if request.range(of: Data("\r\n\r\n".utf8)) != nil {
+        self.respond(to: request, on: connection)
+        return
+      }
+      if error != nil || isComplete || request.count > Self.maximumRequestHeaderSize {
+        connection.cancel()
+        return
+      }
+      self.receiveRequest(on: connection, accumulated: request)
+    }
+  }
+
+  private func respond(to requestData: Data, on connection: NWConnection) {
+    guard let request = String(data: requestData, encoding: .utf8) else {
+      sendError(status: 400, reason: "Bad Request", on: connection)
+      return
+    }
+    let lines = request.components(separatedBy: "\r\n")
+    let requestParts = lines.first?.split(separator: " ") ?? []
+    guard requestParts.count >= 2 else {
+      sendError(status: 400, reason: "Bad Request", on: connection)
+      return
+    }
+    let method = requestParts[0].uppercased()
+    guard method == "GET" || method == "HEAD" else {
+      sendError(status: 405, reason: "Method Not Allowed", on: connection)
+      return
+    }
+    let rangeLine = lines.first { $0.lowercased().hasPrefix("range:") }
+    let requestedRange = rangeLine.flatMap(parseRangeHeader)
+    if rangeLine != nil && requestedRange == nil {
+      sendError(status: 416, reason: "Range Not Satisfiable", on: connection)
+      return
+    }
+    let start = requestedRange?.lowerBound ?? 0
+    let end = requestedRange?.upperBound ?? (fileSize - 1)
+    let partial = requestedRange != nil
+    let length = end - start + 1
+    var header = partial
+      ? "HTTP/1.1 206 Partial Content\r\n"
+      : "HTTP/1.1 200 OK\r\n"
+    header += "Content-Type: video/mp4\r\n"
+    header += "Accept-Ranges: bytes\r\n"
+    header += "Content-Length: \(length)\r\n"
+    if partial {
+      header += "Content-Range: bytes \(start)-\(end)/\(fileSize)\r\n"
+    }
+    header += "Cache-Control: no-store\r\n"
+    header += "Connection: close\r\n\r\n"
+    connection.send(
+      content: Data(header.utf8),
+      completion: .contentProcessed { [weak self] error in
+        guard error == nil, method == "GET", let self else {
+          connection.cancel()
+          return
+        }
+        do {
+          let handle = try FileHandle(forReadingFrom: self.sourceURL)
+          self.stream(
+            connection: connection,
+            handle: handle,
+            cursor: start,
+            endInclusive: end
+          )
+        } catch {
+          connection.cancel()
+        }
+      }
+    )
+  }
+
+  private func parseRangeHeader(_ line: String) -> ClosedRange<UInt64>? {
+    guard let separator = line.firstIndex(of: ":") else { return nil }
+    let value = line[line.index(after: separator)...]
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard value.lowercased().hasPrefix("bytes=") else { return nil }
+    let spec = value.dropFirst(6).split(separator: ",", maxSplits: 1)[0]
+    let bounds = spec.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+    guard bounds.count == 2, let start = UInt64(bounds[0]), start < fileSize else {
+      return nil
+    }
+    let requestedEnd = bounds[1].isEmpty ? fileSize - 1 : UInt64(bounds[1])
+    guard let requestedEnd, requestedEnd >= start else { return nil }
+    return start...min(requestedEnd, fileSize - 1)
+  }
+
+  private func sendError(status: Int, reason: String, on connection: NWConnection) {
+    let response =
+      "HTTP/1.1 \(status) \(reason)\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    connection.send(content: Data(response.utf8), isComplete: true, completion: .idempotent)
+  }
+
+  private func stream(
+    connection: NWConnection,
+    handle: FileHandle,
+    cursor: UInt64,
+    endInclusive: UInt64
+  ) {
+    guard cursor <= endInclusive else {
+      try? handle.close()
+      connection.cancel()
+      return
+    }
     do {
-      if let information = loadingRequest.contentInformationRequest {
-        information.contentType = AVFileType.mp4.rawValue
-        information.contentLength = Int64(fileSize)
-        information.isByteRangeAccessSupported = true
-      }
-      if let dataRequest = loadingRequest.dataRequest {
-        try respond(to: dataRequest, loadingRequest: loadingRequest)
-      }
-      if !loadingRequest.isCancelled {
-        loadingRequest.finishLoading()
-      }
-    } catch {
-      if !loadingRequest.isCancelled {
-        loadingRequest.finishLoading(with: error)
-      }
-    }
-    return true
-  }
-
-  private func respond(
-    to dataRequest: AVAssetResourceLoadingDataRequest,
-    loadingRequest: AVAssetResourceLoadingRequest
-  ) throws {
-    let requestedOffset = max(Int64(0), dataRequest.requestedOffset)
-    let currentOffset = max(requestedOffset, dataRequest.currentOffset)
-    var cursor = UInt64(currentOffset)
-    let end: UInt64
-    if dataRequest.requestsAllDataToEndOfResource {
-      end = fileSize
-    } else {
-      let length = UInt64(max(0, dataRequest.requestedLength))
-      let start = UInt64(requestedOffset)
-      let (sum, overflow) = start.addingReportingOverflow(length)
-      end = overflow ? fileSize : min(fileSize, sum)
-    }
-    guard cursor < end else { return }
-
-    let handle = try FileHandle(forReadingFrom: sourceURL)
-    defer { try? handle.close() }
-    while cursor < end && !loadingRequest.isCancelled {
-      let count = Int(min(UInt64(Self.readChunkSize), end - cursor))
+      let remaining = endInclusive - cursor + 1
+      let count = Int(min(UInt64(Self.readChunkSize), remaining))
       try handle.seek(toOffset: cursor)
       guard let sourceData = try handle.read(upToCount: count), !sourceData.isEmpty else {
         throw CocoaError(.fileReadUnknown)
       }
-      dataRequest.respond(with: patch(sourceData, startingAt: cursor))
-      cursor += UInt64(sourceData.count)
+      let next = cursor + UInt64(sourceData.count)
+      let complete = next > endInclusive
+      connection.send(
+        content: patch(sourceData, startingAt: cursor),
+        isComplete: complete,
+        completion: .contentProcessed { [weak self] error in
+          guard error == nil, !complete, let self else {
+            try? handle.close()
+            if error != nil { connection.cancel() }
+            return
+          }
+          self.stream(
+            connection: connection,
+            handle: handle,
+            cursor: next,
+            endInclusive: endInclusive
+          )
+        }
+      )
+    } catch {
+      try? handle.close()
+      connection.cancel()
     }
   }
 
@@ -316,7 +475,6 @@ private enum PreviewProjectionGeometry {
 }
 
 struct VRPreviewSceneView: NSViewRepresentable {
-  let player: AVPlayer
   let playerItem: AVPlayerItem?
   let projection: PreviewProjectionMode
   let layout: PreviewVideoLayout
@@ -333,7 +491,6 @@ struct VRPreviewSceneView: NSViewRepresentable {
 
   func updateNSView(_ nsView: SCNView, context: Context) {
     context.coordinator.update(
-      player: player,
       playerItem: playerItem,
       projection: projection,
       layout: layout,
@@ -342,18 +499,29 @@ struct VRPreviewSceneView: NSViewRepresentable {
     )
   }
 
-  final class Coordinator: NSObject {
+  final class Coordinator: NSObject, SCNSceneRendererDelegate {
     private let scene = SCNScene()
     private let cameraNode = SCNNode()
     private let videoNode = SCNNode()
     private weak var displayedItem: AVPlayerItem?
-    private var videoScene: SKScene?
-    private var spriteVideoNode: SKVideoNode?
+    private var videoOutput: AVPlayerItemVideoOutput?
+    private var textureCache: CVMetalTextureCache?
+    private var currentPixelBuffer: CVPixelBuffer?
+    private var currentVideoTexture: CVMetalTexture?
     private var currentProjection: PreviewProjectionMode = .vr180
     private var currentLayout: PreviewVideoLayout = .sbs
     private var currentEye: PreviewEye = .left
     private var yaw: CGFloat = 0
     private var pitch: CGFloat = 0
+
+    deinit {
+      if let displayedItem, let videoOutput {
+        displayedItem.remove(videoOutput)
+      }
+      if let textureCache {
+        CVMetalTextureCacheFlush(textureCache, 0)
+      }
+    }
 
     func makeView() -> SCNView {
       let view = SCNView(
@@ -366,6 +534,16 @@ struct VRPreviewSceneView: NSViewRepresentable {
       view.rendersContinuously = true
       view.isPlaying = true
       view.preferredFramesPerSecond = 60
+      view.antialiasingMode = .none
+      view.delegate = self
+      if let device = view.device ?? MTLCreateSystemDefaultDevice() {
+        var cache: CVMetalTextureCache?
+        if CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache)
+          == kCVReturnSuccess
+        {
+          textureCache = cache
+        }
+      }
 
       cameraNode.camera = SCNCamera()
       cameraNode.camera?.fieldOfView = 60
@@ -382,7 +560,6 @@ struct VRPreviewSceneView: NSViewRepresentable {
     }
 
     func update(
-      player: AVPlayer,
       playerItem: AVPlayerItem?,
       projection: PreviewProjectionMode,
       layout: PreviewVideoLayout,
@@ -397,7 +574,7 @@ struct VRPreviewSceneView: NSViewRepresentable {
       if geometryChanged {
         rebuildGeometry()
       }
-      attachVideoSceneIfNeeded(player: player, item: playerItem)
+      attachVideoOutputIfNeeded(to: playerItem)
     }
 
     private func rebuildGeometry() {
@@ -414,31 +591,67 @@ struct VRPreviewSceneView: NSViewRepresentable {
       material.diffuse.magnificationFilter = .linear
       material.diffuse.mipFilter = .none
       videoNode.geometry?.materials = [material]
-      if let videoScene {
-        material.diffuse.contents = videoScene
+      if let currentVideoTexture, let metalTexture = CVMetalTextureGetTexture(currentVideoTexture) {
+        material.diffuse.contents = metalTexture
       }
     }
 
-    private func attachVideoSceneIfNeeded(player: AVPlayer, item: AVPlayerItem?) {
+    private func attachVideoOutputIfNeeded(to item: AVPlayerItem?) {
       guard displayedItem !== item else { return }
+      if let displayedItem, let videoOutput {
+        displayedItem.remove(videoOutput)
+      }
       displayedItem = item
-      spriteVideoNode?.removeFromParent()
-      spriteVideoNode = nil
-      videoScene = nil
+      videoOutput = nil
+      currentPixelBuffer = nil
+      currentVideoTexture = nil
       videoNode.geometry?.firstMaterial?.diffuse.contents = NSColor.black
-      guard item != nil else { return }
-      let skScene = SKScene(size: CGSize(width: 2048, height: 1024))
-      skScene.backgroundColor = .black
-      skScene.scaleMode = .aspectFill
-      let skVideoNode = SKVideoNode(avPlayer: player)
-      skVideoNode.position = CGPoint(x: skScene.size.width / 2, y: skScene.size.height / 2)
-      skVideoNode.size = skScene.size
-      // SpriteKit and SceneKit use opposite vertical texture origins.
-      skVideoNode.yScale = -1
-      skScene.addChild(skVideoNode)
-      videoScene = skScene
-      spriteVideoNode = skVideoNode
-      videoNode.geometry?.firstMaterial?.diffuse.contents = skScene
+      guard let item else { return }
+      let attributes: [String: Any] = [
+        kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+        kCVPixelBufferMetalCompatibilityKey as String: true,
+      ]
+      let output = AVPlayerItemVideoOutput(pixelBufferAttributes: attributes)
+      item.add(output)
+      output.requestNotificationOfMediaDataChange(withAdvanceInterval: 1.0 / 60.0)
+      videoOutput = output
+    }
+
+    func renderer(_ renderer: any SCNSceneRenderer, updateAtTime time: TimeInterval) {
+      guard let videoOutput, let textureCache else { return }
+      let itemTime = videoOutput.itemTime(forHostTime: CACurrentMediaTime())
+      guard videoOutput.hasNewPixelBuffer(forItemTime: itemTime),
+        let pixelBuffer = videoOutput.copyPixelBuffer(
+          forItemTime: itemTime,
+          itemTimeForDisplay: nil
+        )
+      else {
+        return
+      }
+
+      let width = CVPixelBufferGetWidth(pixelBuffer)
+      let height = CVPixelBufferGetHeight(pixelBuffer)
+      var videoTexture: CVMetalTexture?
+      let status = CVMetalTextureCacheCreateTextureFromImage(
+        kCFAllocatorDefault,
+        textureCache,
+        pixelBuffer,
+        nil,
+        .bgra8Unorm_srgb,
+        width,
+        height,
+        0,
+        &videoTexture
+      )
+      guard status == kCVReturnSuccess, let videoTexture,
+        let metalTexture = CVMetalTextureGetTexture(videoTexture)
+      else {
+        return
+      }
+
+      currentPixelBuffer = pixelBuffer
+      currentVideoTexture = videoTexture
+      videoNode.geometry?.firstMaterial?.diffuse.contents = metalTexture
     }
 
     @objc private func handlePan(_ gesture: NSPanGestureRecognizer) {
@@ -491,7 +704,7 @@ final class RealtimePlayerController: ObservableObject {
   private var timeObserver: Any?
   private var sourceItemStatusObservation: NSKeyValueObservation?
   private var sourceTimeControlObservation: NSKeyValueObservation?
-  private var sourceResourceLoader: HEV1VirtualResourceLoader?
+  private var sourceResourceLoader: HEV1LoopbackServer?
   private var sessionDirectory: URL?
   private var requestedStartSeconds = 0.0
   private var shouldPlay = true
@@ -837,7 +1050,6 @@ final class RealtimePlayerController: ObservableObject {
     let durationTime = try await source.load(.duration)
     let durationSeconds = CMTimeGetSeconds(durationTime)
     let duration = durationSeconds.isFinite ? max(0, durationSeconds) : 0
-
     if try await source.load(.isPlayable) {
       return PreparedSourcePlayerItem(
         item: AVPlayerItem(asset: source),
@@ -847,10 +1059,10 @@ final class RealtimePlayerController: ObservableObject {
     }
 
     // HEV1 8K files may contain perfectly decodable samples while AVFoundation
-    // rejects the MP4 sample-entry identifier.  The resource loader exposes the
-    // original file byte-for-byte except for hev1 -> hvc1 inside the moov atom.
-    // This preserves random access without modifying, copying, or remuxing the file.
-    let resourceLoader = try HEV1VirtualResourceLoader(sourceURL: input)
+    // rejects the MP4 sample-entry identifier.  A loopback byte-range server
+    // exposes the original file byte-for-byte except for hev1 -> hvc1 inside the
+    // moov atom. This preserves random access without modifying or copying it.
+    let resourceLoader = try HEV1LoopbackServer(sourceURL: input)
     let compatibleAsset = resourceLoader.makeAsset()
     return PreparedSourcePlayerItem(
       item: AVPlayerItem(asset: compatibleAsset),
@@ -1187,9 +1399,6 @@ struct RealtimePlayerView: View {
             .opacity(controller.showOriginal ? 0.001 : 1)
         } else {
           VRPreviewSceneView(
-            player: controller.sourceOnlyPlayback || controller.showOriginal
-              ? controller.sourcePlayer
-              : controller.restoredPlayer,
             playerItem: controller.sourceOnlyPlayback || controller.showOriginal
               ? controller.sourcePlayer.currentItem
               : controller.restoredPlayer.currentItem,
