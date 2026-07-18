@@ -53,8 +53,9 @@ xcrun swiftc \
   -framework SwiftUI \
   -framework AVFoundation \
   -framework AVKit \
+  -framework Metal \
+  -framework Network \
   -framework SceneKit \
-  -framework SpriteKit \
   "${APP_SWIFT_FLAGS[@]}" \
   "$PACKAGE_DIR/MiohApp.swift" \
   "$PACKAGE_DIR/RealtimePlayer.swift" \
