@@ -24,13 +24,16 @@ def parse_args(argv=None):
     input.add_argument('--input', type=Path, nargs='+', required=True,
                        help="one or more video files/directories containing uncensored source videos")
     input.add_argument('--start-index', type=int, default=0, help="Can be used to continue a previous run. Note the index number next to last processed file name")
-    input.add_argument('--stride-length', default=0, type=int, help="skip frames in between long videos to prevent sampling too many scenes from a single file. value is in seconds")
+    input.add_argument('--stride-length', default=0, type=int,
+                       help="adaptive scan interval in seconds: probe the end of each interval and fully scan the preceding interval only when the crop meets --min-crop-size; 0 scans every frame")
     input.add_argument('--skip-4k', default=True, action=argparse.BooleanOptionalAction, help="skip videos of 4K resolution or higher. Processing those will use a lot of RAM")
 
 
     output = parser.add_argument_group('Output')
     output.add_argument('--output-root', type=Path, default='video_dataset', help="path to directory where dataset should be stored")
     output.add_argument('--out-size', type=int, default=256, help="size (in pixel) of output images")
+    output.add_argument('--min-crop-size', type=int, default=192,
+                        help="Skip cropped scenes when both source crop dimensions are smaller than this value (default: 192)")
     output.add_argument('--save-uncropped', default=False, action=argparse.BooleanOptionalAction,
                         help="Save uncropped, full-size images and masks")
     output.add_argument('--save-cropped', default=True, action=argparse.BooleanOptionalAction,
@@ -48,15 +51,23 @@ def parse_args(argv=None):
     nsfw_detection.add_argument('--model', type=str, default="model_weights/lada_nsfw_detection_model_v1.3.pt",
                         help="path to NSFW detection model")
     nsfw_detection.add_argument('--model-device', type=str, default="cuda", help="device to run the YOLO model on. E.g. 'cuda' or 'cuda:0'")
+    nsfw_detection.add_argument('--detection-start-confidence', type=float, default=0.6,
+                        help="minimum YOLO confidence for a probe or a new scene to start (default: 0.6)")
+    nsfw_detection.add_argument('--detection-continue-confidence', type=float, default=0.25,
+                        help="minimum YOLO confidence for an already tracked scene to continue (default: 0.25)")
 
     scene_duration_filter = parser.add_argument_group('Scene duration filter')
-    scene_duration_filter.add_argument('--scene-min-length', type=float, default=0.5,
-                        help="minimal length of a scene in number of frames in order to be detected (in seconds)")
+    scene_duration_filter.add_argument('--scene-min-frames', type=int, default=24,
+                        help="minimum number of frames required for a scene (default: 24, matching the training window)")
+    scene_duration_filter.add_argument('--scene-min-length', type=float, default=0,
+                        help="optional additional minimum scene duration in seconds (default: disabled)")
     scene_duration_filter.add_argument('--scene-max-length', type=float, default=8,
                         help="maximum length of a scene in number of frames. Scenes longer than that will be cut (in seconds)")
     scene_duration_filter.add_argument('--scene-max-memory', default=6144, type=int, help="limits maximum scene length based on approximate memory consumption of the scene. Value should be given in Megabytes (MB)")
     scene_duration_filter.add_argument('--scene-continuity-iou', type=float, default=0.2,
                         help="continue a scene across tracker-ID changes when adjacent boxes have at least this IoU (default: 0.2)")
+    scene_duration_filter.add_argument('--scene-gap-frames', type=int, default=3,
+                        help="bridge this many consecutive missed detections by interpolating boxes and masks (default: 3)")
 
     video_quality_evaluation = parser.add_argument_group('Scene video quality evaluation')
     video_quality_evaluation.add_argument('--add-video-quality-metadata', default=True, action=argparse.BooleanOptionalAction, help="If enabled will evaluate video quality and add its results to metadata")
@@ -92,10 +103,22 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if not 0 <= args.scene_continuity_iou <= 1:
         parser.error("--scene-continuity-iou must be between 0 and 1")
-    if args.scene_min_length <= 0:
-        parser.error("--scene-min-length must be greater than 0")
+    if not 0 <= args.detection_continue_confidence <= args.detection_start_confidence <= 1:
+        parser.error("detection confidence values must satisfy 0 <= continue <= start <= 1")
+    if args.scene_min_frames <= 0:
+        parser.error("--scene-min-frames must be greater than 0")
+    if args.scene_min_length < 0:
+        parser.error("--scene-min-length must be zero or greater")
     if args.scene_max_length <= 0:
         parser.error("--scene-max-length must be greater than 0")
+    if args.scene_gap_frames < 0:
+        parser.error("--scene-gap-frames must be zero or greater")
+    if args.stride_length < 0:
+        parser.error("--stride-length must be zero or greater")
+    if args.min_crop_size < 0:
+        parser.error("--min-crop-size must be zero or greater")
+    if args.save_cropped and args.resize_crops and args.out_size < args.min_crop_size:
+        parser.error("--out-size must be at least --min-crop-size when --resize-crops is enabled")
     return args
 
 
@@ -147,13 +170,20 @@ def main():
                                                     scene_max_length=args.scene_max_length,
                                                     scene_max_memory=args.scene_max_memory,
                                                     scene_min_length=args.scene_min_length,
+                                                    scene_min_frames=args.scene_min_frames,
                                                     random_extend_masks=True,
                                                     skip4k=args.skip_4k,
-                                                    scene_continuity_iou=args.scene_continuity_iou)
+                                                    scene_continuity_iou=args.scene_continuity_iou,
+                                                    scene_gap_frames=args.scene_gap_frames,
+                                                    probe_min_crop_size=args.min_crop_size,
+                                                    probe_crop_target_size=args.out_size,
+                                                    detection_start_confidence=args.detection_start_confidence,
+                                                    detection_continue_confidence=args.detection_continue_confidence)
 
     scene_processing_options = SceneProcessingOptions(output_dir=output_dir,
                                                   save_flat=args.flat,
                                                   out_size=args.out_size,
+                                                  min_crop_size=args.min_crop_size,
                                                   save_cropped=args.save_cropped,
                                                   save_uncropped=args.save_uncropped,
                                                   resize_crops=args.resize_crops,

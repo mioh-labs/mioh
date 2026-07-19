@@ -54,6 +54,7 @@ class SceneProcessingOptions:
     output_dir: Path
     save_flat: bool
     out_size: int
+    min_crop_size: int
     save_cropped: bool
     save_uncropped: bool
     resize_crops: bool
@@ -355,6 +356,19 @@ class SceneProcessor:
     def process_scene(self, scene: Scene, output_dir: Path, scene_processing_options: SceneProcessingOptions):
         print("Started processing scene", scene.id)
         cropped_scene = CroppedScene(scene, target_size=(scene_processing_options.out_size,scene_processing_options.out_size), border_size=0.08)
+        if scene_processing_options.save_cropped and not cropped_scene_exceeds_minimum_size(
+            cropped_scene, scene_processing_options.min_crop_size
+        ):
+            cropped_images = cropped_scene.get_images()
+            if cropped_images:
+                min_width = min(image.shape[1] for image in cropped_images)
+                min_height = min(image.shape[0] for image in cropped_images)
+                reason = f"smallest crop is {min_width}x{min_height}"
+            else:
+                reason = "no crop frames were produced"
+            print(f"Skipped scene {scene.id}: {reason}; at least one dimension must be at least "
+                  f"{scene_processing_options.min_crop_size}")
+            return
 
         dataset_item_mosaic_crop_unscaled: Optional[DatasetItem] = None
         dataset_item_mosaic_crop_scaled: Optional[DatasetItem] = None
@@ -512,3 +526,14 @@ class SceneProcessor:
                 io_futures.extend(dataset_item_uncropped.save(output_dir, scene, False, scene_processing_options.save_as_images, scene_processing_options.save_flat,  scene.video_meta_data.video_fps, io_executor))
         wait_until_completed(io_futures)
         print("Finished processing scene", scene.id)
+
+
+def cropped_scene_exceeds_minimum_size(cropped_scene: CroppedScene, minimum_size: int) -> bool:
+    """Return true when every crop meets the minimum on at least one dimension."""
+    if minimum_size <= 0:
+        return True
+    images = cropped_scene.get_images()
+    return bool(images) and all(
+        image.shape[0] >= minimum_size or image.shape[1] >= minimum_size
+        for image in images
+    )
