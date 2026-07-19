@@ -93,9 +93,9 @@ class StandaloneAppOptionTests(unittest.TestCase):
 
         for contract in [
             "@Published var previewInputURL: URL?",
-            "func choosePreviewInput()",
+            "func choosePreviewInput(runner: RestorationRunner)",
             "guard let input = previewInputURL",
-            'PathRow(title: "再生動画"',
+            'title: "再生動画"',
             "controller.previewInputURL == nil",
         ]:
             self.assertIn(contract, player)
@@ -240,6 +240,16 @@ class StandaloneAppOptionTests(unittest.TestCase):
             'Picker("形式", selection: $runner.previewVideoLayout)',
             'Picker("目", selection: $runner.previewEye)',
             'Text("視野角")',
+            "private enum PreviewVRDetector",
+            "static func detect(url: URL) async -> PreviewVRDetection",
+            '"vr180", "vr_180", "vr-180", "180vr", "180_vr", "180-vr", "mdvr"',
+            '"gspherical", "spherical=true", "sv3d", "st3d", "equirectangular"',
+            "@Published var isVRVideo = false",
+            "@Published var isDetectingVR = false",
+            "func choosePreviewInput(runner: RestorationRunner)",
+            "if controller.isVRVideo",
+            "ForEach(PreviewProjectionMode.allCases.filter { $0 != .normal })",
+            "controller.previewInputURL == nil || controller.isDetectingVR",
         ]:
             self.assertIn(contract, player)
 

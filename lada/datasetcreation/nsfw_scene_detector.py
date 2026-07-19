@@ -10,6 +10,7 @@ import concurrent.futures as concurrent_futures
 from dataclasses import dataclass
 from typing import Generator, Optional, Dict
 
+import cv2
 import numpy as np
 import torch
 import ultralytics.models
@@ -36,7 +37,13 @@ class FileProcessingOptions:
     scene_max_memory: int
     random_extend_masks: bool
     skip4k: bool
+    scene_min_frames: int = 24
     scene_continuity_iou: float = 0.2
+    scene_gap_frames: int = 3
+    probe_min_crop_size: int = 192
+    probe_crop_target_size: int = 256
+    detection_start_confidence: float = 0.6
+    detection_continue_confidence: float = 0.25
 
 @dataclass
 class NsfwFrame:
@@ -48,15 +55,22 @@ class NsfwFrame:
     _mask: ultralytics.engine.results.Masks
     object_detected: bool = False
     object_id: int = None
+    confidence: float | None = None
+    interpolated_mask: Optional[Mask] = None
+    interpolated_box: Optional[Box] = None
 
     @property
     def mask(self) -> Mask:
+        if self.interpolated_mask is not None:
+            return self.interpolated_mask
         mask = convert_yolo_mask(self._mask, self.frame.shape)
         # TODO: use mask_utils.clean_mask()
         return mask
 
     @property
     def box(self) -> Box:
+        if self.interpolated_box is not None:
+            return self.interpolated_box
         return convert_yolo_box(self._box, self.frame.shape)
 
 
@@ -73,6 +87,91 @@ def box_iou(box_a: Box, box_b: Box) -> float:
     area_b = max(0, box_b[2] - box_b[0] + 1) * max(0, box_b[3] - box_b[1] + 1)
     union = area_a + area_b - intersection
     return intersection / union if union else 0.0
+
+
+def interpolate_box(box_a: Box, box_b: Box, alpha: float) -> Box:
+    """Linearly interpolate a top/left/bottom/right box."""
+    return tuple(
+        int(round(start + (end - start) * alpha))
+        for start, end in zip(box_a, box_b)
+    )
+
+
+def move_mask_to_box(mask: Mask, source_box: Box, target_box: Box) -> Mask:
+    """Move and resize a detected mask into an interpolated box."""
+    source_top, source_left, source_bottom, source_right = source_box
+    target_top, target_left, target_bottom, target_right = target_box
+    height, width = mask.shape[:2]
+    source_top = min(max(source_top, 0), height - 1)
+    source_bottom = min(max(source_bottom, source_top), height - 1)
+    source_left = min(max(source_left, 0), width - 1)
+    source_right = min(max(source_right, source_left), width - 1)
+    target_top = min(max(target_top, 0), height - 1)
+    target_bottom = min(max(target_bottom, target_top), height - 1)
+    target_left = min(max(target_left, 0), width - 1)
+    target_right = min(max(target_right, target_left), width - 1)
+    source_crop = mask[source_top:source_bottom + 1, source_left:source_right + 1]
+    target_width = target_right - target_left + 1
+    target_height = target_bottom - target_top + 1
+    if source_crop.size == 0 or target_width <= 0 or target_height <= 0:
+        return np.zeros_like(mask)
+    resized = cv2.resize(source_crop, (target_width, target_height), interpolation=cv2.INTER_NEAREST)
+    if resized.ndim == 2:
+        resized = resized[:, :, None]
+    result = np.zeros_like(mask)
+    result[target_top:target_bottom + 1, target_left:target_right + 1] = resized
+    return result
+
+
+def build_probe_windows(frame_count: int, stride_frames: int) -> list[tuple[int, int, int]]:
+    """Return inclusive start/end windows and the probe frame at each window end."""
+    if frame_count <= 0 or stride_frames <= 0:
+        return []
+    windows = []
+    window_start = 0
+    while window_start < frame_count:
+        window_end = min(window_start + stride_frames - 1, frame_count - 1)
+        windows.append((window_start, window_end, window_end))
+        window_start = window_end + 1
+    return windows
+
+
+def merge_adjacent_windows(windows: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge selected probe windows so continuous regions keep one tracker session."""
+    merged = []
+    for window_start, window_end in windows:
+        if merged and window_start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], window_end))
+        else:
+            merged.append((window_start, window_end))
+    return merged
+
+
+def crop_meets_minimum_size(
+    frame: Image,
+    mask: Mask,
+    box: Box,
+    target_size: int,
+    minimum_size: int,
+) -> tuple[bool, tuple[int, int]]:
+    """Evaluate a detection using the same crop expansion used by dataset output."""
+    cropped_frame, _, _, _ = crop_to_box_v3(
+        box,
+        frame,
+        mask,
+        (target_size, target_size),
+        border_size=0.08,
+    )
+    height, width = cropped_frame.shape[:2]
+    return height >= minimum_size or width >= minimum_size, (width, height)
+
+
+def detection_meets_confidence(nsfw_frame: NsfwFrame, minimum_confidence: float) -> bool:
+    return (
+        nsfw_frame.object_detected
+        and nsfw_frame.confidence is not None
+        and nsfw_frame.confidence >= minimum_confidence
+    )
 
 
 class Scene:
@@ -98,8 +197,16 @@ class Scene:
     def max_length_reached(self):
         return len(self) >= self.scene_max_length
 
-    def continues_with(self, nsfw_frame: NsfwFrame, min_iou: float) -> bool:
-        if not self._tmp_data or self.frame_end + 1 != nsfw_frame.frame_number:
+    def continues_with(
+        self,
+        nsfw_frame: NsfwFrame,
+        min_iou: float,
+        max_gap_frames: int = 0,
+    ) -> bool:
+        if not self._tmp_data:
+            return False
+        frame_gap = nsfw_frame.frame_number - self.frame_end - 1
+        if frame_gap < 0 or frame_gap > max_gap_frames:
             return False
         same_tracking_id = (
             self.id is not None
@@ -109,6 +216,29 @@ class Scene:
         if same_tracking_id:
             return True
         return box_iou(self._tmp_data[-1].box, nsfw_frame.box) >= min_iou
+
+    def add_interpolated_gap(self, gap_frames: list[NsfwFrame], next_frame: NsfwFrame):
+        """Bridge missed detections using the surrounding masks and boxes."""
+        if not gap_frames:
+            return
+        if len(self) + len(gap_frames) >= self.scene_max_length:
+            raise ValueError("interpolated gap would exceed complete scene")
+        previous_frame = self._tmp_data[-1]
+        previous_box = previous_frame.box
+        next_box = next_frame.box
+        previous_mask = previous_frame.mask
+        next_mask = next_frame.mask
+        denominator = len(gap_frames) + 1
+        for index, gap_frame in enumerate(gap_frames, start=1):
+            alpha = index / denominator
+            target_box = interpolate_box(previous_box, next_box, alpha)
+            if alpha <= 0.5:
+                source_mask, source_box = previous_mask, previous_box
+            else:
+                source_mask, source_box = next_mask, next_box
+            gap_frame.interpolated_box = target_box
+            gap_frame.interpolated_mask = move_mask_to_box(source_mask, source_box, target_box)
+            self.add_frame(gap_frame)
 
     def add_frame(self, nsfw_frame: NsfwFrame):
         if self.max_length_reached():
@@ -332,6 +462,15 @@ def determine_max_scene_length(video_metadata: VideoMetadata, limit_seconds: int
         scene_max_length = min(scene_max_length, scene_max_length_memory) if scene_max_length else scene_max_length_memory
     return scene_max_length
 
+
+def determine_min_scene_frames(
+    video_metadata: VideoMetadata,
+    minimum_frames: int,
+    minimum_seconds: float | None,
+) -> int:
+    seconds_frames = math.ceil((minimum_seconds or 0) * video_metadata.video_fps)
+    return max(minimum_frames, seconds_frames)
+
 def apply_random_mask_extensions(scene: Scene):
     value = np.random.choice([0, 0, 1, 1, 2])
     worker_count = 6
@@ -396,10 +535,8 @@ class NsfwDetector:
 
     def _process_completed_scene(self, completed_scene: Scene) -> Optional[Scene]:
         """returns Scene if it fits the criteria for a valid completed scene like min/max length"""
-        # todo: implementing video strides / discarding frames here is inefficient as we still pass every frame through YOLO / nsfw frames generator.
-        #  We'd need to read and pass only the frames we want to be processed to YOLO instead of passing the video file.
         video_file = completed_scene.video_meta_data.video_file
-        skip_scene = not (completed_scene.min_length_reached() and (self.previous_completed_scene_frame_end[video_file] is None or (completed_scene.frame_start - self.previous_completed_scene_frame_end[video_file]) > self.stride_length_frames))
+        skip_scene = not completed_scene.min_length_reached()
         if skip_scene:
             return None
         completed_scene.complete()
@@ -413,7 +550,11 @@ class NsfwDetector:
     def _init_new_file(self, metadata: VideoMetadata):
         file_path = metadata.video_file
         self.metadata[file_path] = metadata
-        self.scene_min_length =  math.ceil(self.file_processing_options.scene_min_length * metadata.video_fps)
+        self.scene_min_length = determine_min_scene_frames(
+            metadata,
+            self.file_processing_options.scene_min_frames,
+            self.file_processing_options.scene_min_length,
+        )
         scene_max_length = determine_max_scene_length (metadata, self.file_processing_options.scene_max_length, self.file_processing_options.scene_max_memory)
         self.scene_max_length = math.ceil(scene_max_length * metadata.video_fps)
         self.stride_length_frames = math.ceil(self.file_processing_options.stride_length * metadata.video_fps)
@@ -433,7 +574,13 @@ class NsfwDetector:
             print(f"{file_index}, Skipping {file_name}: 4K")
             return None
         scene_max_length = determine_max_scene_length (video_metadata, self.file_processing_options.scene_max_length, self.file_processing_options.scene_max_memory)
-        if scene_max_length < self.file_processing_options.scene_min_length:
+        scene_max_frames = math.ceil(scene_max_length * video_metadata.video_fps)
+        scene_min_frames = determine_min_scene_frames(
+            video_metadata,
+            self.file_processing_options.scene_min_frames,
+            self.file_processing_options.scene_min_length,
+        )
+        if scene_max_frames < scene_min_frames:
             print(f"{file_index}, Skipping {file_name}: Scene maximum length is less than minimum length")
             return None
         return video_metadata
@@ -460,28 +607,159 @@ class NsfwDetector:
                 continue
             if video_file_path not in self.metadata:
                 self._init_new_file(video_metadata)
-            nsfw_frame = None
             print(f"{video_file_index}, Processing {pathlib.Path(video_file_path).name}")
-            for frame_num, results in enumerate(self.nsfw_detection_model.track(source=video_metadata.video_file, stream=True, verbose=False, tracker="bytetrack.yaml", device=self.device)):
+            if self.stride_length_frames > 0:
+                frame_iterator = self._adaptive_frame_iterator(video_metadata)
+            else:
+                frame_iterator = self._full_frame_iterator(video_metadata)
+
+            nsfw_frame = None
+            for nsfw_frame in frame_iterator:
                 if nsfw_frame:
                     self.frame_queue.put(nsfw_frame)
-                    if self.stop_requested:
-                        logger.debug("NsfwDetector: frame detector worker: frame_queue producer unblocked")
-                    if self.stop_requested:
-                        break
-                # Keep detections without a ByteTrack ID as candidates. Scene
-                # continuity is decided below using both tracking ID and box IoU.
-                yolo_box, yolo_mask = choose_biggest_detection(results, tracking_mode=False)
-                object_detected = yolo_box is not None
-                tracking_id = (
-                    int(yolo_box.id.item())
-                    if object_detected and yolo_box.id is not None
-                    else None
+                if self.stop_requested:
+                    logger.debug("NsfwDetector: frame detector worker: frame_queue producer unblocked")
+                    break
+            if nsfw_frame is None and not self.stop_requested:
+                # Even a file without a selected full-scan window must reach the
+                # scene worker so it can be marked as processed.
+                frame = np.zeros((1, 1, 3), dtype=np.uint8)
+                nsfw_frame = NsfwFrame(
+                    video_metadata,
+                    max(video_metadata.frames_count - 1, 0),
+                    True,
+                    frame,
+                    None,
+                    None,
+                    False,
+                    None,
                 )
-                nsfw_frame = NsfwFrame(video_metadata, frame_num, False, results.orig_img, yolo_box, yolo_mask, object_detected, tracking_id)
-            if nsfw_frame and not self.stop_requested:
-                nsfw_frame.last_frame = True
                 self.frame_queue.put(nsfw_frame)
+
+    @staticmethod
+    def _result_to_nsfw_frame(video_metadata: VideoMetadata, frame_number: int, result) -> NsfwFrame:
+        # Keep detections without a ByteTrack ID as candidates. Scene
+        # continuity is decided using both tracking ID and box IoU.
+        yolo_box, yolo_mask = choose_biggest_detection(result, tracking_mode=False)
+        object_detected = yolo_box is not None
+        tracking_id = (
+            int(yolo_box.id.item())
+            if object_detected and yolo_box.id is not None
+            else None
+        )
+        confidence = float(yolo_box.conf[0].item()) if object_detected else None
+        return NsfwFrame(
+            video_metadata,
+            frame_number,
+            False,
+            result.orig_img,
+            yolo_box,
+            yolo_mask,
+            object_detected,
+            tracking_id,
+            confidence,
+        )
+
+    def _full_frame_iterator(self, video_metadata: VideoMetadata) -> Generator[NsfwFrame, None, None]:
+        previous_frame = None
+        for frame_number, result in enumerate(self.nsfw_detection_model.track(
+            source=video_metadata.video_file,
+            stream=True,
+            verbose=False,
+            tracker="bytetrack.yaml",
+            device=self.device,
+            conf=self.file_processing_options.detection_continue_confidence,
+        )):
+            current_frame = self._result_to_nsfw_frame(video_metadata, frame_number, result)
+            if previous_frame is not None:
+                yield previous_frame
+            previous_frame = current_frame
+        if previous_frame is not None:
+            previous_frame.last_frame = True
+            yield previous_frame
+
+    def _reset_yolo_trackers(self):
+        predictor = getattr(self.nsfw_detection_model, "predictor", None)
+        for tracker in getattr(predictor, "trackers", ()):
+            tracker.reset()
+
+    def _probe_window(self, capture: cv2.VideoCapture, video_metadata: VideoMetadata, window: tuple[int, int, int]):
+        window_start, window_end, probe_frame_number = window
+        capture.set(cv2.CAP_PROP_POS_FRAMES, probe_frame_number)
+        success, frame = capture.read()
+        if not success:
+            print(f"  Probe {probe_frame_number}: decode failed, scanning window as a precaution")
+            return window_start, window_end
+
+        results = self.nsfw_detection_model.predict(
+            source=frame,
+            verbose=False,
+            device=self.device,
+            conf=self.file_processing_options.detection_start_confidence,
+        )
+        probe = self._result_to_nsfw_frame(video_metadata, probe_frame_number, results[0])
+        if not probe.object_detected:
+            print(f"  Probe {probe_frame_number}: no detection, skipping window")
+            return None
+
+        meets_minimum, (crop_width, crop_height) = crop_meets_minimum_size(
+            probe.frame,
+            probe.mask,
+            probe.box,
+            self.file_processing_options.probe_crop_target_size,
+            self.file_processing_options.probe_min_crop_size,
+        )
+        if not meets_minimum:
+            print(f"  Probe {probe_frame_number}: crop {crop_width}x{crop_height}, skipping window")
+            return None
+        print(
+            f"  Probe {probe_frame_number}: crop {crop_width}x{crop_height}, "
+            f"full scan {window_start}-{window_end}"
+        )
+        return window_start, window_end
+
+    def _adaptive_frame_iterator(self, video_metadata: VideoMetadata) -> Generator[NsfwFrame, None, None]:
+        windows = build_probe_windows(video_metadata.frames_count, self.stride_length_frames)
+        print(
+            f"  Adaptive scan: one probe every {self.file_processing_options.stride_length:g}s; "
+            f"full scan when crop has a dimension >= {self.file_processing_options.probe_min_crop_size}px"
+        )
+        with video_utils.VideoReaderOpenCV(video_metadata.video_file) as capture:
+            selected_windows = []
+            for window in windows:
+                if self.stop_requested:
+                    return
+                selected_window = self._probe_window(capture, video_metadata, window)
+                if selected_window is not None:
+                    selected_windows.append(selected_window)
+
+            previous_frame = None
+            for window_start, window_end in merge_adjacent_windows(selected_windows):
+                if self.stop_requested:
+                    return
+                self._reset_yolo_trackers()
+                capture.set(cv2.CAP_PROP_POS_FRAMES, window_start)
+                for frame_number in range(window_start, window_end + 1):
+                    success, frame = capture.read()
+                    if not success:
+                        logger.warning("Unable to decode frame %d from %s", frame_number, video_metadata.video_file)
+                        break
+                    results = self.nsfw_detection_model.track(
+                        source=frame,
+                        persist=True,
+                        verbose=False,
+                        tracker="bytetrack.yaml",
+                        device=self.device,
+                        conf=self.file_processing_options.detection_continue_confidence,
+                    )
+                    current_frame = self._result_to_nsfw_frame(video_metadata, frame_number, results[0])
+                    if previous_frame is not None:
+                        yield previous_frame
+                    previous_frame = current_frame
+
+            if previous_frame is not None:
+                previous_frame.last_frame = True
+                yield previous_frame
                 if self.stop_requested:
                     logger.debug("NsfwDetector: frame detector worker: frame_queue producer unblocked")
 
@@ -492,6 +770,7 @@ class NsfwDetector:
         nsfw_frame: NsfwFrame
         previous_file: str = None
         previous_file_no_completed_scenes = True
+        pending_gap_frames: list[NsfwFrame] = []
 
         while self.scene_detector_thread_should_be_running:
             nsfw_frame: NsfwFrame | None = self.frame_queue.get()
@@ -513,25 +792,61 @@ class NsfwDetector:
                     self._mark_file_as_processed(self.no_nsfw_scenes_found_file, previous_file)
                 previous_file = nsfw_frame.video_metadata.video_file
                 previous_file_no_completed_scenes = True
+                pending_gap_frames = []
 
-            if nsfw_frame.object_detected:
-                if scene is None:
+            can_start_scene = detection_meets_confidence(
+                nsfw_frame,
+                self.file_processing_options.detection_start_confidence,
+            )
+            can_continue_scene = detection_meets_confidence(
+                nsfw_frame,
+                self.file_processing_options.detection_continue_confidence,
+            )
+
+            if scene is None:
+                if can_start_scene:
                     scene = Scene(nsfw_frame.video_metadata, nsfw_frame.object_id, self.scene_min_length, self.scene_max_length)
                     scene.add_frame(nsfw_frame)
+                pending_gap_frames = []
+            elif can_continue_scene:
+                required_frames = len(pending_gap_frames) + 1
+                can_fit = len(scene) + required_frames <= scene.scene_max_length
+                continues_same_scene = scene.continues_with(
+                    nsfw_frame,
+                    self.file_processing_options.scene_continuity_iou,
+                    max_gap_frames=self.file_processing_options.scene_gap_frames,
+                )
+                if continues_same_scene and can_fit:
+                    scene.add_interpolated_gap(pending_gap_frames, nsfw_frame)
+                    scene.add_frame(nsfw_frame)
                 else:
-                    if scene.continues_with(nsfw_frame, self.file_processing_options.scene_continuity_iou) and not scene.max_length_reached():
-                        scene.add_frame(nsfw_frame)
-                    else:
-                        completed_scene = self._process_completed_scene(scene)
-                        if completed_scene:
-                            previous_file_no_completed_scenes = False
-                            self.scene_queue.put(completed_scene)
-                            if self.stop_requested:
-                                logger.debug("NsfwDetector: frame detector worker: scene_queue producer unblocked")
+                    completed_scene = self._process_completed_scene(scene)
+                    if completed_scene:
+                        previous_file_no_completed_scenes = False
+                        self.scene_queue.put(completed_scene)
+                        if self.stop_requested:
+                            logger.debug("NsfwDetector: frame detector worker: scene_queue producer unblocked")
+                    scene = None
+                    if can_start_scene:
                         scene = Scene(nsfw_frame.video_metadata, nsfw_frame.object_id, self.scene_min_length, self.scene_max_length)
                         scene.add_frame(nsfw_frame)
+                pending_gap_frames = []
+            elif not nsfw_frame.last_frame:
+                pending_gap_frames.append(nsfw_frame)
+                if (
+                    len(pending_gap_frames) > self.file_processing_options.scene_gap_frames
+                    or scene.max_length_reached()
+                ):
+                    completed_scene = self._process_completed_scene(scene)
+                    if completed_scene:
+                        previous_file_no_completed_scenes = False
+                        self.scene_queue.put(completed_scene)
+                        if self.stop_requested:
+                            logger.debug("NsfwDetector: frame detector worker: scene_queue producer unblocked")
+                    scene = None
+                    pending_gap_frames = []
 
-            if scene is not None and (nsfw_frame.last_frame or not nsfw_frame.object_detected):
+            if scene is not None and nsfw_frame.last_frame:
                 completed_scene = self._process_completed_scene(scene)
                 if completed_scene and not self.stop_requested:
                     previous_file_no_completed_scenes = False
@@ -539,6 +854,7 @@ class NsfwDetector:
                     if self.stop_requested:
                         logger.debug("NsfwDetector: frame detector worker: scene_queue producer unblocked")
                 scene = None
+                pending_gap_frames = []
 
             if nsfw_frame.last_frame:
                 self._mark_file_as_processed(self.done_processing_file, nsfw_frame.video_metadata.video_file)

@@ -32,6 +32,96 @@ enum PreviewEye: String, CaseIterable, Identifiable {
   var id: String { rawValue }
 }
 
+private struct PreviewVRDetection {
+  let projection: PreviewProjectionMode
+  let layout: PreviewVideoLayout
+  let reason: String
+
+  var isVR: Bool { projection != .normal }
+}
+
+private enum PreviewVRDetector {
+  static func detect(url: URL) async -> PreviewVRDetection {
+    let path = url.path.lowercased()
+    let asset = AVURLAsset(url: url)
+    var metadataText = ""
+    if let metadata = try? await asset.load(.metadata) {
+      for item in metadata {
+        if let identifier = item.identifier?.rawValue {
+          metadataText += " " + identifier.lowercased()
+        }
+        if let key = item.commonKey?.rawValue {
+          metadataText += " " + key.lowercased()
+        }
+        if let value = try? await item.load(.stringValue) {
+          metadataText += " " + value.lowercased()
+        }
+      }
+    }
+    let containerText = await Task.detached(priority: .utility) {
+      readContainerSignature(url: url)
+    }.value
+    let evidence = path + " " + metadataText + " " + containerText
+
+    var width = 0.0
+    var height = 0.0
+    if let track = try? await asset.loadTracks(withMediaType: .video).first,
+       let naturalSize = try? await track.load(.naturalSize) {
+      let transform = (try? await track.load(.preferredTransform)) ?? .identity
+      let transformed = naturalSize.applying(transform)
+      width = abs(transformed.width)
+      height = abs(transformed.height)
+    }
+    let aspect = height > 0 ? width / height : 0
+    let isWideVRShape = aspect >= 1.8 && aspect <= 2.2
+
+    let has360Hint = containsAny(evidence, [
+      "vr360", "360vr", "360_vr", "360-vr", "spherical=true",
+      "sphericalvideo", "projectiontype=equirectangular", "projection_type=equirectangular",
+    ])
+    let has180Hint = containsAny(evidence, [
+      "vr180", "vr_180", "vr-180", "180vr", "180_vr", "180-vr", "mdvr",
+    ])
+    let hasSphericalMetadata = containsAny(metadataText + " " + containerText, [
+      "gspherical", "spherical=true", "sv3d", "st3d", "equirectangular",
+    ])
+    let topBottom = containsAny(evidence, [
+      "top-bottom", "top_bottom", "topbottom", "over-under", "over_under",
+    ])
+    let explicitSBS = containsAny(evidence, [
+      "left-right", "left_right", "side-by-side", "side_by_side", "stereo_mode=sbs", " sbs ",
+    ])
+    let layout: PreviewVideoLayout = topBottom ? .topBottom : ((explicitSBS || isWideVRShape) ? .sbs : .mono)
+
+    if has180Hint {
+      return PreviewVRDetection(projection: .vr180, layout: layout, reason: "VR180情報を検出")
+    }
+    if has360Hint || hasSphericalMetadata {
+      return PreviewVRDetection(projection: .sphere360, layout: layout, reason: "全天球メタデータを検出")
+    }
+    return PreviewVRDetection(projection: .normal, layout: .mono, reason: "通常動画")
+  }
+
+  private static func containsAny(_ value: String, _ candidates: [String]) -> Bool {
+    candidates.contains { value.contains($0) }
+  }
+
+  private static func readContainerSignature(url: URL) -> String {
+    guard let handle = try? FileHandle(forReadingFrom: url) else { return "" }
+    defer { try? handle.close() }
+    let sampleSize = 8 * 1024 * 1024
+    var data = (try? handle.read(upToCount: sampleSize)) ?? Data()
+    if let size = try? handle.seekToEnd(), size > UInt64(sampleSize) {
+      let tailSize = UInt64(min(sampleSize, Int(size)))
+      try? handle.seek(toOffset: size - tailSize)
+      if let tail = try? handle.read(upToCount: Int(tailSize)) {
+        data.append(tail)
+      }
+    }
+    return String(decoding: data, as: UTF8.self).lowercased()
+  }
+}
+
 enum RealtimePlayerState: String {
   case idle
   case loading
@@ -684,6 +774,9 @@ final class RealtimePlayerController: ObservableObject {
   @Published var errorMessage = ""
   @Published var playbackDetail = ""
   @Published var sourceOnlyPlayback = false
+  @Published var isVRVideo = false
+  @Published var isDetectingVR = false
+  @Published var vrDetectionDetail = ""
 
   let sourcePlayer = AVPlayer()
   let restoredPlayer = AVQueuePlayer()
@@ -928,7 +1021,7 @@ final class RealtimePlayerController: ObservableObject {
     }
   }
 
-  func choosePreviewInput() {
+  func choosePreviewInput(runner: RestorationRunner) {
     let panel = NSOpenPanel()
     panel.title = "再生動画を選択"
     panel.canChooseFiles = true
@@ -942,6 +1035,23 @@ final class RealtimePlayerController: ObservableObject {
     errorMessage = ""
     playbackDetail = ""
     sourcePlayer.replaceCurrentItem(with: nil)
+    isVRVideo = false
+    isDetectingVR = true
+    vrDetectionDetail = "VR形式を確認中"
+    runner.previewProjectionMode = PreviewProjectionMode.normal.rawValue
+    Task { [weak self] in
+      let detection = await PreviewVRDetector.detect(url: url)
+      guard let self, self.previewInputURL == url else { return }
+      self.isVRVideo = detection.isVR
+      self.isDetectingVR = false
+      self.vrDetectionDetail = detection.reason
+      self.runner = runner
+      runner.previewProjectionMode = detection.projection.rawValue
+      runner.previewVideoLayout = detection.layout.rawValue
+      if detection.isVR {
+        runner.previewEye = PreviewEye.left.rawValue
+      }
+    }
   }
 
   func seek(to seconds: Double) {
@@ -1388,7 +1498,12 @@ struct RealtimePlayerView: View {
 
   var body: some View {
     VStack(spacing: 12) {
-      PathRow(title: "再生動画", icon: "film", url: controller.previewInputURL, action: controller.choosePreviewInput)
+      PathRow(
+        title: "再生動画",
+        icon: "film",
+        url: controller.previewInputURL,
+        action: { controller.choosePreviewInput(runner: runner) }
+      )
 
       ZStack {
         Color.black
@@ -1458,38 +1573,47 @@ struct RealtimePlayerView: View {
         Spacer()
       }
 
-      HStack(spacing: 12) {
-        Picker("表示", selection: $runner.previewProjectionMode) {
-          ForEach(PreviewProjectionMode.allCases) { mode in
-            Text(mode.rawValue).tag(mode.rawValue)
+      if controller.isVRVideo {
+        HStack(spacing: 12) {
+          Picker("表示", selection: $runner.previewProjectionMode) {
+            ForEach(PreviewProjectionMode.allCases.filter { $0 != .normal }) { mode in
+              Text(mode.rawValue).tag(mode.rawValue)
+            }
           }
-        }
-        .frame(width: 150)
-        Picker("形式", selection: $runner.previewVideoLayout) {
-          ForEach(PreviewVideoLayout.allCases) { layout in
-            Text(layout.rawValue).tag(layout.rawValue)
+          .frame(width: 150)
+          Picker("形式", selection: $runner.previewVideoLayout) {
+            ForEach(PreviewVideoLayout.allCases) { layout in
+              Text(layout.rawValue).tag(layout.rawValue)
+            }
           }
-        }
-        .frame(width: 140)
-        Picker("目", selection: $runner.previewEye) {
-          ForEach(PreviewEye.allCases) { eye in
-            Text(eye.rawValue).tag(eye.rawValue)
+          .frame(width: 140)
+          Picker("目", selection: $runner.previewEye) {
+            ForEach(PreviewEye.allCases) { eye in
+              Text(eye.rawValue).tag(eye.rawValue)
+            }
           }
+          .frame(width: 110)
+          Text("視野角")
+          Slider(value: $runner.previewCameraFOV, in: 45...105, step: 1)
+            .frame(maxWidth: 220)
+          Text("\(Int(runner.previewCameraFOV))°")
+            .font(.caption.monospacedDigit())
+            .frame(width: 44, alignment: .trailing)
+          Spacer()
         }
-        .frame(width: 110)
-        Text("視野角")
-        Slider(value: $runner.previewCameraFOV, in: 45...105, step: 1)
-          .frame(maxWidth: 220)
-        Text("\(Int(runner.previewCameraFOV))°")
-          .font(.caption.monospacedDigit())
-          .frame(width: 44, alignment: .trailing)
-        Spacer()
+      } else if controller.isDetectingVR {
+        HStack(spacing: 8) {
+          ProgressView().controlSize(.small)
+          Text(controller.vrDetectionDetail).font(.caption).foregroundStyle(.secondary)
+          Spacer()
+        }
       }
 
       HStack(spacing: 12) {
         if controller.state == .idle || controller.state == .ended || controller.state == .failed {
           Button { controller.start(runner: runner) } label: { Label("再生", systemImage: "play.fill") }
-            .buttonStyle(.borderedProminent).disabled(controller.previewInputURL == nil)
+            .buttonStyle(.borderedProminent)
+            .disabled(controller.previewInputURL == nil || controller.isDetectingVR)
         } else if controller.state == .playing {
           Button(action: controller.togglePlayback) { Label("一時停止", systemImage: "pause.fill") }
         } else {
