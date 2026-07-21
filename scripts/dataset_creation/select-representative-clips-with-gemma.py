@@ -12,10 +12,12 @@ from lada.datasetcreation.gemma_representative_selector import (
     CLASSIFIER_VERSION,
     build_representative_prompt,
     collect_dataset_clips,
+    limit_representatives_with_diversity,
     materialize_representative_dataset,
     remove_legacy_flat_representative_links,
     select_representatives,
     split_representatives_by_source,
+    split_targets_from_training_count,
 )
 from lada.datasetcreation.gemma_video_selector import (
     DEFAULT_API_URL,
@@ -57,6 +59,9 @@ def parse_args(argv=None):
                         help="maximum representatives from one original source video; 0 disables")
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--validation-ratio", type=float, default=0.1)
+    parser.add_argument("--target-train-clips", type=int, default=0,
+                        help="keep exactly this many training clips and cap validation/test "
+                             "to the requested split ratios; 0 disables")
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--max-clips", type=int, default=0, help="0 means no limit")
@@ -79,7 +84,7 @@ def parse_args(argv=None):
         parser.error("similarity and confidence must be between 0 and 1")
     if args.train_ratio <= 0 or args.validation_ratio < 0 or args.train_ratio + args.validation_ratio > 1:
         parser.error("invalid train/validation/test ratios")
-    if args.start_index < 0 or args.max_clips < 0:
+    if args.start_index < 0 or args.max_clips < 0 or args.target_train_clips < 0:
         parser.error("indices and limits cannot be negative")
     return args
 
@@ -172,6 +177,30 @@ def main(argv=None) -> int:
         validation_ratio=args.validation_ratio,
         seed=args.split_seed,
     )
+    available_split_clips = {name: len(values) for name, values in splits.items()}
+    target_split_clips = {"train": 0, "validation": 0, "test": 0}
+    if args.target_train_clips:
+        target_split_clips = split_targets_from_training_count(
+            args.target_train_clips, args.train_ratio, args.validation_ratio
+        )
+        shortages = {
+            name: target - available_split_clips[name]
+            for name, target in target_split_clips.items()
+            if available_split_clips[name] < target
+        }
+        if shortages:
+            details = ", ".join(
+                f"{name}: need {target_split_clips[name]}, have {available_split_clips[name]}"
+                for name in shortages
+            )
+            raise RuntimeError(
+                f"not enough selected clips for the requested split ({details}); "
+                "classify more candidates or relax the selection/source-cap settings"
+            )
+        for split_name, target in target_split_clips.items():
+            splits[split_name] = limit_representatives_with_diversity(
+                splits[split_name], classifications, target
+            )
     summary_path = args.summary or args.output.with_name(f"{args.output.stem}-groups.json")
     selected_list = args.selected_list or args.output.with_name(f"{args.output.stem}-selected.txt")
     summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -182,6 +211,9 @@ def main(argv=None) -> int:
             "ready_clips": len(clips),
             "classified_clips": len(classified),
             "selected_clips": len(selected),
+            "available_split_clips": available_split_clips,
+            "target_train_clips": args.target_train_clips,
+            "target_split_clips": target_split_clips,
             "max_per_source": args.max_per_source,
             "split_ratios": {
                 "train": args.train_ratio,
@@ -218,6 +250,10 @@ def main(argv=None) -> int:
                 split_clips, args.selected_root / split_name, args.selected_mode
             )
     print(f"Classified: {len(classified)}; groups: {len(groups)}; representatives: {len(selected)}")
+    print(
+        "Final splits: "
+        + ", ".join(f"{name}={len(values)}" for name, values in splits.items())
+    )
     print(f"Summary: {summary_path}")
     print(f"Selected list: {selected_list}")
     return 0
