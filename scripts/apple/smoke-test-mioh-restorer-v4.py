@@ -44,7 +44,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--only", help="variant:mode, for example hier27:center1")
     parser.add_argument("--image-size", type=int, default=384)
     parser.add_argument("--runs", type=int, default=20)
+    parser.add_argument(
+        "--high-resolution-detail",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--skip-coreml", action="store_true")
+    parser.add_argument(
+        "--mps",
+        action="store_true",
+        help="also benchmark the same traced contract through PyTorch MPS",
+    )
+    parser.add_argument(
+        "--skip-compute-plan",
+        action="store_true",
+        help="record conversion, latency and numerics without recompiling a compute plan",
+    )
     parser.add_argument("--coreai", action="store_true")
     parser.add_argument("--coreai-architecture", default="h17s")
     parser.add_argument("--coreai-preferred-compute", default="gpu")
@@ -81,11 +96,20 @@ def build(
     variant: str,
     mode: str,
     size: int,
+    *,
+    high_resolution_detail: bool,
 ) -> tuple[MiohRestorerV4Q, MiohRestorerV4ExportWrapper, torch.Tensor, tuple[np.ndarray, np.ndarray]]:
     torch.manual_seed(0)
     model = MiohRestorerV4Q(
-        alignment_variant=variant, execution_mode=mode
+        alignment_variant=variant,
+        execution_mode=mode,
+        high_resolution_detail=high_resolution_detail,
     ).eval()
+    if high_resolution_detail:
+        # Do not let conversion constant-fold the zero-safe V4.1 branch.  The
+        # smoke model must exercise its real graph and memory traffic.
+        with torch.no_grad():
+            model.detail_output.weight.normal_(mean=0.0, std=1e-3)
     wrapper = MiohRestorerV4ExportWrapper(model).eval()
     flat = torch.rand(1, 36, size, size)
     with torch.no_grad():
@@ -154,8 +178,14 @@ def compute_plan(path: Path) -> dict[str, int]:
 
 
 def benchmark_coreml(model, value: np.ndarray, runs: int) -> tuple[dict[str, np.ndarray], dict[str, float]]:
-    for _ in range(3):
+    for index in range(3):
+        started = time.perf_counter()
         model.predict({"frames": value})
+        print(
+            f"  Core ML warmup {index + 1}/3: "
+            f"{(time.perf_counter() - started) * 1_000:.1f} ms",
+            flush=True,
+        )
     durations = []
     result = None
     for _ in range(runs):
@@ -185,6 +215,44 @@ def numeric_report(
             ),
         }
     return report
+
+
+def benchmark_mps(
+    wrapper: MiohRestorerV4ExportWrapper,
+    flat: torch.Tensor,
+    runs: int,
+) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+    if not torch.backends.mps.is_available():
+        raise RuntimeError("MPS is not available")
+    device = torch.device("mps")
+    deployed = copy.deepcopy(wrapper).eval().to(device)
+    value = flat.to(device)
+    with torch.inference_mode():
+        for index in range(3):
+            started = time.perf_counter()
+            result = deployed(value)
+            torch.mps.synchronize()
+            print(
+                f"  MPS warmup {index + 1}/3: "
+                f"{(time.perf_counter() - started) * 1_000:.1f} ms",
+                flush=True,
+            )
+        durations = []
+        for _ in range(runs):
+            started = time.perf_counter()
+            result = deployed(value)
+            torch.mps.synchronize()
+            durations.append((time.perf_counter() - started) * 1_000)
+    values = np.asarray(durations)
+    outputs = {
+        name: tensor.detach().float().cpu().numpy()
+        for name, tensor in zip(("rgb", "confidence"), result, strict=True)
+    }
+    return outputs, {
+        "median_ms": float(np.median(values)),
+        "p10_ms": float(np.percentile(values, 10)),
+        "p90_ms": float(np.percentile(values, 90)),
+    }
 
 
 def convert_coreai(
@@ -291,9 +359,17 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     reports = []
     for variant, mode in configurations(args.only):
+        if args.high_resolution_detail and variant != "hier27":
+            raise ValueError("V4.1 high-resolution detail requires hier27")
+        version = "v41q" if args.high_resolution_detail else "v4q"
         tag = f"{variant}-{mode}"
         print(f"=== {tag} ===", flush=True)
-        model, wrapper, flat, reference = build(variant, mode, args.image_size)
+        model, wrapper, flat, reference = build(
+            variant,
+            mode,
+            args.image_size,
+            high_resolution_detail=args.high_resolution_detail,
+        )
         output_frames = 1 if mode == "center1" else 5
         report: dict[str, object] = {
             "configuration": tag,
@@ -302,18 +378,26 @@ def main() -> int:
             "output_frames": output_frames,
         }
         input_value = flat.numpy().astype(np.float16)
+        if args.mps:
+            result, latency = benchmark_mps(wrapper, flat, args.runs)
+            report["mps"] = {
+                "latency": latency,
+                "numeric": numeric_report(result, reference),
+            }
         if not args.skip_coreml:
-            coreml_path = args.output_dir / f"v4q-{tag}.mlpackage"
+            coreml_path = args.output_dir / f"{version}-{tag}.mlpackage"
             coreml = convert_coreml(wrapper, flat, coreml_path, args.allow_overwrite)
             result, latency = benchmark_coreml(coreml, input_value, args.runs)
             report["coreml"] = {
                 "path": str(coreml_path),
-                "compute_plan": compute_plan(coreml_path),
+                "compute_plan": (
+                    None if args.skip_compute_plan else compute_plan(coreml_path)
+                ),
                 "latency": latency,
                 "numeric": numeric_report(result, reference),
             }
         if args.coreai:
-            coreai_path = args.output_dir / f"v4q-{tag}.aimodel"
+            coreai_path = args.output_dir / f"{version}-{tag}.aimodel"
             convert_coreai(wrapper, flat, coreai_path, args.allow_overwrite)
             compiled = compile_coreai(args, coreai_path, args.output_dir)
             result, latency = benchmark_coreai(

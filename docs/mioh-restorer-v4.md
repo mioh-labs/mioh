@@ -42,6 +42,122 @@ The untrained graph was tested on M5 Pro before training:
 These are architecture and conversion measurements, not restoration-quality
 results. Quality must be established after training using mosaic-ROI metrics.
 
+## V4.1-Q high-resolution detail experiment
+
+V4.1-Q keeps the trained V4 low-resolution trunk and adds a parallel detail
+path.  It retains all 32 full-resolution encoder channels and all 48
+half-resolution channels, aligns every one of the four neighbouring frames,
+and refines motion through half-resolution dilation-two, half-resolution
+dilation-one and full-resolution dilation-one correlation banks.  The final
+detail residual starts at exactly zero, so whitelist-loading the completed V4
+Stage 3 EMA preserves the old output bit for bit before the first update.
+
+Static shift candidates are generated with frozen one-hot dilated depthwise
+convolutions.  This is a graph rewrite only: on MPS the convolutional and
+pad/slice implementations matched exactly in both fp32 and fp16.  No frame,
+candidate, channel or refinement level is removed by this rewrite.
+
+The quality-expanded reference has 9,210,534 parameters.  An apples-to-apples
+M5 Pro Core ML test at `1x36x384x384`, five outputs and ten steady-state runs
+gave:
+
+| Model | Median | p10 | p90 | FP16 agreement |
+|---|---:|---:|---:|---:|
+| V4-Q | 92.25 ms | 91.19 ms | 93.52 ms | 79.44 dB |
+| V4.1-Q | 1042.95 ms | 1035.30 ms | 1048.59 ms | 76.50 dB |
+
+V4.1-Q is therefore 11.31 times slower than V4-Q (`+1030.6%`) and fails both
+the former `+50%` deployment gate and a relaxed `+100%` gate.  This result is
+recorded rather than hidden.  Under the explicit quality-first decision,
+latency does not block the 3,000-step experiment: V4.1-Q is a quality-reference
+model.  It must not replace the shipping model directly.  If its quality gate
+passes, a separate V4-S student must be distilled and measured before app
+integration.
+
+The separately recorded PyTorch MPS series reaches the same conclusion:
+
+| Model | MPS median | p10 | p90 |
+|---|---:|---:|---:|
+| V4-Q | 192.04 ms | 189.75 ms | 195.19 ms |
+| V4.1-Q | 1379.20 ms | 1374.14 ms | 1387.59 ms |
+
+That is 7.18 times slower (`+618.2%`).  The older 221.9/962 ms observations
+belonged to an earlier MPS implementation and must not be mixed with the Core
+ML table above.
+
+Start the frozen detail-path bootstrap from the completed Stage 3 EMA:
+
+```zsh
+cd /Users/okatti/Documents/lada
+zsh scripts/training/run-mioh-restorer-v41-detail-bootstrap.sh
+```
+
+The bootstrap saves and validates every 500 steps and ends at 3,000.  Its gate
+uses a fixed 32-sample paired protocol and reports motion from the p75
+Farneback magnitude inside the clean-target ROI.  At 384px the buckets are
+`static <1`, `low 1-3`, `medium 3-5`, and `high >=5` pixels/frame.  The first
+32 validation samples measured 0.32-7.70 pixels/frame, so these boundaries
+keep the diagnostic buckets populated.
+
+The continuation rules are fixed before training:
+
+- strong signal: combined static+low high-frequency RMSE improves at least
+  5%, while ROI PSNR changes by no less than -0.3 dB;
+- small but positive high-frequency improvement in every populated motion
+  bucket is also a continuation signal for the later full-unfreeze phase;
+- static/low failure is diagnosed as a detail-path or loss/freeze problem
+  first, not as proof that fixed-shift alignment is impossible;
+- static/low improvement with high-speed failure points to fine-alignment
+  features or range;
+- the structure is rejected only after the applicable diagnosis is cleared
+  and the corresponding full-unfreeze attempt still produces no useful gain.
+
+Run the paired, motion-bucketed evaluation against the Stage 3 parent with:
+
+```zsh
+/Users/okatti/.pyenv/versions/lada/bin/python \
+  scripts/training/evaluate-mioh-restorer-v4-checkpoint.py \
+  --checkpoint /path/to/v41-step-0003000.pth \
+  --baseline-checkpoint \
+    /Volumes/Project_HD/lada_finetune_aozora_hikari/mioh_restorer_v4/runs/stage-3-detail-recovery/mioh-restorer-v4-step-0020000.pth \
+  --baseline-weights ema \
+  --metadata-root \
+    /Volumes/Project_HD/lada_finetune_aozora_hikari/dataset_representative/validation/crop_unscaled_meta \
+  --output-dir /path/to/v41-step-3000-evaluation \
+  --device mps \
+  --batches 32 \
+  --weights ema
+```
+
+The JSON report includes each bucket, a combined static+low result, direct
+improvement against the V4 parent and a machine-readable bootstrap-gate
+status.
+
+### Reserved V4-S deployment design
+
+Do not retrofit this into V4.1-Q while its quality experiment is running.
+V4.1-Q remains the fixed teacher/reference.  If it demonstrates useful detail
+recovery, V4-S starts as a separate student with these measured design rules:
+
+- never run learned convolutions on a thin `384x384` feature plane;
+- PixelUnshuffle the full-resolution evidence at the entrance and preserve
+  all four pixel phases as channels;
+- perform correlation, softmax, shift mixing and detail fusion entirely in
+  the folded half/quarter-resolution space;
+- express a full-resolution one-pixel displacement as fixed phase-channel
+  permutation plus half-grid displacement, returning to full resolution with
+  one final PixelShuffle;
+- concentrate ANE work in spatially smaller, channel-deeper tensors and test a
+  GPU-only detail assignment as a separate deployment variant;
+- convert the untrained V4-S prototype before distillation and measure its
+  incremental latency against V4-Q under identical Core ML settings.
+
+PixelUnshuffle does not reduce arithmetic by itself.  A same-width 3x3
+convolution after a 2x fold can increase MACs by four times; its purpose is to
+rearrange work into a shape where Apple accelerators can reach higher
+utilization while retaining subpixel phase information.  The prototype is
+accepted only on measured wall-clock latency, not FLOP estimates.
+
 ## Staged quality training
 
 Run the preflight without starting training:

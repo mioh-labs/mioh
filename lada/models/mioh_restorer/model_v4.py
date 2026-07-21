@@ -26,6 +26,14 @@ NUM_OUTPUT_FRAMES = 5
 OUTPUT_START = 2
 OUTPUT_INDICES = tuple(range(OUTPUT_START, OUTPUT_START + NUM_OUTPUT_FRAMES))
 LOCAL_CONTEXT_RADIUS = 2
+V41_NEW_STATE_PREFIXES = (
+    "detail_full_projection.",
+    "detail_half_projection.",
+    "detail_alignment.",
+    "detail_half_fusion.",
+    "detail_full_fusion.",
+    "detail_output.",
+)
 
 
 def make_offsets(radius: int, dilation: int = 1) -> tuple[tuple[int, int], ...]:
@@ -56,6 +64,77 @@ def shift2d(
     return padded[..., bottom : bottom + height, right : right + width]
 
 
+class FixedShiftBank(nn.Module):
+    """Produce a static shift bank with one depthwise convolution.
+
+    The frozen one-hot kernels are exactly the same translations as
+    :func:`shift2d`, including zero padding at frame boundaries.  Keeping the
+    candidates identical while expressing the bank as a convolution avoids
+    expanding every shift into a separate pad/slice subgraph during Core ML
+    conversion.  No candidate is removed or approximated.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        offsets: Sequence[tuple[int, int]],
+    ) -> None:
+        super().__init__()
+        if channels <= 0 or not offsets:
+            raise ValueError("shift-bank channels and offsets must be non-empty")
+        self.channels = int(channels)
+        self.offsets = tuple((int(y), int(x)) for y, x in offsets)
+
+        nonzero = [
+            abs(value)
+            for offset in self.offsets
+            for value in offset
+            if value
+        ]
+        dilation = math.gcd(*nonzero) if nonzero else 1
+        radius = max(
+            max(abs(vertical), abs(horizontal))
+            for vertical, horizontal in self.offsets
+        ) // dilation
+        expected = {
+            (vertical * dilation, horizontal * dilation)
+            for vertical in range(-radius, radius + 1)
+            for horizontal in range(-radius, radius + 1)
+        }
+        if set(self.offsets) != expected or len(self.offsets) != len(expected):
+            raise ValueError("fixed shift bank requires a complete square grid")
+
+        self.dilation = dilation
+        self.radius = radius
+        kernel_size = radius * 2 + 1
+        kernels = torch.zeros(
+            self.channels * len(self.offsets), 1, kernel_size, kernel_size
+        )
+        for channel in range(self.channels):
+            for index, (vertical, horizontal) in enumerate(self.offsets):
+                kernel_y = radius - vertical // dilation
+                kernel_x = radius - horizontal // dilation
+                kernels[channel * len(self.offsets) + index, 0, kernel_y, kernel_x] = 1
+        self.register_buffer("kernels", kernels, persistent=False)
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        if values.shape[1] != self.channels:
+            raise ValueError(
+                f"shift bank expected {self.channels} channels, got {values.shape[1]}"
+            )
+        shifted = F.conv2d(
+            values,
+            self.kernels.to(dtype=values.dtype),
+            padding=self.radius * self.dilation,
+            dilation=self.dilation,
+            groups=self.channels,
+        )
+        batch, _channels, height, width = shifted.shape
+        return shifted.reshape(
+            batch, self.channels, len(self.offsets), height, width
+        ).permute(0, 2, 1, 3, 4)
+
+
 class ResidualBlock(nn.Module):
     def __init__(self, channels: int) -> None:
         super().__init__()
@@ -77,6 +156,7 @@ class NormalizedShiftCorrelation(nn.Module):
         self,
         offsets: Sequence[tuple[int, int]],
         *,
+        channels: int | None = None,
         initial_temperature: float = 0.5,
         center_bias: float = 1.0,
     ) -> None:
@@ -96,6 +176,10 @@ class NormalizedShiftCorrelation(nn.Module):
         self.offset_bias = nn.Parameter(
             torch.zeros(1, len(self.offsets), 1, 1)
         )
+        self.shift_bank = (
+            FixedShiftBank(channels, self.offsets) if channels is not None else None
+        )
+        self.validity_bank = FixedShiftBank(1, self.offsets)
         if (0, 0) in self.offsets:
             with torch.no_grad():
                 self.offset_bias[:, self.offsets.index((0, 0))].fill_(
@@ -128,25 +212,24 @@ class NormalizedShiftCorrelation(nn.Module):
         # ``Tensor.new_ones`` is not accepted by the current Core ML Torch
         # frontend.  Derive the fixed validity plane from an existing tensor.
         validity_source = torch.ones_like(target[:, :1])
-        shifted_targets: list[torch.Tensor] = []
-        scores: list[torch.Tensor] = []
-        for vertical, horizontal in self.offsets:
-            shifted_target = shift2d(target, vertical, horizontal)
-            shifted_normalized = shift2d(
-                normalized_target, vertical, horizontal
+        if self.shift_bank is None:
+            shifted_targets = torch.stack(
+                [shift2d(target, y, x) for y, x in self.offsets], dim=1
             )
-            valid = shift2d(validity_source, vertical, horizontal)
-            score = (normalized_reference * shifted_normalized).sum(
-                dim=1, keepdim=True
+            shifted_normalized = torch.stack(
+                [shift2d(normalized_target, y, x) for y, x in self.offsets],
+                dim=1,
             )
-            score = score + (valid - 1.0) * 10_000.0
-            shifted_targets.append(shifted_target)
-            scores.append(score)
-        logits = torch.cat(scores, dim=1) + self.offset_bias
+        else:
+            shifted_targets = self.shift_bank(target)
+            shifted_normalized = self.shift_bank(normalized_target)
+        valid = self.validity_bank(validity_source).squeeze(2)
+        logits = (
+            normalized_reference.unsqueeze(1) * shifted_normalized
+        ).sum(dim=2)
+        logits = logits + (valid - 1.0) * 10_000.0 + self.offset_bias
         weights = torch.softmax(logits / self.temperature, dim=1)
-        aligned = torch.zeros_like(target)
-        for index, shifted_target in enumerate(shifted_targets):
-            aligned = aligned + weights[:, index : index + 1] * shifted_target
+        aligned = (weights.unsqueeze(2) * shifted_targets).sum(dim=1)
         return aligned, weights
 
 
@@ -154,15 +237,18 @@ def apply_shift_weights(
     target: torch.Tensor,
     weights: torch.Tensor,
     offsets: Sequence[tuple[int, int]],
+    shift_bank: FixedShiftBank | None = None,
 ) -> torch.Tensor:
     if weights.shape[1] != len(offsets):
         raise ValueError("shift weights and offsets do not match")
-    aligned = torch.zeros_like(target)
-    for index, (vertical, horizontal) in enumerate(offsets):
-        aligned = aligned + weights[:, index : index + 1] * shift2d(
-            target, vertical, horizontal
+    shifted = (
+        shift_bank(target)
+        if shift_bank is not None
+        else torch.stack(
+            [shift2d(target, y, x) for y, x in offsets], dim=1
         )
-    return aligned
+    )
+    return (weights.unsqueeze(2) * shifted).sum(dim=1)
 
 
 class HierarchicalAlignment27(nn.Module):
@@ -170,7 +256,7 @@ class HierarchicalAlignment27(nn.Module):
 
     input_reach = 40
 
-    def __init__(self) -> None:
+    def __init__(self, *, eighth_channels: int = 96, quarter_channels: int = 64) -> None:
         super().__init__()
         self.offsets_eighth_coarse = make_offsets(1, 3)
         self.offsets_eighth_fine = make_offsets(1, 1)
@@ -178,13 +264,19 @@ class HierarchicalAlignment27(nn.Module):
         self.offsets_quarter_coarse = make_offsets(1, 6)
         self.offsets_quarter_mid = make_offsets(1, 2)
         self.eighth_coarse = NormalizedShiftCorrelation(
-            self.offsets_eighth_coarse
+            self.offsets_eighth_coarse, channels=eighth_channels
         )
         self.eighth_fine = NormalizedShiftCorrelation(
-            self.offsets_eighth_fine
+            self.offsets_eighth_fine, channels=eighth_channels
         )
         self.quarter_fine = NormalizedShiftCorrelation(
-            self.offsets_quarter_fine
+            self.offsets_quarter_fine, channels=quarter_channels
+        )
+        self.quarter_coarse_bank = FixedShiftBank(
+            quarter_channels, self.offsets_quarter_coarse
+        )
+        self.quarter_mid_bank = FixedShiftBank(
+            quarter_channels, self.offsets_quarter_mid
         )
 
     def forward(
@@ -210,11 +302,13 @@ class HierarchicalAlignment27(nn.Module):
             target_quarter,
             coarse_quarter,
             self.offsets_quarter_coarse,
+            self.quarter_coarse_bank,
         )
         aligned_quarter = apply_shift_weights(
             aligned_quarter,
             middle_quarter,
             self.offsets_quarter_mid,
+            self.quarter_mid_bank,
         )
         aligned_quarter, fine = self.quarter_fine(
             reference_quarter, aligned_quarter
@@ -222,12 +316,169 @@ class HierarchicalAlignment27(nn.Module):
         return aligned_eighth, aligned_quarter, (coarse, middle, fine)
 
 
+class HighResolutionDetailAlignment(nn.Module):
+    """Refine hierarchical motion down to a one-input-pixel grid.
+
+    The existing V4 alignment ends on a quarter-resolution dilation-two bank,
+    whose candidates are eight input pixels apart.  Reusing those weights at
+    high resolution without refinement would blend displaced texture and blur
+    it.  This module first carries the three coarse banks to half/full
+    resolution, then adds two half-resolution banks and one full-resolution
+    bank.  All operations remain static shifts, correlation, softmax and
+    elementwise blending.
+    """
+
+    def __init__(
+        self,
+        alignment: HierarchicalAlignment27,
+        *,
+        full_channels: int,
+        half_channels: int,
+    ) -> None:
+        super().__init__()
+        self.offsets_eighth_coarse = alignment.offsets_eighth_coarse
+        self.offsets_eighth_fine = alignment.offsets_eighth_fine
+        self.offsets_quarter_fine = alignment.offsets_quarter_fine
+        self.offsets_half_coarse = make_offsets(1, 2)
+        self.offsets_half_fine = make_offsets(1, 1)
+        self.offsets_full_fine = make_offsets(1, 1)
+        self.half_coarse = NormalizedShiftCorrelation(
+            self.offsets_half_coarse, channels=half_channels
+        )
+        self.half_fine = NormalizedShiftCorrelation(
+            self.offsets_half_fine, channels=half_channels
+        )
+        self.full_fine = NormalizedShiftCorrelation(
+            self.offsets_full_fine, channels=full_channels
+        )
+        original_half_offsets = (
+            self._scaled_offsets(self.offsets_eighth_coarse, 4),
+            self._scaled_offsets(self.offsets_eighth_fine, 4),
+            self._scaled_offsets(self.offsets_quarter_fine, 2),
+        )
+        packed_channels = full_channels * 4
+        self.original_half_banks = nn.ModuleList(
+            FixedShiftBank(half_channels, offsets)
+            for offsets in original_half_offsets
+        )
+        self.original_packed_banks = nn.ModuleList(
+            FixedShiftBank(packed_channels, offsets)
+            for offsets in original_half_offsets
+        )
+        self.packed_half_coarse_bank = FixedShiftBank(
+            packed_channels, self.offsets_half_coarse
+        )
+        self.packed_half_fine_bank = FixedShiftBank(
+            packed_channels, self.offsets_half_fine
+        )
+
+    @staticmethod
+    def _scaled_offsets(
+        offsets: Sequence[tuple[int, int]], factor: int
+    ) -> tuple[tuple[int, int], ...]:
+        return tuple(
+            (vertical * factor, horizontal * factor)
+            for vertical, horizontal in offsets
+        )
+
+    @staticmethod
+    def _resize_weights(
+        weights: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
+        return F.interpolate(weights, size=target.shape[-2:], mode="nearest")
+
+    def _apply_original_banks(
+        self,
+        target: torch.Tensor,
+        weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        *,
+        eighth_scale: int,
+        quarter_scale: int,
+        shift_banks: Sequence[FixedShiftBank],
+    ) -> torch.Tensor:
+        coarse, middle, fine = weights
+        target = apply_shift_weights(
+            target,
+            self._resize_weights(coarse, target),
+            self._scaled_offsets(
+                self.offsets_eighth_coarse, eighth_scale
+            ),
+            shift_banks[0],
+        )
+        target = apply_shift_weights(
+            target,
+            self._resize_weights(middle, target),
+            self._scaled_offsets(
+                self.offsets_eighth_fine, eighth_scale
+            ),
+            shift_banks[1],
+        )
+        return apply_shift_weights(
+            target,
+            self._resize_weights(fine, target),
+            self._scaled_offsets(
+                self.offsets_quarter_fine, quarter_scale
+            ),
+            shift_banks[2],
+        )
+
+    def forward(
+        self,
+        reference_full: torch.Tensor,
+        target_full: torch.Tensor,
+        reference_half: torch.Tensor,
+        target_half: torch.Tensor,
+        coarse_weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        aligned_half = self._apply_original_banks(
+            target_half,
+            coarse_weights,
+            eighth_scale=4,
+            quarter_scale=2,
+            shift_banks=self.original_half_banks,
+        )
+        aligned_half, half_coarse = self.half_coarse(
+            reference_half, aligned_half
+        )
+        aligned_half, half_fine = self.half_fine(reference_half, aligned_half)
+
+        # Carry full-resolution texture through the coarse banks without
+        # replaying 45 memory-bound shifts on the 384x384 plane.  Space-to-
+        # depth is lossless: all four pixel phases remain separate channels at
+        # half resolution.  Only the final +/-1px bank runs at full size.
+        packed_full = F.pixel_unshuffle(target_full, 2)
+        packed_full = self._apply_original_banks(
+            packed_full,
+            coarse_weights,
+            eighth_scale=4,
+            quarter_scale=2,
+            shift_banks=self.original_packed_banks,
+        )
+        packed_full = apply_shift_weights(
+            packed_full,
+            self._resize_weights(half_coarse, packed_full),
+            self.offsets_half_coarse,
+            self.packed_half_coarse_bank,
+        )
+        packed_full = apply_shift_weights(
+            packed_full,
+            self._resize_weights(half_fine, packed_full),
+            self.offsets_half_fine,
+            self.packed_half_fine_bank,
+        )
+        aligned_full = F.pixel_shuffle(packed_full, 2)
+        aligned_full, _full_fine = self.full_fine(
+            reference_full, aligned_full
+        )
+        return aligned_full, aligned_half
+
+
 class FullAlignment121(nn.Module):
     """Exhaustive correctness baseline; not intended for V4 training."""
 
     input_reach = 48
 
-    def __init__(self) -> None:
+    def __init__(self, *, eighth_channels: int = 96, quarter_channels: int = 64) -> None:
         super().__init__()
         self.offsets_eighth = make_offsets(5)
         self.offsets_quarter = tuple(
@@ -235,10 +486,13 @@ class FullAlignment121(nn.Module):
             for vertical, horizontal in self.offsets_eighth
         )
         self.offsets_quarter_fine = make_offsets(1, 2)
-        self.eighth = NormalizedShiftCorrelation(self.offsets_eighth)
-        self.quarter_fine = NormalizedShiftCorrelation(
-            self.offsets_quarter_fine
+        self.eighth = NormalizedShiftCorrelation(
+            self.offsets_eighth, channels=eighth_channels
         )
+        self.quarter_fine = NormalizedShiftCorrelation(
+            self.offsets_quarter_fine, channels=quarter_channels
+        )
+        self.quarter_bank = FixedShiftBank(quarter_channels, self.offsets_quarter)
 
     def forward(
         self,
@@ -259,6 +513,7 @@ class FullAlignment121(nn.Module):
             target_quarter,
             coarse_quarter,
             self.offsets_quarter,
+            self.quarter_bank,
         )
         aligned_quarter, fine = self.quarter_fine(
             reference_quarter, aligned_quarter
@@ -301,12 +556,12 @@ class SharedFrameEncoder(nn.Module):
 
     def forward(
         self, values: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        values = self.stem(values)
-        values = self.half_stage(values)
-        quarter = self.quarter(values)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        full = self.stem(values)
+        half = self.half_stage(full)
+        quarter = self.quarter(half)
         eighth = self.eighth(quarter)
-        return quarter, eighth
+        return full, half, quarter, eighth
 
 
 class MiohRestorerV4Q(nn.Module):
@@ -325,6 +580,10 @@ class MiohRestorerV4Q(nn.Module):
         fusion_quarter_channels: int = 96,
         eighth_blocks: int = 10,
         quarter_blocks: int = 4,
+        high_resolution_detail: bool = False,
+        detail_full_channels: int = 32,
+        detail_half_channels: int = 48,
+        detail_fusion_channels: int = 64,
     ) -> None:
         super().__init__()
         if alignment_variant not in ("hier27", "full121"):
@@ -339,16 +598,45 @@ class MiohRestorerV4Q(nn.Module):
         self.fusion_quarter_channels = fusion_quarter_channels
         self.eighth_blocks = eighth_blocks
         self.quarter_blocks = quarter_blocks
+        self.high_resolution_detail = bool(high_resolution_detail)
+        self.detail_full_channels = int(detail_full_channels)
+        self.detail_half_channels = int(detail_half_channels)
+        self.detail_fusion_channels = int(detail_fusion_channels)
+        self.architecture_revision = 2 if self.high_resolution_detail else 1
         self.gradient_checkpointing = False
         self.encoder = SharedFrameEncoder(
             quarter_channels=quarter_channels,
             eighth_channels=eighth_channels,
         )
         self.alignment: HierarchicalAlignment27 | FullAlignment121 = (
-            HierarchicalAlignment27()
+            HierarchicalAlignment27(
+                eighth_channels=eighth_channels,
+                quarter_channels=quarter_channels,
+            )
             if alignment_variant == "hier27"
-            else FullAlignment121()
+            else FullAlignment121(
+                eighth_channels=eighth_channels,
+                quarter_channels=quarter_channels,
+            )
         )
+        if self.high_resolution_detail:
+            if not isinstance(self.alignment, HierarchicalAlignment27):
+                raise ValueError(
+                    "high-resolution detail requires hierarchical alignment"
+                )
+            self.detail_full_projection = nn.Sequential(
+                nn.Conv2d(32, self.detail_full_channels, 1),
+                nn.SiLU(),
+            )
+            self.detail_half_projection = nn.Sequential(
+                nn.Conv2d(48, self.detail_half_channels, 1),
+                nn.SiLU(),
+            )
+            self.detail_alignment = HighResolutionDetailAlignment(
+                self.alignment,
+                full_channels=self.detail_full_channels,
+                half_channels=self.detail_half_channels,
+            )
         context_frames = LOCAL_CONTEXT_RADIUS * 2 + 1
         self.reduce_eighth = nn.Sequential(
             nn.Conv2d(
@@ -413,6 +701,39 @@ class MiohRestorerV4Q(nn.Module):
             nn.SiLU(),
             nn.Conv2d(24, 1, 3, padding=1),
         )
+        if self.high_resolution_detail:
+            self.detail_half_fusion = nn.Sequential(
+                nn.Conv2d(
+                    self.detail_half_channels * context_frames,
+                    self.detail_half_channels,
+                    1,
+                ),
+                nn.SiLU(),
+                ResidualBlock(self.detail_half_channels),
+                nn.Conv2d(
+                    self.detail_half_channels,
+                    self.detail_full_channels * 4,
+                    3,
+                    padding=1,
+                ),
+                nn.PixelShuffle(2),
+                nn.SiLU(),
+            )
+            self.detail_full_fusion = nn.Sequential(
+                nn.Conv2d(
+                    48
+                    + self.detail_full_channels
+                    + self.detail_full_channels * context_frames,
+                    self.detail_fusion_channels,
+                    1,
+                ),
+                nn.SiLU(),
+                ResidualBlock(self.detail_fusion_channels),
+                ResidualBlock(self.detail_fusion_channels),
+            )
+            self.detail_output = nn.Conv2d(
+                self.detail_fusion_channels, 3, 3, padding=1
+            )
         self._zero_initialize_heads()
 
     def _zero_initialize_heads(self) -> None:
@@ -426,6 +747,21 @@ class MiohRestorerV4Q(nn.Module):
                 raise TypeError("V4 output head must end in a convolution")
             nn.init.zeros_(output.weight)
             nn.init.zeros_(output.bias)
+        if self.high_resolution_detail:
+            nn.init.zeros_(self.detail_output.weight)
+            nn.init.zeros_(self.detail_output.bias)
+
+    def high_resolution_detail_modules(self) -> tuple[nn.Module, ...]:
+        if not self.high_resolution_detail:
+            return ()
+        return (
+            self.detail_full_projection,
+            self.detail_half_projection,
+            self.detail_alignment,
+            self.detail_half_fusion,
+            self.detail_full_fusion,
+            self.detail_output,
+        )
 
     @property
     def output_indices(self) -> tuple[int, ...]:
@@ -446,9 +782,16 @@ class MiohRestorerV4Q(nn.Module):
 
     def _encode_frames(
         self, values: torch.Tensor
-    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    ) -> list[
+        tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor | None,
+            torch.Tensor | None,
+        ]
+    ]:
         if self.training and self.gradient_checkpointing:
-            return [
+            encoded = [
                 checkpoint(
                     self.encoder,
                     values[:, index],
@@ -456,7 +799,20 @@ class MiohRestorerV4Q(nn.Module):
                 )
                 for index in range(NUM_INPUT_FRAMES)
             ]
-        return [self.encoder(values[:, index]) for index in range(NUM_INPUT_FRAMES)]
+        else:
+            encoded = [
+                self.encoder(values[:, index]) for index in range(NUM_INPUT_FRAMES)
+            ]
+        features = []
+        for full, half, quarter, eighth in encoded:
+            if self.high_resolution_detail:
+                detail_full = self.detail_full_projection(full)
+                detail_half = self.detail_half_projection(half)
+            else:
+                detail_full = None
+                detail_half = None
+            features.append((quarter, eighth, detail_full, detail_half))
+        return features
 
     def _align_pair(
         self,
@@ -545,45 +901,117 @@ class MiohRestorerV4Q(nn.Module):
 
     def _aligned_context(
         self,
-        features: list[tuple[torch.Tensor, torch.Tensor]],
-        reference_index: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        reference_quarter, reference_eighth = features[reference_index]
-        quarters: list[torch.Tensor] = []
-        eighths: list[torch.Tensor] = []
-        for frame_index in range(
-            reference_index - LOCAL_CONTEXT_RADIUS,
-            reference_index + LOCAL_CONTEXT_RADIUS + 1,
-        ):
-            target_quarter, target_eighth = features[frame_index]
-            if frame_index == reference_index:
-                aligned_eighth = target_eighth
-                aligned_quarter = target_quarter
-            else:
-                aligned_eighth, aligned_quarter = self._align_pair(
-                    reference_eighth,
-                    target_eighth,
-                    reference_quarter,
-                    target_quarter,
-                )
-            eighths.append(aligned_eighth)
-            quarters.append(aligned_quarter)
-        return torch.cat(eighths, dim=1), torch.cat(quarters, dim=1)
-
-    def _aligned_context_with_diagnostics(
-        self,
-        features: list[tuple[torch.Tensor, torch.Tensor]],
+        features: list[
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor | None,
+                torch.Tensor | None,
+            ]
+        ],
         reference_index: int,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        reference_quarter, reference_eighth, reference_full, reference_half = (
+            features[reference_index]
+        )
+        quarters: list[torch.Tensor] = []
+        eighths: list[torch.Tensor] = []
+        fulls: list[torch.Tensor] = []
+        halves: list[torch.Tensor] = []
+        for frame_index in range(
+            reference_index - LOCAL_CONTEXT_RADIUS,
+            reference_index + LOCAL_CONTEXT_RADIUS + 1,
+        ):
+            target_quarter, target_eighth, target_full, target_half = features[
+                frame_index
+            ]
+            if frame_index == reference_index:
+                aligned_eighth = target_eighth
+                aligned_quarter = target_quarter
+                aligned_full = target_full
+                aligned_half = target_half
+            else:
+                if self.high_resolution_detail:
+                    aligned_eighth, aligned_quarter, weights = (
+                        self._align_pair_with_weights(
+                            reference_eighth,
+                            target_eighth,
+                            reference_quarter,
+                            target_quarter,
+                        )
+                    )
+                    if any(
+                        item is None
+                        for item in (
+                            reference_full,
+                            target_full,
+                            reference_half,
+                            target_half,
+                        )
+                    ):
+                        raise AssertionError("V4.1 detail features are missing")
+                    aligned_full, aligned_half = self.detail_alignment(
+                        reference_full,
+                        target_full,
+                        reference_half,
+                        target_half,
+                        weights,
+                    )
+                else:
+                    aligned_eighth, aligned_quarter = self._align_pair(
+                        reference_eighth,
+                        target_eighth,
+                        reference_quarter,
+                        target_quarter,
+                    )
+                    aligned_full = None
+                    aligned_half = None
+            eighths.append(aligned_eighth)
+            quarters.append(aligned_quarter)
+            if self.high_resolution_detail:
+                if aligned_full is None or aligned_half is None:
+                    raise AssertionError("V4.1 aligned detail is missing")
+                fulls.append(aligned_full)
+                halves.append(aligned_half)
+        return (
+            torch.cat(eighths, dim=1),
+            torch.cat(quarters, dim=1),
+            torch.cat(fulls, dim=1) if fulls else None,
+            torch.cat(halves, dim=1) if halves else None,
+        )
+
+    def _aligned_context_with_diagnostics(
+        self,
+        features: list[
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor | None,
+                torch.Tensor | None,
+            ]
+        ],
+        reference_index: int,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
         tuple[
             tuple[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]], ...
         ],
     ]:
-        reference_quarter, reference_eighth = features[reference_index]
+        reference_quarter, reference_eighth, reference_full, reference_half = (
+            features[reference_index]
+        )
         quarters: list[torch.Tensor] = []
         eighths: list[torch.Tensor] = []
+        fulls: list[torch.Tensor] = []
+        halves: list[torch.Tensor] = []
         records: list[
             tuple[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
         ] = []
@@ -591,10 +1019,14 @@ class MiohRestorerV4Q(nn.Module):
             reference_index - LOCAL_CONTEXT_RADIUS,
             reference_index + LOCAL_CONTEXT_RADIUS + 1,
         ):
-            target_quarter, target_eighth = features[frame_index]
+            target_quarter, target_eighth, target_full, target_half = features[
+                frame_index
+            ]
             if frame_index == reference_index:
                 aligned_eighth = target_eighth
                 aligned_quarter = target_quarter
+                aligned_full = target_full
+                aligned_half = target_half
             else:
                 aligned_eighth, aligned_quarter, weights = (
                     self._align_pair_with_weights(
@@ -605,11 +1037,39 @@ class MiohRestorerV4Q(nn.Module):
                     )
                 )
                 records.append((frame_index, weights))
+                if self.high_resolution_detail:
+                    if any(
+                        item is None
+                        for item in (
+                            reference_full,
+                            target_full,
+                            reference_half,
+                            target_half,
+                        )
+                    ):
+                        raise AssertionError("V4.1 detail features are missing")
+                    aligned_full, aligned_half = self.detail_alignment(
+                        reference_full,
+                        target_full,
+                        reference_half,
+                        target_half,
+                        weights,
+                    )
+                else:
+                    aligned_full = None
+                    aligned_half = None
             eighths.append(aligned_eighth)
             quarters.append(aligned_quarter)
+            if self.high_resolution_detail:
+                if aligned_full is None or aligned_half is None:
+                    raise AssertionError("V4.1 aligned detail is missing")
+                fulls.append(aligned_full)
+                halves.append(aligned_half)
         return (
             torch.cat(eighths, dim=1),
             torch.cat(quarters, dim=1),
+            torch.cat(fulls, dim=1) if fulls else None,
+            torch.cat(halves, dim=1) if halves else None,
             tuple(records),
         )
 
@@ -617,6 +1077,8 @@ class MiohRestorerV4Q(nn.Module):
         self,
         context_eighth: torch.Tensor,
         context_quarter: torch.Tensor,
+        context_full: torch.Tensor | None = None,
+        context_half: torch.Tensor | None = None,
         *,
         return_features: bool = False,
     ) -> tuple[torch.Tensor, ...]:
@@ -653,6 +1115,14 @@ class MiohRestorerV4Q(nn.Module):
         )
         full = self.up_half_to_full(half)
         texture = self.texture_head(full)
+        if self.high_resolution_detail:
+            if context_full is None or context_half is None:
+                raise ValueError("V4.1 decoder requires full and half detail")
+            detail_half = self.detail_half_fusion(context_half)
+            detail = self.detail_full_fusion(
+                torch.cat((full, detail_half, context_full), dim=1)
+            )
+            texture = texture + self.detail_output(detail)
         confidence = torch.sigmoid(self.confidence_head(full))
         if return_features:
             return base, texture, confidence, eighth, quarter
@@ -684,16 +1154,23 @@ class MiohRestorerV4Q(nn.Module):
     ]:
         self._validate_input(values)
         features = self._encode_frames(values)
-        contexts: list[tuple[torch.Tensor, torch.Tensor]] = []
+        contexts: list[
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor | None,
+                torch.Tensor | None,
+            ]
+        ] = []
         alignment_records: list[
             tuple[tuple[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]], ...]
         ] = []
         for index in self.output_indices:
             if capture_alignment:
-                eighth, quarter, records = self._aligned_context_with_diagnostics(
-                    features, index
+                eighth, quarter, full, half, records = (
+                    self._aligned_context_with_diagnostics(features, index)
                 )
-                contexts.append((eighth, quarter))
+                contexts.append((eighth, quarter, full, half))
                 alignment_records.append(records)
             else:
                 contexts.append(self._aligned_context(features, index))
@@ -704,9 +1181,21 @@ class MiohRestorerV4Q(nn.Module):
         if self.execution_mode in ("batch", "center1"):
             context_eighth = torch.cat([context[0] for context in contexts], dim=0)
             context_quarter = torch.cat([context[1] for context in contexts], dim=0)
+            context_full = (
+                torch.cat([context[2] for context in contexts], dim=0)
+                if self.high_resolution_detail
+                else None
+            )
+            context_half = (
+                torch.cat([context[3] for context in contexts], dim=0)
+                if self.high_resolution_detail
+                else None
+            )
             decoded = self._decode_context(
                 context_eighth,
                 context_quarter,
+                context_full,
+                context_half,
                 return_features=capture_features,
             )
             base_flat, texture_flat, confidence_flat = decoded[:3]
@@ -831,3 +1320,49 @@ class MiohRestorerV4ExportWrapper(nn.Module):
 
 def parameter_count(model: nn.Module) -> int:
     return sum(parameter.numel() for parameter in model.parameters())
+
+
+def load_v4_state_for_v41_upgrade(
+    model: MiohRestorerV4Q,
+    state_dict: dict[str, torch.Tensor],
+    *,
+    source_revision: int,
+) -> tuple[str, ...]:
+    """Load V4/V4.1 weights without hiding accidental incompatibilities.
+
+    A revision-1 source must provide every legacy key and may omit exactly the
+    explicitly listed V4.1 modules.  A revision-2 source must be an exact
+    match.  Shape changes and unexpected keys are always fatal.
+    """
+
+    if not model.high_resolution_detail:
+        raise ValueError("V4.1 upgrade loading requires high-resolution detail")
+    current = model.state_dict()
+    current_keys = set(current)
+    source_keys = set(state_dict)
+    unexpected = sorted(source_keys - current_keys)
+    if unexpected:
+        raise ValueError(f"unexpected checkpoint keys: {unexpected}")
+    mismatched = sorted(
+        key
+        for key in source_keys
+        if tuple(state_dict[key].shape) != tuple(current[key].shape)
+    )
+    if mismatched:
+        raise ValueError(f"checkpoint tensor shapes changed: {mismatched}")
+    missing = sorted(current_keys - source_keys)
+    allowed_new = sorted(
+        key
+        for key in current_keys
+        if key.startswith(V41_NEW_STATE_PREFIXES)
+    )
+    expected_missing = allowed_new if source_revision < 2 else []
+    if missing != expected_missing:
+        raise ValueError(
+            "checkpoint missing keys do not exactly match the V4.1 whitelist: "
+            f"missing={missing}, expected={expected_missing}"
+        )
+    merged = dict(current)
+    merged.update(state_dict)
+    model.load_state_dict(merged, strict=True)
+    return tuple(missing)
