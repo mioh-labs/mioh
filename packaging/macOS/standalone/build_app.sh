@@ -16,6 +16,8 @@ case "$COREAI_DISTRIBUTION" in
 esac
 APP="$BUILD_DIR/$APP_BASENAME.app"
 DMG="$BUILD_DIR/$DMG_BASENAME.dmg"
+INCLUDE_USER_MANUAL="${INCLUDE_USER_MANUAL:-0}"
+USER_MANUAL_PDF="${USER_MANUAL_PDF:-$ROOT/output/pdf/mioh-user-manual-ja.pdf}"
 CONTENTS="$APP/Contents"
 RESOURCES="$CONTENTS/Resources"
 PYTHON_SOURCE="${PYTHON_SOURCE:-$HOME/.local/share/uv/python/cpython-3.12-macos-aarch64-none}"
@@ -293,6 +295,14 @@ rm -rf "$DMG_ROOT"
 mkdir -p "$DMG_ROOT"
 ditto "$APP" "$DMG_ROOT/$APP_BASENAME.app"
 ln -s /Applications "$DMG_ROOT/Applications"
+if [[ "$INCLUDE_USER_MANUAL" == 1 ]]; then
+  if [[ ! -f "$USER_MANUAL_PDF" ]]; then
+    print -u2 "Missing mioh user manual: $USER_MANUAL_PDF"
+    print -u2 "Generate it with scripts/docs/build_mioh_manual_pdf.py before building."
+    exit 1
+  fi
+  cp "$USER_MANUAL_PDF" "$DMG_ROOT/mioh ユーザーマニュアル.pdf"
+fi
 diskutil image create from \
   --volumeName "$APP_BASENAME" \
   --format UDZO \
