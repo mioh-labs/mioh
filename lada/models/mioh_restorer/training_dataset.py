@@ -30,7 +30,28 @@ from lada.utils.image_utils import (
 from lada.utils.mosaic_utils import addmosaic_base, get_random_parameters_by_block_size
 
 
-def create_degradation_pipeline(image_size: int):
+def create_degradation_pipeline(image_size: int, profile: str = "full"):
+    if profile == "clean":
+        return torchvision_transforms.Compose(
+            [lada_transforms.ResizeFrames(image_size)]
+        )
+    if profile == "mild":
+        return torchvision_transforms.Compose(
+            [
+                lada_transforms.ResizeFrames(image_size),
+                lada_transforms.VideoCompression(
+                    p=0.65,
+                    codecs=["libx264", "libx265", "libvpx-vp9"],
+                    codec_probs=[0.45, 0.35, 0.20],
+                    crf_ranges={"libx264": (14, 22), "libx265": (18, 28)},
+                    bitrate_ranges={"libvpx-vp9": (10_000, 22_000)},
+                ),
+                lada_transforms.GaussianBlur(sigma_range=[0.5, 1.5], p=0.15),
+                lada_transforms.GaussianNoise(snr=60, p=0.10),
+            ]
+        )
+    if profile != "full":
+        raise ValueError(f"unknown degradation profile: {profile}")
     return torchvision_transforms.Compose(
         [
             lada_transforms.ResizeFrames(image_size),
@@ -69,6 +90,9 @@ class MiohRestorationDataset(Dataset):
         degrade: bool = True,
         horizontal_flip: bool = True,
         deterministic: bool = False,
+        degradation_mix: bool = False,
+        time_reverse: bool = False,
+        mosaic_size_multiplier: float = 1.0,
         limit: int | None = None,
     ) -> None:
         if not metadata_roots:
@@ -77,11 +101,16 @@ class MiohRestorationDataset(Dataset):
             raise ValueError("sequence_frames must be positive")
         if image_size <= 0:
             raise ValueError("image_size must be positive")
+        if mosaic_size_multiplier <= 0:
+            raise ValueError("mosaic_size_multiplier must be positive")
         self.sequence_frames = sequence_frames
         self.image_size = image_size
         self.degrade = degrade
         self.horizontal_flip = horizontal_flip
         self.deterministic = deterministic
+        self.degradation_mix = degradation_mix
+        self.time_reverse = time_reverse
+        self.mosaic_size_multiplier = float(mosaic_size_multiplier)
         self.samples: list[tuple[Path, RestorationDatasetMetadataV2]] = []
         skipped_metadata = 0
 
@@ -91,7 +120,6 @@ class MiohRestorationDataset(Dataset):
                 raise FileNotFoundError(f"metadata directory not found: {root}")
             for metadata_path in sorted(root.glob("*.json")):
                 if metadata_path.name.startswith("._"):
-                    skipped_metadata += 1
                     continue
                 try:
                     metadata = RestorationDatasetMetadataV2.from_json_file(metadata_path)
@@ -140,10 +168,11 @@ class MiohRestorationDataset(Dataset):
     def _degrade_inputs(
         self,
         inputs: list[np.ndarray],
+        profile: str = "full",
     ) -> list[np.ndarray]:
         if not self.degrade:
             return inputs
-        return create_degradation_pipeline(self.image_size)(inputs)
+        return create_degradation_pipeline(self.image_size, profile)(inputs)
 
     @staticmethod
     def _read_exact_frames(
@@ -197,7 +226,8 @@ class MiohRestorationDataset(Dataset):
         ]
         mosaic_size, mosaic_mode, rectangle_ratio, feather_size = (
             get_random_parameters_by_block_size(
-                metadata.base_mosaic_block_size.mosaic_size_v1_normal,
+                metadata.base_mosaic_block_size.mosaic_size_v1_normal
+                * self.mosaic_size_multiplier,
                 randomize_size=True,
                 repeatable_random=False,
             )
@@ -217,7 +247,15 @@ class MiohRestorationDataset(Dataset):
             inputs.append(pad_image_by_pad(mosaic, pad))
             mosaic_masks.append(pad_image_by_pad(mosaic_mask, pad))
 
-        inputs = self._degrade_inputs(inputs)
+        degradation_profile = "full"
+        if self.degradation_mix:
+            # Preserve clean spatial evidence while still covering realistic
+            # web/video degradation.  Always-heavy degradation teaches the
+            # network to blur or hallucinate detail that is not observable.
+            degradation_profile = rng.choices(
+                ("clean", "mild", "full"), weights=(0.20, 0.50, 0.30), k=1
+            )[0]
+        inputs = self._degrade_inputs(inputs, degradation_profile)
 
         targets = video_utils.resize_video_frames(targets, self.image_size)
         inputs = video_utils.resize_video_frames(inputs, self.image_size)
@@ -236,6 +274,11 @@ class MiohRestorationDataset(Dataset):
         inputs = repad_image(inputs, scaled_pads, mode="zero")
         targets = repad_image(targets, scaled_pads, mode="zero")
         mosaic_masks = repad_image(mosaic_masks, scaled_pads, mode="zero")
+
+        if self.time_reverse and rng.random() < 0.5:
+            inputs.reverse()
+            targets.reverse()
+            mosaic_masks.reverse()
 
         if self.horizontal_flip and rng.random() < 0.5:
             inputs = [np.ascontiguousarray(np.fliplr(frame)) for frame in inputs]

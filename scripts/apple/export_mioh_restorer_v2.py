@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Lada Authors
 # SPDX-License-Identifier: AGPL-3.0
 
-"""Export a trained MiohRestorerV2 checkpoint to Apple runtimes."""
+"""Export a trained MiohRestorerV2/V3 checkpoint to Apple runtimes."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from lada.models.mioh_restorer import MiohRestorerV2
+from lada.models.mioh_restorer import MiohRestorerV2, MiohRestorerV3
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -33,21 +33,52 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def build_model(checkpoint: Path, raw_weights: bool) -> tuple[MiohRestorerV2, dict]:
+def build_model(
+    checkpoint: Path, raw_weights: bool
+) -> tuple[MiohRestorerV2 | MiohRestorerV3, dict]:
     payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
     config = payload["config"]
-    if int(config.get("version", 0)) != 2:
-        raise ValueError("checkpoint is not MiohRestorerV2")
-    model = MiohRestorerV2(
-        window_frames=int(config["window_frames"]),
-        chunk_frames=int(config["chunk_frames"]),
-        channels=int(config["channels"]),
-        num_blocks=int(config["num_blocks"]),
-        fusion_full_channels=int(config["fusion_full_channels"]),
-        fusion_half_channels=int(config["fusion_half_channels"]),
-        fusion_quarter_channels=int(config["fusion_quarter_channels"]),
-        detail_scale=float(config["detail_scale"]),
-    )
+    version = int(config.get("version", 0))
+    if version == 2:
+        model = MiohRestorerV2(
+            window_frames=int(config["window_frames"]),
+            chunk_frames=int(config["chunk_frames"]),
+            channels=int(config["channels"]),
+            num_blocks=int(config["num_blocks"]),
+            fusion_full_channels=int(config["fusion_full_channels"]),
+            fusion_half_channels=int(config["fusion_half_channels"]),
+            fusion_quarter_channels=int(config["fusion_quarter_channels"]),
+            detail_scale=float(config["detail_scale"]),
+        )
+    elif version == 3:
+        if int(config.get("architecture_revision", 0)) not in (
+            MiohRestorerV3.SUPPORTED_ARCHITECTURE_REVISIONS
+        ):
+            raise ValueError("unsupported MiohRestorerV3 architecture revision")
+        model = MiohRestorerV3(
+            window_frames=int(config["window_frames"]),
+            channels=int(config["channels"]),
+            num_blocks=int(config["num_blocks"]),
+            encoder_blocks=int(config["encoder_blocks"]),
+            reconstruction_blocks=int(config["reconstruction_blocks"]),
+            alignment_radius=int(config["alignment_radius"]),
+            first_order_dilation=int(config["first_order_dilation"]),
+            second_order_dilation=int(config["second_order_dilation"]),
+            alignment_key_channels=int(config["alignment_key_channels"]),
+            alignment_groups=int(config.get("alignment_groups", 1)),
+            hierarchical_alignment_dilations=tuple(
+                int(item)
+                for item in config.get(
+                    "hierarchical_alignment_dilations", []
+                )
+            ),
+            alignment_temperature=float(
+                config.get("alignment_temperature", 1.0)
+            ),
+            detail_scale=float(config["detail_scale"]),
+        )
+    else:
+        raise ValueError("checkpoint is not MiohRestorerV2/V3")
     state_key = "state_dict" if raw_weights else "ema_state_dict"
     if state_key not in payload:
         raise ValueError(f"checkpoint is missing {state_key}")
@@ -67,7 +98,7 @@ def remove_existing(path: Path, allow_overwrite: bool) -> None:
 
 
 def example_inputs(
-    model: MiohRestorerV2,
+    model: MiohRestorerV2 | MiohRestorerV3,
     image_size: int,
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -82,7 +113,7 @@ def example_inputs(
 
 
 def export_coreml(
-    model: MiohRestorerV2,
+    model: MiohRestorerV2 | MiohRestorerV3,
     output: Path,
     image_size: int,
     allow_overwrite: bool,
@@ -104,7 +135,12 @@ def export_coreml(
         compute_precision=ct.precision.FLOAT16,
         minimum_deployment_target=ct.target.iOS16,
     )
-    converted.user_defined_metadata["mioh.restorer"] = "v2"
+    restorer_label = "2"
+    if isinstance(model, MiohRestorerV3):
+        restorer_label = (
+            "3.1" if model.hierarchical_alignment_dilations else "3"
+        )
+    converted.user_defined_metadata["mioh.restorer"] = f"v{restorer_label}"
     converted.user_defined_metadata["mioh.window_frames"] = str(
         model.window_frames
     )
@@ -114,7 +150,7 @@ def export_coreml(
 
 
 def export_coreai(
-    model: MiohRestorerV2,
+    model: MiohRestorerV2 | MiohRestorerV3,
     output: Path,
     image_size: int,
     allow_overwrite: bool,
@@ -143,13 +179,20 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("at least one deployment target must remain enabled")
     model, payload = build_model(args.checkpoint, args.raw_weights)
     config = payload["config"]
+    version = int(config["version"])
+    version_label = (
+        "31"
+        if version == 3
+        and config.get("hierarchical_alignment_dilations")
+        else str(version)
+    )
     image_size = int(config["image_size"])
     args.output_dir.mkdir(parents=True, exist_ok=True)
     stem = (
-        f"mioh-restorer-v2-t{model.window_frames}-c{model.channels}"
+        f"mioh-restorer-v{version_label}-t{model.window_frames}-c{model.channels}"
         f"-s{image_size}-fp16"
     )
-    checkpoint_output = args.output_dir / "mioh-restorer-v2.pth"
+    checkpoint_output = args.output_dir / f"mioh-restorer-v{version_label}.pth"
     coreml_output = args.output_dir / f"{stem}.mlpackage"
     coreai_output = args.output_dir / f"{stem}.aimodel"
     report_output = args.output_dir / "export-report.json"
