@@ -39,6 +39,20 @@ uv pip install pyinstaller
 uv run pyinstaller --noconfirm packaging/macOS/lada.spec
 ```
 
+### mioh-universal user manual
+
+The universal DMG includes the Japanese PDF manual at its top level. Regenerate
+the checked-in PDF after editing `docs/mioh-user-manual-ja.md`:
+
+```bash
+uv run --with reportlab scripts/docs/build_mioh_manual_pdf.py
+```
+
+The result is written to `output/pdf/mioh-user-manual-ja.pdf`.
+`packaging/macOS/standalone/build_universal_app.sh` fails before creating the
+DMG if this file is missing, so a universal package cannot silently omit the
+manual.
+
 Output:
 
 * **CLI:** `dist/cli/` — contains `lada-cli` and `_internal/`
