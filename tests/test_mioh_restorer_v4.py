@@ -21,17 +21,20 @@ from lada.models.mioh_restorer.curriculum_v4 import (
     stage_learning_rate,
 )
 from lada.models.mioh_restorer.model_v4 import (
+    FixedShiftBank,
     HierarchicalAlignment27,
     MiohRestorerV4ExportWrapper,
     MiohRestorerV4Q,
     NormalizedShiftCorrelation,
+    V41_NEW_STATE_PREFIXES,
+    load_v4_state_for_v41_upgrade,
     make_offsets,
     shift2d,
 )
 from lada.models.mioh_restorer.runner_v4 import MiohRestorerV4WindowRunner
 
 
-def tiny_model(*, mode: str = "batch") -> MiohRestorerV4Q:
+def tiny_model(*, mode: str = "batch", detail: bool = False) -> MiohRestorerV4Q:
     return MiohRestorerV4Q(
         execution_mode=mode,
         quarter_channels=8,
@@ -40,6 +43,7 @@ def tiny_model(*, mode: str = "batch") -> MiohRestorerV4Q:
         fusion_quarter_channels=8,
         eighth_blocks=1,
         quarter_blocks=1,
+        high_resolution_detail=detail,
     )
 
 
@@ -47,6 +51,45 @@ def test_shift2d_does_not_wrap_edges() -> None:
     values = torch.arange(9).reshape(1, 1, 3, 3).float()
     shifted = shift2d(values, 1, -1)
     assert shifted.tolist() == [[[[0.0, 0.0, 0.0], [1.0, 2.0, 0.0], [4.0, 5.0, 0.0]]]]
+
+
+@pytest.mark.parametrize("dilation", (1, 2, 3, 4, 12))
+def test_fixed_shift_bank_exactly_matches_explicit_shifts(dilation: int) -> None:
+    values = torch.randn(2, 3, 31, 29)
+    offsets = make_offsets(1, dilation)
+    expected = torch.stack(
+        [shift2d(values, vertical, horizontal) for vertical, horizontal in offsets],
+        dim=1,
+    )
+    actual = FixedShiftBank(3, offsets)(values)
+    # A one-hot convolution is mathematically identical.  Accelerated
+    # convolution may round the copied float32 value by one ULP.
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_fixed_full121_shift_bank_exactly_matches_explicit_shifts() -> None:
+    values = torch.randn(1, 2, 15, 17)
+    offsets = make_offsets(5)
+    expected = torch.stack(
+        [shift2d(values, vertical, horizontal) for vertical, horizontal in offsets],
+        dim=1,
+    )
+    actual = FixedShiftBank(2, offsets)(values)
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_convolutional_correlation_matches_explicit_reference() -> None:
+    offsets = make_offsets(1, 2)
+    explicit = NormalizedShiftCorrelation(offsets).eval()
+    convolutional = NormalizedShiftCorrelation(offsets, channels=4).eval()
+    convolutional.load_state_dict(explicit.state_dict(), strict=False)
+    reference = torch.randn(2, 4, 17, 19)
+    target = torch.randn_like(reference)
+    with torch.no_grad():
+        expected_aligned, expected_weights = explicit(reference, target)
+        actual_aligned, actual_weights = convolutional(reference, target)
+    torch.testing.assert_close(actual_weights, expected_weights, rtol=2e-6, atol=2e-6)
+    torch.testing.assert_close(actual_aligned, expected_aligned, rtol=2e-6, atol=2e-6)
 
 
 def test_hierarchical_alignment_has_required_reach() -> None:
@@ -80,6 +123,34 @@ def test_untrained_model_is_identity_and_preserves_roi_outside() -> None:
     assert torch.equal(restored, expected)
     assert torch.count_nonzero(base) == 0
     assert torch.count_nonzero(texture) == 0
+
+
+def test_v41_whitelist_upgrade_is_exact_and_output_preserving() -> None:
+    legacy = tiny_model().eval()
+    with torch.no_grad():
+        legacy.base_head_half[-1].bias.fill_(0.1)
+        legacy.texture_head[-1].bias.fill_(0.05)
+    upgraded = tiny_model(detail=True).eval()
+    missing = load_v4_state_for_v41_upgrade(
+        upgraded, copy.deepcopy(legacy.state_dict()), source_revision=1
+    )
+    assert missing
+    assert all(key.startswith(V41_NEW_STATE_PREFIXES) for key in missing)
+    values = torch.rand(1, 9, 4, 16, 16)
+    with torch.no_grad():
+        legacy_output = legacy(values)
+        upgraded_output = upgraded(values)
+    for expected, actual in zip(legacy_output, upgraded_output, strict=True):
+        torch.testing.assert_close(expected, actual, rtol=0, atol=0)
+
+
+def test_v41_whitelist_upgrade_rejects_silent_legacy_loss() -> None:
+    legacy_state = copy.deepcopy(tiny_model().state_dict())
+    legacy_state.pop("encoder.stem.0.weight")
+    with pytest.raises(ValueError, match="whitelist"):
+        load_v4_state_for_v41_upgrade(
+            tiny_model(detail=True), legacy_state, source_revision=1
+        )
 
 
 def test_batch_and_serial_execution_match_for_multiple_samples() -> None:

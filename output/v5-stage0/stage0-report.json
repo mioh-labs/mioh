@@ -1,0 +1,13 @@
+{
+  "variant": "s",
+  "sizes": {
+    "128": {
+      "parameters": 2905496,
+      "context_frames": 9,
+      "outputs": 1,
+      "monolithic": {},
+      "split": {},
+      "stateful": {}
+    }
+  }
+}

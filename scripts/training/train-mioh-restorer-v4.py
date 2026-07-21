@@ -41,7 +41,11 @@ from lada.models.mioh_restorer.losses_v4 import (
     MiohRestorerV4Loss,
     confidence_error_correlation,
 )
-from lada.models.mioh_restorer.model_v4 import MiohRestorerV4Q, parameter_count
+from lada.models.mioh_restorer.model_v4 import (
+    MiohRestorerV4Q,
+    load_v4_state_for_v41_upgrade,
+    parameter_count,
+)
 from lada.models.mioh_restorer.synthetic_motion_v4 import (
     alignment_displacement,
     make_synthetic_motion_sequence,
@@ -99,6 +103,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fusion-quarter-channels", type=int, default=96)
     parser.add_argument("--eighth-blocks", type=int, default=10)
     parser.add_argument("--quarter-blocks", type=int, default=4)
+    parser.add_argument(
+        "--high-resolution-detail",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--train-high-resolution-detail-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--initialize-v4-upgrade",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Whitelist-load V4/V4.1 weights and reset optimizer/EMA",
+    )
+    parser.add_argument("--fixed-learning-rate", type=float)
     parser.add_argument(
         "--gradient-checkpointing",
         action=argparse.BooleanOptionalAction,
@@ -211,6 +232,16 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("teacher-shift-temperature must be positive")
     if args.teacher_flow_chunk_size < 0:
         raise ValueError("teacher-flow-chunk-size must not be negative")
+    if args.train_high_resolution_detail_only and not args.high_resolution_detail:
+        raise ValueError(
+            "train-high-resolution-detail-only requires high-resolution-detail"
+        )
+    if args.initialize_v4_upgrade and not args.initialize_from:
+        raise ValueError("initialize-v4-upgrade requires initialize-from")
+    if args.initialize_v4_upgrade and not args.high_resolution_detail:
+        raise ValueError("initialize-v4-upgrade requires high-resolution-detail")
+    if args.fixed_learning_rate is not None and args.fixed_learning_rate <= 0:
+        raise ValueError("fixed-learning-rate must be positive")
     MemoryThresholds(
         warning_mps_ratio=args.memory_warning_ratio,
         critical_mps_ratio=args.memory_critical_ratio,
@@ -267,6 +298,7 @@ def build_model(args: argparse.Namespace) -> MiohRestorerV4Q:
         fusion_quarter_channels=args.fusion_quarter_channels,
         eighth_blocks=args.eighth_blocks,
         quarter_blocks=args.quarter_blocks,
+        high_resolution_detail=args.high_resolution_detail,
     )
     model.enable_gradient_checkpointing(args.gradient_checkpointing)
     return model
@@ -299,8 +331,12 @@ def distillation_settings(args: argparse.Namespace) -> dict[str, float]:
 def model_config(model: MiohRestorerV4Q, args: argparse.Namespace) -> dict[str, object]:
     return {
         "version": 4,
-        "architecture": "v4q-output-specific-hierarchical-correlation",
-        "architecture_revision": model.ARCHITECTURE_REVISION,
+        "architecture": (
+            "v4.1q-high-resolution-detail-correlation"
+            if model.high_resolution_detail
+            else "v4q-output-specific-hierarchical-correlation"
+        ),
+        "architecture_revision": model.architecture_revision,
         "alignment_variant": model.alignment_variant,
         "execution_mode": model.execution_mode,
         "input_frames": WINDOW_FRAMES,
@@ -313,6 +349,12 @@ def model_config(model: MiohRestorerV4Q, args: argparse.Namespace) -> dict[str, 
         "fusion_quarter_channels": model.fusion_quarter_channels,
         "eighth_blocks": model.eighth_blocks,
         "quarter_blocks": model.quarter_blocks,
+        "high_resolution_detail": model.high_resolution_detail,
+        "detail_full_channels": model.detail_full_channels,
+        "detail_half_channels": model.detail_half_channels,
+        "detail_fusion_channels": model.detail_fusion_channels,
+        "train_high_resolution_detail_only": args.train_high_resolution_detail_only,
+        "v41_initialized_keys": getattr(args, "v41_initialized_keys", []),
         "gradient_checkpointing": model.gradient_checkpointing,
         "loss": {
             "candidate": args.candidate_weight,
@@ -354,6 +396,8 @@ def model_config(model: MiohRestorerV4Q, args: argparse.Namespace) -> dict[str, 
 
 
 def learning_rate(args: argparse.Namespace, step: int) -> float:
+    if args.fixed_learning_rate is not None:
+        return float(args.fixed_learning_rate)
     return stage_learning_rate(
         stage_definition(args.stage),
         step,
@@ -378,6 +422,11 @@ def apply_training_stage(model: MiohRestorerV4Q, args: argparse.Namespace) -> st
     set_module_trainable(model.up_half_to_full, stage.train_texture)
     set_module_trainable(model.texture_head, stage.train_texture)
     set_module_trainable(model.confidence_head, stage.train_confidence)
+    if args.train_high_resolution_detail_only:
+        model.requires_grad_(False)
+        for module in model.high_resolution_detail_modules():
+            set_module_trainable(module, True)
+        return f"{stage.name}-high-resolution-detail-only"
     return stage.name
 
 
@@ -835,11 +884,17 @@ def main() -> int:
         )
         if int(payload.get("config", {}).get("version", 0)) != 4:
             raise ValueError("initialization checkpoint is not a V4 checkpoint")
+        source_stage = int(payload.get("stage_id", 0))
         expected_parent = stage.stage_id - 1
-        if int(payload.get("stage_id", 0)) != expected_parent:
+        allowed_source_stages = (
+            {expected_parent, stage.stage_id}
+            if args.initialize_v4_upgrade
+            else {expected_parent}
+        )
+        if source_stage not in allowed_source_stages:
             raise ValueError(
-                f"stage {stage.stage_id} must initialize from completed "
-                f"stage {expected_parent}"
+                f"stage {stage.stage_id} initialization expected one of "
+                f"{sorted(allowed_source_stages)}, got stage {source_stage}"
             )
         if not bool(payload.get("stage_complete", False)):
             raise ValueError("previous-stage checkpoint is not marked complete")
@@ -849,10 +904,25 @@ def main() -> int:
             else "state_dict"
         )
         inherited_state = payload[state_key]
-        model.load_state_dict(inherited_state, strict=True)
+        if args.initialize_v4_upgrade:
+            source_revision = int(
+                payload.get("config", {}).get("architecture_revision", 1)
+            )
+            missing = load_v4_state_for_v41_upgrade(
+                model,
+                inherited_state,
+                source_revision=source_revision,
+            )
+            args.v41_initialized_keys = list(missing)
+            # Rebuild EMA from the expanded model: legacy parameters retain
+            # the selected parent EMA/raw values while new parameters begin
+            # from their deterministic zero-safe initialization.
+            ema.load_state_dict(model.state_dict(), strict=True)
+        else:
+            model.load_state_dict(inherited_state, strict=True)
+            ema.load_state_dict(inherited_state, strict=True)
         # A new EMA begins from the selected parent weights.  Carrying the old
         # average would keep stale history from an objective that has ended.
-        ema.load_state_dict(inherited_state, strict=True)
         args.lineage_base_steps = int(
             payload.get("lineage_total_steps", payload.get("stage_step", 0))
         )

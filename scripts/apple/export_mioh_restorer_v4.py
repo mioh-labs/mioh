@@ -39,7 +39,8 @@ def load_model(path: Path, *, raw: bool) -> tuple[MiohRestorerV4Q, dict]:
     config = payload.get("config", {})
     if int(config.get("version", 0)) != 4:
         raise ValueError(f"checkpoint is not MiohRestorerV4: {path}")
-    if int(config.get("architecture_revision", 0)) != MiohRestorerV4Q.ARCHITECTURE_REVISION:
+    revision = int(config.get("architecture_revision", 0))
+    if revision not in (1, 2):
         raise ValueError("unsupported MiohRestorerV4 architecture revision")
     model = MiohRestorerV4Q(
         alignment_variant=str(config["alignment_variant"]),
@@ -50,6 +51,10 @@ def load_model(path: Path, *, raw: bool) -> tuple[MiohRestorerV4Q, dict]:
         fusion_quarter_channels=int(config["fusion_quarter_channels"]),
         eighth_blocks=int(config["eighth_blocks"]),
         quarter_blocks=int(config["quarter_blocks"]),
+        high_resolution_detail=bool(config.get("high_resolution_detail", False)),
+        detail_full_channels=int(config.get("detail_full_channels", 32)),
+        detail_half_channels=int(config.get("detail_half_channels", 48)),
+        detail_fusion_channels=int(config.get("detail_fusion_channels", 64)),
     )
     key = "state_dict" if raw else "ema_state_dict"
     if key not in payload:
@@ -138,10 +143,11 @@ def main() -> int:
     config = payload["config"]
     image_size = int(config["image_size"])
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"mioh-restorer-v4q-t9-o5-s{image_size}-fp16"
+    version_label = "v41q" if model.high_resolution_detail else "v4q"
+    stem = f"mioh-restorer-{version_label}-t9-o5-s{image_size}-fp16"
     coreml_path = args.output_dir / f"{stem}.mlpackage"
     coreai_path = args.output_dir / f"{stem}.aimodel"
-    selected_path = args.output_dir / "mioh-restorer-v4q.pth"
+    selected_path = args.output_dir / f"mioh-restorer-{version_label}.pth"
     report_path = args.output_dir / "export-report-v4.json"
     remove_existing(selected_path, args.allow_overwrite)
     selected_key = "state_dict" if args.raw_weights else "ema_state_dict"
