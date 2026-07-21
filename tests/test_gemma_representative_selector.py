@@ -9,6 +9,7 @@ from lada.datasetcreation.gemma_representative_selector import (
     category_token_similarity,
     classification_signature,
     group_consecutive_similar_clips,
+    limit_representatives_with_diversity,
     load_dataset_clip,
     materialize_representative_dataset,
     remove_legacy_flat_representative_links,
@@ -16,6 +17,7 @@ from lada.datasetcreation.gemma_representative_selector import (
     representative_score,
     select_representatives,
     split_representatives_by_source,
+    split_targets_from_training_count,
     signature_similarity,
 )
 
@@ -170,6 +172,43 @@ def test_dataset_splits_never_mix_one_source(tmp_path: Path):
     assert sum(len(values) for values in splits.values()) == len(clips)
 
 
+def test_training_limit_keeps_highest_quality_representatives(tmp_path: Path):
+    clips = [make_clip(tmp_path, index) for index in range(1, 5)]
+    decisions = {
+        str(clip.video_path): decision(
+            sharpness=0.4 + clip.clip_index / 10,
+            clarity=0.4 + clip.clip_index / 10,
+        )
+        for clip in clips
+    }
+
+    selected = limit_representatives_with_diversity(clips, decisions, 2)
+
+    assert [clip.clip_index for clip in selected] == [3, 4]
+
+
+def test_training_limit_mixes_semantic_variations_before_duplicates(tmp_path: Path):
+    clips = [make_clip(tmp_path, index) for index in range(1, 5)]
+    decisions = {
+        str(clips[0].video_path): decision(activity="scene_a", sharpness=0.95),
+        str(clips[1].video_path): decision(activity="scene_a", sharpness=0.90),
+        str(clips[2].video_path): decision(activity="scene_b", sharpness=0.70),
+        str(clips[3].video_path): decision(activity="scene_c", sharpness=0.60),
+    }
+
+    selected = limit_representatives_with_diversity(clips, decisions, 3)
+
+    assert [clip.clip_index for clip in selected] == [1, 3, 4]
+
+
+def test_split_targets_keep_exact_training_count_and_80_10_10_ratio():
+    assert split_targets_from_training_count(1500, 0.8, 0.1) == {
+        "train": 1500,
+        "validation": 188,
+        "test": 187,
+    }
+
+
 def test_materialize_links_all_training_triplets(tmp_path: Path):
     clip = make_clip(tmp_path, 1)
     output = tmp_path / "selected"
@@ -197,3 +236,28 @@ def test_remove_legacy_layout_only_removes_symlinks(tmp_path: Path):
     remove_legacy_flat_representative_links(root)
     assert not (legacy / "linked.mp4").exists()
     assert real.exists()
+
+
+def test_remove_legacy_layout_tolerates_link_disappearing_during_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = tmp_path / "selected"
+    legacy = root / "crop_unscaled_img"
+    legacy.mkdir(parents=True)
+    source = tmp_path / "source.mp4"
+    source.touch()
+    link = legacy / "linked.mp4"
+    link.symlink_to(source)
+    original_is_symlink = Path.is_symlink
+
+    def remove_then_report_symlink(path: Path) -> bool:
+        result = original_is_symlink(path)
+        if path == link and result:
+            path.unlink()
+        return result
+
+    monkeypatch.setattr(Path, "is_symlink", remove_then_report_symlink)
+
+    remove_legacy_flat_representative_links(root)
+
+    assert not link.exists()

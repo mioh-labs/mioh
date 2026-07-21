@@ -379,6 +379,105 @@ def split_representatives_by_source(
     return splits
 
 
+def limit_representatives_with_diversity(
+    clips: Iterable[DatasetClip],
+    decisions_by_video: dict[str, dict[str, Any]],
+    limit: int,
+) -> list[DatasetClip]:
+    """Keep varied representatives, preferring quality within each variation.
+
+    This is intended to cap a split *after* sources have been assigned to
+    train/validation/test.  Consequently, clipping the training split cannot
+    leak clips from one original source video into another split. Candidates
+    are bucketed by activity/orientation/pose/framing and selected round-robin;
+    the strongest clip is taken first within every semantic bucket.
+    """
+    clips = list(clips)
+    if limit < 0:
+        raise ValueError("limit cannot be negative")
+    if limit == 0 or len(clips) <= limit:
+        return sorted(clips, key=lambda clip: (clip.source_name, clip.clip_index))
+
+    missing = [
+        str(clip.video_path)
+        for clip in clips
+        if str(clip.video_path) not in decisions_by_video
+    ]
+    if missing:
+        raise ValueError(f"missing Gemma decisions for {len(missing)} clips")
+
+    buckets: dict[tuple[str, str, str, str], list[DatasetClip]] = {}
+    for clip in clips:
+        signature = classification_signature(decisions_by_video[str(clip.video_path)])
+        key = (
+            signature["activity"],
+            signature["orientation"],
+            signature["pose"],
+            signature["framing"],
+        )
+        buckets.setdefault(key, []).append(clip)
+
+    for bucket in buckets.values():
+        bucket.sort(key=lambda clip: (
+            -representative_score(clip, decisions_by_video[str(clip.video_path)]),
+            clip.source_name,
+            clip.clip_index,
+        ))
+
+    selected: list[DatasetClip] = []
+    depth = 0
+    while len(selected) < limit:
+        candidates = [
+            (key, bucket[depth])
+            for key, bucket in buckets.items()
+            if depth < len(bucket)
+        ]
+        if not candidates:
+            break
+        candidates.sort(key=lambda item: (
+            -representative_score(
+                item[1], decisions_by_video[str(item[1].video_path)]
+            ),
+            item[0],
+            item[1].source_name,
+            item[1].clip_index,
+        ))
+        selected.extend(clip for _, clip in candidates[:limit - len(selected)])
+        depth += 1
+
+    return sorted(
+        selected, key=lambda clip: (clip.source_name, clip.clip_index)
+    )
+
+
+def split_targets_from_training_count(
+    training_count: int,
+    train_ratio: float,
+    validation_ratio: float,
+) -> dict[str, int]:
+    """Derive integer 3-way targets while keeping training_count exact."""
+    test_ratio = 1.0 - train_ratio - validation_ratio
+    if training_count < 0:
+        raise ValueError("training_count cannot be negative")
+    if train_ratio <= 0 or validation_ratio < 0 or test_ratio < 0:
+        raise ValueError("invalid train/validation/test ratios")
+    if training_count == 0:
+        return {"train": 0, "validation": 0, "test": 0}
+
+    total = max(training_count, round(training_count / train_ratio))
+    held_out = total - training_count
+    held_out_ratio = validation_ratio + test_ratio
+    if held_out_ratio == 0:
+        validation_count = 0
+    else:
+        validation_count = round(held_out * validation_ratio / held_out_ratio)
+    return {
+        "train": training_count,
+        "validation": validation_count,
+        "test": held_out - validation_count,
+    }
+
+
 def materialize_representative_dataset(clips: Iterable[DatasetClip], output_root: Path, mode: str) -> None:
     clips = list(clips)
     directories = {
@@ -397,7 +496,9 @@ def materialize_representative_dataset(clips: Iterable[DatasetClip], output_root
     for kind, directory in directories.items():
         for existing in directory.iterdir():
             if existing.is_symlink() and existing.name not in expected_names[kind]:
-                existing.unlink()
+                # Another finishing/resumed selector may have removed the same
+                # stale link after iterdir() returned it.
+                existing.unlink(missing_ok=True)
 
     def create(source: Path, destination: Path):
         if destination.exists() or destination.is_symlink():
@@ -426,7 +527,9 @@ def remove_legacy_flat_representative_links(output_root: Path) -> None:
             continue
         for path in directory.iterdir():
             if path.is_symlink():
-                path.unlink()
+                # Cleanup must be restart-safe. A concurrently finishing older
+                # run can remove a link between is_symlink() and unlink().
+                path.unlink(missing_ok=True)
         try:
             directory.rmdir()
         except OSError:
