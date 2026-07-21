@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: Lada Authors
 # SPDX-License-Identifier: AGPL-3.0
 
-"""Train the all-in bidirectional MiohRestorerV2 model."""
+"""Train MiohRestorerV2 or the Core AI aligned MiohRestorerV3 model."""
 
 from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import math
 import random
@@ -20,6 +21,7 @@ from torch.utils.data import DataLoader
 from lada.models.mioh_restorer import (
     MaskedVGG16PerceptualLoss,
     MiohRestorerV2,
+    MiohRestorerV3,
     TemporalPatchDiscriminator,
     discriminator_hinge_loss,
     generator_hinge_loss,
@@ -28,6 +30,20 @@ from lada.models.mioh_restorer import (
     masked_psnr,
     restoration_loss,
     temporal_discriminator_input,
+)
+from lada.models.basicvsrpp.basicvsrpp_gan import BasicVSRPlusPlusGanNet
+from lada.models.basicvsrpp.activation_analysis import (
+    AlignmentActivation,
+    AlignmentCapturePolicy,
+    BasicVSRPPActivationAnalyzer,
+)
+from lada.models.mioh_restorer.distillation import (
+    roi_alignment_kl_loss,
+    roi_confidence_loss,
+    roi_feature_energy_loss,
+    teacher_source_confidence,
+    teacher_hierarchical_shift_distributions,
+    teacher_shift_distribution,
 )
 from lada.models.mioh_restorer.training_dataset import MiohRestorationDataset
 from lada.models.mioh_restorer.training_memory import (
@@ -48,8 +64,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--val-metadata-root", type=Path, nargs="+")
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--initialize-from-v2", type=Path)
+    parser.add_argument("--initialize-from-v3", type=Path)
     parser.add_argument("--reset-optimizers", action="store_true")
+    parser.add_argument(
+        "--gradient-checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--model-version", type=int, choices=(2, 3), default=2)
     parser.add_argument("--steps", type=int, default=60_000)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--workers", type=int, default=2)
@@ -64,6 +88,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--fusion-half-channels", type=int, default=64)
     parser.add_argument("--fusion-quarter-channels", type=int, default=96)
     parser.add_argument("--detail-scale", type=float, default=0.25)
+    parser.add_argument("--encoder-blocks", type=int, default=5)
+    parser.add_argument("--reconstruction-blocks", type=int, default=5)
+    parser.add_argument("--alignment-radius", type=int, default=1)
+    parser.add_argument("--first-order-dilation", type=int, default=2)
+    parser.add_argument("--second-order-dilation", type=int, default=4)
+    parser.add_argument("--alignment-key-channels", type=int, default=16)
+    parser.add_argument("--alignment-groups", type=int, default=1)
+    parser.add_argument(
+        "--hierarchical-alignment-dilations",
+        type=int,
+        nargs="*",
+        default=(),
+    )
+    parser.add_argument("--alignment-temperature", type=float, default=1.0)
+
+    parser.add_argument("--teacher-checkpoint", type=Path)
+    parser.add_argument("--teacher-weight", type=float, default=0.0)
+    parser.add_argument("--teacher-feature-weight", type=float, default=0.0)
+    parser.add_argument("--teacher-alignment-weight", type=float, default=0.0)
+    parser.add_argument("--teacher-distill-calls", type=int, default=2)
+    parser.add_argument("--teacher-shift-temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--teacher-fp16", action=argparse.BooleanOptionalAction, default=True
+    )
 
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--minimum-learning-rate", type=float, default=2e-6)
@@ -148,6 +196,13 @@ def validate_args(args: argparse.Namespace) -> None:
         "fusion_full_channels": args.fusion_full_channels,
         "fusion_half_channels": args.fusion_half_channels,
         "fusion_quarter_channels": args.fusion_quarter_channels,
+        "encoder_blocks": args.encoder_blocks,
+        "reconstruction_blocks": args.reconstruction_blocks,
+        "first_order_dilation": args.first_order_dilation,
+        "second_order_dilation": args.second_order_dilation,
+        "alignment_key_channels": args.alignment_key_channels,
+        "alignment_groups": args.alignment_groups,
+        "alignment_temperature": args.alignment_temperature,
         "learning_rate": args.learning_rate,
         "minimum_learning_rate": args.minimum_learning_rate,
         "max_grad_norm": args.max_grad_norm,
@@ -174,6 +229,7 @@ def validate_args(args: argparse.Namespace) -> None:
         or args.validation_workers < 0
         or args.warmup_steps < 0
         or args.gan_warmup_steps < 0
+        or args.alignment_radius < 0
     ):
         raise ValueError("workers and warmup steps must not be negative")
     if args.window_frames % args.chunk_frames:
@@ -193,12 +249,51 @@ def validate_args(args: argparse.Namespace) -> None:
         "directional_aux_weight": args.directional_aux_weight,
         "direction_consistency_weight": args.direction_consistency_weight,
         "gan_weight": args.gan_weight,
+        "teacher_weight": args.teacher_weight,
+        "teacher_feature_weight": args.teacher_feature_weight,
+        "teacher_alignment_weight": args.teacher_alignment_weight,
     }
     for name, value in loss_weights.items():
         if value < 0:
             raise ValueError(f"{name} must not be negative")
     if args.gan_start_step < 0:
         raise ValueError("gan_start_step must not be negative")
+    teacher_signal = (
+        args.teacher_weight
+        + args.teacher_feature_weight
+        + args.teacher_alignment_weight
+    )
+    if bool(args.teacher_checkpoint) != (teacher_signal > 0):
+        raise ValueError(
+            "teacher-checkpoint and a positive teacher loss weight must be used together"
+        )
+    if args.teacher_distill_calls <= 0:
+        raise ValueError("teacher-distill-calls must be positive")
+    if args.teacher_shift_temperature <= 0:
+        raise ValueError("teacher-shift-temperature must be positive")
+    if any(item <= 0 for item in args.hierarchical_alignment_dilations):
+        raise ValueError("hierarchical alignment dilations must be positive")
+    if (
+        args.model_version != 3
+        and (args.teacher_feature_weight > 0 or args.teacher_alignment_weight > 0)
+    ):
+        raise ValueError("intermediate teacher distillation requires model-version 3")
+    initialization_sources = sum(
+        item is not None
+        for item in (
+            args.resume,
+            args.initialize_from_v2,
+            args.initialize_from_v3,
+        )
+    )
+    if initialization_sources > 1:
+        raise ValueError(
+            "resume, initialize-from-v2 and initialize-from-v3 are mutually exclusive"
+        )
+    if args.initialize_from_v2 is not None and args.model_version != 3:
+        raise ValueError("initialize-from-v2 requires model-version 3")
+    if args.initialize_from_v3 is not None and args.model_version != 3:
+        raise ValueError("initialize-from-v3 requires model-version 3")
     MemoryThresholds(
         warning_mps_ratio=args.memory_warning_ratio,
         critical_mps_ratio=args.memory_critical_ratio,
@@ -239,30 +334,47 @@ def make_loader(
     )
 
 
-def build_model(args: argparse.Namespace) -> MiohRestorerV2:
-    return MiohRestorerV2(
+def build_model(args: argparse.Namespace) -> MiohRestorerV2 | MiohRestorerV3:
+    if args.model_version == 2:
+        return MiohRestorerV2(
+            window_frames=args.window_frames,
+            chunk_frames=args.chunk_frames,
+            channels=args.channels,
+            num_blocks=args.blocks,
+            fusion_full_channels=args.fusion_full_channels,
+            fusion_half_channels=args.fusion_half_channels,
+            fusion_quarter_channels=args.fusion_quarter_channels,
+            detail_scale=args.detail_scale,
+        )
+    return MiohRestorerV3(
         window_frames=args.window_frames,
-        chunk_frames=args.chunk_frames,
         channels=args.channels,
         num_blocks=args.blocks,
-        fusion_full_channels=args.fusion_full_channels,
-        fusion_half_channels=args.fusion_half_channels,
-        fusion_quarter_channels=args.fusion_quarter_channels,
+        encoder_blocks=args.encoder_blocks,
+        reconstruction_blocks=args.reconstruction_blocks,
+        alignment_radius=args.alignment_radius,
+        first_order_dilation=args.first_order_dilation,
+        second_order_dilation=args.second_order_dilation,
+        alignment_key_channels=args.alignment_key_channels,
+        alignment_groups=args.alignment_groups,
+        hierarchical_alignment_dilations=(
+            args.hierarchical_alignment_dilations
+        ),
+        alignment_temperature=args.alignment_temperature,
         detail_scale=args.detail_scale,
     )
 
 
-def model_config(model: MiohRestorerV2, args: argparse.Namespace) -> dict:
-    return {
-        "version": 2,
+def model_config(
+    model: MiohRestorerV2 | MiohRestorerV3,
+    args: argparse.Namespace,
+) -> dict:
+    config = {
+        "version": args.model_version,
         "window_frames": model.window_frames,
-        "chunk_frames": model.chunk_frames,
         "channels": model.channels,
         "num_blocks": model.num_blocks,
         "image_size": args.image_size,
-        "fusion_full_channels": model.fusion_full_channels,
-        "fusion_half_channels": model.fusion_half_channels,
-        "fusion_quarter_channels": model.fusion_quarter_channels,
         "detail_scale": model.detail_scale,
         "gradient_weight": args.gradient_weight,
         "temporal_weight": args.temporal_weight,
@@ -273,6 +385,19 @@ def model_config(model: MiohRestorerV2, args: argparse.Namespace) -> dict:
         "direction_consistency_weight": args.direction_consistency_weight,
         "gan_weight": args.gan_weight,
         "gan_start_step": args.gan_start_step,
+        "teacher_weight": args.teacher_weight,
+        "teacher_feature_weight": args.teacher_feature_weight,
+        "teacher_alignment_weight": args.teacher_alignment_weight,
+        "teacher_distill_calls": args.teacher_distill_calls,
+        "teacher_shift_temperature": args.teacher_shift_temperature,
+        "teacher_checkpoint": (
+            str(args.teacher_checkpoint.resolve())
+            if args.teacher_checkpoint is not None
+            else None
+        ),
+        "teacher_checkpoint_sha256": getattr(
+            args, "teacher_checkpoint_sha256", None
+        ),
         "training_memory": {
             "workers": args.workers,
             "validation_workers": args.validation_workers,
@@ -283,8 +408,147 @@ def model_config(model: MiohRestorerV2, args: argparse.Namespace) -> dict:
             "warning_system_available_gib": args.memory_warning_available_gib,
             "critical_system_available_gib": args.memory_critical_available_gib,
             "emergency_stop": args.memory_emergency_stop,
+            "gradient_checkpointing": args.gradient_checkpointing,
         },
     }
+    if isinstance(model, MiohRestorerV2):
+        config.update(
+            {
+                "chunk_frames": model.chunk_frames,
+                "fusion_full_channels": model.fusion_full_channels,
+                "fusion_half_channels": model.fusion_half_channels,
+                "fusion_quarter_channels": model.fusion_quarter_channels,
+            }
+        )
+    else:
+        config.update(
+            {
+                "encoder_blocks": model.encoder_blocks,
+                "architecture_revision": model.architecture_revision,
+                "reconstruction_blocks": model.reconstruction_blocks,
+                "alignment_radius": model.alignment_radius,
+                "first_order_dilation": model.first_order_dilation,
+                "second_order_dilation": model.second_order_dilation,
+                "alignment_key_channels": model.alignment_key_channels,
+                "alignment_groups": model.alignment_groups,
+                "hierarchical_alignment_dilations": list(
+                    model.hierarchical_alignment_dilations
+                ),
+                "alignment_temperature": model.alignment_temperature,
+            }
+        )
+    return config
+
+
+def checkpoint_prefix(args: argparse.Namespace) -> str:
+    suffix = "1" if args.hierarchical_alignment_dilations else ""
+    return f"mioh-restorer-v{args.model_version}{suffix}"
+
+
+def load_v2_for_initialization(path: Path) -> MiohRestorerV2:
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    config = payload.get("config", {})
+    if int(config.get("version", 0)) != 2:
+        raise ValueError(f"initialization checkpoint is not V2: {path}")
+    model = MiohRestorerV2(
+        window_frames=int(config["window_frames"]),
+        chunk_frames=int(config["chunk_frames"]),
+        channels=int(config["channels"]),
+        num_blocks=int(config["num_blocks"]),
+        fusion_full_channels=int(config["fusion_full_channels"]),
+        fusion_half_channels=int(config["fusion_half_channels"]),
+        fusion_quarter_channels=int(config["fusion_quarter_channels"]),
+        detail_scale=float(config["detail_scale"]),
+    )
+    state = payload.get("ema_state_dict", payload["state_dict"])
+    model.load_state_dict(state, strict=True)
+    return model.eval()
+
+
+def load_v3_state_for_initialization(
+    path: Path,
+) -> tuple[dict, dict[str, torch.Tensor]]:
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    config = payload.get("config", {})
+    if int(config.get("version", 0)) != 3:
+        raise ValueError(f"initialization checkpoint is not V3: {path}")
+    state = payload.get("state_dict")
+    if not isinstance(state, dict):
+        raise ValueError(f"initialization checkpoint has no raw state: {path}")
+    return config, state
+
+
+def load_basicvsrpp_teacher(
+    path: Path,
+    device: torch.device,
+    *,
+    fp16: bool,
+) -> BasicVSRPlusPlusGanNet:
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"unexpected BasicVSR++ checkpoint: {path}")
+    prefix = (
+        "generator_ema."
+        if any(str(key).startswith("generator_ema.") for key in checkpoint)
+        else "generator."
+    )
+    state = {
+        str(key)[len(prefix) :]: value
+        for key, value in checkpoint.items()
+        if str(key).startswith(prefix)
+    }
+    if not state:
+        raise ValueError(f"BasicVSR++ generator weights not found: {path}")
+    teacher = BasicVSRPlusPlusGanNet(
+        mid_channels=64,
+        num_blocks=15,
+        spynet_pretrained=None,
+    )
+    teacher.load_state_dict(state, strict=True)
+    teacher.requires_grad_(False).eval().to(device)
+    if fp16:
+        if device.type == "cpu":
+            raise ValueError("teacher-fp16 requires an accelerator device")
+        teacher.half()
+    return teacher
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def rng_state_payload() -> dict:
+    numpy_state = np.random.get_state()
+    return {
+        "python": random.getstate(),
+        "numpy": {
+            "algorithm": numpy_state[0],
+            "state": torch.from_numpy(numpy_state[1].copy()),
+            "position": numpy_state[2],
+            "has_gauss": numpy_state[3],
+            "cached_gaussian": numpy_state[4],
+        },
+        "torch": torch.random.get_rng_state(),
+    }
+
+
+def restore_rng_state(payload: dict) -> None:
+    random.setstate(payload["python"])
+    numpy_state = payload["numpy"]
+    np.random.set_state(
+        (
+            numpy_state["algorithm"],
+            numpy_state["state"].cpu().numpy(),
+            int(numpy_state["position"]),
+            int(numpy_state["has_gauss"]),
+            float(numpy_state["cached_gaussian"]),
+        )
+    )
+    torch.random.set_rng_state(payload["torch"].cpu())
 
 
 def move_optimizer_state(
@@ -326,7 +590,7 @@ def gan_learning_rate(args: argparse.Namespace, step: int) -> float:
 
 
 @torch.no_grad()
-def update_ema(ema: MiohRestorerV2, model: MiohRestorerV2, decay: float) -> None:
+def update_ema(ema: torch.nn.Module, model: torch.nn.Module, decay: float) -> None:
     for ema_parameter, parameter in zip(
         ema.parameters(), model.parameters(), strict=True
     ):
@@ -341,8 +605,8 @@ def set_requires_grad(module: torch.nn.Module, enabled: bool) -> None:
 
 
 def checkpoint_payload(
-    model: MiohRestorerV2,
-    ema: MiohRestorerV2,
+    model: torch.nn.Module,
+    ema: torch.nn.Module,
     discriminator: TemporalPatchDiscriminator,
     optimizer: torch.optim.Optimizer,
     discriminator_optimizer: torch.optim.Optimizer,
@@ -362,6 +626,7 @@ def checkpoint_payload(
         "step": step,
         "trained": step > 0,
         "config": model_config(model, args),
+        "rng_state": rng_state_payload(),
     }
     if stop_reason is not None:
         payload["stop_reason"] = stop_reason
@@ -369,8 +634,8 @@ def checkpoint_payload(
 
 
 def save_checkpoint(
-    model: MiohRestorerV2,
-    ema: MiohRestorerV2,
+    model: torch.nn.Module,
+    ema: torch.nn.Module,
     discriminator: TemporalPatchDiscriminator,
     optimizer: torch.optim.Optimizer,
     discriminator_optimizer: torch.optim.Optimizer,
@@ -390,18 +655,166 @@ def save_checkpoint(
         step,
         stop_reason="memory_pressure" if emergency else None,
     )
-    latest = args.work_dir / "mioh-restorer-v2-latest.pth"
+    prefix = checkpoint_prefix(args)
+    latest = args.work_dir / f"{prefix}-latest.pth"
     latest_temporary = latest.with_suffix(".tmp")
     torch.save(payload, latest_temporary)
     latest_temporary.replace(latest)
     if not archive:
         return latest
     suffix = "emergency-step" if emergency else "step"
-    output = args.work_dir / f"mioh-restorer-v2-{suffix}-{step:07d}.pth"
+    output = args.work_dir / f"{prefix}-{suffix}-{step:07d}.pth"
     temporary = output.with_suffix(".tmp")
     torch.save(payload, temporary)
     temporary.replace(output)
     return output
+
+
+def distillation_capture_plan(
+    model: MiohRestorerV3,
+    step: int,
+    requested_calls: int,
+) -> tuple[str, frozenset[int], int]:
+    """Cycle branches and choose evenly spaced, memory-bounded calls."""
+
+    branch = model.BRANCHES[(step - 1) % len(model.BRANCHES)][0]
+    available_calls = model.window_frames - 1
+    call_count = min(requested_calls, available_calls)
+    stride = max(1, available_calls // call_count)
+    calls = frozenset(
+        list(range(0, available_calls, stride))[:call_count]
+    )
+    return branch, calls, stride
+
+
+def calculate_intermediate_teacher_losses(
+    model: MiohRestorerV3,
+    diagnostics: list[dict[str, object]],
+    teacher_activations: list[AlignmentActivation],
+    masks: torch.Tensor,
+    *,
+    branch: str,
+    temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Distill selected teacher alignment behavior without channel adapters."""
+
+    zero = masks.new_zeros(())
+    teacher_by_call = {
+        activation.call_index: activation
+        for activation in teacher_activations
+        if activation.branch == branch
+    }
+    propagation = model.propagation[branch]
+    feature_losses: list[torch.Tensor] = []
+    alignment_losses: list[torch.Tensor] = []
+
+    def append_shift_losses(
+        weights: object,
+        alignment: torch.nn.Module,
+        activation: AlignmentActivation,
+        roi_mask: torch.Tensor,
+        *,
+        source: int,
+    ) -> None:
+        if isinstance(weights, torch.Tensor):
+            offsets = getattr(alignment, "offsets", None)
+            if offsets is None:
+                raise TypeError("single-stage alignment has no offsets")
+            target = teacher_shift_distribution(
+                activation.offset,
+                activation.mask,
+                offsets,
+                source=source,
+                temperature=temperature,
+            )
+            alignment_losses.append(
+                roi_alignment_kl_loss(weights, target, roi_mask)
+            )
+            return
+        if isinstance(weights, tuple) and all(
+            isinstance(item, torch.Tensor) for item in weights
+        ):
+            stage_offsets = getattr(alignment, "stage_offsets", None)
+            if stage_offsets is None:
+                raise TypeError("hierarchical alignment has no stage offsets")
+            targets = teacher_hierarchical_shift_distributions(
+                activation.offset,
+                activation.mask,
+                stage_offsets,
+                source=source,
+                temperature=temperature,
+            )
+            if len(weights) != len(targets):
+                raise ValueError("student and teacher hierarchy lengths differ")
+            alignment_losses.extend(
+                roi_alignment_kl_loss(student, target, roi_mask)
+                for student, target in zip(weights, targets, strict=True)
+            )
+    for diagnostic in diagnostics:
+        call_index = int(diagnostic["call_index"])
+        frame_index = int(diagnostic["frame_index"])
+        teacher_activation = teacher_by_call.get(call_index)
+        if teacher_activation is None:
+            continue
+        aligned = diagnostic["aligned"]
+        if not isinstance(aligned, torch.Tensor):
+            continue
+        if teacher_activation.aligned_output is not None:
+            feature_losses.append(
+                roi_feature_energy_loss(
+                    aligned,
+                    teacher_activation.aligned_output,
+                    masks[:, frame_index],
+                )
+            )
+
+        first_weights = diagnostic.get("first_weights")
+        if isinstance(first_weights, (torch.Tensor, tuple)):
+            append_shift_losses(
+                first_weights,
+                propagation.first_order_alignment,
+                teacher_activation,
+                masks[:, frame_index],
+                source=0,
+            )
+            first_confidence = diagnostic.get("first_confidence")
+            if isinstance(first_confidence, torch.Tensor):
+                alignment_losses.append(
+                    roi_confidence_loss(
+                        first_confidence,
+                        teacher_source_confidence(
+                            teacher_activation.mask, source=0
+                        ),
+                        masks[:, frame_index],
+                    )
+                )
+        second_weights = diagnostic.get("second_weights")
+        if isinstance(second_weights, (torch.Tensor, tuple)):
+            append_shift_losses(
+                second_weights,
+                propagation.second_order_alignment,
+                teacher_activation,
+                masks[:, frame_index],
+                source=1,
+            )
+            second_confidence = diagnostic.get("second_confidence")
+            if isinstance(second_confidence, torch.Tensor):
+                alignment_losses.append(
+                    roi_confidence_loss(
+                        second_confidence,
+                        teacher_source_confidence(
+                            teacher_activation.mask, source=1
+                        ),
+                        masks[:, frame_index],
+                    )
+                )
+    feature = (
+        torch.stack(feature_losses).mean() if feature_losses else zero
+    )
+    alignment = (
+        torch.stack(alignment_losses).mean() if alignment_losses else zero
+    )
+    return feature, alignment
 
 
 def calculate_reconstruction_losses(
@@ -412,6 +825,9 @@ def calculate_reconstruction_losses(
     masks: torch.Tensor,
     perceptual_criterion: MaskedVGG16PerceptualLoss,
     args: argparse.Namespace,
+    teacher_targets: torch.Tensor | None = None,
+    teacher_feature_loss: torch.Tensor | None = None,
+    teacher_alignment_loss: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     perceptual = perceptual_criterion(restored, targets, masks)
     structural = masked_multiscale_structural_loss(
@@ -436,10 +852,28 @@ def calculate_reconstruction_losses(
     backward_aux = masked_charbonnier_loss(backward, targets, masks)
     directional_aux = 0.5 * (forward_aux + backward_aux)
     direction_consistency = masked_charbonnier_loss(forward, backward, masks)
+    teacher = (
+        masked_charbonnier_loss(restored, teacher_targets, masks)
+        if teacher_targets is not None
+        else restored.new_zeros(())
+    )
+    teacher_feature = (
+        teacher_feature_loss
+        if teacher_feature_loss is not None
+        else restored.new_zeros(())
+    )
+    teacher_alignment = (
+        teacher_alignment_loss
+        if teacher_alignment_loss is not None
+        else restored.new_zeros(())
+    )
     total = (
         base.total
         + args.directional_aux_weight * directional_aux
         + args.direction_consistency_weight * direction_consistency
+        + args.teacher_weight * teacher
+        + args.teacher_feature_weight * teacher_feature
+        + args.teacher_alignment_weight * teacher_alignment
     )
     return total, {
         "pixel": base.pixel,
@@ -450,12 +884,15 @@ def calculate_reconstruction_losses(
         "structural": base.structural,
         "directional_aux": directional_aux,
         "direction_consistency": direction_consistency,
+        "teacher": teacher,
+        "teacher_feature": teacher_feature,
+        "teacher_alignment": teacher_alignment,
     }
 
 
 @torch.inference_mode()
 def validate(
-    model: MiohRestorerV2,
+    model: torch.nn.Module,
     loader: DataLoader,
     device: torch.device,
     perceptual_criterion: MaskedVGG16PerceptualLoss,
@@ -471,6 +908,9 @@ def validate(
         "structural": 0.0,
         "directional_aux": 0.0,
         "direction_consistency": 0.0,
+        "teacher": 0.0,
+        "teacher_feature": 0.0,
+        "teacher_alignment": 0.0,
         "input_psnr": 0.0,
         "restored_psnr": 0.0,
         "forward_psnr": 0.0,
@@ -556,6 +996,11 @@ def memory_metric(
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     validate_args(args)
+    args.teacher_checkpoint_sha256 = (
+        sha256_file(args.teacher_checkpoint)
+        if args.teacher_checkpoint is not None
+        else None
+    )
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -571,7 +1016,41 @@ def main(argv: list[str] | None = None) -> int:
     )
     args.work_dir.mkdir(parents=True, exist_ok=True)
 
-    model = build_model(args).to(device)
+    model = build_model(args)
+    if args.initialize_from_v2 is not None:
+        if not isinstance(model, MiohRestorerV3):
+            raise AssertionError("V2 initialization requires a V3 model")
+        source_v2 = load_v2_for_initialization(args.initialize_from_v2)
+        model.initialize_from_v2(source_v2)
+        del source_v2
+    if args.initialize_from_v3 is not None:
+        if not isinstance(model, MiohRestorerV3):
+            raise AssertionError("V3 initialization requires a V3 model")
+        source_config, source_state = load_v3_state_for_initialization(
+            args.initialize_from_v3
+        )
+        for key, expected in (
+            ("window_frames", model.window_frames),
+            ("channels", model.channels),
+            ("num_blocks", model.num_blocks),
+            ("encoder_blocks", model.encoder_blocks),
+            ("reconstruction_blocks", model.reconstruction_blocks),
+        ):
+            if int(source_config.get(key, -1)) != expected:
+                raise ValueError(
+                    f"V3 initialization {key}={source_config.get(key)} "
+                    f"does not match target {expected}"
+                )
+        copied, fresh = model.initialize_from_v3_state_dict(source_state)
+        print(
+            "V3 initialization: "
+            f"copied={copied} tensors, fresh={fresh} tensors "
+            "(alignment stages relearned)"
+        )
+        del source_config, source_state
+    model = model.to(device)
+    if isinstance(model, MiohRestorerV3):
+        model.set_gradient_checkpointing(args.gradient_checkpointing)
     ema = copy.deepcopy(model).eval()
     set_requires_grad(ema, False)
     discriminator = TemporalPatchDiscriminator(args.discriminator_channels).to(device)
@@ -585,6 +1064,35 @@ def main(argv: list[str] | None = None) -> int:
         frame_stride=args.perceptual_frame_stride,
         image_size=args.perceptual_image_size,
     ).to(device).eval()
+    teacher = (
+        load_basicvsrpp_teacher(
+            args.teacher_checkpoint,
+            device,
+            fp16=args.teacher_fp16,
+        )
+        if args.teacher_checkpoint is not None
+        else None
+    )
+    teacher_activations: list[AlignmentActivation] = []
+    intermediate_teacher_enabled = (
+        teacher is not None
+        and (
+            args.teacher_feature_weight > 0
+            or args.teacher_alignment_weight > 0
+        )
+    )
+    teacher_analyzer = (
+        BasicVSRPPActivationAnalyzer(
+            teacher,
+            capture_policy=AlignmentCapturePolicy(
+                branches=frozenset(), max_calls_per_branch=0
+            ),
+            activation_callback=teacher_activations.append,
+            collect_statistics=False,
+        )
+        if intermediate_teacher_enabled
+        else None
+    )
 
     start_step = 0
     if args.resume is not None:
@@ -592,22 +1100,67 @@ def main(argv: list[str] | None = None) -> int:
         expected = model_config(model, args)
         checkpoint_config = payload["config"]
         architecture_keys = (
-            "version",
-            "window_frames",
-            "chunk_frames",
-            "channels",
-            "num_blocks",
-            "image_size",
-            "fusion_full_channels",
-            "fusion_half_channels",
-            "fusion_quarter_channels",
+            (
+                "version",
+                "window_frames",
+                "chunk_frames",
+                "channels",
+                "num_blocks",
+                "image_size",
+                "fusion_full_channels",
+                "fusion_half_channels",
+                "fusion_quarter_channels",
+            )
+            if args.model_version == 2
+            else (
+                "version",
+                "architecture_revision",
+                "window_frames",
+                "channels",
+                "num_blocks",
+                "image_size",
+                "encoder_blocks",
+                "reconstruction_blocks",
+                "alignment_radius",
+                "first_order_dilation",
+                "second_order_dilation",
+                "alignment_key_channels",
+                "alignment_groups",
+                "hierarchical_alignment_dilations",
+                "alignment_temperature",
+            )
         )
         for key in architecture_keys:
-            if checkpoint_config[key] != expected[key]:
+            checkpoint_value = checkpoint_config.get(
+                key,
+                [] if key == "hierarchical_alignment_dilations" else 1.0,
+            )
+            if checkpoint_value != expected[key]:
                 raise ValueError(
-                    f"resume checkpoint {key}={checkpoint_config[key]} "
+                    f"resume checkpoint {key}={checkpoint_value} "
                     f"does not match {expected[key]}"
                 )
+        for key in (
+            "teacher_checkpoint_sha256",
+            "teacher_feature_weight",
+            "teacher_alignment_weight",
+            "teacher_distill_calls",
+            "teacher_shift_temperature",
+        ):
+            if checkpoint_config.get(key) != expected.get(key):
+                raise ValueError(
+                    f"resume checkpoint {key}={checkpoint_config.get(key)} "
+                    f"does not match {expected.get(key)}"
+                )
+        checkpoint_gradient_checkpointing = checkpoint_config.get(
+            "training_memory", {}
+        ).get("gradient_checkpointing", False)
+        if checkpoint_gradient_checkpointing != args.gradient_checkpointing:
+            raise ValueError(
+                "resume checkpoint gradient_checkpointing="
+                f"{checkpoint_gradient_checkpointing} does not match "
+                f"{args.gradient_checkpointing}"
+            )
         model.load_state_dict(payload["state_dict"], strict=True)
         ema.load_state_dict(payload["ema_state_dict"], strict=True)
         discriminator.load_state_dict(payload["discriminator_state_dict"], strict=True)
@@ -621,6 +1174,8 @@ def main(argv: list[str] | None = None) -> int:
         start_step = int(payload["step"])
         if start_step >= args.steps:
             raise ValueError("steps must be greater than the resumed step")
+        if "rng_state" in payload:
+            restore_rng_state(payload["rng_state"])
         del payload
         release_device_memory(device)
 
@@ -633,12 +1188,15 @@ def main(argv: list[str] | None = None) -> int:
     train_iterator = iter(train_loader)
     metrics_path = args.work_dir / "metrics.jsonl"
     print(
-        "MiohRestorerV2 all-in training: "
+        f"MiohRestorerV{args.model_version} training: "
         f"device={device}, samples={len(train_loader.dataset)}, "
         f"generator_parameters={sum(p.numel() for p in model.parameters()):,}, "
         "discriminator_parameters="
         f"{sum(p.numel() for p in discriminator.parameters()):,}, "
         f"steps={start_step + 1}-{args.steps}, gan_start={args.gan_start_step}, "
+        f"teacher_weight={args.teacher_weight:.3f}, "
+        f"teacher_feature_weight={args.teacher_feature_weight:.3f}, "
+        f"teacher_alignment_weight={args.teacher_alignment_weight:.3f}, "
         f"workers={args.workers}, prefetch={args.prefetch_factor}, "
         f"memory_warning={args.memory_warning_ratio:.2f}, "
         f"memory_critical={args.memory_critical_ratio:.2f}"
@@ -684,7 +1242,64 @@ def main(argv: list[str] | None = None) -> int:
         )
         set_learning_rate(optimizer, generator_lr)
         optimizer.zero_grad(set_to_none=True)
-        restored, forward, backward = model.forward_with_directions(inputs, masks)
+        teacher_targets = None
+        capture_branch: str | None = None
+        capture_calls: frozenset[int] = frozenset()
+        teacher_activations.clear()
+        if teacher is not None:
+            teacher_dtype = next(teacher.parameters()).dtype
+            if teacher_analyzer is not None:
+                if not isinstance(model, MiohRestorerV3):
+                    raise AssertionError(
+                        "intermediate distillation requires MiohRestorerV3"
+                    )
+                capture_branch, capture_calls, capture_stride = (
+                    distillation_capture_plan(
+                        model, step, args.teacher_distill_calls
+                    )
+                )
+                teacher_analyzer.capture_policy = AlignmentCapturePolicy(
+                    branches=frozenset({capture_branch}),
+                    call_stride=capture_stride,
+                    max_calls_per_branch=len(capture_calls),
+                )
+                teacher_analyzer.begin_clip(inputs.shape[1])
+            with torch.inference_mode():
+                teacher_targets = teacher(inputs.to(dtype=teacher_dtype)).to(
+                    dtype=inputs.dtype
+                )
+            if args.teacher_weight <= 0:
+                teacher_targets = None
+        diagnostics: list[dict[str, object]] = []
+        if capture_branch is not None:
+            if not isinstance(model, MiohRestorerV3):
+                raise AssertionError(
+                    "intermediate distillation requires MiohRestorerV3"
+                )
+            restored, forward, backward, diagnostics = (
+                model.forward_with_distillation(
+                    inputs,
+                    masks,
+                    capture_branch=capture_branch,
+                    capture_calls=capture_calls,
+                )
+            )
+            teacher_feature_loss, teacher_alignment_loss = (
+                calculate_intermediate_teacher_losses(
+                    model,
+                    diagnostics,
+                    teacher_activations,
+                    masks,
+                    branch=capture_branch,
+                    temperature=args.teacher_shift_temperature,
+                )
+            )
+        else:
+            restored, forward, backward = model.forward_with_directions(
+                inputs, masks
+            )
+            teacher_feature_loss = restored.new_zeros(())
+            teacher_alignment_loss = restored.new_zeros(())
         reconstruction_total, components = calculate_reconstruction_losses(
             restored,
             forward,
@@ -693,6 +1308,9 @@ def main(argv: list[str] | None = None) -> int:
             masks,
             perceptual_criterion,
             args,
+            teacher_targets,
+            teacher_feature_loss,
+            teacher_alignment_loss,
         )
 
         discriminator_loss = restored.new_zeros(())
@@ -780,6 +1398,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if active_gan:
             del real_input, fake_input, generator_fake_input
+        if teacher_targets is not None:
+            del teacher_targets
+        teacher_activations.clear()
         del (
             batch,
             inputs,
@@ -795,6 +1416,9 @@ def main(argv: list[str] | None = None) -> int:
             discriminator_grad_norm,
             total,
             grad_norm,
+            diagnostics,
+            teacher_feature_loss,
+            teacher_alignment_loss,
         )
         optimizer.zero_grad(set_to_none=True)
         discriminator_optimizer.zero_grad(set_to_none=True)
@@ -892,6 +1516,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(memory_record))
 
     if emergency_path is not None:
+        if teacher_analyzer is not None:
+            teacher_analyzer.close()
         print(
             "training stopped safely because memory remained critical after cleanup: "
             f"{emergency_path}"
@@ -899,7 +1525,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "resume: "
             f"RESUME='{emergency_path}' "
-            "scripts/training/run-mioh-restorer-v2-allin.sh"
+            f"scripts/training/run-mioh-restorer-v{args.model_version}-allin.sh"
         )
         return MEMORY_EMERGENCY_EXIT_CODE
 
@@ -927,8 +1553,13 @@ def main(argv: list[str] | None = None) -> int:
             archive=True,
         )
     else:
-        final_path = args.work_dir / f"mioh-restorer-v2-step-{args.steps:07d}.pth"
+        final_path = (
+            args.work_dir
+            / f"{checkpoint_prefix(args)}-step-{args.steps:07d}.pth"
+        )
     release_device_memory(device)
+    if teacher_analyzer is not None:
+        teacher_analyzer.close()
     print(f"training complete: {final_path}")
     return 0
 

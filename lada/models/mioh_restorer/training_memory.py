@@ -141,7 +141,13 @@ class TrainingMemoryGuard:
                 recommended = None
 
         virtual_memory = psutil.virtual_memory()
-        swap_memory = psutil.swap_memory()
+        try:
+            swap_used_bytes = int(psutil.swap_memory().used)
+        except OSError:
+            # macOS may deny the underlying sysctl inside a sandbox.  Swap is
+            # supplementary telemetry; MPS and available RAM still provide
+            # the pressure guard's actual stop signals.
+            swap_used_bytes = 0
         return MemorySnapshot(
             stage=stage,
             mps_current_bytes=current,
@@ -149,7 +155,7 @@ class TrainingMemoryGuard:
             mps_recommended_bytes=recommended,
             system_available_bytes=int(virtual_memory.available),
             system_total_bytes=int(virtual_memory.total),
-            swap_used_bytes=int(swap_memory.used),
+            swap_used_bytes=swap_used_bytes,
         )
 
     def status(self, snapshot: MemorySnapshot) -> MemoryStatus:
