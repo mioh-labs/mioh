@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +20,7 @@ from lada.models.mioh_restorer.model_v5 import (
     FRAME_CHANNELS,
     NUM_INPUT_FRAMES,
     MiohRestorerV5,
+    MiohRestorerV5Config,
     V5_BUCKETS,
     parameter_count,
 )
@@ -27,10 +29,11 @@ from lada.models.mioh_restorer.model_v5 import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--variant", choices=("q", "s"), default="q")
-    parser.add_argument("--sizes", default="128,192,256,384,512")
+    parser.add_argument("--sizes", default="128,192,256")
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--device", choices=("mps", "cuda", "cpu"), default="mps")
+    parser.add_argument("--outputs", type=int, choices=(1, 3, 5), default=1)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -70,13 +73,21 @@ def profile_size(
     steps: int,
     warmup: int,
     device: torch.device,
+    outputs: int,
 ) -> dict[str, object]:
-    model = (
-        MiohRestorerV5.quality()
-        if variant == "q"
-        else MiohRestorerV5.shipping()
-    ).to(device).train()
-    loss_function = MiohRestorerV5Loss(stage=4)
+    if variant == "q":
+        indices = {1: (4,), 3: (3, 4, 5), 5: (2, 3, 4, 5, 6)}[outputs]
+        model = MiohRestorerV5(
+            replace(MiohRestorerV5Config.quality(), output_indices=indices)
+        )
+    else:
+        if outputs != 1:
+            raise ValueError("V5-S has one output")
+        model = MiohRestorerV5.shipping()
+    model = model.to(device).train()
+    # Stage 3 exercises the complete model graph without downloading VGG16.
+    # Stage 4 adds perceptual-loss cost and is measured by the real trainer.
+    loss_function = MiohRestorerV5Loss(stage=3)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     durations: list[float] = []
     for step in range(warmup + steps):
@@ -137,11 +148,13 @@ def main() -> int:
             steps=args.steps,
             warmup=args.warmup,
             device=device,
+            outputs=args.outputs,
         )
         report["sizes"][str(size)] = result
         print(json.dumps(result, indent=2), flush=True)
     model = MiohRestorerV5.quality() if args.variant == "q" else MiohRestorerV5.shipping()
     report["parameters"] = parameter_count(model)
+    report["training_outputs"] = args.outputs
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2), encoding="utf-8")
     return 0

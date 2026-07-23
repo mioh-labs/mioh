@@ -137,25 +137,28 @@ def crop_native_frame(
         raise ValueError(f"unsupported V5 bucket: {size}")
     x, y = origin
     height, width = frame.shape[:2]
-    source_x0 = max(x, 0)
-    source_y0 = max(y, 0)
-    source_x1 = min(x + size, width)
-    source_y1 = min(y + size, height)
-    cropped = frame[source_y0:source_y1, source_x0:source_x1]
-    pad_left = max(-x, 0)
-    pad_top = max(-y, 0)
-    pad_right = max(x + size - width, 0)
-    pad_bottom = max(y + size - height, 0)
-    if pad_left or pad_right or pad_top or pad_bottom:
-        cropped = cv2.copyMakeBorder(
-            cropped,
-            pad_top,
-            pad_bottom,
-            pad_left,
-            pad_right,
-            cv2.BORDER_CONSTANT if mask else cv2.BORDER_REPLICATE,
-            value=0,
-        )
+    if height <= 0 or width <= 0:
+        raise ValueError("cannot crop an empty native frame")
+    if mask:
+        cropped = np.zeros((size, size, *frame.shape[2:]), dtype=frame.dtype)
+        source_x0 = max(x, 0)
+        source_y0 = max(y, 0)
+        source_x1 = min(x + size, width)
+        source_y1 = min(y + size, height)
+        if source_x1 > source_x0 and source_y1 > source_y0:
+            destination_x0 = source_x0 - x
+            destination_y0 = source_y0 - y
+            destination_x1 = destination_x0 + source_x1 - source_x0
+            destination_y1 = destination_y0 + source_y1 - source_y0
+            cropped[destination_y0:destination_y1, destination_x0:destination_x1] = (
+                frame[source_y0:source_y1, source_x0:source_x1]
+            )
+    else:
+        # Clipped integer index grids are exactly BORDER_REPLICATE, including
+        # crops whose requested rectangle lies entirely outside the frame.
+        horizontal = np.clip(np.arange(x, x + size), 0, width - 1)
+        vertical = np.clip(np.arange(y, y + size), 0, height - 1)
+        cropped = frame[vertical[:, None], horizontal[None, :]]
     if cropped.shape[:2] != (size, size):
         raise RuntimeError(
             f"native crop produced {cropped.shape[:2]}; expected {(size, size)}"
@@ -270,13 +273,27 @@ class MiohRestorerV5NativeDataset(Dataset):
                 crop_native_frame(frame, origin=origin, size=entry.bucket, mask=True)
             )
 
-        mosaic_size, mosaic_mode, rectangle_ratio, feather_size = (
-            get_random_parameters_by_block_size(
-                entry.mosaic_block_size,
-                randomize_size=True,
-                repeatable_random=False,
+        if self.deterministic:
+            # The mosaic utility uses the module-level Python and NumPy RNGs,
+            # including one direct ``random.uniform`` call for feathering.
+            # Preserve both states so validation sample N is byte-identical on
+            # every pass without perturbing training augmentation randomness.
+            python_state = random.getstate()
+            numpy_state = np.random.get_state()
+            random.seed(index)
+            np.random.seed(index % (2**32))
+        try:
+            mosaic_size, mosaic_mode, rectangle_ratio, feather_size = (
+                get_random_parameters_by_block_size(
+                    entry.mosaic_block_size,
+                    randomize_size=True,
+                    repeatable_random=False,
+                )
             )
-        )
+        finally:
+            if self.deterministic:
+                random.setstate(python_state)
+                np.random.set_state(numpy_state)
         inputs: list[np.ndarray] = []
         affected_masks: list[np.ndarray] = []
         for target, source_mask in zip(targets, native_masks, strict=True):

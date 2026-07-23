@@ -12,20 +12,11 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import NamedTuple, Sequence
 
 import torch
 from torch import nn
 from torch.nn import functional as F
-
-from .model_v4 import (
-    FixedShiftBank,
-    NormalizedShiftCorrelation,
-    ResidualBlock,
-    apply_shift_weights,
-    make_offsets,
-)
-
 
 NUM_INPUT_FRAMES = 9
 NUM_QUALITY_OUTPUT_FRAMES = 5
@@ -35,6 +26,173 @@ FRAME_CHANNELS = 5  # RGB, mosaic mask, mask reliability
 FOLD_FACTOR = 2
 FOLDED_FRAME_CHANNELS = FRAME_CHANNELS * FOLD_FACTOR * FOLD_FACTOR
 V5_BUCKETS = (128, 192, 256, 384, 512)
+
+
+def make_offsets(
+    radius: int, dilation: int = 1
+) -> tuple[tuple[int, int], ...]:
+    if radius < 0 or dilation <= 0:
+        raise ValueError("shift radius must be non-negative and dilation positive")
+    return tuple(
+        (vertical * dilation, horizontal * dilation)
+        for vertical in range(-radius, radius + 1)
+        for horizontal in range(-radius, radius + 1)
+    )
+
+
+def shift2d(values: torch.Tensor, vertical: int, horizontal: int) -> torch.Tensor:
+    """Translate content using static zero padding and slicing."""
+
+    if vertical == 0 and horizontal == 0:
+        return values
+    height, width = values.shape[-2:]
+    left = max(horizontal, 0)
+    right = max(-horizontal, 0)
+    top = max(vertical, 0)
+    bottom = max(-vertical, 0)
+    padded = F.pad(values, (left, right, top, bottom))
+    return padded[..., bottom : bottom + height, right : right + width]
+
+
+class FixedShiftBank(nn.Module):
+    """Generate a complete square shift bank with one frozen convolution."""
+
+    def __init__(
+        self, channels: int, offsets: Sequence[tuple[int, int]]
+    ) -> None:
+        super().__init__()
+        if channels <= 0 or not offsets:
+            raise ValueError("shift-bank channels and offsets must be non-empty")
+        self.channels = int(channels)
+        self.offsets = tuple((int(y), int(x)) for y, x in offsets)
+        nonzero = [abs(value) for offset in self.offsets for value in offset if value]
+        dilation = math.gcd(*nonzero) if nonzero else 1
+        radius = max(
+            max(abs(vertical), abs(horizontal))
+            for vertical, horizontal in self.offsets
+        ) // dilation
+        expected = {
+            (vertical * dilation, horizontal * dilation)
+            for vertical in range(-radius, radius + 1)
+            for horizontal in range(-radius, radius + 1)
+        }
+        if set(self.offsets) != expected or len(self.offsets) != len(expected):
+            raise ValueError("fixed shift bank requires a complete square grid")
+        self.dilation = dilation
+        self.radius = radius
+        kernel_size = radius * 2 + 1
+        kernels = torch.zeros(
+            self.channels * len(self.offsets), 1, kernel_size, kernel_size
+        )
+        for channel in range(self.channels):
+            for index, (vertical, horizontal) in enumerate(self.offsets):
+                kernel_y = radius - vertical // dilation
+                kernel_x = radius - horizontal // dilation
+                kernels[channel * len(self.offsets) + index, 0, kernel_y, kernel_x] = 1
+        self.register_buffer("kernels", kernels, persistent=False)
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        if values.shape[1] != self.channels:
+            raise ValueError(
+                f"shift bank expected {self.channels} channels, got {values.shape[1]}"
+            )
+        shifted = F.conv2d(
+            values,
+            self.kernels.to(dtype=values.dtype),
+            padding=self.radius * self.dilation,
+            dilation=self.dilation,
+            groups=self.channels,
+        )
+        batch, _channels, height, width = shifted.shape
+        return shifted.reshape(
+            batch, self.channels, len(self.offsets), height, width
+        ).permute(0, 2, 1, 3, 4)
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.activation = nn.SiLU()
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        return values + self.conv2(self.activation(self.conv1(values)))
+
+
+class NormalizedShiftCorrelation(nn.Module):
+    """Cosine correlation over a frozen V5 shift bank."""
+
+    MINIMUM_TEMPERATURE = 0.1
+    MAXIMUM_TEMPERATURE = 1.5
+
+    def __init__(
+        self,
+        offsets: Sequence[tuple[int, int]],
+        *,
+        channels: int,
+        initial_temperature: float = 0.5,
+        center_bias: float = 1.0,
+    ) -> None:
+        super().__init__()
+        if not offsets:
+            raise ValueError("correlation needs at least one shift")
+        if not self.MINIMUM_TEMPERATURE < initial_temperature < self.MAXIMUM_TEMPERATURE:
+            raise ValueError("initial temperature is outside the supported range")
+        self.offsets = tuple((int(y), int(x)) for y, x in offsets)
+        fraction = (
+            (initial_temperature - self.MINIMUM_TEMPERATURE)
+            / (self.MAXIMUM_TEMPERATURE - self.MINIMUM_TEMPERATURE)
+        )
+        self.raw_temperature = nn.Parameter(
+            torch.tensor(math.log(fraction / (1.0 - fraction)))
+        )
+        self.offset_bias = nn.Parameter(torch.zeros(1, len(self.offsets), 1, 1))
+        self.shift_bank = FixedShiftBank(channels, self.offsets)
+        self.validity_bank = FixedShiftBank(1, self.offsets)
+        if (0, 0) in self.offsets:
+            with torch.no_grad():
+                self.offset_bias[:, self.offsets.index((0, 0))].fill_(center_bias)
+
+    @property
+    def temperature(self) -> torch.Tensor:
+        span = self.MAXIMUM_TEMPERATURE - self.MINIMUM_TEMPERATURE
+        return self.MINIMUM_TEMPERATURE + span * torch.sigmoid(self.raw_temperature)
+
+    @staticmethod
+    def _normalize(values: torch.Tensor) -> torch.Tensor:
+        inverse = torch.rsqrt(
+            values.float().square().sum(dim=1, keepdim=True) + 1e-6
+        ).to(values.dtype)
+        return values * inverse
+
+    def forward(
+        self, reference: torch.Tensor, target: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if reference.shape != target.shape:
+            raise ValueError("reference and target feature shapes must match")
+        normalized_reference = self._normalize(reference)
+        normalized_target = self._normalize(target)
+        shifted_targets = self.shift_bank(target)
+        shifted_normalized = self.shift_bank(normalized_target)
+        valid = self.validity_bank(torch.ones_like(target[:, :1])).squeeze(2)
+        logits = (
+            normalized_reference.unsqueeze(1) * shifted_normalized
+        ).sum(dim=2)
+        logits = logits + (valid - 1.0) * 10_000.0 + self.offset_bias
+        weights = torch.softmax(logits / self.temperature, dim=1)
+        return (weights.unsqueeze(2) * shifted_targets).sum(dim=1), weights
+
+
+def apply_shift_weights(
+    target: torch.Tensor,
+    weights: torch.Tensor,
+    offsets: Sequence[tuple[int, int]],
+    shift_bank: FixedShiftBank,
+) -> torch.Tensor:
+    if weights.shape[1] != len(offsets):
+        raise ValueError("shift weights and offsets do not match")
+    return (weights.unsqueeze(2) * shift_bank(target)).sum(dim=1)
 
 
 @dataclass(frozen=True)

@@ -17,6 +17,22 @@ def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return (values * expanded).sum() / expanded.sum().clamp_min(1.0)
 
 
+def masked_correlation(
+    left: torch.Tensor, right: torch.Tensor, mask: torch.Tensor
+) -> torch.Tensor:
+    left_mean = masked_mean(left, mask)
+    right_mean = masked_mean(right, mask)
+    left_centered = left - left_mean
+    right_centered = right - right_mean
+    covariance = masked_mean(left_centered * right_centered, mask)
+    denominator = torch.sqrt(
+        masked_mean(left_centered.square(), mask)
+        * masked_mean(right_centered.square(), mask)
+        + 1e-12
+    )
+    return covariance / denominator
+
+
 def masked_charbonnier(
     prediction: torch.Tensor,
     target: torch.Tensor,
@@ -87,10 +103,11 @@ class MiohRestorerV5Loss(nn.Module):
         self,
         *,
         stage: int | str = 3,
+        weights: V5LossWeights | None = None,
         confidence_scale: float = 0.05,
     ) -> None:
         super().__init__()
-        self.weights: V5LossWeights = stage_definition(stage).loss
+        self.weights: V5LossWeights = weights or stage_definition(stage).loss
         self.confidence_scale = float(confidence_scale)
 
     def forward(
@@ -129,6 +146,7 @@ class MiohRestorerV5Loss(nn.Module):
         confidence_regularization = masked_mean(1.0 - confidence, mask)
 
         temporal = restored.new_zeros(())
+        temporal_acceleration = restored.new_zeros(())
         if weights.temporal:
             if (
                 aligned_previous_restored is None
@@ -138,10 +156,24 @@ class MiohRestorerV5Loss(nn.Module):
                 raise ValueError("flow-aligned temporal tensors are required for this stage")
             current_delta = restored[:, 1:] - aligned_previous_restored
             target_delta = target[:, 1:] - aligned_previous_target
+            temporal_error = current_delta - target_delta
             temporal = masked_charbonnier(
                 current_delta, target_delta, mask[:, 1:] * temporal_valid
             )
+            if temporal_error.shape[1] > 1:
+                acceleration_valid = (
+                    mask[:, 2:]
+                    * temporal_valid[:, 1:]
+                    * temporal_valid[:, :-1]
+                )
+                temporal_acceleration = masked_charbonnier(
+                    temporal_error[:, 1:] - temporal_error[:, :-1],
+                    torch.zeros_like(temporal_error[:, 1:]),
+                    acceleration_valid,
+                )
 
+        if weights.perceptual and perceptual is None:
+            raise ValueError("perceptual loss value is required for this stage")
         perceptual_loss = restored.new_zeros(()) if perceptual is None else perceptual
         total = (
             weights.reconstruction * reconstruction
@@ -151,7 +183,7 @@ class MiohRestorerV5Loss(nn.Module):
             + weights.wavelet * wavelet
             + weights.gradient * gradients
             + weights.perceptual * perceptual_loss
-            + weights.temporal * temporal
+            + weights.temporal * (temporal + 0.25 * temporal_acceleration)
             + weights.confidence * confidence_loss
             + weights.confidence_regularization * confidence_regularization
         )
@@ -163,9 +195,14 @@ class MiohRestorerV5Loss(nn.Module):
             "high_frequency": float(hf_loss.detach()),
             "wavelet": float(wavelet.detach()),
             "gradient": float(gradients.detach()),
+            "perceptual": float(perceptual_loss.detach()),
             "temporal": float(temporal.detach()),
+            "temporal_acceleration": float(temporal_acceleration.detach()),
             "confidence": float(confidence_loss.detach()),
             "confidence_mean": float(masked_mean(confidence, mask).detach()),
             "confidence_std": float(confidence.detach().std()),
+            "confidence_error_correlation": float(
+                masked_correlation(confidence, -error, mask).detach()
+            ),
         }
         return total, stats
