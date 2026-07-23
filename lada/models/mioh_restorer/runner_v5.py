@@ -10,8 +10,7 @@ import math
 
 import torch
 
-from .model_v4 import shift2d
-from .model_v5 import CENTER_INDEX, NUM_INPUT_FRAMES, V5_BUCKETS
+from .model_v5 import CENTER_INDEX, NUM_INPUT_FRAMES, V5_BUCKETS, shift2d
 
 
 def round_to_even(value: float) -> int:

@@ -32,7 +32,7 @@ class V5TrainingStage:
     loss: V5LossWeights
     exact_motion_weight: float = 0.0
     natural_motion_weight: float = 0.0
-    feature_distillation_weight: float = 0.0
+    feature_consistency_weight: float = 0.0
 
 
 V5_STAGES = (
@@ -53,7 +53,7 @@ V5_STAGES = (
         4e-5,
         V5LossWeights(0.5, 0.25, 0.08, 0.04, 0.0, 0.03, 0.0, 0.0, 0.15, 1e-3),
         natural_motion_weight=0.2,
-        feature_distillation_weight=0.03,
+        feature_consistency_weight=0.03,
     ),
     V5TrainingStage(
         3,

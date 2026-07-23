@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from collections import Counter
 from json import JSONDecodeError
 from pathlib import Path
@@ -24,7 +25,6 @@ from lada.datasetcreation.restoration_dataset_metadata import RestorationDataset
 from lada.models.mioh_restorer.model_v5 import NUM_INPUT_FRAMES, V5_BUCKETS
 from lada.models.mioh_restorer.native_dataset_v5 import decode_native_frames
 from lada.models.mioh_restorer.runner_v5 import (
-    required_v5_crop_size,
     native_tile_offsets,
     round_to_even,
     select_v5_bucket,
@@ -39,6 +39,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stride", type=int, default=4)
     parser.add_argument("--context-fraction", type=float, default=0.30)
     parser.add_argument("--tile-overlap", type=int, default=64)
+    parser.add_argument(
+        "--maximum-bucket",
+        type=int,
+        choices=V5_BUCKETS,
+        default=256,
+        help="largest native training tile; larger ROIs become overlapping tiles",
+    )
     parser.add_argument("--limit", type=int)
     return parser.parse_args()
 
@@ -69,6 +76,7 @@ def entries_for_metadata(
     stride: int,
     context_fraction: float,
     tile_overlap: int,
+    maximum_bucket: int,
 ):
     metadata = RestorationDatasetMetadataV2.from_json_file(metadata_path)
     target = (metadata_path.parent / metadata.relative_nsfw_video_path).resolve()
@@ -86,20 +94,12 @@ def entries_for_metadata(
             continue
         maximum_width = max(value[1] for value in detected)
         maximum_height = max(value[2] for value in detected)
-        required = required_v5_crop_size(
+        selected_bucket = select_v5_bucket(
             maximum_width,
             maximum_height,
             context_fraction=context_fraction,
         )
-        bucket = (
-            select_v5_bucket(
-                maximum_width,
-                maximum_height,
-                context_fraction=context_fraction,
-            )
-            if required <= V5_BUCKETS[-1]
-            else V5_BUCKETS[-1]
-        )
+        bucket = min(selected_bucket, maximum_bucket)
         window_centres = centres[start : start + NUM_INPUT_FRAMES]
         offsets = native_tile_offsets(
             maximum_width,
@@ -144,8 +144,8 @@ def main() -> int:
         raise ValueError("stride must be positive")
     if args.context_fraction < 0:
         raise ValueError("context fraction must be non-negative")
-    if args.tile_overlap < 0 or args.tile_overlap >= V5_BUCKETS[-1]:
-        raise ValueError("tile overlap must be in [0, 512)")
+    if args.tile_overlap < 0 or args.tile_overlap >= args.maximum_bucket:
+        raise ValueError("tile overlap must be smaller than maximum-bucket")
     metadata_paths: list[Path] = []
     for root in args.metadata_root:
         if not root.is_dir():
@@ -158,6 +158,8 @@ def main() -> int:
     counts: Counter[int] = Counter()
     written = 0
     skipped_metadata = 0
+    processed_metadata = 0
+    started = time.monotonic()
     with temporary.open("w", encoding="utf-8") as destination:
         for metadata_path in metadata_paths:
             try:
@@ -166,6 +168,7 @@ def main() -> int:
                     stride=args.stride,
                     context_fraction=args.context_fraction,
                     tile_overlap=args.tile_overlap,
+                    maximum_bucket=args.maximum_bucket,
                 ):
                     serializable = dict(entry)
                     serializable["target_video"] = relative_or_absolute(entry["target_video"], args.output)
@@ -177,6 +180,17 @@ def main() -> int:
                         break
             except (OSError, JSONDecodeError, KeyError, TypeError, ValueError):
                 skipped_metadata += 1
+            processed_metadata += 1
+            if processed_metadata == 1 or processed_metadata % 25 == 0:
+                elapsed = time.monotonic() - started
+                rate = processed_metadata / max(elapsed, 1e-6)
+                remaining = (len(metadata_paths) - processed_metadata) / max(rate, 1e-6)
+                print(
+                    f"metadata {processed_metadata}/{len(metadata_paths)} | "
+                    f"windows {written} | skipped {skipped_metadata} | "
+                    f"{rate:.2f} files/s | ETA {remaining / 60:.1f} min",
+                    flush=True,
+                )
             if args.limit is not None and written >= args.limit:
                 break
     if not written:
@@ -191,6 +205,7 @@ def main() -> int:
                 "buckets": {str(key): counts[key] for key in V5_BUCKETS},
                 "skipped_metadata": skipped_metadata,
                 "resized_frames": 0,
+                "maximum_bucket": args.maximum_bucket,
             },
             ensure_ascii=False,
             indent=2,
