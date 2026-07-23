@@ -51,6 +51,12 @@ def load_restoration_model(
         else:
             raise ValueError(f"Unsupported MiohRestorer model asset: {model_path}")
         return MiohMosaicRestorer(runtime), "zero"
+    if model_name.endswith("-coreai-variable"):
+        from lada.restorationpipeline.basicvsrpp_coreai_restorer import (
+            CoreAIVariableBasicvsrppMosaicRestorer,
+        )
+
+        return CoreAIVariableBasicvsrppMosaicRestorer(Path(model_path)), "zero"
     if model_path.endswith((".aimodel", ".aimodelc")):
         from lada.restorationpipeline.basicvsrpp_coreai_restorer import (
             CoreAIBasicvsrppMosaicRestorer,

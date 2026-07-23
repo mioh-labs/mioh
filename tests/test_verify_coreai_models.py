@@ -24,6 +24,7 @@ EXPECTED_MODELS = {
     "RealESRGAN_x4plus-256-fp16.h17s.aimodelc",
     "realesr-general-x4v3-256-fp16.h17s.aimodelc",
     "4xNomosWebPhoto_RealPLKSR-256-fp16.h17s.aimodelc",
+    "basicvsrpp-v1.2-variable-coreai.h17s.aimodelc",
 }
 
 EXPECTED_PORTABLE_MODELS = {
@@ -34,6 +35,7 @@ EXPECTED_PORTABLE_MODELS = {
     "RealESRGAN_x4plus-256-fp16.aimodel",
     "realesr-general-x4v3-256-fp16.aimodel",
     "4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel",
+    "basicvsrpp-v1.2-variable-coreai.aimodel",
 }
 
 
@@ -54,7 +56,7 @@ def test_verifier_rejects_source_models(tmp_path):
         verifier.verify_asset_set(tmp_path)
 
 
-def test_verifier_manifest_is_exactly_the_seven_m5_pro_models():
+def test_verifier_manifest_includes_variable_pipeline_collection():
     assert verifier.EXPECTED_MODEL_ASSETS == EXPECTED_MODELS
     assert set(verifier.MODEL_CONTRACTS) == {
         "basicvsrpp-v1.2-coreai",
@@ -94,7 +96,7 @@ def test_portable_verifier_rejects_compiled_model(tmp_path):
         verifier.verify_asset_set(tmp_path, distribution="portable")
 
 
-def test_distribution_manifest_maps_same_seven_models_to_each_format():
+def test_distribution_manifest_adds_variable_collection_to_dedicated_build():
     assert verifier.expected_model_assets("dedicated", "h17s") == EXPECTED_MODELS
     assert verifier.expected_model_assets("portable", "h17s") == EXPECTED_PORTABLE_MODELS
 
@@ -115,6 +117,15 @@ def test_verifier_resolves_all_seven_models_for_distribution(
         (models / asset).mkdir()
 
     def resolve(name, kind):
+        if name == verifier.VARIABLE_MODEL_NAME:
+            variable_asset = (
+                "basicvsrpp-v1.2-variable-coreai.h17s.aimodelc"
+                if distribution == "dedicated"
+                else "basicvsrpp-v1.2-variable-coreai.aimodel"
+            )
+            return SimpleNamespace(
+                path=str(models / variable_asset)
+            )
         contract = verifier.MODEL_CONTRACTS[name]
         asset = verifier.model_asset_name(contract["asset"], distribution, "h17s")
         return SimpleNamespace(path=str(models / asset))
@@ -123,6 +134,9 @@ def test_verifier_resolves_all_seven_models_for_distribution(
     monkeypatch.setattr(verifier, "_verify_restoration", lambda *args: None)
     monkeypatch.setattr(verifier, "_verify_detection", lambda *args: None)
     monkeypatch.setattr(verifier, "_verify_enhancer", lambda *args: None)
+    monkeypatch.setattr(
+        verifier, "_verify_variable_restoration", lambda *args: None
+    )
 
     verifier.verify_models(
         resources,
@@ -140,3 +154,6 @@ def test_portable_environment_removes_architecture_override(tmp_path, monkeypatc
 
     assert "LADA_COREAI_ARCHITECTURE" not in verifier.os.environ
     assert verifier.os.environ["LADA_MODEL_WEIGHTS_DIR"] == str(resources / "models")
+    assert verifier.os.environ["LADA_VARIABLE_COREAI_SWIFT_RUNNER"].endswith(
+        "lada-basicvsrpp-variable-runner"
+    )

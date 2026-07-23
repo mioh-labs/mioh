@@ -94,6 +94,15 @@ def _coreai_model_path(filename: str) -> str:
     return source_path
 
 
+def _variable_coreai_model_path() -> str:
+    architecture = os.environ.get("LADA_COREAI_ARCHITECTURE")
+    suffix = f".{architecture}.aimodelc" if architecture else ".aimodel"
+    return os.path.join(
+        MODEL_WEIGHTS_DIR,
+        f"basicvsrpp-v1.2-variable-coreai{suffix}",
+    )
+
+
 class ModelFiles:
     _WELL_KNOWN_RESTORATION_MODELS = [
         ModelFile('basicvsrpp-v1.0', None, os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_restoration_model_generic.pth')),
@@ -102,6 +111,7 @@ class ModelFiles:
         ModelFile('basicvsrpp-v1.2-coreai', _("BasicVSR++ v1.2 on Core AI with Metal 4 kernels"), _coreai_model_path('basicvsrpp-v1.2-t18-fp16.aimodel')),
         ModelFile('basicvsrpp-v1.2-coreai-t36', _("BasicVSR++ v1.2 fixed-T36 on Core AI with Metal 4 kernels"), _coreai_model_path('basicvsrpp-v1.2-t36-fp16.aimodel')),
         ModelFile('basicvsrpp-v1.2-coreai-t90', _("BasicVSR++ v1.2 fixed-T90 on Core AI with Metal 4 kernels"), _coreai_model_path('basicvsrpp-v1.2-t90-fp16.aimodel')),
+        ModelFile('basicvsrpp-v1.2-coreai-variable', _("BasicVSR++ v1.2 variable-length Swift/Core AI pipeline"), _variable_coreai_model_path()),
         ModelFile('deepmosaics', _("Restoration model from abandoned DeepMosaics project"), os.path.join(MODEL_WEIGHTS_DIR, '3rd_party', 'clean_youknow_video.pth')),
     ]
     _WELL_KNOWN_DETECTION_MODELS = [

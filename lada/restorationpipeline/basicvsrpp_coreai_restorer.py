@@ -17,6 +17,7 @@ import torch
 
 from lada.coreai.compiled_runtime import CompiledCoreAIRuntime, TensorSpec
 from lada.coreai.source_runtime import load_source_model
+from lada.coreai.variable_basicvsrpp_runtime import VariableBasicVSRPPRuntime
 from lada.restorationpipeline.basicvsrpp_mosaic_restorer import (
     BasicvsrppMosaicRestorer,
 )
@@ -275,3 +276,86 @@ class CoreAIBasicvsrppMosaicRestorer(BasicvsrppMosaicRestorer):
 
 
 FixedT18ModelAdapter = FixedCoreAIModelAdapter
+
+
+class VariableCoreAIModelRuntime:
+    """Torch-facing adapter for the six-frame-chunk Swift variable runner."""
+
+    def __init__(
+        self,
+        models_path: Path,
+        runtime_factory: Callable[..., VariableBasicVSRPPRuntime] = (
+            VariableBasicVSRPPRuntime
+        ),
+    ):
+        self.models_path = Path(models_path)
+        self._runtime = runtime_factory(self.models_path)
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _validate_input(inputs: torch.Tensor) -> None:
+        if inputs.ndim != 5 or tuple(inputs.shape[:1] + inputs.shape[2:]) != (
+            1,
+            3,
+            256,
+            256,
+        ):
+            raise ValueError(
+                "variable Core AI BasicVSR++ requires shape (1,T,3,256,256)"
+            )
+        if inputs.dtype != torch.float16:
+            raise ValueError("variable Core AI BasicVSR++ requires FP16 input")
+
+    def infer_many(self, inputs: Iterable[torch.Tensor]) -> list[torch.Tensor]:
+        with self._lock:
+            outputs: list[torch.Tensor] = []
+            for input_tensor in inputs:
+                self._validate_input(input_tensor)
+                input_array = input_tensor.detach().cpu().contiguous().numpy()
+                output = self._runtime.infer(input_array)
+                if output.shape != input_array.shape:
+                    raise ValueError(
+                        f"unexpected variable Core AI output shape {output.shape}; "
+                        f"expected {input_array.shape}"
+                    )
+                outputs.append(torch.from_numpy(output))
+            return outputs
+
+    def __call__(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.infer_many((inputs,))[0]
+
+    def close(self) -> None:
+        with self._lock:
+            self._runtime.close()
+
+
+class VariableCoreAIModelAdapter:
+    def __init__(self, runtime: VariableCoreAIModelRuntime):
+        self.runtime = runtime
+
+    def __call__(self, *, inputs: torch.Tensor) -> torch.Tensor:
+        return self.runtime(inputs)
+
+    def infer_many(self, inputs: Iterable[torch.Tensor]) -> list[torch.Tensor]:
+        return self.runtime.infer_many(inputs)
+
+
+class CoreAIVariableBasicvsrppMosaicRestorer(BasicvsrppMosaicRestorer):
+    """Variable-length BasicVSR++ without fixed-T padding."""
+
+    def __init__(
+        self,
+        models_path: Path,
+        runtime: VariableCoreAIModelRuntime | None = None,
+    ):
+        adapter = VariableCoreAIModelAdapter(
+            runtime or VariableCoreAIModelRuntime(models_path)
+        )
+        super().__init__(adapter, torch.device("cpu"), fp16=True)
+        self.models_path = Path(models_path)
+
+    def _run_model_chunks(self, chunks: list[torch.Tensor]) -> list[torch.Tensor]:
+        return self.model.infer_many(chunks)
+
+    def close(self) -> None:
+        self.model.runtime.close()
