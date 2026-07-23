@@ -32,7 +32,7 @@ struct PlatformCapabilities {
   let baseRestorationModels = ["basicvsrpp-v1.2", "カスタム"]
   let coreAIRestorationModels = [
     "basicvsrpp-v1.2-coreai-t90", "basicvsrpp-v1.2-coreai-t36",
-    "basicvsrpp-v1.2-coreai",
+    "basicvsrpp-v1.2-coreai", "basicvsrpp-v1.2-coreai-variable",
   ]
 
   var restorationModels: [String] {
@@ -113,6 +113,8 @@ struct MiohUserDefaultsSnapshot: Codable {
   var detectFaceMosaics: Bool
 
   var previewBufferLimit: Double
+  var previewRestorationModel: String?
+  var previewCustomRestorationModel: String?
   var previewProjectionMode: String?
   var previewVideoLayout: String?
   var previewEye: String?
@@ -183,6 +185,8 @@ struct MiohUserDefaultsSnapshot: Codable {
       detectionEmptyLookahead: 10,
       detectFaceMosaics: false,
       previewBufferLimit: 8.0,
+      previewRestorationModel: capabilities.previewRestorationModel,
+      previewCustomRestorationModel: "",
       previewProjectionMode: "通常",
       previewVideoLayout: "SBS 左右",
       previewEye: "左目",
@@ -267,6 +271,8 @@ final class RestorationRunner: ObservableObject {
   @Published var detectFaceMosaics = false
 
   @Published var previewBufferLimit = 8.0
+  @Published var previewRestorationModel: String
+  @Published var previewCustomRestorationModel = ""
   @Published var previewProjectionMode = "通常"
   @Published var previewVideoLayout = "SBS 左右"
   @Published var previewEye = "左目"
@@ -289,6 +295,7 @@ final class RestorationRunner: ObservableObject {
   init(capabilities: PlatformCapabilities = PlatformCapabilities()) {
     self.capabilities = capabilities
     restorationModel = capabilities.defaultRestorationModel
+    previewRestorationModel = capabilities.previewRestorationModel
     detectionModel = "v2-coreml"
     loadSavedDefaultsOnLaunch()
   }
@@ -516,6 +523,8 @@ final class RestorationRunner: ObservableObject {
       detectionEmptyLookahead: detectionEmptyLookahead,
       detectFaceMosaics: detectFaceMosaics,
       previewBufferLimit: previewBufferLimit,
+      previewRestorationModel: previewRestorationModel,
+      previewCustomRestorationModel: previewCustomRestorationModel,
       previewProjectionMode: previewProjectionMode,
       previewVideoLayout: previewVideoLayout,
       previewEye: previewEye,
@@ -592,6 +601,10 @@ final class RestorationRunner: ObservableObject {
     detectFaceMosaics = snapshot.detectFaceMosaics
 
     previewBufferLimit = min(max(snapshot.previewBufferLimit, 1), 60)
+    previewRestorationModel = restorationModels.contains(
+      snapshot.previewRestorationModel ?? ""
+    ) ? snapshot.previewRestorationModel! : capabilities.previewRestorationModel
+    previewCustomRestorationModel = snapshot.previewCustomRestorationModel ?? ""
     previewProjectionMode = ["通常", "VR180", "360"].contains(snapshot.previewProjectionMode ?? "")
       ? snapshot.previewProjectionMode!
       : "通常"
@@ -613,7 +626,7 @@ final class RestorationRunner: ObservableObject {
 
   func previewArguments(resources: URL, outputDirectory: URL, input: URL) throws -> [String] {
     normalizeModelSelections()
-    let previewModel = capabilities.previewRestorationModel
+    let previewModel = try resolvedPreviewRestorationModel(in: resources)
     try rejectUnsupportedCoreAIModel(previewModel)
     let detection = try resolvedDetectionModel(in: resources)
     if roiEnhancer != "none" { try rejectUnsupportedCoreAIModel(roiEnhancerModel) }
@@ -627,6 +640,7 @@ final class RestorationRunner: ObservableObject {
     case "basicvsrpp-v1.2-coreai": automaticClipLength = 98
     case "basicvsrpp-v1.2-coreai-t36": automaticClipLength = 104
     case "basicvsrpp-v1.2-coreai-t90": automaticClipLength = 178
+    case "basicvsrpp-v1.2-coreai-variable": automaticClipLength = 180
     default: automaticClipLength = 180
     }
     add(&args, "--max-clip-length", useMaxClipLength ? maxClipLength : automaticClipLength)
@@ -725,6 +739,18 @@ final class RestorationRunner: ObservableObject {
     return restorationModel
   }
 
+  private func resolvedPreviewRestorationModel(in resources: URL) throws -> String {
+    if previewRestorationModel == "カスタム" {
+      guard !previewCustomRestorationModel.isEmpty else {
+        throw RunnerError.missingValue("再生用復元モデル")
+      }
+      try rejectUnsupportedCoreAIModel(previewCustomRestorationModel)
+      return previewCustomRestorationModel
+    }
+    try rejectUnsupportedCoreAIModel(previewRestorationModel)
+    return previewRestorationModel
+  }
+
   private func resolvedDetectionModel(in resources: URL) throws -> String {
     if detectionModel == "カスタム" {
       guard !customDetectionModel.isEmpty else { throw RunnerError.missingValue("検出モデル") }
@@ -737,6 +763,9 @@ final class RestorationRunner: ObservableObject {
   private func normalizeModelSelections() {
     if !restorationModels.contains(restorationModel) {
       restorationModel = capabilities.defaultRestorationModel
+    }
+    if !restorationModels.contains(previewRestorationModel) {
+      previewRestorationModel = capabilities.previewRestorationModel
     }
     if !detectionModels.contains(detectionModel) {
       detectionModel = "v2-coreml"
@@ -767,6 +796,7 @@ final class RestorationRunner: ObservableObject {
     result["LADA_MODEL_WEIGHTS_DIR"] = resources.appendingPathComponent("models").path
     if capabilities.supportsCoreAI {
       result["LADA_COREAI_SWIFT_RUNNER"] = resources.appendingPathComponent("bin/lada-coreai-runner").path
+      result["LADA_VARIABLE_COREAI_SWIFT_RUNNER"] = resources.appendingPathComponent("bin/lada-basicvsrpp-variable-runner").path
 #if MIOH_PORTABLE_COREAI
       result.removeValue(forKey: "LADA_COREAI_ARCHITECTURE")
 #else
@@ -775,6 +805,7 @@ final class RestorationRunner: ObservableObject {
     } else {
       result.removeValue(forKey: "LADA_COREAI_PYTHON")
       result.removeValue(forKey: "LADA_COREAI_SWIFT_RUNNER")
+      result.removeValue(forKey: "LADA_VARIABLE_COREAI_SWIFT_RUNNER")
       result.removeValue(forKey: "LADA_COREAI_ARCHITECTURE")
     }
     result["PATH"] = [resources.appendingPathComponent("bin").path, "/usr/bin", "/bin", "/usr/sbin", "/sbin"].joined(separator: ":")

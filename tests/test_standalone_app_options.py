@@ -242,8 +242,11 @@ class StandaloneAppOptionTests(unittest.TestCase):
             'Text("視野角")',
             "private enum PreviewVRDetector",
             "static func detect(url: URL) async -> PreviewVRDetection",
-            '"vr180", "vr_180", "vr-180", "180vr", "180_vr", "180-vr", "mdvr"',
-            '"gspherical", "spherical=true", "sv3d", "st3d", "equirectangular"',
+            '"vr180", "vr_180", "vr-180", "180vr", "180_vr", "180-vr"',
+            'of: #"(^|[^a-z0-9])mdvr[-_ ]?[0-9]+"#',
+            '"gspherical", "spherical=true", "sv3d", "equirectangular"',
+            '"st3d", "stereo_mode=sbs", "stereo_mode=top-bottom"',
+            'private static func containsMP4Box(_ data: Data, type: String) -> Bool',
             "@Published var isVRVideo = false",
             "@Published var isDetectingVR = false",
             "func choosePreviewInput(runner: RestorationRunner)",
@@ -311,17 +314,24 @@ class StandaloneAppOptionTests(unittest.TestCase):
         ]:
             self.assertIn(contract, player)
 
-    def test_preview_uses_t18_without_changing_t90_export_default(self):
+    def test_preview_has_independent_selectable_restoration_model(self):
         source = APP_SOURCE.read_text()
+        player = PLAYER_SOURCE.read_text()
 
-        self.assertIn("var previewRestorationModel: String", source)
+        self.assertIn("@Published var previewRestorationModel: String", source)
+        self.assertIn("var previewRestorationModel: String?", source)
         self.assertIn(
             'supportsCoreAI ? "basicvsrpp-v1.2-coreai" : "basicvsrpp-v1.2"',
             source,
         )
-        self.assertIn("let previewModel = capabilities.previewRestorationModel", source)
+        self.assertIn("let previewModel = try resolvedPreviewRestorationModel", source)
         self.assertIn('add(&args, "--restoration-model", previewModel)', source)
         self.assertIn("switch previewModel", source)
+        self.assertIn(
+            'Picker("復元モデル", selection: $runner.previewRestorationModel)',
+            player,
+        )
+        self.assertIn('if !controller.isVRVideo', player)
         self.assertIn(
             'case "basicvsrpp-v1.2-coreai": automaticClipLength = 98',
             source,
@@ -340,8 +350,8 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertEqual(info["LSMinimumSystemVersion"], "26.0")
         self.assertNotIn("import CoreAI", source)
         self.assertEqual(build_script.count("-target arm64-apple-macosx26.0"), 1)
-        self.assertEqual(build_script.count("-target arm64-apple-macosx27.0"), 1)
-        self.assertEqual(build_script.count("-framework CoreAI"), 1)
+        self.assertEqual(build_script.count("-target arm64-apple-macosx27.0"), 2)
+        self.assertEqual(build_script.count("-framework CoreAI"), 2)
 
     def test_model_choices_follow_coreai_os_availability(self):
         source = APP_SOURCE.read_text()
