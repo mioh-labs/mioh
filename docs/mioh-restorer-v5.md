@@ -1,9 +1,10 @@
 # MiohRestorer V5 integrated specification
 
-Mioh means **Motion-Informed Optical Healing**. V5 is a greenfield mosaic
-restorer built from the measurements and failure analyses of V4 and V4.1. It
-does not inherit V4 weights or its deployment graph. V4.1 remains a diagnostic
-quality reference and may later be used as an auxiliary teacher.
+Mioh means **Motion-Informed Optical Healing**. V5 is the shared data,
+evaluation and curriculum generation. It now has two deliberately separate
+model families: greenfield ANE-oriented V5-Q/S and quality-first hybrid V5-HQ.
+V5-Q/S do not inherit V4 weights. V5-HQ initializes its recurrent backbone
+from the established BasicVSR++ v1.2 weights and adds a new ROI refiner.
 
 This document is the implementation contract. Items marked as measurements
 must be resolved by the Stage 0 prototype before full training starts.
@@ -22,6 +23,44 @@ The Stage 0 implementation now exists independently of V4/V4.1:
   window padding and isolated mask-miss repair;
 - six independent loss curricula and a model-only wall-clock profiler;
 - fixed-shape Core ML export and residual-motion measurement tools.
+
+The quality-first V5-HQ path is also implemented and verified independently:
+
+- nine-frame BasicVSR++ recurrent propagation with SPyNet optical flow;
+- true bilinear sub-pixel `grid_sample` warping;
+- second-order modulated DCNv2 propagation;
+- learned flow-residual deformable attention and visibility-weighted fusion;
+- five output-specific ROI restorations with exact source preservation outside
+  the mask;
+- six stages that progressively unfreeze the refiner, recurrent backbone and
+  finally SPyNet;
+- a Core AI exporter that registers the existing custom Metal kernels for
+  `grid_sample` and DCNv2.
+
+On the M5 Pro, an actual 256px MPS training step completed in 5.33 seconds with
+8.32 GiB driver memory in Stage 1. A full backward pass through the dynamic
+warp completed with 11.70 GiB driver memory. PyTorch MPS lacks
+`grid_sampler_2d_backward`, so **training only** uses its documented CPU
+fallback for that derivative. The exported inference program does not use that
+fallback: the conversion smoke test succeeded with 9,627 operations, including
+111 custom Metal grid-sample calls and 32 custom Metal DCNv2 calls.
+
+Run a fresh V5-HQ curriculum with:
+
+```zsh
+TRAIN_MANIFEST=/path/to/train-native-256.jsonl \
+VALIDATION_MANIFEST=/path/to/validation-native-256.jsonl \
+WORK_ROOT=/path/to/mioh-restorer-v5-hq-run \
+zsh scripts/training/run-mioh-restorer-v5-hq-local.sh
+```
+
+Export a trained EMA checkpoint with:
+
+```zsh
+.venv-coreai/bin/python scripts/apple/export_mioh_restorer_v5_hq_coreai.py \
+  --checkpoint /path/to/mioh-v5-hq-stage6-latest.pth \
+  --output /path/to/mioh-restorer-v5-hq.aimodel
+```
 
 The first M5 Pro measurements use the untrained, uncompromised V5-S baseline:
 9-frame context, full 49-candidate coarse search and the original 32/48/80/128
@@ -81,15 +120,46 @@ python scripts/apple/validate-mioh-restorer-v5-stage0.py \
 - Preserve source pixels at their native scale. Never enlarge a small crop or
   shrink a large crop merely to fit one model input.
 - Put no learned convolution on a thin full-resolution feature plane.
-- Use only Apple-deployable operations in the inference graph: convolution,
-  fixed shift-bank convolution, reshape, PixelShuffle/PixelUnshuffle, softmax,
-  elementwise operations and supported activations.
-- No deformable convolution, `grid_sample`, optical-flow warp or recurrent
-  PyTorch state in the shipping graph.
+- V5-Q/S use only ANE-oriented fixed operators. V5-HQ intentionally keeps
+  deformable convolution, `grid_sample`, optical-flow warp and recurrent
+  propagation, implemented by Core AI plus custom Metal kernels.
 - A quality-reference model and a shipping model are separate products. A
   quality experiment is not promoted merely because it converts successfully.
 
 ## Native-resolution ROI buckets
+
+### Next full-training dataset rebuild
+
+The next from-scratch training run must replace the current boundary-tile-heavy
+manifest with a native, mask-centred multi-bucket dataset. The present run is
+allowed to finish unchanged so it remains a comparable baseline.
+
+- Reuse clean native source videos or `crop_unscaled_img`; do not resize or
+  regenerate every video merely to obtain a fixed square file.
+- Store source path, nine-frame range, per-frame tracked mask, stabilized even
+  crop origin, motion bucket and crop size in the manifest. Decode and crop at
+  training time to avoid another lossy RGB encode.
+- Train shared weights with native 192, 256 and 384 crops, initially sampled at
+  approximately 10%, 30% and 60%. Never upscale a smaller ROI. Tile only ROIs
+  larger than 384, using overlapping native 384 tiles.
+- Require a non-empty mask in the five output frames. Prefer mask occupancy of
+  20-70%; retain 70-95% occupancy for large-ROI coverage, limit 5-20% boundary
+  tiles to 10-15% of samples, and reject empty or token edge fragments.
+- Keep the tracked mask near the crop centre while retaining unmasked context.
+  Quantize the stabilized crop trajectory to even integer pixels and never
+  cross a scene cut.
+- Stratify by crop size and motion (static/low/medium/high), cap each source
+  video at roughly 30-50 representative windows, and split train/validation/
+  test strictly by source video.
+- Generate mosaic shape, block size, compression, blur, noise, mask jitter and
+  detection misses online. Validation and test degradations must be completely
+  deterministic.
+- Before restarting Stage 1, run a real 384px MPS forward/backward memory probe
+  on the fully trainable V5-HQ graph. If it fits 48 GiB, make 384 the primary
+  quality bucket; otherwise alternate 256/384 batches without resizing.
+
+This is the required input pipeline for the next run, not a request to mutate
+the currently running Stage 2 experiment.
 
 V5 uses five fixed, square input shapes compiled from shared weights:
 
@@ -118,15 +188,19 @@ allowed only after the ROI plus safety margin fits the smaller bucket for at
 least 18 consecutive frames. A bucket transition rebuilds the feature cache
 and blends the old and new output briefly through the existing ROI feather.
 
-The training loader forms same-size batches and samples native 128, 192, 256,
-384 and 512 crops. ROI losses are normalized by valid ROI pixels. Validation
-is reported as a size-by-motion grid so regression in one bucket cannot be
-hidden by the global average.
+The shipping graph retains all five inference shapes, but Apple Silicon
+quality training uses native 128, 192 and 256 crops. This matches the current
+BasicVSR++ 256-pixel training/restoration unit and fits V5-Q backward passes in
+48 GB. A direct 512 V5-Q training probe reached approximately 63 GB and is
+therefore prohibited on this machine. Larger regions are represented by
+overlapping native 256 tiles; they are never resized. ROI losses are normalized
+by valid ROI pixels and validation is reported by tile size so a regression in
+one bucket cannot be hidden by the global average.
 
 The V5 loader is deliberately separate from the legacy fixed-size loader. A
 native manifest stores the original clean and mask videos, exact nine-frame
 range, even crop origin for every frame, mask reliability and bucket. Oversize
-regions become overlapping tracked 512 tiles; they are not discarded. Build a
+regions become overlapping tracked 256 training tiles; they are not discarded. Build a
 manifest for each already source-separated split with, for example:
 
 ```zsh
@@ -135,14 +209,14 @@ python scripts/training/build-mioh-restorer-v5-native-manifest.py \
   --output /path/to/v5/train-native.jsonl \
   --stride 4 \
   --context-fraction 0.30 \
+  --maximum-bucket 256 \
   --tile-overlap 64
 ```
 
 `MiohRestorerV5NativeDataset` performs only exact native crops and edge
-padding. `V5BucketBatchSampler` keeps every batch shape-homogeneous. The smoke
-manifest built from the current data reports `resized_frames: 0`, and an
-actual 512 sample decodes as inputs `[9,5,512,512]` and target
-`[1,3,512,512]`.
+padding. `V5BucketBatchSampler` keeps every batch shape-homogeneous. The
+manifest report must say `resized_frames: 0` and `maximum_bucket: 256` before
+the local six-stage run starts.
 
 ## Tracking, cuts and temporal boundaries
 
@@ -239,6 +313,18 @@ The benchmark includes model-call overhead, ANE-to-memory transfers, cache
 updates and synchronization. If the split-model transfer erases the saved
 compute, the stateful or monolithic form wins.
 
+### Core AI temporal-I/O contract
+
+Every Core AI model that repeats work across frames must expose the repeated
+frames, contexts, flows or features as one contiguous temporal tensor such as
+`[K,C,H,W]`. It must not expand that axis into `K` separately named inputs.
+The variable-length BasicVSR++ investigation measured a Core AI numerical
+regression for the separate-input graph while the equivalent contiguous
+tensor graph retained parity. This is therefore a numerical-correctness
+requirement, not merely a performance preference. All Stage 0 execution
+variants, including future stateful variants, must pass the contiguous-input
+canary before training or packaging.
+
 ## Folded-space architecture
 
 The input enters PixelUnshuffle immediately. All learned correlation, fusion
@@ -284,24 +370,56 @@ stage; `RESUME` is reserved for resuming the same interrupted stage.
 1. **Known-motion alignment:** integer and subpixel translation, all folded
    phase residues, occlusion, scale and small rotation. Exact hierarchical
    shift targets supervise alignment and reliability.
-2. **Natural-motion alignment:** same nine-frame information available to the
-   student, SPyNet flow and forward/backward consistency for occlusion. No
-   teacher information from outside the window.
+2. **Natural-motion alignment:** the same nine-frame information available at
+   inference. Clean non-mosaic context supplies photometric correspondence,
+   feature consistency and reliability/occlusion targets. No pretrained flow
+   network or information from outside the window is used.
 3. **Faithful structure:** clean GT reconstruction, colour, shape and
    low-frequency structure.
 4. **Detail recovery:** Haar/wavelet bands, gradients, multiscale frequency
    losses and weak perceptual supervision. Texture is never trained only
    through the confidence gate.
-5. **Temporal consistency:** teacher-flow-aligned temporal loss, acceleration
-   and occlusion masking. Unaligned frame-difference loss is forbidden because
-   it penalizes legitimate motion and causes blur.
+5. **Temporal consistency:** detached local correspondences calculated from
+   paired clean GT provide aligned temporal and acceleration losses with
+   visibility masking. Unaligned frame-difference loss is forbidden because it
+   penalizes legitimate motion and causes blur.
 6. **Fidelity polish:** fresh low-rate optimizer against clean GT. GAN is an
    optional separately evaluated experiment, never an automatic stage.
 
-BasicVSR++ supplies only alignment and intermediate-feature hints on paired
-data. RGB pseudo-targets are allowed only for real inputs without clean GT.
-V4.1-Q may become an auxiliary V5-S teacher only after its 3,000-step detail
-experiment demonstrates useful high-frequency recovery.
+The production V5 curriculum is independent. It does not load V3/V4 weights,
+BasicVSR++, SPyNet or an external optical-flow model. Stage 1 generates exact
+quarter-pixel translations analytically; Stage 2 uses V5's own alignment over
+clean context; Stages 5/6 derive detached local correspondences directly from
+paired clean GT. Clean GT remains the primary target in every stage.
+
+## Apple Silicon training
+
+The local runner supports all six stages on MPS. Each completed stage writes
+its raw weights, EMA weights, optimizer/scaler state, metrics JSONL and a
+`stage-complete.json` gate. The next stage loads the previous EMA weights and
+always creates a fresh optimizer. An interrupted stage resumes automatically
+from its own `latest.pth`; it never crosses a stage boundary with the old
+optimizer.
+
+Build separate native manifests for the source-separated training and
+validation splits, then run:
+
+```zsh
+cd /Users/okatti/Documents/lada
+
+TRAIN_MANIFEST=/path/to/train-native.jsonl \
+VALIDATION_MANIFEST=/path/to/validation-native.jsonl \
+WORK_ROOT=/Volumes/Project_HD/lada_finetune_aozora_hikari/mioh_restorer_v5/runs/v5-q-native \
+zsh scripts/training/run-mioh-restorer-v5-local.sh
+```
+
+For a ten-step end-to-end pilot of every stage, add `STEPS=10`. For a partial
+run, set `START_STAGE` and `END_STAGE`. Stage 5/6 require V5-Q because temporal
+loss needs its five consecutive outputs. MPS mixed precision remains off;
+batch size 1 plus gradient accumulation is the safe default for the M5 Pro
+48 GB machine. The macOS runner defaults to `WORKERS=0` so PyTorch does not
+depend on `torch_shm_manager`; opt into worker processes only after verifying
+that shared storage is supported by the selected temporary volume.
 
 Before full training, every model size runs 100 measured steps. The report
 must include seconds per step, peak memory, data-loading time and projected
