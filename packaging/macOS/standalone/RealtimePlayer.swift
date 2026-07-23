@@ -43,6 +43,7 @@ private struct PreviewVRDetection {
 private enum PreviewVRDetector {
   static func detect(url: URL) async -> PreviewVRDetection {
     let path = url.path.lowercased()
+    let filename = url.deletingPathExtension().lastPathComponent.lowercased()
     let asset = AVURLAsset(url: url)
     var metadataText = ""
     if let metadata = try? await asset.load(.metadata) {
@@ -61,7 +62,8 @@ private enum PreviewVRDetector {
     let containerText = await Task.detached(priority: .utility) {
       readContainerSignature(url: url)
     }.value
-    let evidence = path + " " + metadataText + " " + containerText
+    let declaredEvidence = path + " " + metadataText
+    let sphericalEvidence = metadataText + " " + containerText
 
     var width = 0.0
     var height = 0.0
@@ -73,27 +75,43 @@ private enum PreviewVRDetector {
       height = abs(transformed.height)
     }
     let aspect = height > 0 ? width / height : 0
-    let isWideVRShape = aspect >= 1.8 && aspect <= 2.2
+    // 16:9 normal video is 1.778. A stereo VR180 frame is normally 2:1,
+    // so do not let a generic wide frame become evidence for VR by itself.
+    let isStereoVRShape = aspect >= 1.9 && aspect <= 2.1
 
-    let has360Hint = containsAny(evidence, [
+    let has360Hint = containsAny(declaredEvidence, [
       "vr360", "360vr", "360_vr", "360-vr", "spherical=true",
       "sphericalvideo", "projectiontype=equirectangular", "projection_type=equirectangular",
     ])
-    let has180Hint = containsAny(evidence, [
-      "vr180", "vr_180", "vr-180", "180vr", "180_vr", "180-vr", "mdvr",
+    let hasExplicit180Hint = containsAny(declaredEvidence, [
+      "vr180", "vr_180", "vr-180", "180vr", "180_vr", "180-vr",
     ])
-    let hasSphericalMetadata = containsAny(metadataText + " " + containerText, [
-      "gspherical", "spherical=true", "sv3d", "st3d", "equirectangular",
+    // MDVR is a useful product-code hint, but is too short to trust as an
+    // unrestricted substring. Require the code in the filename and a 2:1
+    // stereo frame before it can select VR180.
+    let hasMDVRProductHint = filename.range(
+      of: #"(^|[^a-z0-9])mdvr[-_ ]?[0-9]+"#,
+      options: .regularExpression
+    ) != nil
+    let hasSphericalMetadata = containsAny(sphericalEvidence, [
+      "gspherical", "spherical=true", "sv3d", "equirectangular",
     ])
-    let topBottom = containsAny(evidence, [
+    let hasStereoMetadata = containsAny(sphericalEvidence, [
+      "st3d", "stereo_mode=sbs", "stereo_mode=top-bottom",
+    ])
+    let topBottom = containsAny(declaredEvidence, [
       "top-bottom", "top_bottom", "topbottom", "over-under", "over_under",
     ])
-    let explicitSBS = containsAny(evidence, [
+    let explicitSBS = containsAny(declaredEvidence, [
       "left-right", "left_right", "side-by-side", "side_by_side", "stereo_mode=sbs", " sbs ",
     ])
-    let layout: PreviewVideoLayout = topBottom ? .topBottom : ((explicitSBS || isWideVRShape) ? .sbs : .mono)
+    let layout: PreviewVideoLayout = topBottom
+      ? .topBottom
+      : ((explicitSBS || isStereoVRShape) ? .sbs : .mono)
 
-    if has180Hint {
+    if hasExplicit180Hint
+      || (hasMDVRProductHint && isStereoVRShape)
+      || (hasSphericalMetadata && hasStereoMetadata && isStereoVRShape) {
       return PreviewVRDetection(projection: .vr180, layout: layout, reason: "VR180情報を検出")
     }
     if has360Hint || hasSphericalMetadata {
@@ -110,15 +128,52 @@ private enum PreviewVRDetector {
     guard let handle = try? FileHandle(forReadingFrom: url) else { return "" }
     defer { try? handle.close() }
     let sampleSize = 8 * 1024 * 1024
-    var data = (try? handle.read(upToCount: sampleSize)) ?? Data()
+    let head = (try? handle.read(upToCount: sampleSize)) ?? Data()
+    var samples = [head]
     if let size = try? handle.seekToEnd(), size > UInt64(sampleSize) {
       let tailSize = UInt64(min(sampleSize, Int(size)))
       try? handle.seek(toOffset: size - tailSize)
       if let tail = try? handle.read(upToCount: Int(tailSize)) {
-        data.append(tail)
+        samples.append(tail)
       }
     }
-    return String(decoding: data, as: UTF8.self).lowercased()
+    var signatures: [String] = []
+    for sample in samples {
+      // Short four-character strings can occur by chance in compressed video.
+      // Accept sv3d/st3d only when they are the type of a plausible MP4 box.
+      if containsMP4Box(sample, type: "sv3d") { signatures.append("sv3d") }
+      if containsMP4Box(sample, type: "st3d") { signatures.append("st3d") }
+      let text = String(decoding: sample, as: UTF8.self).lowercased()
+      for marker in [
+        "gspherical", "spherical=true", "equirectangular",
+        "projectiontype=equirectangular", "projection_type=equirectangular",
+        "stereo_mode=sbs", "stereo_mode=top-bottom",
+      ] where text.contains(marker) {
+        signatures.append(marker)
+      }
+    }
+    return signatures.joined(separator: " ")
+  }
+
+  private static func containsMP4Box(_ data: Data, type: String) -> Bool {
+    let marker = Array(type.utf8)
+    guard marker.count == 4, data.count >= 8 else { return false }
+    return data.withUnsafeBytes { rawBuffer in
+      let bytes = rawBuffer.bindMemory(to: UInt8.self)
+      for index in 4...(bytes.count - 4) {
+        guard bytes[index] == marker[0], bytes[index + 1] == marker[1],
+          bytes[index + 2] == marker[2], bytes[index + 3] == marker[3]
+        else { continue }
+        let size = UInt32(bytes[index - 4]) << 24
+          | UInt32(bytes[index - 3]) << 16
+          | UInt32(bytes[index - 2]) << 8
+          | UInt32(bytes[index - 1])
+        if size == 0 || size == 1 || (size >= 8 && Int(size) <= data.count - index + 4) {
+          return true
+        }
+      }
+      return false
+    }
   }
 }
 
@@ -1504,6 +1559,28 @@ struct RealtimePlayerView: View {
         url: controller.previewInputURL,
         action: { controller.choosePreviewInput(runner: runner) }
       )
+
+      if !controller.isVRVideo {
+        HStack(spacing: 12) {
+          Picker("復元モデル", selection: $runner.previewRestorationModel) {
+            ForEach(runner.restorationModels, id: \.self) { model in
+              Text(model).tag(model)
+            }
+          }
+          .frame(maxWidth: 430)
+          if runner.previewRestorationModel == "カスタム" {
+            TextField("モデル名またはパス", text: $runner.previewCustomRestorationModel)
+              .textFieldStyle(.roundedBorder)
+              .frame(maxWidth: 360)
+            Button {
+              runner.choosePath(\.previewCustomRestorationModel)
+            } label: {
+              Image(systemName: "folder")
+            }
+          }
+          Spacer()
+        }
+      }
 
       ZStack {
         Color.black
