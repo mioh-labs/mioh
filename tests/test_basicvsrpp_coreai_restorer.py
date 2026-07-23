@@ -17,6 +17,7 @@ from lada.cli import main as cli_main
 import lada.restorationpipeline as restorationpipeline
 from lada.restorationpipeline.basicvsrpp_coreai_restorer import (
     CoreAIBasicvsrppMosaicRestorer,
+    CoreAIVariableBasicvsrppMosaicRestorer,
     CoreAIModelRuntime,
 )
 
@@ -220,7 +221,20 @@ class CoreAIBasicVSRPPRestorerTests(unittest.TestCase):
         self.assertEqual(len(restored), 3)
         self.assertTrue(all(frame.shape == (4, 4, 3) for frame in restored))
 
-    def test_long_clip_uses_t18_chunks_with_two_frame_crossfade(self):
+    def test_variable_model_uses_exact_clip_length_without_padding(self):
+        runtime = StreamingRecordingRuntime()
+        restorer = CoreAIVariableBasicvsrppMosaicRestorer(
+            Path("unused-variable.aimodelc"),
+            runtime=runtime,
+        )
+        video = [torch.zeros((4, 4, 3), dtype=torch.uint8) for _ in range(5)]
+
+        restored = restorer.restore(video)
+
+        self.assertEqual(runtime.calls, [(1, 5, 3, 4, 4)])
+        self.assertEqual(len(restored), 5)
+
+    def test_long_clip_uses_t18_chunks_with_default_eight_frame_crossfade(self):
         runtime = RecordingRuntime(step=90.0)
         restorer = CoreAIBasicvsrppMosaicRestorer(
             Path("unused.aimodel"),
@@ -229,6 +243,26 @@ class CoreAIBasicVSRPPRestorerTests(unittest.TestCase):
         video = [torch.zeros((2, 2, 3), dtype=torch.uint8) for _ in range(20)]
 
         restored = restorer.restore(video, max_frames=-1)
+
+        self.assertEqual(
+            runtime.calls,
+            [
+                (1, 18, 3, 2, 2),
+                (1, 18, 3, 2, 2),
+            ],
+        )
+        values = [int(frame[0, 0, 0]) for frame in restored]
+        self.assertEqual(values, [0] * 10 + [10, 20, 30, 40, 50, 60, 70, 80, 90, 90])
+
+    def test_long_clip_honors_explicit_two_frame_crossfade(self):
+        runtime = RecordingRuntime(step=90.0)
+        restorer = CoreAIBasicvsrppMosaicRestorer(
+            Path("unused.aimodel"),
+            runtime=runtime,
+        )
+        video = [torch.zeros((2, 2, 3), dtype=torch.uint8) for _ in range(20)]
+
+        restored = restorer.restore(video, max_frames=-1, temporal_overlap=2)
 
         self.assertEqual(
             runtime.calls,
@@ -329,6 +363,29 @@ class CoreAIBasicVSRPPRestorerTests(unittest.TestCase):
         self.assertTrue(models["basicvsrpp-v1.2-coreai-t36"].endswith("t36-fp16.aimodel"))
         self.assertIn("basicvsrpp-v1.2-coreai-t90", models)
         self.assertTrue(models["basicvsrpp-v1.2-coreai-t90"].endswith("t90-fp16.aimodel"))
+        self.assertIn("basicvsrpp-v1.2-coreai-variable", models)
+        self.assertTrue(
+            models["basicvsrpp-v1.2-coreai-variable"].endswith(
+                "basicvsrpp-v1.2-variable-coreai.aimodel"
+            )
+        )
+
+    def test_restoration_loader_selects_variable_swift_pipeline(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "basicvsrpp-variable.h17s.aimodelc"
+            model_path.mkdir()
+
+            restorer, pad_mode = restorationpipeline.load_restoration_model(
+                torch.device("mps"),
+                "basicvsrpp-v1.2-coreai-variable",
+                str(model_path),
+                None,
+                fp16=True,
+            )
+            restorer.close()
+
+        self.assertIsInstance(restorer, CoreAIVariableBasicvsrppMosaicRestorer)
+        self.assertEqual(pad_mode, "zero")
 
     def test_restoration_loader_selects_t36_contract_from_model_name(self):
         with tempfile.TemporaryDirectory() as temp_dir:

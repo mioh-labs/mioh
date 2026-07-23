@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Lada Authors
+# SPDX-License-Identifier: AGPL-3.0
+
+"""Export the validated six-frame variable BasicVSR++ Core AI assets.
+
+The recurrent propagation is unrolled over one contiguous six-frame tensor.
+Keeping the temporal axis in a single input is intentional: equivalent models
+with six separately named context inputs trigger a Core AI numeric regression.
+"""
+
+from __future__ import annotations
+
+import argparse
+import shutil
+import time
+from contextlib import ExitStack
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import torch
+
+try:
+    from .basicvsrpp_coreai_kernels import (
+        build_deform_conv_kernel,
+        build_grid_sample_kernel,
+    )
+    from .benchmark_basicvsrpp_variable_coreai import (
+        BRANCHES,
+        FEATURE_SIZE,
+        IMAGE_SIZE,
+        MID_CHANNELS,
+        PairFlow,
+        PropagationFirst,
+        PropagationInit,
+        PropagationLater,
+        Reconstruction,
+        SpatialEncoder,
+    )
+    from .export_basicvsrpp_coreai import (
+        import_coreai,
+        load_generator,
+        save_program_asset,
+        use_deform_conv_metal_kernel,
+        use_grid_sample_metal_kernel,
+    )
+except ImportError:
+    from basicvsrpp_coreai_kernels import (  # type: ignore[import-not-found]
+        build_deform_conv_kernel,
+        build_grid_sample_kernel,
+    )
+    from benchmark_basicvsrpp_variable_coreai import (  # type: ignore[import-not-found]
+        BRANCHES,
+        FEATURE_SIZE,
+        IMAGE_SIZE,
+        MID_CHANNELS,
+        PairFlow,
+        PropagationFirst,
+        PropagationInit,
+        PropagationLater,
+        Reconstruction,
+        SpatialEncoder,
+    )
+    from export_basicvsrpp_coreai import (  # type: ignore[import-not-found]
+        import_coreai,
+        load_generator,
+        save_program_asset,
+        use_deform_conv_metal_kernel,
+        use_grid_sample_metal_kernel,
+    )
+
+
+CHUNK_SIZE = 6
+
+
+class BidirectionalFlow6(PairFlow):
+    def forward(self, frames: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        references = frames[:CHUNK_SIZE]
+        supports = frames[1 : CHUNK_SIZE + 1]
+        return super().forward(references, supports), super().forward(
+            supports, references
+        )
+
+
+class PropagationStart6(torch.nn.Module):
+    """First chunk: internal zero state followed by five recurrent steps."""
+
+    def __init__(self, generator: torch.nn.Module, branch: str):
+        super().__init__()
+        self.initial = PropagationInit(generator, branch)
+        self.first = PropagationFirst(generator, branch)
+        self.later = PropagationLater(generator, branch)
+
+    def forward(self, contexts: torch.Tensor, flows: torch.Tensor) -> torch.Tensor:
+        outputs = [self.initial(contexts[0:1])]
+        outputs.append(self.first(contexts[1:2], outputs[-1], flows[0:1]))
+        for index in range(2, CHUNK_SIZE):
+            outputs.append(
+                self.later(
+                    contexts[index : index + 1],
+                    outputs[-1],
+                    outputs[-2],
+                    flows[index - 1 : index],
+                    flows[index - 2 : index - 1],
+                )
+            )
+        return torch.cat(outputs, dim=0)
+
+
+class PropagationContinue6(torch.nn.Module):
+    """Continuation chunk with the two recurrent boundary features."""
+
+    def __init__(self, generator: torch.nn.Module, branch: str):
+        super().__init__()
+        self.later = PropagationLater(generator, branch)
+
+    def forward(
+        self,
+        contexts: torch.Tensor,
+        state_n1: torch.Tensor,
+        state_n2: torch.Tensor,
+        flows: torch.Tensor,
+        flow_previous: torch.Tensor,
+    ) -> torch.Tensor:
+        outputs = []
+        previous = state_n1
+        older = state_n2
+        previous_flow = flow_previous
+        for index in range(CHUNK_SIZE):
+            flow = flows[index : index + 1]
+            result = self.later(
+                contexts[index : index + 1],
+                previous,
+                older,
+                flow,
+                previous_flow,
+            )
+            outputs.append(result)
+            older, previous, previous_flow = previous, result, flow
+        return torch.cat(outputs, dim=0)
+
+
+@dataclass(frozen=True)
+class ChunkAssetSpec:
+    name: str
+    module: torch.nn.Module
+    input_names: tuple[str, ...]
+    output_names: tuple[str, ...]
+    examples: tuple[torch.Tensor, ...]
+
+
+def _random(shape: tuple[int, ...], seed: int) -> torch.Tensor:
+    rng = np.random.default_rng(seed)
+    value = rng.random(shape, dtype=np.float32).astype(np.float16)
+    return torch.from_numpy(value)
+
+
+def build_chunk_specs(generator: torch.nn.Module) -> list[ChunkAssetSpec]:
+    frames6 = _random((CHUNK_SIZE, 3, IMAGE_SIZE, IMAGE_SIZE), 1)
+    frames7 = _random((CHUNK_SIZE + 1, 3, IMAGE_SIZE, IMAGE_SIZE), 2)
+    feature = _random((1, MID_CHANNELS, FEATURE_SIZE, FEATURE_SIZE), 3)
+    flow = _random((1, 2, FEATURE_SIZE, FEATURE_SIZE), 4) - 0.5
+    specs = [
+        ChunkAssetSpec(
+            "spatial6",
+            SpatialEncoder(generator),
+            ("frames",),
+            ("features",),
+            (frames6,),
+        ),
+        ChunkAssetSpec(
+            "flow6",
+            BidirectionalFlow6(generator),
+            ("frames",),
+            ("backward", "forward"),
+            (frames7,),
+        ),
+    ]
+    for index, branch in enumerate(BRANCHES):
+        context = _random(
+            (
+                CHUNK_SIZE,
+                MID_CHANNELS * (index + 1),
+                FEATURE_SIZE,
+                FEATURE_SIZE,
+            ),
+            10 + index,
+        )
+        flows = flow.repeat(CHUNK_SIZE, 1, 1, 1)
+        specs.extend(
+            (
+                ChunkAssetSpec(
+                    f"{branch}_start6",
+                    PropagationStart6(generator, branch),
+                    ("contexts", "flows"),
+                    ("features",),
+                    (context, flows[: CHUNK_SIZE - 1]),
+                ),
+                ChunkAssetSpec(
+                    f"{branch}_continue6",
+                    PropagationContinue6(generator, branch),
+                    (
+                        "contexts",
+                        "state_n1",
+                        "state_n2",
+                        "flows",
+                        "flow_previous",
+                    ),
+                    ("features",),
+                    (context, feature, feature.clone(), flows, flow),
+                ),
+            )
+        )
+    specs.append(
+        ChunkAssetSpec(
+            "reconstruction6",
+            Reconstruction(generator),
+            ("frames", "features"),
+            ("restored",),
+            (
+                frames6,
+                _random(
+                    (
+                        CHUNK_SIZE,
+                        MID_CHANNELS * 5,
+                        FEATURE_SIZE,
+                        FEATURE_SIZE,
+                    ),
+                    30,
+                ),
+            ),
+        )
+    )
+    return specs
+
+
+def export_assets(checkpoint: Path, output_dir: Path, *, overwrite: bool) -> None:
+    _coreai, coreai_torch = import_coreai()
+    generator = load_generator(checkpoint).generator
+    grid_kernel = build_grid_sample_kernel(coreai_torch)
+    deform_kernel = build_deform_conv_kernel(coreai_torch)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for spec in build_chunk_specs(generator):
+        destination = output_dir / f"basicvsrpp-variable-{spec.name}.aimodel"
+        if destination.exists():
+            if not overwrite:
+                continue
+            shutil.rmtree(destination)
+        module = spec.module.half().eval()
+        started = time.perf_counter()
+        with torch.no_grad(), ExitStack() as stack:
+            stack.enter_context(use_grid_sample_metal_kernel(grid_kernel))
+            stack.enter_context(use_deform_conv_metal_kernel(deform_kernel))
+            exported = torch.export.export(module, spec.examples)
+            exported = exported.run_decompositions(coreai_torch.get_decomp_table())
+        converter = coreai_torch.TorchConverter()
+        converter.register_custom_kernels([grid_kernel, deform_kernel])
+        converter.add_exported_program(
+            exported,
+            input_names=list(spec.input_names),
+            output_names=list(spec.output_names),
+        )
+        save_program_asset(converter.to_coreai(), destination)
+        print(
+            f"exported {spec.name}: {time.perf_counter() - started:.2f}s -> "
+            f"{destination}",
+            flush=True,
+        )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=Path("model_weights/lada_mosaic_restoration_model_generic_v1.2.pth"),
+    )
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--overwrite", action="store_true")
+    args = parser.parse_args()
+    export_assets(args.checkpoint, args.output_dir, overwrite=args.overwrite)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -22,6 +22,7 @@ EXPECTED_MODEL_ASSETS = {
     "RealESRGAN_x4plus-256-fp16.h17s.aimodelc",
     "realesr-general-x4v3-256-fp16.h17s.aimodelc",
     "4xNomosWebPhoto_RealPLKSR-256-fp16.h17s.aimodelc",
+    "basicvsrpp-v1.2-variable-coreai.h17s.aimodelc",
 }
 
 EXPECTED_SOURCE_MODEL_ASSETS = {
@@ -32,6 +33,22 @@ EXPECTED_SOURCE_MODEL_ASSETS = {
     "RealESRGAN_x4plus-256-fp16.aimodel",
     "realesr-general-x4v3-256-fp16.aimodel",
     "4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel",
+    "basicvsrpp-v1.2-variable-coreai.aimodel",
+}
+
+VARIABLE_MODEL_NAME = "basicvsrpp-v1.2-coreai-variable"
+VARIABLE_ASSET_NAMES = {
+    "spatial6",
+    "flow6",
+    "backward_1_start6",
+    "backward_1_continue6",
+    "forward_1_start6",
+    "forward_1_continue6",
+    "backward_2_start6",
+    "backward_2_continue6",
+    "forward_2_start6",
+    "forward_2_continue6",
+    "reconstruction6",
 }
 
 MODEL_CONTRACTS = {
@@ -78,10 +95,12 @@ def expected_model_assets(distribution: str, architecture: str) -> set[str]:
     if distribution == "portable":
         return set(EXPECTED_SOURCE_MODEL_ASSETS)
     if distribution == "dedicated":
-        return {
+        assets = {
             f"{Path(asset).stem}.{architecture}.aimodelc"
             for asset in EXPECTED_SOURCE_MODEL_ASSETS
         }
+        assets.add(f"basicvsrpp-v1.2-variable-coreai.{architecture}.aimodelc")
+        return assets
     raise ValueError(f"unsupported Core AI distribution: {distribution}")
 
 
@@ -165,6 +184,42 @@ def _verify_restoration(name: str, path: Path, frames: int) -> None:
         runtime.close()
 
 
+def _verify_variable_restoration(name: str, path: Path, architecture: str) -> None:
+    import torch
+
+    from lada.restorationpipeline.basicvsrpp_coreai_restorer import (
+        VariableCoreAIModelRuntime,
+    )
+
+    compiled = path.suffix == ".aimodelc"
+    expected = {
+        (
+            f"basicvsrpp-variable-{asset}.{architecture}.aimodelc"
+            if compiled
+            else f"basicvsrpp-variable-{asset}.aimodel"
+        )
+        for asset in VARIABLE_ASSET_NAMES
+    }
+    actual = {
+        item.name
+        for item in path.iterdir()
+        if item.is_dir()
+        and item.name.endswith(".aimodelc" if compiled else ".aimodel")
+    }
+    if actual != expected:
+        raise RuntimeError(
+            f"variable Core AI asset mismatch; "
+            f"missing={sorted(expected - actual)}, unexpected={sorted(actual - expected)}"
+        )
+    runtime = VariableCoreAIModelRuntime(path)
+    try:
+        input_array = gradient_input((1, 3, 3, 256, 256))
+        output = runtime(torch.from_numpy(input_array)).numpy()
+        _verify_array(name, output, input_array.shape)
+    finally:
+        runtime.close()
+
+
 def _verify_detection(name: str, path: Path) -> None:
     from lada.models.yolo.yolo11_coreai_segmentation_model import (
         CoreAISegmentationRuntime,
@@ -201,8 +256,10 @@ def verify_models(
 ) -> None:
     models_dir = resources / "models"
     verify_asset_set(models_dir, distribution, architecture)
-    selected_smokes = set(MODEL_CONTRACTS) if smoke_names is None else smoke_names
-    unknown_smokes = selected_smokes - set(MODEL_CONTRACTS)
+    all_smokes = set(MODEL_CONTRACTS)
+    all_smokes.add(VARIABLE_MODEL_NAME)
+    selected_smokes = all_smokes if smoke_names is None else smoke_names
+    unknown_smokes = selected_smokes - all_smokes
     if unknown_smokes:
         raise ValueError(f"unknown Core AI smoke models: {sorted(unknown_smokes)}")
     for name, contract in MODEL_CONTRACTS.items():
@@ -226,6 +283,29 @@ def verify_models(
         else:
             _verify_enhancer(name, path)
         print(f"Core AI smoke passed: {name} -> {path.name}", flush=True)
+    model = _resolve_model(VARIABLE_MODEL_NAME, "restoration")
+    path = Path(model.path)
+    variable_asset = (
+        f"basicvsrpp-v1.2-variable-coreai.{architecture}.aimodelc"
+        if distribution == "dedicated"
+        else "basicvsrpp-v1.2-variable-coreai.aimodel"
+    )
+    expected_path = models_dir / variable_asset
+    if path != expected_path:
+        raise RuntimeError(
+            f"{VARIABLE_MODEL_NAME} resolved to {path}, expected {expected_path}"
+        )
+    if VARIABLE_MODEL_NAME in selected_smokes:
+        _verify_variable_restoration(VARIABLE_MODEL_NAME, path, architecture)
+        print(
+            f"Core AI smoke passed: {VARIABLE_MODEL_NAME} -> {path.name}",
+            flush=True,
+        )
+    else:
+        print(
+            f"Core AI asset passed: {VARIABLE_MODEL_NAME} -> {path.name}",
+            flush=True,
+        )
 
 
 def configure_environment(
@@ -244,9 +324,17 @@ def configure_environment(
             "LADA_COREAI_SWIFT_RUNNER",
             str(resources / "bin" / "lada-coreai-runner"),
         )
+        os.environ.setdefault(
+            "LADA_VARIABLE_COREAI_SWIFT_RUNNER",
+            str(resources / "bin" / "lada-basicvsrpp-variable-runner"),
+        )
     elif distribution == "portable":
         os.environ.pop("LADA_COREAI_ARCHITECTURE", None)
         os.environ.pop("LADA_COREAI_SWIFT_RUNNER", None)
+        os.environ.setdefault(
+            "LADA_VARIABLE_COREAI_SWIFT_RUNNER",
+            str(resources / "bin" / "lada-basicvsrpp-variable-runner"),
+        )
     else:
         raise ValueError(f"unsupported Core AI distribution: {distribution}")
 
@@ -263,7 +351,7 @@ def main() -> None:
     parser.add_argument(
         "--smoke-model",
         action="append",
-        choices=tuple(MODEL_CONTRACTS),
+        choices=tuple(MODEL_CONTRACTS) + (VARIABLE_MODEL_NAME,),
     )
     args = parser.parse_args()
     resources = args.resources.resolve()
