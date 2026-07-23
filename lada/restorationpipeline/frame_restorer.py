@@ -741,6 +741,15 @@ class FrameRestorer:
         if self.mosaic_detection:
             restored_clip_images = visualization_utils.draw_mosaic_detections(clip)
         else:
+            if (
+                self.mosaic_restoration_model_name.startswith("mioh-restorer")
+                and clip.masks
+            ):
+                # Use one temporally stable mask for both model gating and the
+                # later full-frame compositor. Otherwise small segmentation
+                # contractions reveal a strip of the original mosaic for one
+                # frame and produce the characteristic flashing ROI edge.
+                clip.masks = mask_utils.stabilize_temporal_masks(clip.masks)
             restored_clip_images = self._restore_clip_frames(clip.frames, clip.masks)
         assert len(restored_clip_images) == len(clip.frames)
 

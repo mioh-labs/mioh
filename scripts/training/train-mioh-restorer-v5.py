@@ -466,7 +466,13 @@ def main() -> int:
         lr=stage.learning_rate,
     )
     scaler = torch.amp.GradScaler(device.type, enabled=scale_gradients)
-    loss_function = MiohRestorerV5Loss(weights=stage.loss).to(device)
+    boundary_temporal_weight = float(
+        getattr(stage, "boundary_temporal_weight", 0.0)
+    )
+    loss_function = MiohRestorerV5Loss(
+        weights=stage.loss,
+        boundary_temporal_weight=boundary_temporal_weight,
+    ).to(device)
     perceptual = (
         V5PerceptualLoss(image_size=args.perceptual_image_size).to(device).eval()
         if stage.loss.perceptual
@@ -583,7 +589,7 @@ def main() -> int:
                             else None
                         )
                         temporal_values = (None, None, None)
-                        if stage.loss.temporal:
+                        if stage.loss.temporal or boundary_temporal_weight:
                             temporal_values = flow_aligned_temporal_tensors(
                                 restored, targets, masks
                             )

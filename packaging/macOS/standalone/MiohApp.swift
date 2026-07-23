@@ -1026,7 +1026,13 @@ struct ContentView: View {
     HStack(spacing: 12) {
       Image(nsImage: NSImage(named: "AppIcon") ?? NSImage()).resizable().frame(width: 34, height: 34)
       VStack(alignment: .leading, spacing: 2) {
-        Text("mioh").font(.title2.weight(.semibold))
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+          Text("mioh").font(.title2.weight(.semibold))
+          Text("Motion-Informed Optical Healing")
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+        }
         Text(runner.restorationModel).font(.caption).foregroundStyle(.secondary)
       }
       Spacer()

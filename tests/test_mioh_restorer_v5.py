@@ -32,7 +32,10 @@ from lada.models.mioh_restorer.curriculum_v5_hq import (
     hq_learning_rate,
     hq_stage_definition,
 )
-from lada.models.mioh_restorer.losses_v5 import MiohRestorerV5Loss
+from lada.models.mioh_restorer.losses_v5 import (
+    MiohRestorerV5Loss,
+    mask_boundary_band,
+)
 from lada.models.mioh_restorer.model_v5_hq import (
     MiohRestorerV5HQ,
     MiohRestorerV5HQConfig,
@@ -403,6 +406,51 @@ def test_v5_loss_backpropagates_and_requires_aligned_time_only_in_stage5() -> No
     assert base.grad is not None and texture.grad is not None
     assert confidence.grad is not None
     assert set(stats) >= {"wavelet", "high_frequency", "confidence_mean"}
+
+
+def test_v5_hq_stage4_supervises_flow_aligned_roi_boundary() -> None:
+    shape = (1, 5, 3, 16, 16)
+    source = torch.rand(shape)
+    target = torch.rand(shape)
+    mask = torch.zeros(1, 5, 1, 16, 16)
+    mask[..., 4:12, 4:12] = 1
+    base = torch.zeros(shape, requires_grad=True)
+    texture = torch.zeros(shape, requires_grad=True)
+    confidence = torch.full((1, 5, 1, 16, 16), 0.5, requires_grad=True)
+    restored = source + mask * (base + confidence * texture)
+    aligned_restored, aligned_target, valid = flow_aligned_temporal_tensors(
+        restored, target, mask, radius=1, scale=2
+    )
+    stage = hq_stage_definition(4)
+    total, stats = MiohRestorerV5Loss(
+        weights=stage.loss,
+        boundary_temporal_weight=stage.boundary_temporal_weight,
+    )(
+        restored,
+        confidence,
+        base,
+        texture,
+        target,
+        source,
+        mask,
+        aligned_previous_restored=aligned_restored,
+        aligned_previous_target=aligned_target,
+        temporal_valid=valid,
+        perceptual=restored.new_tensor(0.25),
+    )
+    total.backward()
+    assert stage.boundary_temporal_weight > 0
+    assert stats["boundary_temporal"] > 0
+    assert base.grad is not None
+
+
+def test_v5_boundary_band_excludes_flat_interior_and_background() -> None:
+    mask = torch.zeros(1, 2, 1, 24, 24)
+    mask[..., 6:18, 6:18] = 1
+    band = mask_boundary_band(mask, radius=2)
+    assert band[0, 0, 0, 12, 12].item() == 0
+    assert band[0, 0, 0, 0, 0].item() == 0
+    assert band[0, 0, 0, 6, 12].item() > 0
 
 
 def test_v5_known_motion_supervision_is_teacher_free_and_backpropagates() -> None:

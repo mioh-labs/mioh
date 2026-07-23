@@ -69,6 +69,9 @@ for stage in {$start_stage..$end_stage}; do
   if [[ "$variant" == "hq" ]]; then
     command+=(--basicvsrpp-checkpoint "$basicvsrpp_checkpoint")
   fi
+  if [[ "${RESTART_STAGE:-0}" == "1" ]]; then
+    command+=(--restart-stage)
+  fi
   if [[ -n "${STEPS:-}" ]]; then
     command+=(--steps "$STEPS")
   fi

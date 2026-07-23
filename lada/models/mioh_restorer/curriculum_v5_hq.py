@@ -20,6 +20,7 @@ class V5HQTrainingStage:
     loss: V5LossWeights
     train_backbone: bool
     train_spynet: bool
+    boundary_temporal_weight: float = 0.0
 
 
 V5_HQ_STAGES = (
@@ -62,6 +63,7 @@ V5_HQ_STAGES = (
         V5LossWeights(1.0, 0.25, 0.08, 0.28, 0.20, 0.14, 0.02, 0.0, 0.15, 2e-4),
         True,
         True,
+        0.12,
     ),
     V5HQTrainingStage(
         5,
@@ -72,6 +74,7 @@ V5_HQ_STAGES = (
         V5LossWeights(1.0, 0.2, 0.06, 0.26, 0.18, 0.12, 0.02, 0.2, 0.12, 1e-4),
         True,
         True,
+        0.10,
     ),
     V5HQTrainingStage(
         6,
@@ -82,6 +85,7 @@ V5_HQ_STAGES = (
         V5LossWeights(1.0, 0.2, 0.08, 0.22, 0.14, 0.10, 0.01, 0.1, 0.1, 1e-4),
         True,
         True,
+        0.06,
     ),
 )
 
