@@ -26,6 +26,7 @@ from torch.utils.data import Dataset, Sampler
 from torchvision.transforms import transforms as torchvision_transforms
 
 from lada.utils import transforms as lada_transforms
+from lada.utils.mask_utils import stabilize_temporal_mask_tensor
 from lada.utils.mosaic_utils import addmosaic_base, get_random_parameters_by_block_size
 
 from .model_v5 import FRAME_CHANNELS, NUM_INPUT_FRAMES, V5_BUCKETS
@@ -330,6 +331,11 @@ class MiohRestorerV5NativeDataset(Dataset):
         mask_tensor = torch.stack(
             [torch.from_numpy(value).float().div_(255.0).unsqueeze(0) for value in affected_masks]
         ).clamp_(0.0, 1.0)
+        # Match the production V5 compositor: retain neighbouring detections
+        # softly and include a small guard band. The added clean context ring
+        # has an identity target, teaching the model a stable transition
+        # instead of a frame-varying hard edge.
+        mask_tensor = stabilize_temporal_mask_tensor(mask_tensor)
         reliability_tensor = torch.tensor(reliability, dtype=torch.float32).view(-1, 1, 1, 1)
         reliability_tensor = reliability_tensor.expand_as(mask_tensor)
         values = torch.cat((input_rgb, mask_tensor, reliability_tensor), dim=1)

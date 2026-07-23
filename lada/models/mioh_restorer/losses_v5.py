@@ -98,6 +98,23 @@ def wavelet_loss(
     ) / 3.0
 
 
+def mask_boundary_band(mask: torch.Tensor, *, radius: int = 3) -> torch.Tensor:
+    """Return a soft inner/outer band around an ROI mask boundary."""
+
+    if mask.ndim != 5 or mask.shape[2] != 1:
+        raise ValueError("boundary masks must be [B,T,1,H,W]")
+    if radius <= 0:
+        raise ValueError("boundary radius must be positive")
+    shape = mask.shape
+    flat = mask.reshape(-1, 1, shape[-2], shape[-1]).clamp(0.0, 1.0)
+    kernel = radius * 2 + 1
+    outer = F.max_pool2d(flat, kernel, stride=1, padding=radius)
+    inner = 1.0 - F.max_pool2d(
+        1.0 - flat, kernel, stride=1, padding=radius
+    )
+    return (outer - inner).clamp(0.0, 1.0).reshape_as(mask)
+
+
 class MiohRestorerV5Loss(nn.Module):
     def __init__(
         self,
@@ -105,10 +122,14 @@ class MiohRestorerV5Loss(nn.Module):
         stage: int | str = 3,
         weights: V5LossWeights | None = None,
         confidence_scale: float = 0.05,
+        boundary_temporal_weight: float = 0.0,
     ) -> None:
         super().__init__()
         self.weights: V5LossWeights = weights or stage_definition(stage).loss
         self.confidence_scale = float(confidence_scale)
+        self.boundary_temporal_weight = float(boundary_temporal_weight)
+        if self.boundary_temporal_weight < 0:
+            raise ValueError("boundary temporal weight must be non-negative")
 
     def forward(
         self,
@@ -147,7 +168,8 @@ class MiohRestorerV5Loss(nn.Module):
 
         temporal = restored.new_zeros(())
         temporal_acceleration = restored.new_zeros(())
-        if weights.temporal:
+        boundary_temporal = restored.new_zeros(())
+        if weights.temporal or self.boundary_temporal_weight:
             if (
                 aligned_previous_restored is None
                 or aligned_previous_target is None
@@ -157,19 +179,27 @@ class MiohRestorerV5Loss(nn.Module):
             current_delta = restored[:, 1:] - aligned_previous_restored
             target_delta = target[:, 1:] - aligned_previous_target
             temporal_error = current_delta - target_delta
-            temporal = masked_charbonnier(
-                current_delta, target_delta, mask[:, 1:] * temporal_valid
-            )
-            if temporal_error.shape[1] > 1:
-                acceleration_valid = (
-                    mask[:, 2:]
-                    * temporal_valid[:, 1:]
-                    * temporal_valid[:, :-1]
+            if weights.temporal:
+                temporal = masked_charbonnier(
+                    current_delta, target_delta, mask[:, 1:] * temporal_valid
                 )
-                temporal_acceleration = masked_charbonnier(
-                    temporal_error[:, 1:] - temporal_error[:, :-1],
-                    torch.zeros_like(temporal_error[:, 1:]),
-                    acceleration_valid,
+                if temporal_error.shape[1] > 1:
+                    acceleration_valid = (
+                        mask[:, 2:]
+                        * temporal_valid[:, 1:]
+                        * temporal_valid[:, :-1]
+                    )
+                    temporal_acceleration = masked_charbonnier(
+                        temporal_error[:, 1:] - temporal_error[:, :-1],
+                        torch.zeros_like(temporal_error[:, 1:]),
+                        acceleration_valid,
+                    )
+            if self.boundary_temporal_weight:
+                boundary = mask_boundary_band(mask[:, 1:])
+                boundary_temporal = masked_charbonnier(
+                    current_delta,
+                    target_delta,
+                    boundary * temporal_valid,
                 )
 
         if weights.perceptual and perceptual is None:
@@ -184,6 +214,7 @@ class MiohRestorerV5Loss(nn.Module):
             + weights.gradient * gradients
             + weights.perceptual * perceptual_loss
             + weights.temporal * (temporal + 0.25 * temporal_acceleration)
+            + self.boundary_temporal_weight * boundary_temporal
             + weights.confidence * confidence_loss
             + weights.confidence_regularization * confidence_regularization
         )
@@ -198,6 +229,7 @@ class MiohRestorerV5Loss(nn.Module):
             "perceptual": float(perceptual_loss.detach()),
             "temporal": float(temporal.detach()),
             "temporal_acceleration": float(temporal_acceleration.detach()),
+            "boundary_temporal": float(boundary_temporal.detach()),
             "confidence": float(confidence_loss.detach()),
             "confidence_mean": float(masked_mean(confidence, mask).detach()),
             "confidence_std": float(confidence.detach().std()),

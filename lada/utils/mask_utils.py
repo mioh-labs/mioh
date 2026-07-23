@@ -67,8 +67,121 @@ def get_mask_area(mask: Mask) -> float:
 def smooth_mask(mask: Mask, kernel_size: int) -> Mask:
     return cv2.medianBlur(mask, kernel_size).reshape(mask.shape)
 
+
+def stabilize_temporal_mask_tensor(
+    masks: torch.Tensor,
+    *,
+    temporal_radius: int = 2,
+    temporal_decay: float = 0.82,
+    spatial_radius: int | None = None,
+    feather_radius: int | None = None,
+) -> torch.Tensor:
+    """Stabilize a tracked mask sequence without resampling it.
+
+    The direct mask remains fully active. Neighbouring masks are retained with
+    a distance-dependent alpha so small detector contractions cannot switch a
+    boundary abruptly between the original and restored images. A narrow
+    spatial guard band covers segmentation uncertainty and a finite-support
+    box filter supplies a soft compositing edge.
+
+    Accepted layouts are ``[T,1,H,W]`` and ``[B,T,1,H,W]``. Floating input is
+    returned in ``[0,1]``; integer input keeps its dtype and 0..255 range.
+    """
+
+    if masks.ndim not in (4, 5) or masks.shape[-3] != 1:
+        raise ValueError("temporal masks must be [T,1,H,W] or [B,T,1,H,W]")
+    if temporal_radius < 0:
+        raise ValueError("temporal radius must be non-negative")
+    if not 0.0 <= temporal_decay <= 1.0:
+        raise ValueError("temporal decay must be in [0,1]")
+
+    had_batch = masks.ndim == 5
+    values = masks if had_batch else masks.unsqueeze(0)
+    source_dtype = values.dtype
+    source_is_float = source_dtype.is_floating_point
+    values = values.float()
+    if values.numel() and float(values.max()) > 1.0:
+        values = values / 255.0
+    values = values.clamp(0.0, 1.0)
+
+    height, width = values.shape[-2:]
+    scale_radius = max(1, int(round(min(height, width) / 128.0)))
+    spatial_radius = scale_radius if spatial_radius is None else spatial_radius
+    feather_radius = scale_radius if feather_radius is None else feather_radius
+    if spatial_radius < 0 or feather_radius < 0:
+        raise ValueError("mask radii must be non-negative")
+
+    batch, frames = values.shape[:2]
+    flat = values.reshape(batch * frames, 1, height, width)
+    if spatial_radius:
+        kernel = spatial_radius * 2 + 1
+        flat = F.max_pool2d(flat, kernel, stride=1, padding=spatial_radius)
+    guarded = flat.reshape(batch, frames, 1, height, width)
+
+    stable_frames = []
+    for index in range(frames):
+        stable = guarded[:, index]
+        first = max(0, index - temporal_radius)
+        last = min(frames, index + temporal_radius + 1)
+        for neighbour in range(first, last):
+            distance = abs(neighbour - index)
+            if distance:
+                stable = torch.maximum(
+                    stable,
+                    guarded[:, neighbour] * (temporal_decay**distance),
+                )
+        stable_frames.append(stable)
+    stable = torch.stack(stable_frames, dim=1)
+
+    if feather_radius:
+        flat = stable.reshape(batch * frames, 1, height, width)
+        kernel = feather_radius * 2 + 1
+        feathered = F.avg_pool2d(
+            flat, kernel, stride=1, padding=feather_radius
+        ).reshape_as(stable)
+        stable = torch.maximum(stable, feathered)
+    stable = stable.clamp(0.0, 1.0)
+
+    if not source_is_float:
+        stable = stable.mul(255.0).round().to(source_dtype)
+    else:
+        stable = stable.to(source_dtype)
+    return stable if had_batch else stable.squeeze(0)
+
+
+def stabilize_temporal_masks(
+    masks: list[torch.Tensor],
+    **kwargs,
+) -> list[torch.Tensor]:
+    """List adapter used by the restoration/compositing pipeline."""
+
+    if not masks:
+        return []
+    shapes = {tuple(mask.shape) for mask in masks}
+    if len(shapes) != 1:
+        raise ValueError("all temporal masks must have the same shape")
+    sample = masks[0]
+    if sample.ndim == 2:
+        stacked = torch.stack(masks, dim=0).unsqueeze(1)
+        stabilized = stabilize_temporal_mask_tensor(stacked, **kwargs)[:, 0]
+    elif sample.ndim == 3 and sample.shape[-1] == 1:
+        stacked = torch.stack(masks, dim=0).permute(0, 3, 1, 2)
+        stabilized = stabilize_temporal_mask_tensor(stacked, **kwargs).permute(
+            0, 2, 3, 1
+        )
+    elif sample.ndim == 3 and sample.shape[0] == 1:
+        stacked = torch.stack(masks, dim=0)
+        stabilized = stabilize_temporal_mask_tensor(stacked, **kwargs)
+    else:
+        raise ValueError("mask list items must be HW, HW1 or 1HW tensors")
+    return list(stabilized.unbind(0))
+
+
 def create_blend_mask(crop_mask: torch.Tensor, feather_multiplier: float = 1.0):
-    mask = (crop_mask.squeeze() > 0).to(dtype=crop_mask.dtype)
+    mask = crop_mask.squeeze().to(dtype=crop_mask.dtype)
+    if mask.numel() and float(mask.max()) > 1.0:
+        mask = mask / 255.0
+    mask = mask.clamp(0.0, 1.0)
     h, w = mask.shape
     if feather_multiplier <= 0:
         return mask
