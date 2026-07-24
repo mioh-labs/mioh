@@ -233,6 +233,18 @@ about 126 ms, so `realesrgan-x4-coreml` remains the recommended x4plus backend.
 Core AI and Core ML outputs measured 52.83 dB PSNR on the deterministic test
 image.
 
+`RealESRGAN_x2plus` uses the same exporter with its native pixel-unshuffle
+input path and produces a 512px result from a fixed 256px ROI:
+
+```bash
+.venv-coreai/bin/python scripts/apple/export_realesrgan_coreai.py \
+  --scale 2 --allow-overwrite
+```
+
+Its registered name is `realesrgan-x2-coreai`. The standalone app filters the
+ROI enhancer model picker by enhancer family and automatically changes the
+enhancer scale to 2x when this model is selected.
+
 An alternative enhancer is MewZoom (Apache-2.0, UNet-based, trained for
 blur/noise/compression artifact removal — the open counterpart of
 jasna's unet-4x):

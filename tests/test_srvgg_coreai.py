@@ -135,6 +135,20 @@ class RealESRGANCoreAIExportTests(unittest.TestCase):
         self.assertEqual(args.imgsz, 256)
         self.assertEqual(args.scale, 4)
 
+    def test_x2_defaults_and_network_contract(self):
+        args = rrdb_exporter.parse_args(["--scale", "2"])
+
+        self.assertEqual(args.model, Path("model_weights/RealESRGAN_x2plus.pth"))
+        self.assertEqual(
+            args.output,
+            Path("model_weights/RealESRGAN_x2plus-256-fp16.aimodel"),
+        )
+        net = rrdb_exporter.build_rrdbnet(scale=2).eval()
+        self.assertEqual(net.conv_first.in_channels, 12)
+        with torch.no_grad():
+            output = net(torch.zeros((1, 3, 16, 16)))
+        self.assertEqual(output.shape, (1, 3, 32, 32))
+
     def test_x4plus_coreai_name_is_registered(self):
         with mock.patch("lada.os.path.exists", return_value=True):
             model = ModelFiles.get_enhancer_model_by_name("realesrgan-x4-coreai")
@@ -142,6 +156,15 @@ class RealESRGANCoreAIExportTests(unittest.TestCase):
         self.assertIsNotNone(model)
         self.assertTrue(
             model.path.endswith("RealESRGAN_x4plus-256-fp16.aimodel")
+        )
+
+    def test_x2plus_coreai_name_is_registered(self):
+        with mock.patch("lada.os.path.exists", return_value=True):
+            model = ModelFiles.get_enhancer_model_by_name("realesrgan-x2-coreai")
+
+        self.assertIsNotNone(model)
+        self.assertTrue(
+            model.path.endswith("RealESRGAN_x2plus-256-fp16.aimodel")
         )
 
 

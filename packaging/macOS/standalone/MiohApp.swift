@@ -49,6 +49,14 @@ struct PlatformCapabilities {
   }
 }
 
+struct ROIEnhancerModelOption: Identifiable {
+  let name: String
+  let label: String
+  let scale: Int
+
+  var id: String { name }
+}
+
 struct MiohUserDefaultsSnapshot: Codable {
   var inputPath: String?
   var outputPath: String?
@@ -307,6 +315,129 @@ final class RestorationRunner: ObservableObject {
   var restorationModels: [String] { capabilities.restorationModels }
   var detectionModels: [String] { capabilities.detectionModels }
   let enhancerModels = ["none", "realesrgan", "mewzoom", "swinir", "spandrel"]
+  private let knownROIEnhancerModelNames: Set<String> = [
+    "realesrgan-x2", "realesrgan-x2-coreai",
+    "realesrgan-x4", "realesrgan-x4-coreml", "realesrgan-x4-coreai",
+    "realesr-general-x4v3-coreml", "realesr-general-x4v3-coreai",
+    "mewzoom-x4-coreml", "mewzoom-x4-coreml-512",
+    "swinir-x4-coreml", "swinir-real-x4-coreml",
+    "nomos-webphoto-realplksr-x4",
+    "nomos-webphoto-realplksr-x4-coreml",
+    "nomos-webphoto-realplksr-x4-coreai",
+    "nomos-uni-span-x4", "nomos-uni-compact-x2",
+  ]
+
+  var roiEnhancerModelOptions: [ROIEnhancerModelOption] {
+    var options: [ROIEnhancerModelOption]
+    switch roiEnhancer {
+    case "realesrgan":
+      options = [
+        ROIEnhancerModelOption(
+          name: "realesrgan-x2-coreai",
+          label: "Real-ESRGAN x2plus — Core AI (2x)",
+          scale: 2
+        ),
+        ROIEnhancerModelOption(
+          name: "realesrgan-x4-coreai",
+          label: "Real-ESRGAN x4plus — Core AI (4x)",
+          scale: 4
+        ),
+        ROIEnhancerModelOption(
+          name: "realesrgan-x4-coreml",
+          label: "Real-ESRGAN x4plus — Core ML (4x)",
+          scale: 4
+        ),
+        ROIEnhancerModelOption(
+          name: "realesr-general-x4v3-coreai",
+          label: "Real-ESRGAN Compact — Core AI (4x)",
+          scale: 4
+        ),
+        ROIEnhancerModelOption(
+          name: "realesr-general-x4v3-coreml",
+          label: "Real-ESRGAN Compact — Core ML (4x)",
+          scale: 4
+        ),
+        ROIEnhancerModelOption(
+          name: "realesrgan-x2",
+          label: "Real-ESRGAN x2plus — PyTorch (2x)",
+          scale: 2
+        ),
+        ROIEnhancerModelOption(
+          name: "realesrgan-x4",
+          label: "Real-ESRGAN x4plus — PyTorch (4x)",
+          scale: 4
+        ),
+      ]
+    case "mewzoom":
+      options = [
+        ROIEnhancerModelOption(
+          name: "mewzoom-x4-coreml",
+          label: "MewZoom 256 — Core ML (4x)",
+          scale: 4
+        ),
+        ROIEnhancerModelOption(
+          name: "mewzoom-x4-coreml-512",
+          label: "MewZoom 512 — Core ML (4x)",
+          scale: 4
+        ),
+      ]
+    case "swinir":
+      options = [
+        ROIEnhancerModelOption(
+          name: "swinir-real-x4-coreml",
+          label: "SwinIR Real — Core ML (4x)",
+          scale: 4
+        ),
+      ]
+    case "spandrel":
+      options = [
+        ROIEnhancerModelOption(
+          name: "nomos-webphoto-realplksr-x4-coreai",
+          label: "Nomos WebPhoto RealPLKSR — Core AI (4x)",
+          scale: 4
+        ),
+        ROIEnhancerModelOption(
+          name: "nomos-webphoto-realplksr-x4-coreml",
+          label: "Nomos WebPhoto RealPLKSR — Core ML (4x)",
+          scale: 4
+        ),
+        ROIEnhancerModelOption(
+          name: "nomos-webphoto-realplksr-x4",
+          label: "Nomos WebPhoto RealPLKSR — Spandrel (4x)",
+          scale: 4
+        ),
+        ROIEnhancerModelOption(
+          name: "nomos-uni-span-x4",
+          label: "Nomos Uni SPAN — Spandrel (4x)",
+          scale: 4
+        ),
+        ROIEnhancerModelOption(
+          name: "nomos-uni-compact-x2",
+          label: "Nomos Uni Compact — Spandrel (2x)",
+          scale: 2
+        ),
+      ]
+    default:
+      options = []
+    }
+    if !capabilities.supportsCoreAI {
+      options.removeAll { $0.name.contains("coreai") }
+    }
+    let selected = roiEnhancerModel.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !selected.isEmpty && !options.contains(where: { $0.name == selected })
+      && !knownROIEnhancerModelNames.contains(selected)
+    {
+      let displayName = URL(fileURLWithPath: selected).lastPathComponent
+      options.append(
+        ROIEnhancerModelOption(
+          name: selected,
+          label: "カスタム — \(displayName)",
+          scale: roiEnhancerScale
+        )
+      )
+    }
+    return options
+  }
 
   var canStart: Bool {
     inputURL != nil && outputURL != nil && !isRunning
@@ -337,6 +468,34 @@ final class RestorationRunner: ObservableObject {
     panel.canChooseDirectories = true
     panel.allowsMultipleSelection = false
     if panel.runModal() == .OK { self[keyPath: keyPath] = panel.url?.path ?? "" }
+  }
+
+  func chooseROIEnhancerModel() {
+    let panel = NSOpenPanel()
+    panel.title = "ROIエンハンサーモデルを選択"
+    panel.canChooseFiles = true
+    panel.canChooseDirectories = true
+    panel.allowsMultipleSelection = false
+    guard panel.runModal() == .OK, let path = panel.url?.path else { return }
+    roiEnhancerModel = path
+    let normalized = panel.url?.lastPathComponent.lowercased() ?? ""
+    if normalized.contains("x2") || normalized.hasPrefix("2x") {
+      roiEnhancerScale = 2
+    } else if normalized.contains("x4") || normalized.hasPrefix("4x") {
+      roiEnhancerScale = 4
+    }
+  }
+
+  func selectROIEnhancer(_ enhancer: String) {
+    roiEnhancer = enhancer
+    synchronizeROIEnhancerModel(forceDefault: true)
+  }
+
+  func selectROIEnhancerModel(_ model: String) {
+    roiEnhancerModel = model
+    if let option = roiEnhancerModelOptions.first(where: { $0.name == model }) {
+      roiEnhancerScale = option.scale
+    }
   }
 
   func start() {
@@ -770,10 +929,32 @@ final class RestorationRunner: ObservableObject {
     if !detectionModels.contains(detectionModel) {
       detectionModel = "v2-coreml"
     }
-    if roiEnhancer == "spandrel" && roiEnhancerModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-      roiEnhancerModel = capabilities.supportsCoreAI
-        ? "nomos-webphoto-realplksr-x4-coreai"
-        : "nomos-webphoto-realplksr-x4-coreml"
+    synchronizeROIEnhancerModel()
+  }
+
+  private func synchronizeROIEnhancerModel(forceDefault: Bool = false) {
+    if roiEnhancer == "none" {
+      roiEnhancerModel = ""
+      return
+    }
+    let options = roiEnhancerModelOptions
+    if !forceDefault,
+      let selected = options.first(where: { $0.name == roiEnhancerModel })
+    {
+      roiEnhancerScale = selected.scale
+      return
+    }
+    if !forceDefault,
+      !roiEnhancerModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+      !knownROIEnhancerModelNames.contains(roiEnhancerModel)
+    {
+      return
+    }
+    if let preferred = options.first {
+      roiEnhancerModel = preferred.name
+      roiEnhancerScale = preferred.scale
+    } else {
+      roiEnhancerModel = ""
     }
   }
 
@@ -1118,11 +1299,31 @@ struct ContentView: View {
         LabeledContent("エフェクト倍率") { Stepper(value: $runner.effectUpscale, in: 1...4) { Text("\(runner.effectUpscale)x") } }
       }
       Section("ROIエンハンサー") {
-        Picker("方式", selection: $runner.roiEnhancer) {
+        Picker("方式", selection: Binding(
+          get: { runner.roiEnhancer },
+          set: { runner.selectROIEnhancer($0) }
+        )) {
           ForEach(runner.enhancerModels, id: \.self) { Text($0).tag($0) }
         }
-        PathSettingRow(title: "モデル名・パス", value: $runner.roiEnhancerModel) { runner.choosePath(\.roiEnhancerModel) }
-          .disabled(runner.roiEnhancer == "none")
+        if runner.roiEnhancer != "none" {
+          LabeledContent("モデル") {
+            HStack {
+              Picker("", selection: Binding(
+                get: { runner.roiEnhancerModel },
+                set: { runner.selectROIEnhancerModel($0) }
+              )) {
+                ForEach(runner.roiEnhancerModelOptions) { option in
+                  Text(option.label).tag(option.name)
+                }
+              }
+              .labelsHidden()
+              Button { runner.chooseROIEnhancerModel() } label: {
+                Image(systemName: "folder")
+              }
+              .help("一覧にない対応モデルを選択")
+            }
+          }
+        }
         LabeledContent("倍率") { Stepper(value: $runner.roiEnhancerScale, in: 1...8) { Text("\(runner.roiEnhancerScale)x") } }
           .disabled(runner.roiEnhancer == "none")
         doubleSliderField("強度", value: $runner.roiEnhancerStrength, range: 0...1, step: 0.05).disabled(runner.roiEnhancer == "none")

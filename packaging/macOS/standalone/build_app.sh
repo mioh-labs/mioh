@@ -17,6 +17,7 @@ esac
 APP="$BUILD_DIR/$APP_BASENAME.app"
 DMG="$BUILD_DIR/$DMG_BASENAME.dmg"
 INCLUDE_USER_MANUAL="${INCLUDE_USER_MANUAL:-0}"
+MIOH_MODELESS_DISTRIBUTION="${MIOH_MODELESS_DISTRIBUTION:-0}"
 USER_MANUAL_PDF="${USER_MANUAL_PDF:-$ROOT/output/pdf/mioh-user-manual-ja.pdf}"
 CONTENTS="$APP/Contents"
 RESOURCES="$CONTENTS/Resources"
@@ -46,8 +47,14 @@ APP_SWIFT_FLAGS=()
 if [[ "$COREAI_DISTRIBUTION" == "portable" ]]; then
   APP_SWIFT_FLAGS+=(-D MIOH_PORTABLE_COREAI)
 fi
+typeset -a SWIFT_SUBPROCESS_FLAGS
+SWIFT_SUBPROCESS_FLAGS=()
+if [[ "${MIOH_DISABLE_SWIFT_SANDBOX:-0}" == "1" ]]; then
+  SWIFT_SUBPROCESS_FLAGS+=(-disable-sandbox)
+fi
 
 xcrun swiftc \
+  "${SWIFT_SUBPROCESS_FLAGS[@]}" \
   -O \
   -parse-as-library \
   -target arm64-apple-macosx26.0 \
@@ -63,6 +70,7 @@ xcrun swiftc \
   "$PACKAGE_DIR/RealtimePlayer.swift" \
   -o "$CONTENTS/MacOS/mioh"
 xcrun swiftc \
+  "${SWIFT_SUBPROCESS_FLAGS[@]}" \
   -O \
   -parse-as-library \
   -target arm64-apple-macosx27.0 \
@@ -70,6 +78,7 @@ xcrun swiftc \
   "$PACKAGE_DIR/CoreAIRunner.swift" \
   -o "$RESOURCES/bin/lada-coreai-runner"
 xcrun swiftc \
+  "${SWIFT_SUBPROCESS_FLAGS[@]}" \
   -O \
   -parse-as-library \
   -target arm64-apple-macosx27.0 \
@@ -81,7 +90,8 @@ xcrun swiftc \
 cp "$PACKAGE_DIR/Info.plist" "$CONTENTS/Info.plist"
 ditto "$PYTHON_SOURCE" "$RESOURCES/runtime"
 mkdir -p "$RESOURCES/runtime/lib/python3.12/site-packages"
-ditto "$SITE_PACKAGES" "$RESOURCES/runtime/lib/python3.12/site-packages"
+rsync -a --exclude '.DS_Store' \
+  "$SITE_PACKAGES/" "$RESOURCES/runtime/lib/python3.12/site-packages/"
 rm -f "$RESOURCES/runtime/lib/python3.12/site-packages/__editable__.lada-0.11.0.pth"
 rm -f "$RESOURCES/runtime/lib/python3.12/site-packages/__editable___lada_0_11_0_finder.py"
 rm -f "$RESOURCES/runtime/lib/python3.12/site-packages/_virtualenv.pth"
@@ -91,6 +101,7 @@ uv pip install \
   --python "$RESOURCES/runtime/bin/python3.12" \
   --break-system-packages \
   --no-deps \
+  --no-build-isolation \
   --reinstall \
   "$ROOT"
 rm -rf "$MPS_DEFORM_BUILD_SOURCE"
@@ -102,10 +113,12 @@ uv pip install \
   --no-build-isolation \
   --reinstall \
   "$MPS_DEFORM_BUILD_SOURCE"
-PYTHONHOME="$RESOURCES/runtime" \
-PYTHONPATH="$RESOURCES/runtime/lib/python3.12/site-packages" \
-  "$RESOURCES/runtime/bin/python3.12" \
-  "$PACKAGE_DIR/verify_mps_deform_conv.py"
+if [[ "${MIOH_SKIP_HARDWARE_SMOKE:-0}" != "1" ]]; then
+  PYTHONHOME="$RESOURCES/runtime" \
+  PYTHONPATH="$RESOURCES/runtime/lib/python3.12/site-packages" \
+    "$RESOURCES/runtime/bin/python3.12" \
+    "$PACKAGE_DIR/verify_mps_deform_conv.py"
+fi
 cp "$ROOT/process_video_parallel.py" \
   "$RESOURCES/runtime/lib/python3.12/site-packages/process_video_parallel.py"
 cp "$PACKAGE_DIR/mioh_preview_worker.py" \
@@ -129,6 +142,20 @@ if [[ ! -x "$FFMPEG_CACHE/ffprobe" ]]; then
 fi
 cp "$FFMPEG_CACHE/ffmpeg" "$RESOURCES/bin/ffmpeg"
 cp "$FFMPEG_CACHE/ffprobe" "$RESOURCES/bin/ffprobe"
+
+MODEL_TOOLS_SOURCE="$PACKAGE_DIR/model-tools"
+if [[ -d "$MODEL_TOOLS_SOURCE" ]]; then
+  mkdir -p "$RESOURCES/model-tools/scripts"
+  ditto "$MODEL_TOOLS_SOURCE" "$RESOURCES/model-tools"
+  ditto "$ROOT/scripts/apple" "$RESOURCES/model-tools/scripts/apple"
+  cp "$ROOT/scripts/download_nomos_roi_enhancers.py" \
+    "$RESOURCES/model-tools/scripts/download_nomos_roi_enhancers.py"
+  chmod +x \
+    "$RESOURCES/model-tools/download-mioh-models.zsh" \
+    "$RESOURCES/model-tools/convert-mioh-models.zsh"
+fi
+
+if [[ "$MIOH_MODELESS_DISTRIBUTION" != 1 ]]; then
 
 MODEL_ASSETS=(
   lada_mosaic_restoration_model_generic_v1.2.pth
@@ -171,6 +198,7 @@ COREAI_MODEL_ASSETS=(
   basicvsrpp-v1.2-t36-fp16.aimodel
   basicvsrpp-v1.2-t90-fp16.aimodel
   lada_mosaic_detection_model_v4_fast-fp16.aimodel
+  RealESRGAN_x2plus-256-fp16.aimodel
   RealESRGAN_x4plus-256-fp16.aimodel
   realesr-general-x4v3-256-fp16.aimodel
   4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel
@@ -303,30 +331,41 @@ else
     ditto "$source_asset" "$variable_source_collection/${source_asset:t}"
   done
 fi
+else
+  print "Modeless distribution: skipping bundled model assets and Core ML/Core AI exports"
+fi
 cp "$ROOT/LICENSE.md" "$RESOURCES/LICENSE.md"
 ditto "$ROOT/LICENSES" "$RESOURCES/LICENSES"
 cp "$VENDORED_MPS_DEFORM_CONV/LICENSE" "$RESOURCES/LICENSES/mps-deform-conv.txt"
 
-ICONSET="$BUILD_DIR/AppIcon.iconset"
-rm -rf "$ICONSET"
-mkdir -p "$ICONSET"
-SOURCE_ICON="$ROOT/lada/gui/icons/mioh-icon.png"
-for spec in "16 icon_16x16" "32 icon_16x16@2x" "32 icon_32x32" \
-            "64 icon_32x32@2x" "128 icon_128x128" "256 icon_128x128@2x" \
-            "256 icon_256x256" "512 icon_256x256@2x" "512 icon_512x512" \
-            "1024 icon_512x512@2x"; do
-  size="${spec%% *}"
-  name="${spec#* }"
-  sips -z "$size" "$size" "$SOURCE_ICON" --out "$ICONSET/$name.png" >/dev/null
-done
-iconutil -c icns "$ICONSET" -o "$RESOURCES/AppIcon.icns"
+if [[ -n "${MIOH_PREBUILT_APP_ICON:-}" ]]; then
+  ditto "$MIOH_PREBUILT_APP_ICON" "$RESOURCES/AppIcon.icns"
+else
+  ICONSET="$BUILD_DIR/AppIcon.iconset"
+  rm -rf "$ICONSET"
+  mkdir -p "$ICONSET"
+  SOURCE_ICON="$ROOT/lada/gui/icons/mioh-icon.png"
+  for spec in "16 icon_16x16" "32 icon_16x16@2x" "32 icon_32x32" \
+              "64 icon_32x32@2x" "128 icon_128x128" "256 icon_128x128@2x" \
+              "256 icon_256x256" "512 icon_256x256@2x" "512 icon_512x512" \
+              "1024 icon_512x512@2x"; do
+    size="${spec%% *}"
+    name="${spec#* }"
+    sips -z "$size" "$size" "$SOURCE_ICON" --out "$ICONSET/$name.png" >/dev/null
+  done
+  iconutil -c icns "$ICONSET" -o "$RESOURCES/AppIcon.icns"
+fi
 
 chmod +x "$CONTENTS/MacOS/mioh" "$RESOURCES/runtime/bin/python3.12" \
   "$RESOURCES/bin/ffmpeg" "$RESOURCES/bin/ffprobe" \
   "$RESOURCES/bin/lada-coreai-runner" \
   "$RESOURCES/bin/lada-basicvsrpp-variable-runner"
 
-if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
+if [[ "$MIOH_MODELESS_DISTRIBUTION" == 1 ]]; then
+  print "Skipping model smoke tests for modeless distribution"
+elif [[ "${MIOH_SKIP_HARDWARE_SMOKE:-0}" == "1" ]]; then
+  print "Skipping MPS/Core AI hardware smoke tests by request"
+elif [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
   PYTHONHOME="$RESOURCES/runtime" \
   PYTHONPATH="$RESOURCES/runtime/lib/python3.12/site-packages" \
   LADA_MODEL_WEIGHTS_DIR="$RESOURCES/models" \
@@ -382,6 +421,9 @@ if [[ "$INCLUDE_USER_MANUAL" == 1 ]]; then
     exit 1
   fi
   cp "$USER_MANUAL_PDF" "$DMG_ROOT/mioh ユーザーマニュアル.pdf"
+fi
+if [[ -d "$RESOURCES/model-tools" ]]; then
+  ditto "$RESOURCES/model-tools" "$DMG_ROOT/model-tools"
 fi
 diskutil image create from \
   --volumeName "$APP_BASENAME" \

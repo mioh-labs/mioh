@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Lada Authors
 # SPDX-License-Identifier: AGPL-3.0
 
-"""Export Real-ESRGAN RRDBNet x4plus to fixed-shape FP16 Core AI."""
+"""Export Real-ESRGAN RRDBNet x2plus/x4plus to fixed-shape FP16 Core AI."""
 
 from __future__ import annotations
 
@@ -14,19 +14,26 @@ import torch
 
 DEFAULT_MODEL = Path("model_weights/RealESRGAN_x4plus.pth")
 DEFAULT_OUTPUT = Path("model_weights/RealESRGAN_x4plus-256-fp16.aimodel")
+X2_MODEL = Path("model_weights/RealESRGAN_x2plus.pth")
+X2_OUTPUT = Path("model_weights/RealESRGAN_x2plus-256-fp16.aimodel")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Export Real-ESRGAN RRDBNet to fixed-shape FP16 Core AI"
     )
-    parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--model", type=Path)
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--imgsz", type=int, default=256)
-    parser.add_argument("--scale", type=int, default=4, choices=(4,))
+    parser.add_argument("--scale", type=int, default=4, choices=(2, 4))
     parser.add_argument("--allow-overwrite", action="store_true")
     parser.add_argument("--verbose", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.model is None:
+        args.model = X2_MODEL if args.scale == 2 else DEFAULT_MODEL
+    if args.output is None:
+        args.output = X2_OUTPUT if args.scale == 2 else DEFAULT_OUTPUT
+    return args
 
 
 class CoreAIImageWrapper(torch.nn.Module):
@@ -98,7 +105,8 @@ def build_rrdbnet(scale: int) -> torch.nn.Module:
         def __init__(self):
             super().__init__()
             self.scale = scale
-            self.conv_first = torch.nn.Conv2d(3, 64, 3, 1, 1)
+            input_channels = 12 if scale == 2 else 3
+            self.conv_first = torch.nn.Conv2d(input_channels, 64, 3, 1, 1)
             self.body = torch.nn.Sequential(*(RRDB() for _ in range(23)))
             self.conv_body = torch.nn.Conv2d(64, 64, 3, 1, 1)
             self.conv_up1 = torch.nn.Conv2d(64, 64, 3, 1, 1)
@@ -108,6 +116,8 @@ def build_rrdbnet(scale: int) -> torch.nn.Module:
             self.lrelu = torch.nn.LeakyReLU(negative_slope=0.2, inplace=True)
 
         def forward(self, image: torch.Tensor) -> torch.Tensor:
+            if self.scale == 2:
+                image = torch.nn.functional.pixel_unshuffle(image, 2)
             feature = self.conv_first(image)
             body_feature = self.conv_body(self.body(feature))
             feature = feature + body_feature
@@ -131,8 +141,6 @@ def build_rrdbnet(scale: int) -> torch.nn.Module:
             )
             return self.conv_last(self.lrelu(self.conv_hr(feature)))
 
-    if scale != 4:
-        raise ValueError("vendored RRDBNet Core AI export currently requires scale=4")
     return RRDBNet()
 
 
