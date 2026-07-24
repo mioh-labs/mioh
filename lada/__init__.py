@@ -132,6 +132,7 @@ class ModelFiles:
     ]
     _WELL_KNOWN_ENHANCER_MODELS = [
         ModelFile('realesrgan-x2', _("Real-ESRGAN 2x upscaler (PyTorch)"), os.path.join(MODEL_WEIGHTS_DIR, 'RealESRGAN_x2plus.pth')),
+        ModelFile('realesrgan-x2-coreai', _("Real-ESRGAN 2x FP16 on Core AI"), _coreai_model_path('RealESRGAN_x2plus-256-fp16.aimodel')),
         ModelFile('realesrgan-x4', _("Real-ESRGAN 4x upscaler (PyTorch)"), os.path.join(MODEL_WEIGHTS_DIR, 'RealESRGAN_x4plus.pth')),
         ModelFile('realesrgan-x4-coreml', _("Real-ESRGAN 4x on Apple Neural Engine via Core ML"), os.path.join(MODEL_WEIGHTS_DIR, 'RealESRGAN_x4plus_256.mlpackage')),
         ModelFile('realesrgan-x4-coreai', _("Real-ESRGAN 4x FP16 on Core AI"), _coreai_model_path('RealESRGAN_x4plus-256-fp16.aimodel')),

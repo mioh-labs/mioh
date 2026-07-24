@@ -14,11 +14,12 @@ INFO_PLIST = ROOT / "packaging" / "macOS" / "standalone" / "Info.plist"
 COREAI_RUNNER_SOURCE = (
     ROOT / "packaging" / "macOS" / "standalone" / "CoreAIRunner.swift"
 )
-EXPECTED_SEVEN_COREAI_SOURCES = (
+EXPECTED_COREAI_SOURCES = (
     "basicvsrpp-v1.2-t18-fp16.aimodel",
     "basicvsrpp-v1.2-t36-fp16.aimodel",
     "basicvsrpp-v1.2-t90-fp16.aimodel",
     "lada_mosaic_detection_model_v4_fast-fp16.aimodel",
+    "RealESRGAN_x2plus-256-fp16.aimodel",
     "RealESRGAN_x4plus-256-fp16.aimodel",
     "realesr-general-x4v3-256-fp16.aimodel",
     "4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel",
@@ -407,7 +408,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertNotIn('for model in "$COMPILED_MODELS"/*.aimodelc', script)
         self.assertNotIn("basicvsrpp-v1.2-t36-b2-fp16.aimodel", script)
         regular_assets = script.split("MODEL_ASSETS=(", 1)[1].split(")", 1)[0]
-        for source in EXPECTED_SEVEN_COREAI_SOURCES:
+        for source in EXPECTED_COREAI_SOURCES:
             self.assertIn(source, script)
             self.assertNotIn(source, regular_assets)
 
@@ -650,6 +651,21 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn("4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel", script)
         self.assertIn('"nomos-webphoto-realplksr-x4-coreai"', verifier)
         self.assertIn('"4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel"', verifier)
+
+    def test_roi_enhancer_model_picker_is_filtered_by_method(self):
+        source = APP_SOURCE.read_text()
+        script = BUILD_SCRIPT.read_text()
+        verifier = (
+            ROOT / "packaging" / "macOS" / "standalone" / "verify_coreai_models.py"
+        ).read_text()
+
+        self.assertIn("var roiEnhancerModelOptions: [ROIEnhancerModelOption]", source)
+        self.assertIn('case "realesrgan":', source)
+        self.assertIn('"realesrgan-x2-coreai"', source)
+        self.assertIn("ForEach(runner.roiEnhancerModelOptions)", source)
+        self.assertIn("runner.selectROIEnhancerModel($0)", source)
+        self.assertIn("RealESRGAN_x2plus-256-fp16.aimodel", script)
+        self.assertIn('"realesrgan-x2-coreai"', verifier)
 
 
 if __name__ == "__main__":

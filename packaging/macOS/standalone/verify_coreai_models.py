@@ -19,6 +19,7 @@ EXPECTED_MODEL_ASSETS = {
     "basicvsrpp-v1.2-t36-fp16.h17s.aimodelc",
     "basicvsrpp-v1.2-t90-fp16.h17s.aimodelc",
     "lada_mosaic_detection_model_v4_fast-fp16.h17s.aimodelc",
+    "RealESRGAN_x2plus-256-fp16.h17s.aimodelc",
     "RealESRGAN_x4plus-256-fp16.h17s.aimodelc",
     "realesr-general-x4v3-256-fp16.h17s.aimodelc",
     "4xNomosWebPhoto_RealPLKSR-256-fp16.h17s.aimodelc",
@@ -30,6 +31,7 @@ EXPECTED_SOURCE_MODEL_ASSETS = {
     "basicvsrpp-v1.2-t36-fp16.aimodel",
     "basicvsrpp-v1.2-t90-fp16.aimodel",
     "lada_mosaic_detection_model_v4_fast-fp16.aimodel",
+    "RealESRGAN_x2plus-256-fp16.aimodel",
     "RealESRGAN_x4plus-256-fp16.aimodel",
     "realesr-general-x4v3-256-fp16.aimodel",
     "4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel",
@@ -74,14 +76,22 @@ MODEL_CONTRACTS = {
     "realesrgan-x4-coreai": {
         "kind": "enhancer",
         "asset": "RealESRGAN_x4plus-256-fp16.aimodel",
+        "scale": 4,
+    },
+    "realesrgan-x2-coreai": {
+        "kind": "enhancer",
+        "asset": "RealESRGAN_x2plus-256-fp16.aimodel",
+        "scale": 2,
     },
     "realesr-general-x4v3-coreai": {
         "kind": "enhancer",
         "asset": "realesr-general-x4v3-256-fp16.aimodel",
+        "scale": 4,
     },
     "nomos-webphoto-realplksr-x4-coreai": {
         "kind": "enhancer",
         "asset": "4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel",
+        "scale": 4,
     },
 }
 
@@ -236,13 +246,13 @@ def _verify_detection(name: str, path: Path) -> None:
         runtime.close()
 
 
-def _verify_enhancer(name: str, path: Path) -> None:
+def _verify_enhancer(name: str, path: Path, scale: int) -> None:
     from lada.restorationpipeline.coreai_roi_enhancer import CoreAIEnhancerRuntime
 
-    runtime = CoreAIEnhancerRuntime(path, imgsz=256, scale=4)
+    runtime = CoreAIEnhancerRuntime(path, imgsz=256, scale=scale)
     try:
         output = runtime(gradient_input((1, 3, 256, 256)))
-        _verify_array(name, output, (1, 3, 1024, 1024))
+        _verify_array(name, output, (1, 3, 256 * scale, 256 * scale))
     finally:
         runtime.close()
 
@@ -281,7 +291,7 @@ def verify_models(
         elif kind == "detection":
             _verify_detection(name, path)
         else:
-            _verify_enhancer(name, path)
+            _verify_enhancer(name, path, int(contract.get("scale", 4)))
         print(f"Core AI smoke passed: {name} -> {path.name}", flush=True)
     model = _resolve_model(VARIABLE_MODEL_NAME, "restoration")
     path = Path(model.path)
