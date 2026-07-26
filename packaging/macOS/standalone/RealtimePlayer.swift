@@ -583,7 +583,11 @@ private enum PreviewProjectionGeometry {
             radius * sin(theta) * cos(phi)
           )
         )
-        texcoords.append(CGPoint(x: uv.minX + uv.width * u, y: uv.minY + uv.height * v))
+        // The geometry is viewed from inside the sphere. Its increasing
+        // longitude runs right-to-left from the camera, so using increasing
+        // texture U mirrors the video. Reverse U inside the selected eye's
+        // window while preserving the SBS/top-bottom eye assignment.
+        texcoords.append(CGPoint(x: uv.maxX - uv.width * u, y: uv.minY + uv.height * v))
       }
     }
 

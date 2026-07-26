@@ -201,6 +201,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "enum PreviewEye: String, CaseIterable, Identifiable",
             "PreviewProjectionGeometry.makeSphere",
             "static func uvWindow(layout: PreviewVideoLayout, eye: PreviewEye) -> CGRect",
+            "uv.maxX - uv.width * u",
             "struct VRPreviewSceneView: NSViewRepresentable",
             "final class Coordinator: NSObject",
             "AVPlayerItemVideoOutput(pixelBufferAttributes: attributes)",
