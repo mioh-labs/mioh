@@ -6,7 +6,7 @@ PACKAGE_DIR="$ROOT/packaging/macos/standalone"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build/macos-standalone}"
 COREAI_DISTRIBUTION="${COREAI_DISTRIBUTION:-dedicated}"
 APP_BASENAME="${APP_BASENAME:-mioh}"
-DMG_BASENAME="${DMG_BASENAME:-mioh-0.11.0-unsigned}"
+DMG_BASENAME="${DMG_BASENAME:-mioh-0.14.3-unsigned}"
 case "$COREAI_DISTRIBUTION" in
   dedicated|portable) ;;
   *)
@@ -39,7 +39,7 @@ VENDORED_MPS_DEFORM_CONV="$PACKAGE_DIR/vendor/mps-deform-conv-0.2.2"
 MPS_DEFORM_BUILD_SOURCE="$BUILD_DIR/mps-deform-conv-source"
 
 rm -rf "$APP" "$BUILD_DIR/Lada.app"
-rm -f "$DMG" "$BUILD_DIR/Lada-0.11.0-unsigned.dmg"
+rm -f "$DMG" "$BUILD_DIR/Lada-0.11.0-unsigned.dmg" "$BUILD_DIR/mioh-0.11.0-unsigned.dmg"
 mkdir -p "$CONTENTS/MacOS" "$RESOURCES/bin" "$RESOURCES/models"
 
 typeset -a APP_SWIFT_FLAGS
@@ -97,11 +97,11 @@ ditto "$PYTHON_SOURCE" "$RESOURCES/runtime"
 mkdir -p "$RESOURCES/runtime/lib/python3.12/site-packages"
 rsync -a --exclude '.DS_Store' \
   "$SITE_PACKAGES/" "$RESOURCES/runtime/lib/python3.12/site-packages/"
-rm -f "$RESOURCES/runtime/lib/python3.12/site-packages/__editable__.lada-0.11.0.pth"
-rm -f "$RESOURCES/runtime/lib/python3.12/site-packages/__editable___lada_0_11_0_finder.py"
+rm -f "$RESOURCES/runtime/lib/python3.12/site-packages"/__editable__.lada-*.pth(N)
+rm -f "$RESOURCES/runtime/lib/python3.12/site-packages"/__editable___lada_*_finder.py(N)
 rm -f "$RESOURCES/runtime/lib/python3.12/site-packages/_virtualenv.pth"
 rm -f "$RESOURCES/runtime/lib/python3.12/site-packages/_virtualenv.py"
-rm -rf "$RESOURCES/runtime/lib/python3.12/site-packages/lada-0.11.0.dist-info"
+rm -rf "$RESOURCES/runtime/lib/python3.12/site-packages"/lada-*.dist-info(N)
 uv pip install \
   --python "$RESOURCES/runtime/bin/python3.12" \
   --break-system-packages \
@@ -128,7 +128,7 @@ cp "$ROOT/process_video_parallel.py" \
   "$RESOURCES/runtime/lib/python3.12/site-packages/process_video_parallel.py"
 cp "$PACKAGE_DIR/mioh_preview_worker.py" \
   "$RESOURCES/runtime/lib/python3.12/site-packages/mioh_preview_worker.py"
-rm -f "$RESOURCES/runtime/lib/python3.12/site-packages/lada-0.11.0.dist-info/direct_url.json"
+rm -f "$RESOURCES/runtime/lib/python3.12/site-packages"/lada-*.dist-info/direct_url.json(N)
 
 mkdir -p "$FFMPEG_CACHE"
 if [[ ! -x "$FFMPEG_CACHE/ffmpeg" ]]; then
