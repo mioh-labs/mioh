@@ -15,6 +15,7 @@ enum PreviewProjectionMode: String, CaseIterable, Identifiable {
   case sphere360 = "360"
 
   var id: String { rawValue }
+  var displayName: String { L(rawValue) }
 }
 
 enum PreviewVideoLayout: String, CaseIterable, Identifiable {
@@ -23,6 +24,7 @@ enum PreviewVideoLayout: String, CaseIterable, Identifiable {
   case topBottom = "上下"
 
   var id: String { rawValue }
+  var displayName: String { L(rawValue) }
 }
 
 enum PreviewEye: String, CaseIterable, Identifiable {
@@ -30,6 +32,7 @@ enum PreviewEye: String, CaseIterable, Identifiable {
   case right = "右目"
 
   var id: String { rawValue }
+  var displayName: String { L(rawValue) }
 }
 
 private struct PreviewVRDetection {
@@ -112,12 +115,12 @@ private enum PreviewVRDetector {
     if hasExplicit180Hint
       || (hasMDVRProductHint && isStereoVRShape)
       || (hasSphericalMetadata && hasStereoMetadata && isStereoVRShape) {
-      return PreviewVRDetection(projection: .vr180, layout: layout, reason: "VR180情報を検出")
+      return PreviewVRDetection(projection: .vr180, layout: layout, reason: L("VR180情報を検出"))
     }
     if has360Hint || hasSphericalMetadata {
-      return PreviewVRDetection(projection: .sphere360, layout: layout, reason: "全天球メタデータを検出")
+      return PreviewVRDetection(projection: .sphere360, layout: layout, reason: L("全天球メタデータを検出"))
     }
-    return PreviewVRDetection(projection: .normal, layout: .mono, reason: "通常動画")
+    return PreviewVRDetection(projection: .normal, layout: .mono, reason: L("通常動画"))
   }
 
   private static func containsAny(_ value: String, _ candidates: [String]) -> Bool {
@@ -189,14 +192,14 @@ enum RealtimePlayerState: String {
 
   var label: String {
     switch self {
-    case .idle: return "待機中"
-    case .loading: return "読み込み中"
-    case .buffering: return "バッファ中"
-    case .playing: return "再生中"
-    case .paused: return "一時停止"
-    case .seeking: return "シーク中"
-    case .ended: return "再生終了"
-    case .failed: return "エラー"
+    case .idle: return L("待機中")
+    case .loading: return L("読み込み中")
+    case .buffering: return L("バッファ中")
+    case .playing: return L("再生中")
+    case .paused: return L("一時停止")
+    case .seeking: return L("シーク中")
+    case .ended: return L("再生終了")
+    case .failed: return L("エラー")
     }
   }
 }
@@ -242,13 +245,13 @@ private enum SourcePlaybackError: LocalizedError {
   var errorDescription: String? {
     switch self {
     case .missingHEV1SampleEntry:
-      return "AVFoundation互換にできるHEV1トラックが見つかりません"
+      return L("AVFoundation互換にできるHEV1トラックが見つかりません")
     case .incompatibleVirtualContainer:
-      return "この動画はAVFoundationで再生できません"
+      return L("この動画はAVFoundationで再生できません")
     case .invalidFileSize:
-      return "動画ファイルの大きさを取得できません"
+      return L("動画ファイルの大きさを取得できません")
     case .loopbackServerFailed:
-      return "AVFoundation互換ストリーミングを開始できません"
+      return L("AVFoundation互換ストリーミングを開始できません")
     }
   }
 }
@@ -1568,7 +1571,7 @@ struct RealtimePlayerView: View {
         HStack(spacing: 12) {
           Picker("復元モデル", selection: $runner.previewRestorationModel) {
             ForEach(runner.restorationModels, id: \.self) { model in
-              Text(model).tag(model)
+              Text(L(model)).tag(model)
             }
           }
           .frame(maxWidth: 430)
@@ -1658,19 +1661,19 @@ struct RealtimePlayerView: View {
         HStack(spacing: 12) {
           Picker("表示", selection: $runner.previewProjectionMode) {
             ForEach(PreviewProjectionMode.allCases.filter { $0 != .normal }) { mode in
-              Text(mode.rawValue).tag(mode.rawValue)
+              Text(mode.displayName).tag(mode.rawValue)
             }
           }
           .frame(width: 150)
           Picker("形式", selection: $runner.previewVideoLayout) {
             ForEach(PreviewVideoLayout.allCases) { layout in
-              Text(layout.rawValue).tag(layout.rawValue)
+              Text(layout.displayName).tag(layout.rawValue)
             }
           }
           .frame(width: 140)
           Picker("目", selection: $runner.previewEye) {
             ForEach(PreviewEye.allCases) { eye in
-              Text(eye.rawValue).tag(eye.rawValue)
+              Text(eye.displayName).tag(eye.rawValue)
             }
           }
           .frame(width: 110)
@@ -1685,7 +1688,7 @@ struct RealtimePlayerView: View {
       } else if controller.isDetectingVR {
         HStack(spacing: 8) {
           ProgressView().controlSize(.small)
-          Text(controller.vrDetectionDetail).font(.caption).foregroundStyle(.secondary)
+          Text(L(controller.vrDetectionDetail)).font(.caption).foregroundStyle(.secondary)
           Spacer()
         }
       }
@@ -1719,9 +1722,9 @@ struct RealtimePlayerView: View {
           .disabled(controller.state == .idle)
       }
       if !controller.errorMessage.isEmpty {
-        Text(controller.errorMessage).foregroundStyle(.red).font(.caption)
+        Text(L(controller.errorMessage)).foregroundStyle(.red).font(.caption)
       } else {
-        Text(controller.statusLabel).font(.caption).foregroundStyle(.secondary)
+        Text(L(controller.statusLabel)).font(.caption).foregroundStyle(.secondary)
       }
     }
     .padding(.vertical, 12)
@@ -1743,16 +1746,16 @@ private extension RealtimePlayerController {
   }
 
   var processingOverlayLabel: String {
-    if !sourceOnlyPlayback { return "バッファ中" }
-    if state == .seeking { return "シーク中" }
-    return playbackDetail.isEmpty ? "VR動画を準備中" : playbackDetail
+    if !sourceOnlyPlayback { return L("バッファ中") }
+    if state == .seeking { return L("シーク中") }
+    return playbackDetail.isEmpty ? L("VR動画を準備中") : L(playbackDetail)
   }
 
   var statusLabel: String {
     if sourceOnlyPlayback {
       switch state {
       case .loading, .buffering:
-        return playbackDetail.isEmpty ? "VR動画を準備中" : playbackDetail
+        return playbackDetail.isEmpty ? L("VR動画を準備中") : L(playbackDetail)
       default: return state.label
       }
     }

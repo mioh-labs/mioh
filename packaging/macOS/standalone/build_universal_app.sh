@@ -7,7 +7,7 @@ ROOT="${PACKAGE_DIR:h:h:h}"
 export COREAI_DISTRIBUTION="portable"
 export BUILD_DIR="${BUILD_DIR:-$ROOT/build/macos-standalone-universal}"
 export APP_BASENAME="mioh-universal"
-export DMG_BASENAME="mioh-universal-0.11.0-unsigned"
+export DMG_BASENAME="mioh-universal-0.14.3-unsigned"
 export INCLUDE_USER_MANUAL=1
 export MIOH_MODELESS_DISTRIBUTION="${MIOH_MODELESS_DISTRIBUTION:-1}"
 
