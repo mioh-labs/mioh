@@ -4,6 +4,10 @@ import SwiftUI
 
 private let appProgressPrefix = "@@LADA_PROGRESS@@"
 
+func L(_ key: String) -> String {
+  NSLocalizedString(key, comment: "")
+}
+
 struct AppProgressEvent: Decodable {
   let kind: String
   let lane: String
@@ -1129,8 +1133,8 @@ enum RunnerError: LocalizedError {
 
   var errorDescription: String? {
     switch self {
-    case .missingResource(let name): return "必要なリソースが見つかりません: \(name)"
-    case .missingValue(let name): return "値を指定してください: \(name)"
+    case .missingResource(let name): return String(format: L("必要なリソースが見つかりません: %@"), name)
+    case .missingValue(let name): return String(format: L("値を指定してください: %@"), name)
     case .unsupportedFeature(let message): return message
     }
   }
@@ -1146,13 +1150,13 @@ struct PathRow: View {
     HStack(spacing: 12) {
       Image(systemName: icon).frame(width: 20).foregroundStyle(.secondary)
       VStack(alignment: .leading, spacing: 3) {
-        Text(title).font(.caption).foregroundStyle(.secondary)
-        Text(url?.path ?? "未選択")
+        Text(L(title)).font(.caption).foregroundStyle(.secondary)
+        Text(url?.path ?? L("未選択"))
           .lineLimit(1).truncationMode(.middle)
           .frame(maxWidth: .infinity, alignment: .leading)
       }
       Button(action: action) { Image(systemName: "folder") }
-        .buttonStyle(.borderless).help("選択")
+        .buttonStyle(.borderless).help(L("選択"))
     }
     .frame(minHeight: 42)
   }
@@ -1164,12 +1168,12 @@ struct PathSettingRow: View {
   let action: () -> Void
 
   var body: some View {
-    LabeledContent(title) {
+    LabeledContent(L(title)) {
       HStack {
-        TextField("", text: $value, prompt: Text("未指定"))
+        TextField("", text: $value, prompt: Text(L("未指定")))
           .textFieldStyle(.roundedBorder).frame(width: 380)
         Button(action: action) { Image(systemName: "folder") }
-          .buttonStyle(.borderless).help("選択")
+          .buttonStyle(.borderless).help(L("選択"))
       }
     }
   }
@@ -1217,7 +1221,7 @@ struct ContentView: View {
         Text(runner.restorationModel).font(.caption).foregroundStyle(.secondary)
       }
       Spacer()
-      Text(runner.status).font(.callout.monospacedDigit())
+      Text(L(runner.status)).font(.callout.monospacedDigit())
         .foregroundStyle(runner.status == "エラー" ? .red : .secondary)
     }
     .padding(.horizontal, 20).frame(height: 66)
@@ -1270,7 +1274,7 @@ struct ContentView: View {
     Form {
       Section("モデル") {
         Picker("復元モデル", selection: $runner.restorationModel) {
-          ForEach(runner.restorationModels, id: \.self) { Text($0).tag($0) }
+          ForEach(runner.restorationModels, id: \.self) { Text(L($0)).tag($0) }
         }
         if runner.restorationModel == "カスタム" {
           PathSettingRow(title: "モデルパス", value: $runner.customRestorationModel) { runner.choosePath(\.customRestorationModel) }
@@ -1313,7 +1317,7 @@ struct ContentView: View {
                 set: { runner.selectROIEnhancerModel($0) }
               )) {
                 ForEach(runner.roiEnhancerModelOptions) { option in
-                  Text(option.label).tag(option.name)
+                  Text(L(option.label)).tag(option.name)
                 }
               }
               .labelsHidden()
@@ -1336,7 +1340,7 @@ struct ContentView: View {
     Form {
       Section("検出モデル") {
         Picker("モデル", selection: $runner.detectionModel) {
-          ForEach(runner.detectionModels, id: \.self) { Text($0).tag($0) }
+          ForEach(runner.detectionModels, id: \.self) { Text(L($0)).tag($0) }
         }
         if runner.detectionModel == "カスタム" {
           PathSettingRow(title: "モデルパス", value: $runner.customDetectionModel) { runner.choosePath(\.customDetectionModel) }
@@ -1420,7 +1424,7 @@ struct ContentView: View {
             Label("初期値に戻す", systemImage: "trash")
           }
         }
-        Text(runner.defaultsStatus)
+        Text(L(runner.defaultsStatus))
           .font(.caption)
           .foregroundStyle(.secondary)
       }
@@ -1443,7 +1447,7 @@ struct ContentView: View {
   private var footer: some View {
     HStack(spacing: 10) {
       Button(action: runner.revealOutput) { Image(systemName: "folder.badge.gearshape") }
-        .help("出力をFinderで表示").disabled(runner.outputURL == nil)
+        .help(L("出力をFinderで表示")).disabled(runner.outputURL == nil)
       Spacer()
       if runner.isRunning {
         Button(role: .destructive, action: runner.stop) { Label("停止", systemImage: "stop.fill") }

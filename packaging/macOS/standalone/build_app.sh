@@ -88,6 +88,11 @@ xcrun swiftc \
   -o "$RESOURCES/bin/lada-basicvsrpp-variable-runner"
 
 cp "$PACKAGE_DIR/Info.plist" "$CONTENTS/Info.plist"
+if [[ -d "$PACKAGE_DIR/Localizations" ]]; then
+  for localization in "$PACKAGE_DIR/Localizations"/*.lproj(N); do
+    ditto "$localization" "$RESOURCES/${localization:t}"
+  done
+fi
 ditto "$PYTHON_SOURCE" "$RESOURCES/runtime"
 mkdir -p "$RESOURCES/runtime/lib/python3.12/site-packages"
 rsync -a --exclude '.DS_Store' \
