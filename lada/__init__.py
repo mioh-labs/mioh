@@ -94,13 +94,12 @@ def _coreai_model_path(filename: str) -> str:
     return source_path
 
 
-def _variable_coreai_model_path() -> str:
+def _variable_coreai_model_path(
+    stem: str = "basicvsrpp-v1.2-variable-coreai",
+) -> str:
     architecture = os.environ.get("LADA_COREAI_ARCHITECTURE")
     suffix = f".{architecture}.aimodelc" if architecture else ".aimodel"
-    return os.path.join(
-        MODEL_WEIGHTS_DIR,
-        f"basicvsrpp-v1.2-variable-coreai{suffix}",
-    )
+    return os.path.join(MODEL_WEIGHTS_DIR, f"{stem}{suffix}")
 
 
 class ModelFiles:
@@ -111,7 +110,8 @@ class ModelFiles:
         ModelFile('basicvsrpp-v1.2-coreai', _("BasicVSR++ v1.2 on Core AI with Metal 4 kernels"), _coreai_model_path('basicvsrpp-v1.2-t18-fp16.aimodel')),
         ModelFile('basicvsrpp-v1.2-coreai-t36', _("BasicVSR++ v1.2 fixed-T36 on Core AI with Metal 4 kernels"), _coreai_model_path('basicvsrpp-v1.2-t36-fp16.aimodel')),
         ModelFile('basicvsrpp-v1.2-coreai-t90', _("BasicVSR++ v1.2 fixed-T90 on Core AI with Metal 4 kernels"), _coreai_model_path('basicvsrpp-v1.2-t90-fp16.aimodel')),
-        ModelFile('basicvsrpp-v1.2-coreai-variable', _("BasicVSR++ v1.2 variable-length Swift/Core AI pipeline"), _variable_coreai_model_path()),
+        ModelFile('basicvsrpp-v1.2-coreai-variable', _("BasicVSR++ v1.2 variable-length Swift/Core AI pipeline (fast chunk6)"), _variable_coreai_model_path()),
+        ModelFile('basicvsrpp-v1.2-coreai-variable-hq', _("BasicVSR++ v1.2 variable-length Swift/Core AI pipeline (quality-priority step1)"), _variable_coreai_model_path("basicvsrpp-v1.2-variable-hq-coreai")),
         ModelFile('deepmosaics', _("Restoration model from abandoned DeepMosaics project"), os.path.join(MODEL_WEIGHTS_DIR, '3rd_party', 'clean_youknow_video.pth')),
     ]
     _WELL_KNOWN_DETECTION_MODELS = [
@@ -122,10 +122,15 @@ class ModelFiles:
         ModelFile('v4-fast', _("Fast and efficient. Recommended"), os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_detection_model_v4_fast.pt')),
         ModelFile('v4-accurate', _("Can be slightly more accurate than v4-fast but slower"), os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_detection_model_v4_accurate.pt')),
         ModelFile('vr-v2-accurate', _("VR-focused accurate mosaic detector"), os.path.join(MODEL_WEIGHTS_DIR, 'lada_mosaic_detection_model_vr_v2_accurate.pt')),
+        ModelFile('v2-coreai', _("v2 FP16 running with Core AI"), _coreai_model_path('lada_mosaic_detection_model_v2-fp16.aimodel')),
+        ModelFile('v3.1-fast-coreai', _("v3.1-fast FP16 running with Core AI"), _coreai_model_path('lada_mosaic_detection_model_v3.1_fast-fp16.aimodel')),
+        ModelFile('v3.1-accurate-coreai', _("v3.1-accurate FP16 running with Core AI"), _coreai_model_path('lada_mosaic_detection_model_v3.1_accurate-fp16.aimodel')),
         ModelFile('v4-fast-coreml', _("v4-fast running on Apple Neural Engine via Core ML"), _coreml_detection_path('lada_mosaic_detection_model_v4_fast.mlpackage')),
         ModelFile('v4-fast-coreai', _("v4-fast FP16 running with Core AI"), _coreai_model_path('lada_mosaic_detection_model_v4_fast-fp16.aimodel')),
         ModelFile('v4-accurate-coreml', _("v4-accurate running on Apple Neural Engine via Core ML"), _coreml_detection_path('lada_mosaic_detection_model_v4_accurate.mlpackage')),
+        ModelFile('v4-accurate-coreai', _("v4-accurate FP16 running with Core AI"), _coreai_model_path('lada_mosaic_detection_model_v4_accurate-fp16.aimodel')),
         ModelFile('vr-v2-accurate-coreml', _("VR-focused accurate mosaic detector via Core ML"), _coreml_detection_path('lada_mosaic_detection_model_vr_v2_accurate.mlpackage')),
+        ModelFile('vr-v2-accurate-coreai', _("VR-focused accurate mosaic detector FP16 via Core AI"), _coreai_model_path('lada_mosaic_detection_model_vr_v2_accurate-fp16.aimodel')),
         ModelFile('v3.1-fast-coreml', _("v3.1-fast running on Apple Neural Engine via Core ML"), _coreml_detection_path('lada_mosaic_detection_model_v3.1_fast.mlpackage')),
         ModelFile('v3.1-accurate-coreml', _("v3.1-accurate running on Apple Neural Engine via Core ML"), _coreml_detection_path('lada_mosaic_detection_model_v3.1_accurate.mlpackage')),
         ModelFile('v2-coreml', _("v2 running on Apple Neural Engine via Core ML"), _coreml_detection_path('lada_mosaic_detection_model_v2.mlpackage')),

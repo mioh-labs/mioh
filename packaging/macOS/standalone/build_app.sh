@@ -46,6 +46,8 @@ typeset -a APP_SWIFT_FLAGS
 APP_SWIFT_FLAGS=()
 if [[ "$COREAI_DISTRIBUTION" == "portable" ]]; then
   APP_SWIFT_FLAGS+=(-D MIOH_PORTABLE_COREAI)
+else
+  APP_SWIFT_FLAGS+=(-D MIOH_DEDICATED_VARIABLE_HQ)
 fi
 typeset -a SWIFT_SUBPROCESS_FLAGS
 SWIFT_SUBPROCESS_FLAGS=()
@@ -77,6 +79,7 @@ xcrun swiftc \
   -framework CoreAI \
   "$PACKAGE_DIR/CoreAIRunner.swift" \
   -o "$RESOURCES/bin/lada-coreai-runner"
+VARIABLE_RUNNER_SOURCE="$PACKAGE_DIR/VariableBasicVSRPPChunk6Runner.swift"
 xcrun swiftc \
   "${SWIFT_SUBPROCESS_FLAGS[@]}" \
   -O \
@@ -84,8 +87,19 @@ xcrun swiftc \
   -target arm64-apple-macosx27.0 \
   -framework CoreAI \
   -framework Metal \
-  "$PACKAGE_DIR/VariableBasicVSRPPChunk6Runner.swift" \
+  "$VARIABLE_RUNNER_SOURCE" \
   -o "$RESOURCES/bin/lada-basicvsrpp-variable-runner"
+if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
+  xcrun swiftc \
+    "${SWIFT_SUBPROCESS_FLAGS[@]}" \
+    -O \
+    -parse-as-library \
+    -target arm64-apple-macosx27.0 \
+    -framework CoreAI \
+    -framework Metal \
+    "$PACKAGE_DIR/VariableBasicVSRPPRunner.swift" \
+    -o "$RESOURCES/bin/lada-basicvsrpp-variable-hq-runner"
+fi
 
 cp "$PACKAGE_DIR/Info.plist" "$CONTENTS/Info.plist"
 if [[ -d "$PACKAGE_DIR/Localizations" ]]; then
@@ -198,18 +212,43 @@ for package in "${COREML_DETECTION_ASSETS[@]}"; do
   ditto "$compiled_model" "$RESOURCES/models/$compiled_name"
 done
 
+COREAI_DETECTION_STEMS=(
+  lada_mosaic_detection_model_v2
+  lada_mosaic_detection_model_v3.1_fast
+  lada_mosaic_detection_model_v3.1_accurate
+  lada_mosaic_detection_model_v4_fast
+  lada_mosaic_detection_model_v4_accurate
+  lada_mosaic_detection_model_vr_v2_accurate
+)
+for stem in "${COREAI_DETECTION_STEMS[@]}"; do
+  detection_checkpoint="$ROOT/model_weights/$stem.pt"
+  detection_asset="$ROOT/model_weights/$stem-fp16.aimodel"
+  if [[ ! -d "$detection_asset" || "$detection_checkpoint" -nt "$detection_asset" ]]; then
+    PYTHONPATH="$ROOT" "$LADA_STANDALONE_PYTHON_ENV/bin/python" \
+      "$ROOT/scripts/apple/export_v4_fast_coreai.py" \
+      --model "$detection_checkpoint" \
+      --output "$detection_asset" \
+      --allow-overwrite
+  fi
+done
+
 COREAI_MODEL_ASSETS=(
   basicvsrpp-v1.2-t18-fp16.aimodel
   basicvsrpp-v1.2-t36-fp16.aimodel
   basicvsrpp-v1.2-t90-fp16.aimodel
+  lada_mosaic_detection_model_v2-fp16.aimodel
+  lada_mosaic_detection_model_v3.1_fast-fp16.aimodel
+  lada_mosaic_detection_model_v3.1_accurate-fp16.aimodel
   lada_mosaic_detection_model_v4_fast-fp16.aimodel
+  lada_mosaic_detection_model_v4_accurate-fp16.aimodel
+  lada_mosaic_detection_model_vr_v2_accurate-fp16.aimodel
   RealESRGAN_x2plus-256-fp16.aimodel
   RealESRGAN_x4plus-256-fp16.aimodel
   realesr-general-x4v3-256-fp16.aimodel
   4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel
 )
 VARIABLE_COREAI_SOURCE_MODELS="${VARIABLE_COREAI_SOURCE_MODELS:-$BUILD_DIR/variable-basicvsrpp-source}"
-VARIABLE_COREAI_CHECKPOINT="$ROOT/model_weights/lada_mosaic_restoration_model_generic_v1.2.pth"
+VARIABLE_COREAI_CHECKPOINT="${VARIABLE_COREAI_CHECKPOINT:-$ROOT/model_weights/lada_mosaic_restoration_model_generic_v1.2.pth}"
 VARIABLE_COREAI_ASSETS=(
   spatial6 flow6
   backward_1_start6 backward_1_continue6
@@ -217,6 +256,15 @@ VARIABLE_COREAI_ASSETS=(
   backward_2_start6 backward_2_continue6
   forward_2_start6 forward_2_continue6
   reconstruction6
+)
+VARIABLE_COREAI_STEP1_SOURCE_MODELS="${VARIABLE_COREAI_STEP1_SOURCE_MODELS:-$BUILD_DIR/variable-basicvsrpp-step1-source}"
+VARIABLE_COREAI_STEP1_ASSETS=(
+  spatial flow
+  backward_1_init backward_1_first backward_1_later
+  forward_1_init forward_1_first forward_1_later
+  backward_2_init backward_2_first backward_2_later
+  forward_2_init forward_2_first forward_2_later
+  reconstruction
 )
 needs_variable_export=0
 for name in "${VARIABLE_COREAI_ASSETS[@]}"; do
@@ -235,6 +283,26 @@ if (( needs_variable_export )); then
     --overwrite
 fi
 if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
+  needs_step1_export=0
+  for name in "${VARIABLE_COREAI_STEP1_ASSETS[@]}"; do
+    source_asset="$VARIABLE_COREAI_STEP1_SOURCE_MODELS/basicvsrpp-variable-$name.aimodel"
+    if [[ ! -d "$source_asset" || "$VARIABLE_COREAI_CHECKPOINT" -nt "$source_asset" ]]; then
+      needs_step1_export=1
+      break
+    fi
+  done
+  if (( needs_step1_export )); then
+    mkdir -p "$VARIABLE_COREAI_STEP1_SOURCE_MODELS"
+    PYTHONPATH="$ROOT" "$LADA_STANDALONE_PYTHON_ENV/bin/python" \
+      "$ROOT/scripts/apple/benchmark_basicvsrpp_variable_coreai.py" \
+      --checkpoint "$VARIABLE_COREAI_CHECKPOINT" \
+      --output-dir "$VARIABLE_COREAI_STEP1_SOURCE_MODELS" \
+      --export \
+      --export-only \
+      --overwrite
+  fi
+fi
+if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
 mkdir -p "$COMPILED_MODELS"
 find "$COMPILED_MODELS" -maxdepth 1 -type d -name '*.aimodelc' \
   ! -name "*.$COREAI_ARCHITECTURE.aimodelc" -exec rm -rf {} +
@@ -244,8 +312,13 @@ for asset in "${COREAI_MODEL_ASSETS[@]}"; do
   compiled_name="${asset:r}.$COREAI_ARCHITECTURE.aimodelc"
   expected_coreai_models[$compiled_name]=1
 done
-variable_collection_name="basicvsrpp-v1.2-variable-coreai.$COREAI_ARCHITECTURE.aimodelc"
-expected_coreai_models[$variable_collection_name]=1
+generic_variable_collection_name="basicvsrpp-v1.2-variable-coreai.$COREAI_ARCHITECTURE.aimodelc"
+variable_collection_name="$generic_variable_collection_name"
+expected_coreai_models[$generic_variable_collection_name]=1
+if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
+  hq_variable_collection_name="basicvsrpp-v1.2-variable-hq-coreai.$COREAI_ARCHITECTURE.aimodelc"
+  expected_coreai_models[$hq_variable_collection_name]=1
+fi
 for model in "$COMPILED_MODELS"/*.$COREAI_ARCHITECTURE.aimodelc(N); do
   if [[ -z "${expected_coreai_models[${model:t}]-}" ]]; then
     rm -rf "$model"
@@ -320,6 +393,40 @@ for compiled_asset in "$variable_collection"/*.$COREAI_ARCHITECTURE.aimodelc(N);
   fi
 done
 ditto "$variable_collection" "$RESOURCES/models/$variable_collection_name"
+if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
+  step1_collection="$COMPILED_MODELS/$hq_variable_collection_name"
+  if [[ -f "$step1_collection/metadata.json" ]]; then
+    rm -rf "$step1_collection"
+  fi
+  mkdir -p "$step1_collection"
+  step1_compile_output="$BUILD_DIR/variable-basicvsrpp-step1-compiled-stage"
+  mkdir -p "$step1_compile_output"
+  typeset -A expected_step1_assets
+  for name in "${VARIABLE_COREAI_STEP1_ASSETS[@]}"; do
+    source_asset="$VARIABLE_COREAI_STEP1_SOURCE_MODELS/basicvsrpp-variable-$name.aimodel"
+    compiled_name="basicvsrpp-variable-$name.$COREAI_ARCHITECTURE.aimodelc"
+    compiled_asset="$step1_collection/$compiled_name"
+    expected_step1_assets[$compiled_name]=1
+    if [[ ! -d "$compiled_asset" || "$source_asset" -nt "$compiled_asset" ]]; then
+      rm -rf "$compiled_asset"
+      rm -rf "$step1_compile_output/$compiled_name"
+      xcrun coreai-build compile \
+        "$source_asset" \
+        --output "$step1_compile_output" \
+        --platform macOS \
+        --min-deployment-version 27.0 \
+        --preferred-compute gpu \
+        --architecture "$COREAI_ARCHITECTURE"
+      ditto "$step1_compile_output/$compiled_name" "$compiled_asset"
+    fi
+  done
+  for compiled_asset in "$step1_collection"/*.$COREAI_ARCHITECTURE.aimodelc(N); do
+    if [[ -z "${expected_step1_assets[${compiled_asset:t}]-}" ]]; then
+      rm -rf "$compiled_asset"
+    fi
+  done
+  ditto "$step1_collection" "$RESOURCES/models/$hq_variable_collection_name"
+fi
 else
   for asset in "${COREAI_MODEL_ASSETS[@]}"; do
     source_model="$ROOT/model_weights/$asset"
@@ -365,6 +472,9 @@ chmod +x "$CONTENTS/MacOS/mioh" "$RESOURCES/runtime/bin/python3.12" \
   "$RESOURCES/bin/ffmpeg" "$RESOURCES/bin/ffprobe" \
   "$RESOURCES/bin/lada-coreai-runner" \
   "$RESOURCES/bin/lada-basicvsrpp-variable-runner"
+if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
+  chmod +x "$RESOURCES/bin/lada-basicvsrpp-variable-hq-runner"
+fi
 
 if [[ "$MIOH_MODELESS_DISTRIBUTION" == 1 ]]; then
   print "Skipping model smoke tests for modeless distribution"
@@ -377,6 +487,7 @@ elif [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
   LADA_COREAI_ARCHITECTURE="$COREAI_ARCHITECTURE" \
   LADA_COREAI_SWIFT_RUNNER="$RESOURCES/bin/lada-coreai-runner" \
   LADA_VARIABLE_COREAI_SWIFT_RUNNER="$RESOURCES/bin/lada-basicvsrpp-variable-runner" \
+  LADA_VARIABLE_COREAI_HQ_SWIFT_RUNNER="$RESOURCES/bin/lada-basicvsrpp-variable-hq-runner" \
     "$RESOURCES/runtime/bin/python3.12" \
     "$PACKAGE_DIR/verify_coreai_models.py" \
     --resources "$RESOURCES" \

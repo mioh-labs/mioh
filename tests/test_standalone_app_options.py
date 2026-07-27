@@ -18,7 +18,12 @@ EXPECTED_COREAI_SOURCES = (
     "basicvsrpp-v1.2-t18-fp16.aimodel",
     "basicvsrpp-v1.2-t36-fp16.aimodel",
     "basicvsrpp-v1.2-t90-fp16.aimodel",
+    "lada_mosaic_detection_model_v2-fp16.aimodel",
+    "lada_mosaic_detection_model_v3.1_fast-fp16.aimodel",
+    "lada_mosaic_detection_model_v3.1_accurate-fp16.aimodel",
     "lada_mosaic_detection_model_v4_fast-fp16.aimodel",
+    "lada_mosaic_detection_model_v4_accurate-fp16.aimodel",
+    "lada_mosaic_detection_model_vr_v2_accurate-fp16.aimodel",
     "RealESRGAN_x2plus-256-fp16.aimodel",
     "RealESRGAN_x4plus-256-fp16.aimodel",
     "realesr-general-x4v3-256-fp16.aimodel",
@@ -352,8 +357,8 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertEqual(info["LSMinimumSystemVersion"], "26.0")
         self.assertNotIn("import CoreAI", source)
         self.assertEqual(build_script.count("-target arm64-apple-macosx26.0"), 1)
-        self.assertEqual(build_script.count("-target arm64-apple-macosx27.0"), 2)
-        self.assertEqual(build_script.count("-framework CoreAI"), 2)
+        self.assertEqual(build_script.count("-target arm64-apple-macosx27.0"), 3)
+        self.assertEqual(build_script.count("-framework CoreAI"), 3)
 
     def test_model_choices_follow_coreai_os_availability(self):
         source = APP_SOURCE.read_text()
@@ -368,10 +373,15 @@ class StandaloneAppOptionTests(unittest.TestCase):
             'supportsCoreAI ? coreAIRestorationModels + baseRestorationModels : baseRestorationModels',
             source,
         )
-        self.assertIn(
-            'supportsCoreAI ? baseDetectionModels + ["v4-fast-coreai"] : baseDetectionModels',
-            source,
-        )
+        for name in (
+            "v2-coreai",
+            "v3.1-fast-coreai",
+            "v3.1-accurate-coreai",
+            "v4-fast-coreai",
+            "v4-accurate-coreai",
+            "vr-v2-accurate-coreai",
+        ):
+            self.assertIn(f'"{name}"', source)
         self.assertIn('"vr-v2-accurate-coreml"', source)
         base_models = source.split("let baseDetectionModels = [", 1)[1].split("]", 1)[0]
         self.assertNotIn('"v2"', base_models)
@@ -468,7 +478,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn('COREAI_DISTRIBUTION="portable"', script)
         self.assertIn('build/macos-standalone-universal', script)
         self.assertIn('APP_BASENAME="mioh-universal"', script)
-        self.assertIn('DMG_BASENAME="mioh-universal-0.11.0-unsigned"', script)
+        self.assertIn('DMG_BASENAME="mioh-universal-0.14.3-unsigned"', script)
         self.assertIn('exec "$PACKAGE_DIR/build_app.sh"', script)
 
     def test_portable_swift_build_omits_architecture_override(self):
@@ -504,7 +514,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn('APP="$BUILD_DIR/$APP_BASENAME.app"', build_script)
         self.assertIn('-o "$CONTENTS/MacOS/mioh"', build_script)
         self.assertIn(
-            'DMG_BASENAME="${DMG_BASENAME:-mioh-0.11.0-unsigned}"',
+            'DMG_BASENAME="${DMG_BASENAME:-mioh-0.14.3-unsigned}"',
             build_script,
         )
         self.assertIn('DMG="$BUILD_DIR/$DMG_BASENAME.dmg"', build_script)

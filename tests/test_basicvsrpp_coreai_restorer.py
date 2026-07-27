@@ -369,6 +369,12 @@ class CoreAIBasicVSRPPRestorerTests(unittest.TestCase):
                 "basicvsrpp-v1.2-variable-coreai.aimodel"
             )
         )
+        self.assertIn("basicvsrpp-v1.2-coreai-variable-hq", models)
+        self.assertTrue(
+            models["basicvsrpp-v1.2-coreai-variable-hq"].endswith(
+                "basicvsrpp-v1.2-variable-hq-coreai.aimodel"
+            )
+        )
 
     def test_restoration_loader_selects_variable_swift_pipeline(self):
         with tempfile.TemporaryDirectory() as temp_dir:

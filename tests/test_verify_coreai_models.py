@@ -20,19 +20,30 @@ EXPECTED_MODELS = {
     "basicvsrpp-v1.2-t18-fp16.h17s.aimodelc",
     "basicvsrpp-v1.2-t36-fp16.h17s.aimodelc",
     "basicvsrpp-v1.2-t90-fp16.h17s.aimodelc",
+    "lada_mosaic_detection_model_v2-fp16.h17s.aimodelc",
+    "lada_mosaic_detection_model_v3.1_fast-fp16.h17s.aimodelc",
+    "lada_mosaic_detection_model_v3.1_accurate-fp16.h17s.aimodelc",
     "lada_mosaic_detection_model_v4_fast-fp16.h17s.aimodelc",
+    "lada_mosaic_detection_model_v4_accurate-fp16.h17s.aimodelc",
+    "lada_mosaic_detection_model_vr_v2_accurate-fp16.h17s.aimodelc",
     "RealESRGAN_x2plus-256-fp16.h17s.aimodelc",
     "RealESRGAN_x4plus-256-fp16.h17s.aimodelc",
     "realesr-general-x4v3-256-fp16.h17s.aimodelc",
     "4xNomosWebPhoto_RealPLKSR-256-fp16.h17s.aimodelc",
     "basicvsrpp-v1.2-variable-coreai.h17s.aimodelc",
+    "basicvsrpp-v1.2-variable-hq-coreai.h17s.aimodelc",
 }
 
 EXPECTED_PORTABLE_MODELS = {
     "basicvsrpp-v1.2-t18-fp16.aimodel",
     "basicvsrpp-v1.2-t36-fp16.aimodel",
     "basicvsrpp-v1.2-t90-fp16.aimodel",
+    "lada_mosaic_detection_model_v2-fp16.aimodel",
+    "lada_mosaic_detection_model_v3.1_fast-fp16.aimodel",
+    "lada_mosaic_detection_model_v3.1_accurate-fp16.aimodel",
     "lada_mosaic_detection_model_v4_fast-fp16.aimodel",
+    "lada_mosaic_detection_model_v4_accurate-fp16.aimodel",
+    "lada_mosaic_detection_model_vr_v2_accurate-fp16.aimodel",
     "RealESRGAN_x2plus-256-fp16.aimodel",
     "RealESRGAN_x4plus-256-fp16.aimodel",
     "realesr-general-x4v3-256-fp16.aimodel",
@@ -64,7 +75,12 @@ def test_verifier_manifest_includes_variable_pipeline_collection():
         "basicvsrpp-v1.2-coreai",
         "basicvsrpp-v1.2-coreai-t36",
         "basicvsrpp-v1.2-coreai-t90",
+        "v2-coreai",
+        "v3.1-fast-coreai",
+        "v3.1-accurate-coreai",
         "v4-fast-coreai",
+        "v4-accurate-coreai",
+        "vr-v2-accurate-coreai",
         "realesrgan-x2-coreai",
         "realesrgan-x4-coreai",
         "realesr-general-x4v3-coreai",
@@ -128,6 +144,13 @@ def test_verifier_resolves_all_seven_models_for_distribution(
             )
             return SimpleNamespace(
                 path=str(models / variable_asset)
+            )
+        if name == verifier.VARIABLE_HQ_MODEL_NAME:
+            return SimpleNamespace(
+                path=str(
+                    models
+                    / "basicvsrpp-v1.2-variable-hq-coreai.h17s.aimodelc"
+                )
             )
         contract = verifier.MODEL_CONTRACTS[name]
         asset = verifier.model_asset_name(contract["asset"], distribution, "h17s")
