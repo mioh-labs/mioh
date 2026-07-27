@@ -155,7 +155,7 @@ x2plusは入力256px・出力512pxの固定形状モデルで、macOS 27以降�
 | v3.1-fast-coreml / v4-fast-coreml | 速度優先です。 |
 | v3.1-accurate-coreml / v4-accurate-coreml | 精度優先です。 |
 | vr-v2-accurate-coreml | VR素材向けです。 |
-| v4-fast-coreai | macOS 27のCore AIを使う高速モデルです。 |
+| v2 / v3.1 / v4 / VRの各`-coreai`モデル | macOS 27のCore AIを使うFP16検出モデルです。 |
 | カスタム | 対応モデルを指定します。 |
 
 「空検出先読み」は一時的に検出が途切れたとき、同じシーンの追跡を継続するフレーム数です。大きくすると短い検出抜けに強くなりますが、別の領域へ誤って追従する場合があります。

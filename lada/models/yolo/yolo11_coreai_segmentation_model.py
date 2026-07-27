@@ -24,11 +24,26 @@ from lada.models.yolo.yolo11_segmentation_model import Yolo11SegmentationModel
 from lada.utils import ImageTensor
 
 
+def detection_candidate_channels(model_path: str | Path) -> int:
+    """Return the raw YOLO candidate width for a shipped detector.
+
+    The original v2 checkpoint has one class (4 box + 1 class + 32 masks);
+    every later shipped detector has two classes.
+    """
+    name = Path(model_path).name
+    return 37 if name.startswith("lada_mosaic_detection_model_v2-") else 38
+
+
 class CoreAISegmentationRuntime:
-    def __init__(self, model_path: Path):
+    def __init__(self, model_path: Path, candidate_channels: int | None = None):
         if not model_path.is_dir():
             raise FileNotFoundError(model_path)
         self.model_path = model_path
+        self.candidate_channels = (
+            detection_candidate_channels(model_path)
+            if candidate_channels is None
+            else candidate_channels
+        )
         self._runner: asyncio.Runner | None = None
         self._model = None
         self._function = None
@@ -42,7 +57,10 @@ class CoreAISegmentationRuntime:
                     self.model_path,
                     inputs=(TensorSpec("image", (1, 3, 640, 640)),),
                     outputs=(
-                        TensorSpec("candidates", (1, 38, 8400)),
+                        TensorSpec(
+                            "candidates",
+                            (1, self.candidate_channels, 8400),
+                        ),
                         TensorSpec("prototypes", (1, 32, 160, 160)),
                     ),
                 )
@@ -131,11 +149,20 @@ class Yolo11CoreAISegmentationModel(Yolo11SegmentationModel):
         self.args = get_cfg(DEFAULT_CFG, {**custom, **kwargs})
         self.device = torch.device("cpu")
         self.dtype = torch.float16
+        candidate_channels = detection_candidate_channels(model_path)
+        names = (
+            {0: "nsfw"}
+            if candidate_channels == 37
+            else {0: "mosaic_nsfw", 1: "mosaic_sfw_head"}
+        )
         self.model = SimpleNamespace(
-            names={0: "mosaic_nsfw", 1: "mosaic_sfw_head"},
+            names=names,
             end2end=False,
         )
-        self.runtime = runtime or CoreAISegmentationRuntime(model_path)
+        self.runtime = runtime or CoreAISegmentationRuntime(
+            model_path,
+            candidate_channels=candidate_channels,
+        )
 
     def preprocess(self, imgs: list[ImageTensor]) -> torch.Tensor:
         imgs = [img if img.device.type == "cpu" else img.cpu() for img in imgs]

@@ -284,12 +284,19 @@ class VariableCoreAIModelRuntime:
     def __init__(
         self,
         models_path: Path,
+        runner_path: str | None = None,
         runtime_factory: Callable[..., VariableBasicVSRPPRuntime] = (
             VariableBasicVSRPPRuntime
         ),
     ):
         self.models_path = Path(models_path)
-        self._runtime = runtime_factory(self.models_path)
+        if runner_path is None:
+            self._runtime = runtime_factory(self.models_path)
+        else:
+            self._runtime = runtime_factory(
+                self.models_path,
+                runner_path=runner_path,
+            )
         self._lock = threading.Lock()
 
     @staticmethod
@@ -346,10 +353,11 @@ class CoreAIVariableBasicvsrppMosaicRestorer(BasicvsrppMosaicRestorer):
     def __init__(
         self,
         models_path: Path,
+        runner_path: str | None = None,
         runtime: VariableCoreAIModelRuntime | None = None,
     ):
         adapter = VariableCoreAIModelAdapter(
-            runtime or VariableCoreAIModelRuntime(models_path)
+            runtime or VariableCoreAIModelRuntime(models_path, runner_path)
         )
         super().__init__(adapter, torch.device("cpu"), fp16=True)
         self.models_path = Path(models_path)

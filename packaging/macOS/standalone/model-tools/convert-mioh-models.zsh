@@ -72,6 +72,9 @@ run_py() {
 
 if [[ "$COREML" == 1 ]]; then
   for detector in \
+    lada_mosaic_detection_model_v2.pt \
+    lada_mosaic_detection_model_v3.1_fast.pt \
+    lada_mosaic_detection_model_v3.1_accurate.pt \
     lada_mosaic_detection_model_v4_fast.pt \
     lada_mosaic_detection_model_v4_accurate.pt \
     lada_mosaic_detection_model_vr_v2_accurate.pt; do
@@ -108,12 +111,20 @@ if [[ "$COREAI" == 1 ]]; then
       --overwrite
   fi
 
-  if [[ -f "$MODELS/lada_mosaic_detection_model_v4_fast.pt" ]]; then
-    run_py "$TOOLS/scripts/apple/export_v4_fast_coreai.py" \
-      --model "$MODELS/lada_mosaic_detection_model_v4_fast.pt" \
-      --output "$MODELS/lada_mosaic_detection_model_v4_fast-fp16.aimodel" \
-      --allow-overwrite
-  fi
+  for detector in \
+    lada_mosaic_detection_model_v2.pt \
+    lada_mosaic_detection_model_v3.1_fast.pt \
+    lada_mosaic_detection_model_v3.1_accurate.pt \
+    lada_mosaic_detection_model_v4_fast.pt \
+    lada_mosaic_detection_model_v4_accurate.pt \
+    lada_mosaic_detection_model_vr_v2_accurate.pt; do
+    if [[ -f "$MODELS/$detector" ]]; then
+      run_py "$TOOLS/scripts/apple/export_v4_fast_coreai.py" \
+        --model "$MODELS/$detector" \
+        --output "$MODELS/${detector:r}-fp16.aimodel" \
+        --allow-overwrite
+    fi
+  done
 
   if [[ -f "$MODELS/RealESRGAN_x2plus.pth" ]]; then
     run_py "$TOOLS/scripts/apple/export_realesrgan_coreai.py" \

@@ -11,6 +11,7 @@ from lada.coreai.compiled_runtime import TensorSpec
 from lada.models.yolo.yolo11_coreai_segmentation_model import (
     CoreAISegmentationRuntime,
     Yolo11CoreAISegmentationModel,
+    detection_candidate_channels,
 )
 
 
@@ -48,6 +49,32 @@ class Yolo11CoreAISegmentationModelTests(unittest.TestCase):
             ),
         )
 
+    def test_v2_uses_single_class_candidate_contract(self):
+        path = Path(
+            "lada_mosaic_detection_model_v2-fp16.h17s.aimodelc"
+        )
+        self.assertEqual(detection_candidate_channels(path), 37)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / path.name
+            model_path.mkdir()
+            with mock.patch(
+                "lada.models.yolo.yolo11_coreai_segmentation_model."
+                "CompiledCoreAIRuntime"
+            ) as compiled:
+                runtime = CoreAISegmentationRuntime(model_path)
+                runtime._ensure_loaded()
+                runtime.close()
+
+        compiled.assert_called_once_with(
+            model_path,
+            inputs=(TensorSpec("image", (1, 3, 640, 640)),),
+            outputs=(
+                TensorSpec("candidates", (1, 37, 8400)),
+                TensorSpec("prototypes", (1, 32, 160, 160)),
+            ),
+        )
+
     def test_detection_model_accepts_compiled_path(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             model_path = Path(temp_dir) / "detect.h17s.aimodelc"
@@ -60,14 +87,24 @@ class Yolo11CoreAISegmentationModelTests(unittest.TestCase):
 
         self.assertIsNotNone(model.runtime)
 
-    def test_v4_fast_coreai_is_registered(self):
+    def test_all_shipped_detection_models_have_coreai_variants(self):
         models = {
             model.name: model.path
             for model in ModelFiles._WELL_KNOWN_DETECTION_MODELS
         }
 
-        self.assertIn("v4-fast-coreai", models)
-        self.assertTrue(models["v4-fast-coreai"].endswith(".aimodel"))
+        for name in (
+            "v2",
+            "v3.1-fast",
+            "v3.1-accurate",
+            "v4-fast",
+            "v4-accurate",
+            "vr-v2-accurate",
+        ):
+            with self.subTest(name=name):
+                coreai_name = f"{name}-coreai"
+                self.assertIn(coreai_name, models)
+                self.assertTrue(models[coreai_name].endswith(".aimodel"))
 
     def test_rejects_non_aimodel_path(self):
         with self.assertRaises(ValueError):

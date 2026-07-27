@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 from pathlib import Path
 
@@ -51,12 +52,20 @@ def load_restoration_model(
         else:
             raise ValueError(f"Unsupported MiohRestorer model asset: {model_path}")
         return MiohMosaicRestorer(runtime), "zero"
-    if model_name.endswith("-coreai-variable"):
+    if model_name.endswith(("-coreai-variable", "-coreai-variable-hq")):
         from lada.restorationpipeline.basicvsrpp_coreai_restorer import (
             CoreAIVariableBasicvsrppMosaicRestorer,
         )
 
-        return CoreAIVariableBasicvsrppMosaicRestorer(Path(model_path)), "zero"
+        runner_path = None
+        if model_name.endswith("-coreai-variable-hq"):
+            runner_path = os.environ.get(
+                "LADA_VARIABLE_COREAI_HQ_SWIFT_RUNNER"
+            )
+        return CoreAIVariableBasicvsrppMosaicRestorer(
+            Path(model_path),
+            runner_path=runner_path,
+        ), "zero"
     if model_path.endswith((".aimodel", ".aimodelc")):
         from lada.restorationpipeline.basicvsrpp_coreai_restorer import (
             CoreAIBasicvsrppMosaicRestorer,

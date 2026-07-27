@@ -34,10 +34,16 @@ struct PlatformCapabilities {
   }
 
   let baseRestorationModels = ["basicvsrpp-v1.2", "カスタム"]
-  let coreAIRestorationModels = [
-    "basicvsrpp-v1.2-coreai-t90", "basicvsrpp-v1.2-coreai-t36",
-    "basicvsrpp-v1.2-coreai", "basicvsrpp-v1.2-coreai-variable",
-  ]
+  var coreAIRestorationModels: [String] {
+    var models = [
+      "basicvsrpp-v1.2-coreai-t90", "basicvsrpp-v1.2-coreai-t36",
+      "basicvsrpp-v1.2-coreai", "basicvsrpp-v1.2-coreai-variable",
+    ]
+#if MIOH_DEDICATED_VARIABLE_HQ
+    models.append("basicvsrpp-v1.2-coreai-variable-hq")
+#endif
+    return models
+  }
 
   var restorationModels: [String] {
     supportsCoreAI ? coreAIRestorationModels + baseRestorationModels : baseRestorationModels
@@ -49,7 +55,12 @@ struct PlatformCapabilities {
   ]
 
   var detectionModels: [String] {
-    supportsCoreAI ? baseDetectionModels + ["v4-fast-coreai"] : baseDetectionModels
+    supportsCoreAI
+      ? baseDetectionModels + [
+        "v2-coreai", "v3.1-fast-coreai", "v3.1-accurate-coreai",
+        "v4-fast-coreai", "v4-accurate-coreai", "vr-v2-accurate-coreai",
+      ]
+      : baseDetectionModels
   }
 }
 
@@ -803,7 +814,9 @@ final class RestorationRunner: ObservableObject {
     case "basicvsrpp-v1.2-coreai": automaticClipLength = 98
     case "basicvsrpp-v1.2-coreai-t36": automaticClipLength = 104
     case "basicvsrpp-v1.2-coreai-t90": automaticClipLength = 178
-    case "basicvsrpp-v1.2-coreai-variable": automaticClipLength = 180
+    case "basicvsrpp-v1.2-coreai-variable",
+      "basicvsrpp-v1.2-coreai-variable-hq":
+      automaticClipLength = 180
     default: automaticClipLength = 180
     }
     add(&args, "--max-clip-length", useMaxClipLength ? maxClipLength : automaticClipLength)
@@ -924,6 +937,12 @@ final class RestorationRunner: ObservableObject {
   }
 
   private func normalizeModelSelections() {
+    if restorationModel == "basicvsrpp-v1.2-coreai-variable-chunk6" {
+      restorationModel = "basicvsrpp-v1.2-coreai-variable"
+    }
+    if previewRestorationModel == "basicvsrpp-v1.2-coreai-variable-chunk6" {
+      previewRestorationModel = "basicvsrpp-v1.2-coreai-variable"
+    }
     if !restorationModels.contains(restorationModel) {
       restorationModel = capabilities.defaultRestorationModel
     }
@@ -982,6 +1001,9 @@ final class RestorationRunner: ObservableObject {
     if capabilities.supportsCoreAI {
       result["LADA_COREAI_SWIFT_RUNNER"] = resources.appendingPathComponent("bin/lada-coreai-runner").path
       result["LADA_VARIABLE_COREAI_SWIFT_RUNNER"] = resources.appendingPathComponent("bin/lada-basicvsrpp-variable-runner").path
+#if MIOH_DEDICATED_VARIABLE_HQ
+      result["LADA_VARIABLE_COREAI_HQ_SWIFT_RUNNER"] = resources.appendingPathComponent("bin/lada-basicvsrpp-variable-hq-runner").path
+#endif
 #if MIOH_PORTABLE_COREAI
       result.removeValue(forKey: "LADA_COREAI_ARCHITECTURE")
 #else
@@ -991,6 +1013,7 @@ final class RestorationRunner: ObservableObject {
       result.removeValue(forKey: "LADA_COREAI_PYTHON")
       result.removeValue(forKey: "LADA_COREAI_SWIFT_RUNNER")
       result.removeValue(forKey: "LADA_VARIABLE_COREAI_SWIFT_RUNNER")
+      result.removeValue(forKey: "LADA_VARIABLE_COREAI_HQ_SWIFT_RUNNER")
       result.removeValue(forKey: "LADA_COREAI_ARCHITECTURE")
     }
     result["PATH"] = [resources.appendingPathComponent("bin").path, "/usr/bin", "/bin", "/usr/sbin", "/sbin"].joined(separator: ":")

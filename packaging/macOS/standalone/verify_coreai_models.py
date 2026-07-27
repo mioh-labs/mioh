@@ -18,19 +18,30 @@ EXPECTED_MODEL_ASSETS = {
     "basicvsrpp-v1.2-t18-fp16.h17s.aimodelc",
     "basicvsrpp-v1.2-t36-fp16.h17s.aimodelc",
     "basicvsrpp-v1.2-t90-fp16.h17s.aimodelc",
+    "lada_mosaic_detection_model_v2-fp16.h17s.aimodelc",
+    "lada_mosaic_detection_model_v3.1_fast-fp16.h17s.aimodelc",
+    "lada_mosaic_detection_model_v3.1_accurate-fp16.h17s.aimodelc",
     "lada_mosaic_detection_model_v4_fast-fp16.h17s.aimodelc",
+    "lada_mosaic_detection_model_v4_accurate-fp16.h17s.aimodelc",
+    "lada_mosaic_detection_model_vr_v2_accurate-fp16.h17s.aimodelc",
     "RealESRGAN_x2plus-256-fp16.h17s.aimodelc",
     "RealESRGAN_x4plus-256-fp16.h17s.aimodelc",
     "realesr-general-x4v3-256-fp16.h17s.aimodelc",
     "4xNomosWebPhoto_RealPLKSR-256-fp16.h17s.aimodelc",
     "basicvsrpp-v1.2-variable-coreai.h17s.aimodelc",
+    "basicvsrpp-v1.2-variable-hq-coreai.h17s.aimodelc",
 }
 
 EXPECTED_SOURCE_MODEL_ASSETS = {
     "basicvsrpp-v1.2-t18-fp16.aimodel",
     "basicvsrpp-v1.2-t36-fp16.aimodel",
     "basicvsrpp-v1.2-t90-fp16.aimodel",
+    "lada_mosaic_detection_model_v2-fp16.aimodel",
+    "lada_mosaic_detection_model_v3.1_fast-fp16.aimodel",
+    "lada_mosaic_detection_model_v3.1_accurate-fp16.aimodel",
     "lada_mosaic_detection_model_v4_fast-fp16.aimodel",
+    "lada_mosaic_detection_model_v4_accurate-fp16.aimodel",
+    "lada_mosaic_detection_model_vr_v2_accurate-fp16.aimodel",
     "RealESRGAN_x2plus-256-fp16.aimodel",
     "RealESRGAN_x4plus-256-fp16.aimodel",
     "realesr-general-x4v3-256-fp16.aimodel",
@@ -39,7 +50,25 @@ EXPECTED_SOURCE_MODEL_ASSETS = {
 }
 
 VARIABLE_MODEL_NAME = "basicvsrpp-v1.2-coreai-variable"
-VARIABLE_ASSET_NAMES = {
+VARIABLE_HQ_MODEL_NAME = "basicvsrpp-v1.2-coreai-variable-hq"
+VARIABLE_STEP1_ASSET_NAMES = {
+    "spatial",
+    "flow",
+    "backward_1_init",
+    "backward_1_first",
+    "backward_1_later",
+    "forward_1_init",
+    "forward_1_first",
+    "forward_1_later",
+    "backward_2_init",
+    "backward_2_first",
+    "backward_2_later",
+    "forward_2_init",
+    "forward_2_first",
+    "forward_2_later",
+    "reconstruction",
+}
+VARIABLE_CHUNK6_ASSET_NAMES = {
     "spatial6",
     "flow6",
     "backward_1_start6",
@@ -72,6 +101,32 @@ MODEL_CONTRACTS = {
     "v4-fast-coreai": {
         "kind": "detection",
         "asset": "lada_mosaic_detection_model_v4_fast-fp16.aimodel",
+        "candidate_channels": 38,
+    },
+    "v2-coreai": {
+        "kind": "detection",
+        "asset": "lada_mosaic_detection_model_v2-fp16.aimodel",
+        "candidate_channels": 37,
+    },
+    "v3.1-fast-coreai": {
+        "kind": "detection",
+        "asset": "lada_mosaic_detection_model_v3.1_fast-fp16.aimodel",
+        "candidate_channels": 38,
+    },
+    "v3.1-accurate-coreai": {
+        "kind": "detection",
+        "asset": "lada_mosaic_detection_model_v3.1_accurate-fp16.aimodel",
+        "candidate_channels": 38,
+    },
+    "v4-accurate-coreai": {
+        "kind": "detection",
+        "asset": "lada_mosaic_detection_model_v4_accurate-fp16.aimodel",
+        "candidate_channels": 38,
+    },
+    "vr-v2-accurate-coreai": {
+        "kind": "detection",
+        "asset": "lada_mosaic_detection_model_vr_v2_accurate-fp16.aimodel",
+        "candidate_channels": 38,
     },
     "realesrgan-x4-coreai": {
         "kind": "enhancer",
@@ -110,6 +165,9 @@ def expected_model_assets(distribution: str, architecture: str) -> set[str]:
             for asset in EXPECTED_SOURCE_MODEL_ASSETS
         }
         assets.add(f"basicvsrpp-v1.2-variable-coreai.{architecture}.aimodelc")
+        assets.add(
+            f"basicvsrpp-v1.2-variable-hq-coreai.{architecture}.aimodelc"
+        )
         return assets
     raise ValueError(f"unsupported Core AI distribution: {distribution}")
 
@@ -194,7 +252,12 @@ def _verify_restoration(name: str, path: Path, frames: int) -> None:
         runtime.close()
 
 
-def _verify_variable_restoration(name: str, path: Path, architecture: str) -> None:
+def _verify_variable_restoration(
+    name: str,
+    path: Path,
+    architecture: str,
+    asset_names: set[str],
+) -> None:
     import torch
 
     from lada.restorationpipeline.basicvsrpp_coreai_restorer import (
@@ -208,7 +271,7 @@ def _verify_variable_restoration(name: str, path: Path, architecture: str) -> No
             if compiled
             else f"basicvsrpp-variable-{asset}.aimodel"
         )
-        for asset in VARIABLE_ASSET_NAMES
+        for asset in asset_names
     }
     actual = {
         item.name
@@ -230,17 +293,28 @@ def _verify_variable_restoration(name: str, path: Path, architecture: str) -> No
         runtime.close()
 
 
-def _verify_detection(name: str, path: Path) -> None:
+def _verify_detection(
+    name: str,
+    path: Path,
+    candidate_channels: int = 38,
+) -> None:
     from lada.models.yolo.yolo11_coreai_segmentation_model import (
         CoreAISegmentationRuntime,
     )
 
-    runtime = CoreAISegmentationRuntime(path)
+    runtime = CoreAISegmentationRuntime(
+        path,
+        candidate_channels=candidate_channels,
+    )
     try:
         candidates, prototypes = runtime(
             np.zeros((1, 3, 640, 640), dtype=np.float16)
         )
-        _verify_array(name + "/candidates", candidates, (1, 38, 8400))
+        _verify_array(
+            name + "/candidates",
+            candidates,
+            (1, candidate_channels, 8400),
+        )
         _verify_array(name + "/prototypes", prototypes, (1, 32, 160, 160))
     finally:
         runtime.close()
@@ -268,6 +342,8 @@ def verify_models(
     verify_asset_set(models_dir, distribution, architecture)
     all_smokes = set(MODEL_CONTRACTS)
     all_smokes.add(VARIABLE_MODEL_NAME)
+    if distribution == "dedicated":
+        all_smokes.add(VARIABLE_HQ_MODEL_NAME)
     selected_smokes = all_smokes if smoke_names is None else smoke_names
     unknown_smokes = selected_smokes - all_smokes
     if unknown_smokes:
@@ -289,33 +365,61 @@ def verify_models(
         if kind == "restoration":
             _verify_restoration(name, path, int(contract["frames"]))
         elif kind == "detection":
-            _verify_detection(name, path)
+            _verify_detection(
+                name,
+                path,
+                int(contract.get("candidate_channels", 38)),
+            )
         else:
             _verify_enhancer(name, path, int(contract.get("scale", 4)))
         print(f"Core AI smoke passed: {name} -> {path.name}", flush=True)
-    model = _resolve_model(VARIABLE_MODEL_NAME, "restoration")
-    path = Path(model.path)
-    variable_asset = (
-        f"basicvsrpp-v1.2-variable-coreai.{architecture}.aimodelc"
-        if distribution == "dedicated"
-        else "basicvsrpp-v1.2-variable-coreai.aimodel"
-    )
-    expected_path = models_dir / variable_asset
-    if path != expected_path:
-        raise RuntimeError(
-            f"{VARIABLE_MODEL_NAME} resolved to {path}, expected {expected_path}"
+    variable_models = [
+        (
+            VARIABLE_MODEL_NAME,
+            (
+                f"basicvsrpp-v1.2-variable-coreai.{architecture}.aimodelc"
+                if distribution == "dedicated"
+                else "basicvsrpp-v1.2-variable-coreai.aimodel"
+            ),
+            VARIABLE_CHUNK6_ASSET_NAMES,
+            None,
         )
-    if VARIABLE_MODEL_NAME in selected_smokes:
-        _verify_variable_restoration(VARIABLE_MODEL_NAME, path, architecture)
-        print(
-            f"Core AI smoke passed: {VARIABLE_MODEL_NAME} -> {path.name}",
-            flush=True,
+    ]
+    if distribution == "dedicated":
+        variable_models.append(
+            (
+                VARIABLE_HQ_MODEL_NAME,
+                f"basicvsrpp-v1.2-variable-hq-coreai.{architecture}.aimodelc",
+                VARIABLE_STEP1_ASSET_NAMES,
+                resources / "bin" / "lada-basicvsrpp-variable-hq-runner",
+            )
         )
-    else:
-        print(
-            f"Core AI asset passed: {VARIABLE_MODEL_NAME} -> {path.name}",
-            flush=True,
-        )
+    for name, asset, asset_names, runner in variable_models:
+        model = _resolve_model(name, "restoration")
+        path = Path(model.path)
+        expected_path = models_dir / asset
+        if path != expected_path:
+            raise RuntimeError(f"{name} resolved to {path}, expected {expected_path}")
+        if name in selected_smokes:
+            previous_runner = os.environ.get("LADA_VARIABLE_COREAI_SWIFT_RUNNER")
+            if runner is not None:
+                os.environ["LADA_VARIABLE_COREAI_SWIFT_RUNNER"] = str(runner)
+            try:
+                _verify_variable_restoration(
+                    name,
+                    path,
+                    architecture,
+                    asset_names,
+                )
+            finally:
+                if runner is not None:
+                    if previous_runner is None:
+                        os.environ.pop("LADA_VARIABLE_COREAI_SWIFT_RUNNER", None)
+                    else:
+                        os.environ["LADA_VARIABLE_COREAI_SWIFT_RUNNER"] = previous_runner
+            print(f"Core AI smoke passed: {name} -> {path.name}", flush=True)
+        else:
+            print(f"Core AI asset passed: {name} -> {path.name}", flush=True)
 
 
 def configure_environment(
@@ -337,6 +441,10 @@ def configure_environment(
         os.environ.setdefault(
             "LADA_VARIABLE_COREAI_SWIFT_RUNNER",
             str(resources / "bin" / "lada-basicvsrpp-variable-runner"),
+        )
+        os.environ.setdefault(
+            "LADA_VARIABLE_COREAI_HQ_SWIFT_RUNNER",
+            str(resources / "bin" / "lada-basicvsrpp-variable-hq-runner"),
         )
     elif distribution == "portable":
         os.environ.pop("LADA_COREAI_ARCHITECTURE", None)
@@ -361,7 +469,8 @@ def main() -> None:
     parser.add_argument(
         "--smoke-model",
         action="append",
-        choices=tuple(MODEL_CONTRACTS) + (VARIABLE_MODEL_NAME,),
+        choices=tuple(MODEL_CONTRACTS)
+        + (VARIABLE_MODEL_NAME, VARIABLE_HQ_MODEL_NAME),
     )
     args = parser.parse_args()
     resources = args.resources.resolve()

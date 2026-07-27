@@ -1,7 +1,12 @@
 # SPDX-FileCopyrightText: Lada Authors
 # SPDX-License-Identifier: AGPL-3.0
 
-"""Export the v4-fast YOLO segmentation model to fixed FP16 Core AI."""
+"""Export a LADA YOLO segmentation model to fixed-shape FP16 Core AI.
+
+The historical filename is retained for compatibility with existing build and
+model-tool commands.  All shipped LADA YOLO11 segmentation checkpoints share
+the same raw output contract and can be passed through ``--model``.
+"""
 
 from __future__ import annotations
 
@@ -20,7 +25,7 @@ DEFAULT_OUTPUT = Path(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Export LADA v4-fast detection to Core AI"
+        description="Export a LADA YOLO segmentation detector to Core AI"
     )
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
@@ -61,7 +66,7 @@ def convert_exported_program(exported: torch.export.ExportedProgram, coreai_torc
 
 def export_model(args: argparse.Namespace) -> Path:
     if args.imgsz != 640:
-        raise ValueError("v4-fast Core AI export requires imgsz=640")
+        raise ValueError("LADA Core AI detection export requires imgsz=640")
     if not args.model.is_file():
         raise FileNotFoundError(args.model)
     if args.output.exists() and not args.allow_overwrite:

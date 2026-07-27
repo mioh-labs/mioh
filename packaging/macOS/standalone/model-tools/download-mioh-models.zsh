@@ -67,6 +67,8 @@ hf_lada() {
 
 download "$(hf_lada lada_mosaic_restoration_model_generic_v1.2.pth)" "$MODELS/lada_mosaic_restoration_model_generic_v1.2.pth"
 download "$(hf_lada lada_mosaic_detection_model_v2.pt)" "$MODELS/lada_mosaic_detection_model_v2.pt"
+download "$(hf_lada lada_mosaic_detection_model_v3.1_fast.pt)" "$MODELS/lada_mosaic_detection_model_v3.1_fast.pt"
+download "$(hf_lada lada_mosaic_detection_model_v3.1_accurate.pt)" "$MODELS/lada_mosaic_detection_model_v3.1_accurate.pt"
 download "$(hf_lada lada_mosaic_detection_model_v4_fast.pt)" "$MODELS/lada_mosaic_detection_model_v4_fast.pt"
 download "$(hf_lada lada_mosaic_detection_model_v4_accurate.pt)" "$MODELS/lada_mosaic_detection_model_v4_accurate.pt"
 download "$(hf_lada lada_mosaic_detection_model_vr_v2_accurate.pt)" "$MODELS/lada_mosaic_detection_model_vr_v2_accurate.pt"
