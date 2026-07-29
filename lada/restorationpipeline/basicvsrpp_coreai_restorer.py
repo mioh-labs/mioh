@@ -350,6 +350,8 @@ class VariableCoreAIModelAdapter:
 class CoreAIVariableBasicvsrppMosaicRestorer(BasicvsrppMosaicRestorer):
     """Variable-length BasicVSR++ without fixed-T padding."""
 
+    stream_model_chunks = True
+
     def __init__(
         self,
         models_path: Path,

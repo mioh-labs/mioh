@@ -48,7 +48,10 @@ EXPECTED_SOURCE_MODEL_ASSETS = {
     "4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel",
     "basicvsrpp-v1.2-variable-coreai.aimodel",
 }
-
+EXPECTED_DEDICATED_SOURCE_MODEL_ASSETS = {
+    "rfdetr-v6-576-fp32.aimodel",
+    "rfdetr-v6-large-768-fp32.aimodel",
+}
 VARIABLE_MODEL_NAME = "basicvsrpp-v1.2-coreai-variable"
 VARIABLE_HQ_MODEL_NAME = "basicvsrpp-v1.2-coreai-variable-hq"
 VARIABLE_STEP1_ASSET_NAMES = {
@@ -164,6 +167,7 @@ def expected_model_assets(distribution: str, architecture: str) -> set[str]:
             f"{Path(asset).stem}.{architecture}.aimodelc"
             for asset in EXPECTED_SOURCE_MODEL_ASSETS
         }
+        assets.update(EXPECTED_DEDICATED_SOURCE_MODEL_ASSETS)
         assets.add(f"basicvsrpp-v1.2-variable-coreai.{architecture}.aimodelc")
         assets.add(
             f"basicvsrpp-v1.2-variable-hq-coreai.{architecture}.aimodelc"
@@ -196,8 +200,12 @@ def verify_asset_set(
         for item in models_dir.iterdir()
         if item.is_dir() and item.name.endswith(".aimodel")
     }
-    if distribution == "dedicated" and source_assets:
-        raise RuntimeError(f"source Core AI assets are packaged: {sorted(source_assets)}")
+    if distribution == "dedicated":
+        unexpected_sources = source_assets - EXPECTED_DEDICATED_SOURCE_MODEL_ASSETS
+        if unexpected_sources:
+            raise RuntimeError(
+                f"source Core AI assets are packaged: {sorted(unexpected_sources)}"
+            )
     compiled_assets = {
         item.name
         for item in models_dir.iterdir()

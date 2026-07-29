@@ -190,9 +190,12 @@ class RealBasicVSR(BaseEditModel):
         if self.if_run_d():
             set_requires_grad(self.discriminator, True)
 
-            gt_pixel, gt_percep, gt_gan = batch_gt_data
+            gt_pixel, gt_percep, gt_gan = batch_gt_data[:3]
             fake_g_output, fake_g_lq = batch_outputs
             fake_g_output = fake_g_output.view(gt_pixel.shape)
+            fake_g_output = self.prepare_discriminator_fake(
+                fake_g_output, batch_gt_data
+            )
 
             for _ in range(self.disc_repeat):
                 # detach before function call to resolve PyTorch2.0 compile bug
@@ -226,6 +229,10 @@ class RealBasicVSR(BaseEditModel):
         """
 
         return self.generator(batch_inputs, return_lqs=True)
+
+    def prepare_discriminator_fake(self, fake_output, batch_gt_data):
+        """Hook for models that restrict discriminator gradients to an ROI."""
+        return fake_output
 
 
 
@@ -432,4 +439,3 @@ class RealBasicVSR(BaseEditModel):
             d_optim_wrapper.zero_grad()
 
         return log_vars
-

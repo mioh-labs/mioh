@@ -131,6 +131,19 @@ class ModelFiles:
         ModelFile('v4-accurate-coreai', _("v4-accurate FP16 running with Core AI"), _coreai_model_path('lada_mosaic_detection_model_v4_accurate-fp16.aimodel')),
         ModelFile('vr-v2-accurate-coreml', _("VR-focused accurate mosaic detector via Core ML"), _coreml_detection_path('lada_mosaic_detection_model_vr_v2_accurate.mlpackage')),
         ModelFile('vr-v2-accurate-coreai', _("VR-focused accurate mosaic detector FP16 via Core AI"), _coreai_model_path('lada_mosaic_detection_model_vr_v2_accurate-fp16.aimodel')),
+        ModelFile(
+            'jasna-v6-coreai',
+            _("Jasna RF-DETR v6 mosaic detector at 576px via Core AI"),
+            os.path.join(MODEL_WEIGHTS_DIR, 'rfdetr-v6-576-fp32.aimodel'),
+        ),
+        ModelFile(
+            'jasna-v6-large-coreai',
+            _("Jasna RF-DETR v6 Large detector for 4K at 768px via Core AI"),
+            os.path.join(
+                MODEL_WEIGHTS_DIR,
+                'rfdetr-v6-large-768-fp32.aimodel',
+            ),
+        ),
         ModelFile('v3.1-fast-coreml', _("v3.1-fast running on Apple Neural Engine via Core ML"), _coreml_detection_path('lada_mosaic_detection_model_v3.1_fast.mlpackage')),
         ModelFile('v3.1-accurate-coreml', _("v3.1-accurate running on Apple Neural Engine via Core ML"), _coreml_detection_path('lada_mosaic_detection_model_v3.1_accurate.mlpackage')),
         ModelFile('v2-coreml', _("v2 running on Apple Neural Engine via Core ML"), _coreml_detection_path('lada_mosaic_detection_model_v2.mlpackage')),

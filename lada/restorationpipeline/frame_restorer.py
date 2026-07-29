@@ -21,7 +21,12 @@ from lada.utils.threading_utils import EOF_MARKER, STOP_MARKER, StopMarker, EofM
     ErrorMarker
 from lada.utils import image_utils, video_utils, threading_utils, mask_utils, ImageTensor, Image
 from lada.utils import visualization_utils
-from lada.utils.mps_utils import get_mps_available_memory_gb, get_mps_memory_stats, serialized_mps_execution
+from lada.utils.mps_utils import (
+    get_mps_available_memory_gb,
+    get_mps_memory_stats,
+    release_mps_memory_if_needed,
+    serialized_mps_execution,
+)
 from lada.restorationpipeline.mosaic_detector import MosaicDetector
 from lada.restorationpipeline.mosaic_detector import Clip
 from lada.models.yolo.yolo11_segmentation_model import Yolo11SegmentationModel
@@ -313,7 +318,7 @@ def calculate_optimal_queue_size_mb(device: torch.device, video_resolution: tupl
     else:
         # CPU の場合は控えめに
         base_memory_mb = 256
-    
+
     return base_memory_mb
 
 
@@ -371,25 +376,30 @@ class FrameRestorer:
         self.restore_temporal_overlap = restore_temporal_overlap
         self.restore_crossfade = restore_crossfade
         self.restore_roi_enhancer = None
-        if restore_roi_enhancer in ("realesrgan", "mewzoom", "swinir", "spandrel"):
-            if restore_roi_enhancer in ("mewzoom", "swinir") and not str(restore_roi_enhancer_model_path).endswith(".mlpackage"):
-                raise ValueError(f"{restore_roi_enhancer} enhancer requires a Core ML .mlpackage model")
-            if restore_roi_enhancer == "spandrel":
-                self.restore_roi_enhancer = create_spandrel_enhancer(
-                    restore_roi_enhancer_model_path,
-                    scale=restore_roi_enhancer_scale,
-                    tile=restore_roi_enhancer_tile,
-                    fp16=fp16_enabled,
-                    device=self.device,
-                )
-            else:
-                self.restore_roi_enhancer = create_realesrgan_enhancer(
-                    restore_roi_enhancer_model_path,
-                    scale=restore_roi_enhancer_scale,
-                    tile=restore_roi_enhancer_tile,
-                    fp16=fp16_enabled,
-                    device=self.device,
-                )
+        supported_roi_enhancers = ("realesrgan", "mewzoom", "swinir", "spandrel")
+        if restore_roi_enhancer in supported_roi_enhancers:
+            # A selected but zero-strength enhancer has no effect on pixels.
+            # Do not load its Torch/Core ML/Core AI weights until it can
+            # actually be used; some enhancer assets exceed 200 MiB.
+            if restore_roi_enhancer_strength > 0:
+                if restore_roi_enhancer in ("mewzoom", "swinir") and not str(restore_roi_enhancer_model_path).endswith(".mlpackage"):
+                    raise ValueError(f"{restore_roi_enhancer} enhancer requires a Core ML .mlpackage model")
+                if restore_roi_enhancer == "spandrel":
+                    self.restore_roi_enhancer = create_spandrel_enhancer(
+                        restore_roi_enhancer_model_path,
+                        scale=restore_roi_enhancer_scale,
+                        tile=restore_roi_enhancer_tile,
+                        fp16=fp16_enabled,
+                        device=self.device,
+                    )
+                else:
+                    self.restore_roi_enhancer = create_realesrgan_enhancer(
+                        restore_roi_enhancer_model_path,
+                        scale=restore_roi_enhancer_scale,
+                        tile=restore_roi_enhancer_tile,
+                        fp16=fp16_enabled,
+                        device=self.device,
+                    )
         elif restore_roi_enhancer != "none":
             raise ValueError(f"Unsupported restore ROI enhancer: {restore_roi_enhancer}")
         self.mosaic_detection_empty_lookahead = mosaic_detection_empty_lookahead
@@ -402,7 +412,7 @@ class FrameRestorer:
         video_resolution = (self.video_meta_data.video_width, self.video_meta_data.video_height)
         base_queue_size_mb = calculate_optimal_queue_size_mb(self.device, video_resolution)
         queue_size_bytes = base_queue_size_mb * 1024 * 1024
-        
+
         # limit queue size based on calculated value
         max_frames_in_frame_restoration_queue = queue_size_bytes // (self.video_meta_data.video_width * self.video_meta_data.video_height * 3)
         self.frame_restoration_queue = PipelineQueue(name="frame_restoration_queue", maxsize=max_frames_in_frame_restoration_queue)
@@ -512,12 +522,11 @@ class FrameRestorer:
             logger.debug(f"FrameRestorer: stopped, took {time.time() - start}")
             self._dump_queue_stats()
             
-            # MPS最適化: メモリキャッシュクリア
+            # All worker threads are joined here, so a forced synchronized
+            # release is safe and returns unused driver allocations promptly.
             if self.device.type == 'mps':
                 try:
-                    if hasattr(torch.mps, 'empty_cache'):
-                        torch.mps.empty_cache()
-                        logger.debug("MPS cache cleared")
+                    release_mps_memory_if_needed(force=True, cooldown_seconds=0)
                 except Exception as e:
                     logger.debug(f"Could not clear MPS cache: {e}")
 
@@ -786,17 +795,20 @@ class FrameRestorer:
         if has_processed_clips:
             processed_clips.clear()
             del processed_clip
-            gc.collect()
             if self.device.type == 'cuda':
+                gc.collect()
                 torch.cuda.empty_cache()
             elif self.device.type == 'mps':
-                torch.mps.empty_cache()
-            released_bytes = _release_darwin_malloc_cache()
-            if released_bytes:
-                logger.debug(
-                    "Released %.1f MiB of unused malloc pages after completed clip",
-                    released_bytes / (1024 ** 2),
-                )
+                released_mps_cache = release_mps_memory_if_needed()
+                if released_mps_cache:
+                    released_bytes = _release_darwin_malloc_cache()
+                    if released_bytes:
+                        logger.debug(
+                            "Released %.1f MiB of unused malloc pages under memory pressure",
+                            released_bytes / (1024 ** 2),
+                        )
+            else:
+                gc.collect()
 
     def _clip_buffer_contains_all_cips_needed_for_current_restoration(self, current_frame_num, num_mosaic_detections, clip_buffer):
         num_clips_starting_at_frame = len([clip for clip in clip_buffer if clip.frame_start == current_frame_num])
@@ -819,9 +831,8 @@ class FrameRestorer:
                     break
             else:
                 self._restore_clip(clip)
-                # Release MPS driver cached memory to prevent unbounded growth
-                if self.device.type == 'mps' and hasattr(torch.mps, 'empty_cache'):
-                    torch.mps.empty_cache()
+                if self.device.type == 'mps':
+                    release_mps_memory_if_needed()
                 self.restored_clip_queue.put(clip)
                 if self.stop_requested:
                     logger.debug("clip restoration worker: restored_clip_queue producer unblocked")

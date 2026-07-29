@@ -64,8 +64,10 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "event.generation == generation",
             "startupSegmentCount = 3",
             "rebufferSegmentCount = 2",
+            "generationReachedEOF",
             "driftToleranceSeconds = 0.080",
-            'sendCommand(["command": "seek"',
+            "A seek is a generation boundary",
+            "kill(-processIdentifier, SIGTERM)",
             '"--generation", String(startingGeneration)',
             "showOriginal",
             "sourceOnlyPlayback",
@@ -86,12 +88,109 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "private var generationHasStarted = false",
             "private var generationStartPending = false",
             "guard state != .playing, !generationStartPending else { return }",
-            "generationHasStarted ? rebufferSegmentCount : startupSegmentCount",
+            "Double(generationHasStarted ? rebufferSegmentCount : startupSegmentCount)",
+            "bufferedSeconds + 0.1 >= required",
             "private func startPlayersFromCurrentPosition()",
             "let startingGeneration = generation",
             "guard self.generation == startingGeneration else { return }",
         ]:
             self.assertIn(contract, player)
+
+    def test_repeated_seek_serializes_worker_retirement_before_restart(self):
+        player = PLAYER_SOURCE.read_text()
+
+        for contract in [
+            "private var workerRetirementTask: Task<Void, Never>?",
+            "let retirement = workerRetirementTask",
+            "await retirement.value",
+            "while retiringWorker.isRunning",
+            "A new generation must not load Core AI assets until the old process",
+        ]:
+            self.assertIn(contract, player)
+        self.assertNotIn('sendCommand(["command": "seek"', player)
+
+    def test_worker_reports_the_actual_segment_duration(self):
+        player = PLAYER_SOURCE.read_text()
+
+        self.assertIn("let segmentSeconds: Double?", player)
+        self.assertIn(
+            "previewSegmentSeconds = max(0.1, event.segmentSeconds ?? 2.0)",
+            player,
+        )
+
+    def test_full_worker_capacity_unblocks_timestamp_shortfall(self):
+        player = PLAYER_SOURCE.read_text()
+        worker = (
+            ROOT
+            / "packaging"
+            / "macOS"
+            / "standalone"
+            / "mioh_preview_worker.py"
+        ).read_text()
+
+        self.assertIn('case "buffer_full":', player)
+        self.assertIn("resumeIfBuffered(bufferIsFull: true)", player)
+        self.assertIn("bufferIsFull && !queuedSegments.isEmpty", player)
+        self.assertIn('emit_event(\n                        "buffer_full"', worker)
+
+    def test_rolling_buffer_release_does_not_depend_only_on_end_notification(self):
+        player = PLAYER_SOURCE.read_text()
+        worker = (
+            ROOT
+            / "packaging"
+            / "macOS"
+            / "standalone"
+            / "mioh_preview_worker.py"
+        ).read_text()
+
+        for contract in [
+            "restoredPlayer.actionAtItemEnd = .advance",
+            "retireSegmentsBeforeCurrentItem()",
+            '\"command\": \"release_through\"',
+            "releaseConsumedSegments(through: activeSegment.sequence - 1)",
+        ]:
+            self.assertIn(contract, player)
+        self.assertIn('command not in {"release_through", "set_buffer_limit", "stop"}', worker)
+        self.assertIn("def _release_segments_through", worker)
+
+    def test_seek_starts_before_the_configured_buffer_is_full(self):
+        player = PLAYER_SOURCE.read_text()
+
+        for contract in [
+            "Double(generationHasStarted ? rebufferSegmentCount : startupSegmentCount)",
+            "Start as soon as a short playable lead is available",
+            "min(runner?.previewBufferLimit ?? 8, previewSegmentSeconds)",
+        ]:
+            self.assertIn(contract, player)
+        self.assertNotIn("requireConfiguredBuffer", player)
+        self.assertNotIn("generationNeedsSeekBuffer", player)
+
+    def test_seek_slider_uses_the_dragged_position_until_commit(self):
+        player = PLAYER_SOURCE.read_text()
+
+        for contract in [
+            "@State private var isScrubbing = false",
+            "get: { isScrubbing ? seekPosition : controller.position }",
+            "isScrubbing = true",
+            "let target = seekPosition",
+            "controller.seek(to: target)",
+        ]:
+            self.assertIn(contract, player)
+
+    def test_seek_keeps_the_source_frame_and_bar_visible_while_refilling(self):
+        player = PLAYER_SOURCE.read_text()
+
+        for contract in [
+            "preserveCurrentSource: Bool = false",
+            "stop(preserveSourceItem: canReuseCurrentSource)",
+            "preserveCurrentSource: true",
+            "sourcePlayer.seek(",
+            "self.position = startSeconds",
+            "showsSourceFrameWhilePreparingRestoration",
+            "position = requestedStartSeconds",
+        ]:
+            self.assertIn(contract, player)
+        self.assertIn("if !preserveSourceItem", player)
 
     def test_playback_input_is_independent_from_export_input(self):
         player = PLAYER_SOURCE.read_text()
@@ -143,6 +242,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "--roi-enhancer", "--roi-enhancer-model", "--roi-enhancer-scale",
             "--roi-enhancer-strength", "--roi-enhancer-tile",
             "--effect-upscale", "--buffer-limit",
+            "--realtime-optimize",
         ]:
             self.assertIn(option, app)
 
@@ -321,14 +421,24 @@ class StandaloneAppOptionTests(unittest.TestCase):
         ]:
             self.assertIn(contract, player)
 
+    def test_app_supports_processing_without_segment_copy(self):
+        source = APP_SOURCE.read_text()
+
+        self.assertIn("@Published var noSplit = false", source)
+        self.assertIn('Toggle("分割しない", isOn: $runner.noSplit)', source)
+        self.assertIn('args.append("--no-split")', source)
+        self.assertIn(".disabled(runner.noSplit)", source)
+
     def test_preview_has_independent_selectable_restoration_model(self):
         source = APP_SOURCE.read_text()
         player = PLAYER_SOURCE.read_text()
 
         self.assertIn("@Published var previewRestorationModel: String", source)
         self.assertIn("var previewRestorationModel: String?", source)
+        self.assertIn("@Published var previewDetectionModel: String", source)
+        self.assertIn("@Published var previewRealtimeOptimization = true", source)
         self.assertIn(
-            'supportsCoreAI ? "basicvsrpp-v1.2-coreai" : "basicvsrpp-v1.2"',
+            'supportsCoreAI ? "basicvsrpp-v1.2-coreai-variable" : "basicvsrpp-v1.2"',
             source,
         )
         self.assertIn("let previewModel = try resolvedPreviewRestorationModel", source)
@@ -336,6 +446,14 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn("switch previewModel", source)
         self.assertIn(
             'Picker("復元モデル", selection: $runner.previewRestorationModel)',
+            player,
+        )
+        self.assertIn(
+            'Picker("再生用検出モデル", selection: $runner.previewDetectionModel)',
+            player,
+        )
+        self.assertIn(
+            'Toggle("リアルタイム最適化", isOn: $runner.previewRealtimeOptimization)',
             player,
         )
         self.assertIn('if !controller.isVRVideo', player)
@@ -357,8 +475,8 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertEqual(info["LSMinimumSystemVersion"], "26.0")
         self.assertNotIn("import CoreAI", source)
         self.assertEqual(build_script.count("-target arm64-apple-macosx26.0"), 1)
-        self.assertEqual(build_script.count("-target arm64-apple-macosx27.0"), 3)
-        self.assertEqual(build_script.count("-framework CoreAI"), 3)
+        self.assertEqual(build_script.count("-target arm64-apple-macosx27.0"), 4)
+        self.assertEqual(build_script.count("-framework CoreAI"), 4)
 
     def test_model_choices_follow_coreai_os_availability(self):
         source = APP_SOURCE.read_text()
@@ -383,11 +501,41 @@ class StandaloneAppOptionTests(unittest.TestCase):
         ):
             self.assertIn(f'"{name}"', source)
         self.assertIn('"vr-v2-accurate-coreml"', source)
+        self.assertIn('#if !MIOH_PORTABLE_COREAI', source)
+        self.assertIn('models.append("jasna-v6-coreai")', source)
+        self.assertIn('models.append("jasna-v6-large-coreai")', source)
         base_models = source.split("let baseDetectionModels = [", 1)[1].split("]", 1)[0]
         self.assertNotIn('"v2"', base_models)
         self.assertNotIn('"v4-fast"', base_models)
         self.assertNotIn('"vr-v2-accurate"', base_models)
         self.assertIn("normalizeModelSelections()", source)
+
+    def test_rfdetr_is_dedicated_only_and_does_not_change_shared_memory_policy(self):
+        source = APP_SOURCE.read_text()
+        build_script = BUILD_SCRIPT.read_text()
+        restorer = (
+            ROOT / "lada" / "restorationpipeline" / "frame_restorer.py"
+        ).read_text()
+        detector = (
+            ROOT / "lada" / "restorationpipeline" / "mosaic_detector.py"
+        ).read_text()
+
+        self.assertIn(
+            '#if !MIOH_PORTABLE_COREAI\n    models.append("jasna-v6-coreai")',
+            source,
+        )
+        self.assertIn(
+            'if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]',
+            build_script,
+        )
+        self.assertIn("rfdetr-v6-576-fp32.aimodel", build_script)
+        self.assertIn("rfdetr-v6-large-768-fp32.aimodel", build_script)
+        self.assertIn("-iname '*rfdetr*' -delete", build_script)
+        self.assertIn('site-packages/rfdetr"', build_script)
+        self.assertNotIn('site-packages/lada/models/rfdetr"', build_script)
+        self.assertNotIn("calculate_frame_detection_queue_size", restorer)
+        self.assertNotIn("pipeline_queue_depth", detector)
+        self.assertIn("maxsize=8", detector)
 
     def test_coreai_helper_environment_is_only_exported_when_supported(self):
         source = APP_SOURCE.read_text()
@@ -578,6 +726,14 @@ class StandaloneAppOptionTests(unittest.TestCase):
             '"$RESOURCES/runtime/lib/python3.12/site-packages/mioh_preview_worker.py"',
             script,
         )
+        self.assertIn('"$PACKAGE_DIR/NativePreviewPipeline.swift"', script)
+        self.assertIn(
+            '"$RESOURCES/bin/mioh-native-coreai-preview"',
+            script,
+        )
+        source = APP_SOURCE.read_text()
+        self.assertIn('"LADA_NATIVE_COREAI_PREVIEW_RUNNER"', source)
+        self.assertIn('"LADA_NATIVE_SWIFT_PREVIEW"] = "1"', source)
 
     def test_app_allows_loopback_video_streaming(self):
         info = INFO_PLIST.read_text()

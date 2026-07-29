@@ -15,7 +15,7 @@ class FakeClip:
 
 
 class FrameRestorerMemoryReleaseTests(unittest.TestCase):
-    def test_completed_clip_releases_only_unused_memory(self):
+    def test_completed_clip_releases_only_unused_memory_under_pressure(self):
         restorer = object.__new__(FrameRestorer)
         restorer.device = torch.device("mps")
         completed = FakeClip(0)
@@ -23,8 +23,10 @@ class FrameRestorerMemoryReleaseTests(unittest.TestCase):
         clip_buffer = [completed, active]
 
         with (
-            mock.patch("gc.collect") as collect,
-            mock.patch("torch.mps.empty_cache") as empty_cache,
+            mock.patch(
+                "lada.restorationpipeline.frame_restorer.release_mps_memory_if_needed",
+                return_value=True,
+            ) as release_mps,
             mock.patch(
                 "lada.restorationpipeline.frame_restorer._release_darwin_malloc_cache",
                 create=True,
@@ -33,9 +35,29 @@ class FrameRestorerMemoryReleaseTests(unittest.TestCase):
             restorer._collect_garbage(clip_buffer)
 
         self.assertEqual(clip_buffer, [active])
-        collect.assert_called_once_with()
-        empty_cache.assert_called_once_with()
+        release_mps.assert_called_once_with()
         release_malloc.assert_called_once_with()
+
+    def test_completed_clip_keeps_caches_without_memory_pressure(self):
+        restorer = object.__new__(FrameRestorer)
+        restorer.device = torch.device("mps")
+        clip_buffer = [FakeClip(0)]
+
+        with (
+            mock.patch(
+                "lada.restorationpipeline.frame_restorer.release_mps_memory_if_needed",
+                return_value=False,
+            ) as release_mps,
+            mock.patch(
+                "lada.restorationpipeline.frame_restorer._release_darwin_malloc_cache",
+                create=True,
+            ) as release_malloc,
+        ):
+            restorer._collect_garbage(clip_buffer)
+
+        self.assertEqual(clip_buffer, [])
+        release_mps.assert_called_once_with()
+        release_malloc.assert_not_called()
 
     def test_active_clip_does_not_trigger_memory_release(self):
         restorer = object.__new__(FrameRestorer)
@@ -44,7 +66,9 @@ class FrameRestorerMemoryReleaseTests(unittest.TestCase):
 
         with (
             mock.patch("gc.collect") as collect,
-            mock.patch("torch.mps.empty_cache") as empty_cache,
+            mock.patch(
+                "lada.restorationpipeline.frame_restorer.release_mps_memory_if_needed",
+            ) as release_mps,
             mock.patch(
                 "lada.restorationpipeline.frame_restorer._release_darwin_malloc_cache",
                 create=True,
@@ -53,7 +77,7 @@ class FrameRestorerMemoryReleaseTests(unittest.TestCase):
             restorer._collect_garbage(clip_buffer)
 
         collect.assert_not_called()
-        empty_cache.assert_not_called()
+        release_mps.assert_not_called()
         release_malloc.assert_not_called()
 
 

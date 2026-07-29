@@ -208,8 +208,8 @@ class CompiledCoreAIRuntime:
         if self._mapping is None:
             raise RuntimeError("compiled Core AI runtime has not started")
         layout = self._layouts[name]
-        payload = value.tobytes(order="C")
-        if len(payload) != layout["byteCount"]:
+        payload = memoryview(value).cast("B")
+        if payload.nbytes != layout["byteCount"]:
             raise ValueError(f"Core AI tensor {name} byte count does not match contract")
         self._mapping.seek(int(layout["offset"]))
         self._mapping.write(payload)
@@ -220,12 +220,15 @@ class CompiledCoreAIRuntime:
         result: dict[str, np.ndarray] = {}
         for spec in self.outputs:
             layout = self._layouts[spec.name]
-            self._mapping.seek(int(layout["offset"]))
-            payload = self._mapping.read(int(layout["byteCount"]))
-            if len(payload) != layout["byteCount"]:
-                raise RuntimeError(f"short Core AI output for tensor {spec.name}")
-            result[spec.name] = np.frombuffer(payload, dtype=np.float16).reshape(
-                spec.shape
+            # Read directly from the persistent mmap and make only the one
+            # owning copy returned to the caller. mmap.read() would first
+            # allocate an equally large bytes object, doubling every Core AI
+            # output at the host boundary.
+            result[spec.name] = np.ndarray(
+                shape=spec.shape,
+                dtype=np.float16,
+                buffer=self._mapping,
+                offset=int(layout["offset"]),
             ).copy()
         return result
 

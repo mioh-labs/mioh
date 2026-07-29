@@ -30,7 +30,11 @@ struct PlatformCapabilities {
   }
 
   var previewRestorationModel: String {
-    supportsCoreAI ? "basicvsrpp-v1.2-coreai" : "basicvsrpp-v1.2"
+    supportsCoreAI ? "basicvsrpp-v1.2-coreai-variable" : "basicvsrpp-v1.2"
+  }
+
+  var previewDetectionModel: String {
+    supportsCoreAI ? "v4-accurate-coreai" : "v4-accurate-coreml"
   }
 
   let baseRestorationModels = ["basicvsrpp-v1.2", "カスタム"]
@@ -55,12 +59,20 @@ struct PlatformCapabilities {
   ]
 
   var detectionModels: [String] {
-    supportsCoreAI
-      ? baseDetectionModels + [
+    guard supportsCoreAI else { return baseDetectionModels }
+    var models = baseDetectionModels + [
         "v2-coreai", "v3.1-fast-coreai", "v3.1-accurate-coreai",
         "v4-fast-coreai", "v4-accurate-coreai", "vr-v2-accurate-coreai",
       ]
-      : baseDetectionModels
+#if !MIOH_PORTABLE_COREAI
+    models.append("jasna-v6-coreai")
+    models.append("jasna-v6-large-coreai")
+#endif
+    return models
+  }
+
+  var previewDetectionModels: [String] {
+    detectionModels.filter { !$0.hasPrefix("jasna-v6") }
   }
 }
 
@@ -85,6 +97,7 @@ struct MiohUserDefaultsSnapshot: Codable {
   var useSegmentCount: Bool
   var segmentCount: Int
   var segmentDuration: Int
+  var noSplit: Bool?
   var mergeEncoder: String
   var deleteSegments: Bool
   var keepTemp: Bool
@@ -138,6 +151,9 @@ struct MiohUserDefaultsSnapshot: Codable {
   var previewBufferLimit: Double
   var previewRestorationModel: String?
   var previewCustomRestorationModel: String?
+  var previewDetectionModel: String?
+  var previewCustomDetectionModel: String?
+  var previewRealtimeOptimization: Bool?
   var previewProjectionMode: String?
   var previewVideoLayout: String?
   var previewEye: String?
@@ -162,6 +178,7 @@ struct MiohUserDefaultsSnapshot: Codable {
       useSegmentCount: true,
       segmentCount: 4,
       segmentDuration: 60,
+      noSplit: false,
       mergeEncoder: "copy",
       deleteSegments: false,
       keepTemp: true,
@@ -210,6 +227,9 @@ struct MiohUserDefaultsSnapshot: Codable {
       previewBufferLimit: 8.0,
       previewRestorationModel: capabilities.previewRestorationModel,
       previewCustomRestorationModel: "",
+      previewDetectionModel: capabilities.previewDetectionModel,
+      previewCustomDetectionModel: "",
+      previewRealtimeOptimization: true,
       previewProjectionMode: "通常",
       previewVideoLayout: "SBS 左右",
       previewEye: "左目",
@@ -243,6 +263,7 @@ final class RestorationRunner: ObservableObject {
   @Published var useSegmentCount = true
   @Published var segmentCount = 4
   @Published var segmentDuration = 60
+  @Published var noSplit = false
   @Published var mergeEncoder = "copy"
   @Published var deleteSegments = false
   @Published var keepTemp = true
@@ -296,6 +317,9 @@ final class RestorationRunner: ObservableObject {
   @Published var previewBufferLimit = 8.0
   @Published var previewRestorationModel: String
   @Published var previewCustomRestorationModel = ""
+  @Published var previewDetectionModel: String
+  @Published var previewCustomDetectionModel = ""
+  @Published var previewRealtimeOptimization = true
   @Published var previewProjectionMode = "通常"
   @Published var previewVideoLayout = "SBS 左右"
   @Published var previewEye = "左目"
@@ -319,6 +343,7 @@ final class RestorationRunner: ObservableObject {
     self.capabilities = capabilities
     restorationModel = capabilities.defaultRestorationModel
     previewRestorationModel = capabilities.previewRestorationModel
+    previewDetectionModel = capabilities.previewDetectionModel
     detectionModel = "v2-coreml"
     loadSavedDefaultsOnLaunch()
   }
@@ -329,6 +354,7 @@ final class RestorationRunner: ObservableObject {
   ]
   var restorationModels: [String] { capabilities.restorationModels }
   var detectionModels: [String] { capabilities.detectionModels }
+  var previewDetectionModels: [String] { capabilities.previewDetectionModels }
   let enhancerModels = ["none", "realesrgan", "mewzoom", "swinir", "spandrel"]
   private let knownROIEnhancerModelNames: Set<String> = [
     "realesrgan-x2", "realesrgan-x2-coreai",
@@ -651,6 +677,7 @@ final class RestorationRunner: ObservableObject {
       useSegmentCount: useSegmentCount,
       segmentCount: segmentCount,
       segmentDuration: segmentDuration,
+      noSplit: noSplit,
       mergeEncoder: mergeEncoder,
       deleteSegments: deleteSegments,
       keepTemp: keepTemp,
@@ -699,6 +726,9 @@ final class RestorationRunner: ObservableObject {
       previewBufferLimit: previewBufferLimit,
       previewRestorationModel: previewRestorationModel,
       previewCustomRestorationModel: previewCustomRestorationModel,
+      previewDetectionModel: previewDetectionModel,
+      previewCustomDetectionModel: previewCustomDetectionModel,
+      previewRealtimeOptimization: previewRealtimeOptimization,
       previewProjectionMode: previewProjectionMode,
       previewVideoLayout: previewVideoLayout,
       previewEye: previewEye,
@@ -724,6 +754,7 @@ final class RestorationRunner: ObservableObject {
     useSegmentCount = snapshot.useSegmentCount
     segmentCount = min(max(snapshot.segmentCount, 1), 128)
     segmentDuration = min(max(snapshot.segmentDuration, 10), 3600)
+    noSplit = snapshot.noSplit ?? false
     mergeEncoder = snapshot.mergeEncoder
     deleteSegments = snapshot.deleteSegments
     keepTemp = snapshot.keepTemp
@@ -779,6 +810,11 @@ final class RestorationRunner: ObservableObject {
       snapshot.previewRestorationModel ?? ""
     ) ? snapshot.previewRestorationModel! : capabilities.previewRestorationModel
     previewCustomRestorationModel = snapshot.previewCustomRestorationModel ?? ""
+    previewDetectionModel = previewDetectionModels.contains(
+      snapshot.previewDetectionModel ?? ""
+    ) ? snapshot.previewDetectionModel! : capabilities.previewDetectionModel
+    previewCustomDetectionModel = snapshot.previewCustomDetectionModel ?? ""
+    previewRealtimeOptimization = snapshot.previewRealtimeOptimization ?? true
     previewProjectionMode = ["通常", "VR180", "360"].contains(snapshot.previewProjectionMode ?? "")
       ? snapshot.previewProjectionMode!
       : "通常"
@@ -802,8 +838,10 @@ final class RestorationRunner: ObservableObject {
     normalizeModelSelections()
     let previewModel = try resolvedPreviewRestorationModel(in: resources)
     try rejectUnsupportedCoreAIModel(previewModel)
-    let detection = try resolvedDetectionModel(in: resources)
-    if roiEnhancer != "none" { try rejectUnsupportedCoreAIModel(roiEnhancerModel) }
+    let detection = try resolvedPreviewDetectionModel(in: resources)
+    if !previewRealtimeOptimization && roiEnhancer != "none" {
+      try rejectUnsupportedCoreAIModel(roiEnhancerModel)
+    }
     var args = ["--input", input.path, "--output-dir", outputDirectory.path]
     add(&args, "--device", device)
     args.append(fp16 ? "--fp16" : "--no-fp16")
@@ -814,8 +852,9 @@ final class RestorationRunner: ObservableObject {
     case "basicvsrpp-v1.2-coreai": automaticClipLength = 98
     case "basicvsrpp-v1.2-coreai-t36": automaticClipLength = 104
     case "basicvsrpp-v1.2-coreai-t90": automaticClipLength = 178
-    case "basicvsrpp-v1.2-coreai-variable",
-      "basicvsrpp-v1.2-coreai-variable-hq":
+    case "basicvsrpp-v1.2-coreai-variable":
+      automaticClipLength = previewRealtimeOptimization ? 90 : 180
+    case "basicvsrpp-v1.2-coreai-variable-hq":
       automaticClipLength = 180
     default: automaticClipLength = 180
     }
@@ -828,15 +867,18 @@ final class RestorationRunner: ObservableObject {
     add(&args, "--blend-feather", blendFeather)
     add(&args, "--texture-mix", textureMix)
     add(&args, "--smooth-strength", smoothStrength)
-    add(&args, "--roi-enhancer", roiEnhancer)
-    addOptional(&args, "--roi-enhancer-model", roiEnhancerModel)
+    add(&args, "--roi-enhancer", previewRealtimeOptimization ? "none" : roiEnhancer)
+    if !previewRealtimeOptimization {
+      addOptional(&args, "--roi-enhancer-model", roiEnhancerModel)
+    }
     add(&args, "--roi-enhancer-scale", roiEnhancerScale)
-    add(&args, "--roi-enhancer-strength", roiEnhancerStrength)
+    add(&args, "--roi-enhancer-strength", previewRealtimeOptimization ? 0 : roiEnhancerStrength)
     add(&args, "--roi-enhancer-tile", roiEnhancerTile)
-    add(&args, "--effect-upscale", effectUpscale)
+    add(&args, "--effect-upscale", previewRealtimeOptimization ? 1 : effectUpscale)
     add(&args, "--detection-empty-lookahead", detectionEmptyLookahead)
     addFlag(&args, "--detect-face-mosaics", detectFaceMosaics)
     add(&args, "--buffer-limit", previewBufferLimit)
+    if previewRealtimeOptimization { args.append("--realtime-optimize") }
     return args
   }
 
@@ -847,7 +889,9 @@ final class RestorationRunner: ObservableObject {
     addOptional(&args, "--lada-temp-dir", ladaTempDirectory)
     add(&args, "--parallel-workers", parallelWorkers)
     add(&args, "--executor", executor)
-    if useSegmentCount {
+    if noSplit {
+      args.append("--no-split")
+    } else if useSegmentCount {
       add(&args, "--segment-count", segmentCount)
     } else {
       add(&args, "--segment-duration", segmentDuration)
@@ -870,7 +914,7 @@ final class RestorationRunner: ObservableObject {
     if useQMin { add(&args, "--qmin", qmin) }
     if useQMax { add(&args, "--qmax", qmax) }
     if useFPS { add(&args, "--fps", fps) }
-    addFlag(&args, "--pre-fps-conversion", useFPS && preFPSConversion)
+    addFlag(&args, "--pre-fps-conversion", useFPS && preFPSConversion && !noSplit)
     addFlag(&args, "--mp4-fast-start", mp4FastStart)
     args.append(autoOptimize ? "--auto-optimize" : "--no-auto-optimize")
 
@@ -936,6 +980,18 @@ final class RestorationRunner: ObservableObject {
     return detectionModel
   }
 
+  private func resolvedPreviewDetectionModel(in resources: URL) throws -> String {
+    if previewDetectionModel == "カスタム" {
+      guard !previewCustomDetectionModel.isEmpty else {
+        throw RunnerError.missingValue("再生用検出モデル")
+      }
+      try rejectUnsupportedCoreAIModel(previewCustomDetectionModel)
+      return previewCustomDetectionModel
+    }
+    try rejectUnsupportedCoreAIModel(previewDetectionModel)
+    return previewDetectionModel
+  }
+
   private func normalizeModelSelections() {
     if restorationModel == "basicvsrpp-v1.2-coreai-variable-chunk6" {
       restorationModel = "basicvsrpp-v1.2-coreai-variable"
@@ -948,6 +1004,9 @@ final class RestorationRunner: ObservableObject {
     }
     if !restorationModels.contains(previewRestorationModel) {
       previewRestorationModel = capabilities.previewRestorationModel
+    }
+    if !previewDetectionModels.contains(previewDetectionModel) {
+      previewDetectionModel = capabilities.previewDetectionModel
     }
     if !detectionModels.contains(detectionModel) {
       detectionModel = "v2-coreml"
@@ -998,7 +1057,12 @@ final class RestorationRunner: ObservableObject {
     result["PYTHONHOME"] = resources.appendingPathComponent("runtime").path
     result["PYTHONPATH"] = sitePackages.path
     result["LADA_MODEL_WEIGHTS_DIR"] = resources.appendingPathComponent("models").path
+    result["LADA_PREVIEW_VIDEOTOOLBOX_RUNNER"] = resources
+      .appendingPathComponent("bin/mioh-preview-videotoolbox-encoder").path
     if capabilities.supportsCoreAI {
+      result["LADA_NATIVE_COREAI_PREVIEW_RUNNER"] = resources
+        .appendingPathComponent("bin/mioh-native-coreai-preview").path
+      result["LADA_NATIVE_SWIFT_PREVIEW"] = "1"
       result["LADA_COREAI_SWIFT_RUNNER"] = resources.appendingPathComponent("bin/lada-coreai-runner").path
       result["LADA_VARIABLE_COREAI_SWIFT_RUNNER"] = resources.appendingPathComponent("bin/lada-basicvsrpp-variable-runner").path
 #if MIOH_DEDICATED_VARIABLE_HQ
@@ -1011,6 +1075,8 @@ final class RestorationRunner: ObservableObject {
 #endif
     } else {
       result.removeValue(forKey: "LADA_COREAI_PYTHON")
+      result.removeValue(forKey: "LADA_NATIVE_COREAI_PREVIEW_RUNNER")
+      result.removeValue(forKey: "LADA_NATIVE_SWIFT_PREVIEW")
       result.removeValue(forKey: "LADA_COREAI_SWIFT_RUNNER")
       result.removeValue(forKey: "LADA_VARIABLE_COREAI_SWIFT_RUNNER")
       result.removeValue(forKey: "LADA_VARIABLE_COREAI_HQ_SWIFT_RUNNER")
@@ -1274,21 +1340,32 @@ struct ContentView: View {
     Form {
       Section("並列処理") {
         LabeledContent("並列数") { Stepper(value: $runner.parallelWorkers, in: 1...16) { Text("\(runner.parallelWorkers)") } }
+          .disabled(runner.noSplit)
         Picker("実行方式", selection: $runner.executor) { Text("プロセス").tag("process"); Text("スレッド").tag("thread") }
+          .disabled(runner.noSplit)
       }
       Section("セグメント") {
+        Toggle("分割しない", isOn: $runner.noSplit)
+        if runner.noSplit {
+          Text("元動画をsegmentsへコピーせず、そのまま1本で処理します")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
         Picker("分割方法", selection: $runner.useSegmentCount) {
           Text("個数").tag(true); Text("秒数").tag(false)
-        }.pickerStyle(.segmented)
+        }.pickerStyle(.segmented).disabled(runner.noSplit)
         if runner.useSegmentCount {
           LabeledContent("分割数") { Stepper(value: $runner.segmentCount, in: 1...128) { Text("\(runner.segmentCount)") } }
+            .disabled(runner.noSplit)
         } else {
           LabeledContent("長さ（秒）") { Stepper(value: $runner.segmentDuration, in: 10...3600, step: 10) { Text("\(runner.segmentDuration)") } }
+            .disabled(runner.noSplit)
         }
         LabeledContent("結合エンコーダー") { TextField("", text: $runner.mergeEncoder).frame(width: 220) }
         Toggle("処理済みセグメントを削除", isOn: $runner.deleteSegments)
         Toggle("一時ファイルを保持", isOn: $runner.keepTemp)
         Toggle("強制的に再分割", isOn: $runner.forceSplit)
+          .disabled(runner.noSplit)
       }
     }.formStyle(.grouped)
   }
@@ -1412,7 +1489,8 @@ struct ContentView: View {
       }
       Section("フレームレート") {
         optionalInt("FPS", enabled: $runner.useFPS, value: $runner.fps, range: 1...240)
-        Toggle("復元前にFPS変換", isOn: $runner.preFPSConversion).disabled(!runner.useFPS)
+        Toggle("復元前にFPS変換", isOn: $runner.preFPSConversion)
+          .disabled(!runner.useFPS || runner.noSplit)
       }
     }.formStyle(.grouped)
   }

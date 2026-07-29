@@ -33,7 +33,10 @@ EXPECTED_MODELS = {
     "basicvsrpp-v1.2-variable-coreai.h17s.aimodelc",
     "basicvsrpp-v1.2-variable-hq-coreai.h17s.aimodelc",
 }
-
+EXPECTED_DEDICATED_MODELS = EXPECTED_MODELS | {
+    "rfdetr-v6-576-fp32.aimodel",
+    "rfdetr-v6-large-768-fp32.aimodel",
+}
 EXPECTED_PORTABLE_MODELS = {
     "basicvsrpp-v1.2-t18-fp16.aimodel",
     "basicvsrpp-v1.2-t36-fp16.aimodel",
@@ -53,7 +56,7 @@ EXPECTED_PORTABLE_MODELS = {
 
 
 def test_verifier_requires_exact_specialization_set(tmp_path):
-    for model in EXPECTED_MODELS | {"unexpected.h17g.aimodelc"}:
+    for model in EXPECTED_DEDICATED_MODELS | {"unexpected.h17g.aimodelc"}:
         (tmp_path / model).mkdir()
 
     with pytest.raises(RuntimeError, match="unexpected Core AI assets"):
@@ -61,7 +64,7 @@ def test_verifier_requires_exact_specialization_set(tmp_path):
 
 
 def test_verifier_rejects_source_models(tmp_path):
-    for model in EXPECTED_MODELS:
+    for model in EXPECTED_DEDICATED_MODELS:
         (tmp_path / model).mkdir()
     (tmp_path / "basicvsrpp-v1.2-t36-b2-fp16.aimodel").mkdir()
 
@@ -116,7 +119,10 @@ def test_portable_verifier_rejects_compiled_model(tmp_path):
 
 
 def test_distribution_manifest_adds_variable_collection_to_dedicated_build():
-    assert verifier.expected_model_assets("dedicated", "h17s") == EXPECTED_MODELS
+    assert (
+        verifier.expected_model_assets("dedicated", "h17s")
+        == EXPECTED_DEDICATED_MODELS
+    )
     assert verifier.expected_model_assets("portable", "h17s") == EXPECTED_PORTABLE_MODELS
 
 

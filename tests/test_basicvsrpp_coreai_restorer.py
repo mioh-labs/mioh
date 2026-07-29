@@ -311,6 +311,31 @@ class CoreAIBasicVSRPPRestorerTests(unittest.TestCase):
         self.assertEqual(len(runtime.calls), 3)
         self.assertEqual(len(restored), 36)
 
+    def test_variable_long_clip_releases_each_chunk_output_before_next_call(self):
+        runtime = StreamingRecordingRuntime(step=30.0)
+        restorer = CoreAIVariableBasicvsrppMosaicRestorer(
+            Path("unused-variable.aimodelc"),
+            runtime=runtime,
+        )
+        video = [torch.zeros((2, 2, 3), dtype=torch.uint8) for _ in range(12)]
+
+        restored = restorer.restore(
+            video,
+            max_frames=6,
+            temporal_overlap=2,
+        )
+
+        self.assertEqual(runtime.stream_calls, 3)
+        self.assertEqual(
+            runtime.calls,
+            [
+                (1, 6, 3, 2, 2),
+                (1, 6, 3, 2, 2),
+                (1, 6, 3, 2, 2),
+            ],
+        )
+        self.assertEqual(len(restored), 12)
+
     def test_t36_model_pads_and_processes_fixed_36_frame_chunks(self):
         runtime = RecordingRuntime(step=90.0)
         restorer = CoreAIBasicvsrppMosaicRestorer(

@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Lada Authors
 # SPDX-License-Identifier: AGPL-3.0
 
+import torch.nn.functional as F
+
 from lada.models.basicvsrpp.mmagic.registry import MODELS
 from lada.models.basicvsrpp.mmagic.basicvsr_plusplus_net import BasicVSRPlusPlusNet
 from lada.models.basicvsrpp.mmagic.real_basicvsr import RealBasicVSR
@@ -99,3 +101,97 @@ class BasicVSRPlusPlusGan(RealBasicVSR):
         gt_gan = gt_gan.view(-1, c, h, w)
 
         return gt_pixel, gt_percep, gt_gan
+
+
+@MODELS.register_module()
+class BasicVSRPlusPlusSharpGan(BasicVSRPlusPlusGan):
+    """Sharpness-focused fine-tuning with ROI-only perceptual/GAN gradients."""
+
+    def __init__(
+        self,
+        generator,
+        discriminator=None,
+        gan_loss=None,
+        pixel_loss=None,
+        perceptual_loss=None,
+        high_frequency_loss=None,
+        temporal_loss=None,
+        roi_dilation=4,
+        **kwargs,
+    ):
+        super().__init__(
+            generator=generator,
+            discriminator=discriminator,
+            gan_loss=gan_loss,
+            pixel_loss=pixel_loss,
+            perceptual_loss=perceptual_loss,
+            **kwargs,
+        )
+        self.high_frequency_loss = (
+            MODELS.build(high_frequency_loss) if high_frequency_loss else None
+        )
+        self.temporal_loss = MODELS.build(temporal_loss) if temporal_loss else None
+        self.roi_dilation = roi_dilation
+
+    def _expanded_mask(self, mask):
+        if self.roi_dilation <= 0:
+            return mask
+        kernel = self.roi_dilation * 2 + 1
+        return F.max_pool2d(
+            mask, kernel_size=kernel, stride=1, padding=self.roi_dilation
+        )
+
+    def extract_gt_data(self, data_samples):
+        gt_sequence = data_samples.gt_img
+        mask_sequence = data_samples.mask.to(dtype=gt_sequence.dtype).clamp(0, 1)
+        n, t, c, h, w = gt_sequence.shape
+        gt_flat = gt_sequence.reshape(n * t, c, h, w)
+        mask_flat = mask_sequence.reshape(n * t, 1, h, w)
+        return (
+            gt_flat.clone(),
+            gt_flat.clone(),
+            gt_flat.clone(),
+            mask_flat,
+            gt_sequence,
+            mask_sequence,
+        )
+
+    def _roi_composite(self, prediction, batch_gt_data):
+        gt = batch_gt_data[2]
+        mask = self._expanded_mask(batch_gt_data[3])
+        return prediction * mask + gt * (1.0 - mask)
+
+    def prepare_discriminator_fake(self, fake_output, batch_gt_data):
+        return self._roi_composite(fake_output, batch_gt_data)
+
+    def g_step(self, batch_outputs, batch_gt_data):
+        gt_pixel, gt_percep, _, mask, gt_sequence, mask_sequence = batch_gt_data
+        fake_output, _ = batch_outputs
+        fake_output = fake_output.view(gt_pixel.shape)
+        fake_roi = self._roi_composite(fake_output, batch_gt_data)
+
+        losses = {}
+        if self.pixel_loss:
+            losses['loss_pix'] = self.pixel_loss(fake_output, gt_pixel)
+        if self.perceptual_loss:
+            loss_percep, loss_style = self.perceptual_loss(fake_roi, gt_percep)
+            if loss_percep is not None:
+                losses['loss_perceptual_roi'] = loss_percep
+            if loss_style is not None:
+                losses['loss_style_roi'] = loss_style
+        if self.high_frequency_loss:
+            losses['loss_high_frequency_roi'] = self.high_frequency_loss(
+                fake_output, gt_pixel, mask
+            )
+        if self.temporal_loss:
+            losses['loss_temporal_roi'] = self.temporal_loss(
+                fake_output.view_as(gt_sequence),
+                gt_sequence,
+                mask_sequence,
+            )
+        if self.gan_loss and self.discriminator:
+            fake_prediction = self.discriminator(fake_roi)
+            losses['loss_gan_roi'] = self.gan_loss(
+                fake_prediction, target_is_real=True, is_disc=False
+            )
+        return losses
