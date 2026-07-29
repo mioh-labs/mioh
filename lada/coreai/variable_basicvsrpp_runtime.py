@@ -195,19 +195,24 @@ class VariableBasicVSRPPRuntime:
             self._ensure_started(frame_count)
             assert self._mapping is not None and self._process is not None
             assert self._process.stdin is not None and self._process.stdout is not None
-            byte_count = frames.nbytes
             self._mapping.seek(0)
-            self._mapping.write(frames.tobytes(order="C"))
+            # ``frames`` is already validated as contiguous. Passing its
+            # buffer directly avoids a second whole-sequence bytes allocation
+            # for every temporal chunk.
+            self._mapping.write(memoryview(frames).cast("B"))
             self._process.stdin.write(struct.pack("<H", frame_count))
             self._process.stdin.flush()
             response = self._read_exact(self._process.stdout, 1)
             if response != b"\x00":
                 raise RuntimeError("variable Core AI runner returned an invalid response")
-            self._mapping.seek(self._sequence_bytes)
-            payload = self._mapping.read(byte_count)
-            if len(payload) != byte_count:
-                raise RuntimeError("short output from variable Core AI runner")
-            return np.frombuffer(payload, dtype=np.float16).reshape(frames.shape).copy()
+            # Copy once into the returned array instead of mmap.read() bytes
+            # followed by a second NumPy copy.
+            return np.ndarray(
+                shape=frames.shape,
+                dtype=np.float16,
+                buffer=self._mapping,
+                offset=self._sequence_bytes,
+            ).copy()
 
     def close(self) -> None:
         with self._lock:

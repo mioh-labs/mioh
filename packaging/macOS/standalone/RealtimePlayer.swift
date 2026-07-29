@@ -2,6 +2,7 @@ import AppKit
 import AVFoundation
 import AVKit
 import CoreVideo
+import Darwin
 import Foundation
 import Metal
 import Network
@@ -219,6 +220,7 @@ struct PreviewWorkerEvent: Decodable {
   let detail: String?
   let positionNs: Int64?
   let seconds: Double?
+  let segmentSeconds: Double?
 }
 
 private struct PreviewSegment {
@@ -660,6 +662,7 @@ struct VRPreviewSceneView: NSViewRepresentable {
     private var textureCache: CVMetalTextureCache?
     private var currentPixelBuffer: CVPixelBuffer?
     private var currentVideoTexture: CVMetalTexture?
+    private let textureLock = NSLock()
     private var currentProjection: PreviewProjectionMode = .vr180
     private var currentLayout: PreviewVideoLayout = .sbs
     private var currentEye: PreviewEye = .left
@@ -670,8 +673,12 @@ struct VRPreviewSceneView: NSViewRepresentable {
       if let displayedItem, let videoOutput {
         displayedItem.remove(videoOutput)
       }
-      if let textureCache {
-        CVMetalTextureCacheFlush(textureCache, 0)
+      textureLock.withLock {
+        currentPixelBuffer = nil
+        currentVideoTexture = nil
+        if let textureCache {
+          CVMetalTextureCacheFlush(textureCache, 0)
+        }
       }
     }
 
@@ -754,10 +761,18 @@ struct VRPreviewSceneView: NSViewRepresentable {
         displayedItem.remove(videoOutput)
       }
       displayedItem = item
-      videoOutput = nil
-      currentPixelBuffer = nil
-      currentVideoTexture = nil
-      videoNode.geometry?.firstMaterial?.diffuse.contents = NSColor.black
+      textureLock.withLock {
+        videoOutput = nil
+        videoNode.geometry?.firstMaterial?.diffuse.contents = NSColor.black
+        currentPixelBuffer = nil
+        currentVideoTexture = nil
+        if let textureCache {
+          // AVPlayerItem replacement is a generation boundary. Releasing the
+          // old texture before flushing prevents 8K seek generations from
+          // accumulating stale IOSurface-backed cache entries.
+          CVMetalTextureCacheFlush(textureCache, 0)
+        }
+      }
       guard let item else { return }
       let attributes: [String: Any] = [
         kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
@@ -766,10 +781,14 @@ struct VRPreviewSceneView: NSViewRepresentable {
       let output = AVPlayerItemVideoOutput(pixelBufferAttributes: attributes)
       item.add(output)
       output.requestNotificationOfMediaDataChange(withAdvanceInterval: 1.0 / 60.0)
-      videoOutput = output
+      textureLock.withLock {
+        videoOutput = output
+      }
     }
 
     func renderer(_ renderer: any SCNSceneRenderer, updateAtTime time: TimeInterval) {
+      textureLock.lock()
+      defer { textureLock.unlock() }
       guard let videoOutput, let textureCache else { return }
       let itemTime = videoOutput.itemTime(forHostTime: CACurrentMediaTime())
       guard videoOutput.hasNewPixelBuffer(forItemTime: itemTime),
@@ -847,34 +866,47 @@ final class RealtimePlayerController: ObservableObject {
   let driftToleranceSeconds = 0.080
 
   private var worker: Process?
+  private var workerRetirementTask: Task<Void, Never>?
   private var workerInput: Pipe?
   private var stdoutPipe: Pipe?
   private var stderrPipe: Pipe?
   private var stdoutBuffer = ""
   private var generation = 0
   private var nextSequence = 0
+  private var releasedThroughSequence = -1
   private var queuedSegments: [PreviewSegment] = []
   private var itemSegments: [ObjectIdentifier: PreviewSegment] = [:]
   private var notificationTokens: [NSObjectProtocol] = []
   private var timeObserver: Any?
   private var sourceItemStatusObservation: NSKeyValueObservation?
   private var sourceTimeControlObservation: NSKeyValueObservation?
+  private var sourceLoadedTimeRangesObservation: NSKeyValueObservation?
   private var sourceResourceLoader: HEV1LoopbackServer?
   private var sessionDirectory: URL?
   private var requestedStartSeconds = 0.0
   private var shouldPlay = true
   private var generationHasStarted = false
   private var generationStartPending = false
+  private var generationReachedEOF = false
+  private var sourceSeekNeedsBuffer = false
+  private var previewSegmentSeconds = 2.0
   private weak var runner: RestorationRunner?
+
+  var showsSourceFrameWhilePreparingRestoration: Bool {
+    guard !sourceOnlyPlayback, !generationHasStarted else { return false }
+    return state == .loading || state == .seeking || state == .buffering
+  }
 
   init() {
     restoredPlayer.isMuted = true
+    restoredPlayer.actionAtItemEnd = .advance
     sourcePlayer.volume = 1
   }
 
   deinit {
     sourceItemStatusObservation?.invalidate()
     sourceTimeControlObservation?.invalidate()
+    sourceLoadedTimeRangesObservation?.invalidate()
     if let timeObserver {
       sourcePlayer.removeTimeObserver(timeObserver)
     }
@@ -883,8 +915,15 @@ final class RealtimePlayerController: ObservableObject {
     }
   }
 
-  func start(runner: RestorationRunner, at startSeconds: Double = 0) {
-    stop()
+  func start(
+    runner: RestorationRunner,
+    at startSeconds: Double = 0,
+    autoPlay: Bool = true,
+    preserveCurrentSource: Bool = false
+  ) {
+    let canReuseCurrentSource = preserveCurrentSource && sourcePlayer.currentItem != nil
+    stop(preserveSourceItem: canReuseCurrentSource)
+    let retirement = workerRetirementTask
     guard let input = previewInputURL else {
       fail("再生タブで入力動画を選択してください")
       return
@@ -907,14 +946,35 @@ final class RealtimePlayerController: ObservableObject {
       generation += 1
       let startingGeneration = generation
       nextSequence = 0
+      releasedThroughSequence = -1
       requestedStartSeconds = startSeconds
-      shouldPlay = true
+      position = startSeconds
+      shouldPlay = autoPlay
       generationHasStarted = false
       generationStartPending = false
+      generationReachedEOF = false
+      sourceSeekNeedsBuffer = false
       sourceOnlyPlayback = runner.previewProjectionMode != "通常"
       state = .loading
       errorMessage = ""
       playbackDetail = sourceOnlyPlayback ? "VR動画のコンテナを確認中" : ""
+
+      if canReuseCurrentSource && !sourceOnlyPlayback {
+        // Keep the already-decoded source item visible while the restoration
+        // worker retires and refills. This gives immediate visual feedback at
+        // the requested time without weakening the process-per-seek boundary.
+        sourcePlayer.pause()
+        sourcePlayer.seek(
+          to: CMTime(seconds: startSeconds, preferredTimescale: 600),
+          toleranceBefore: .zero,
+          toleranceAfter: .zero
+        ) { [weak self] _ in
+          Task { @MainActor in
+            guard let self, self.generation == startingGeneration else { return }
+            self.position = startSeconds
+          }
+        }
+      }
 
       if sourceOnlyPlayback {
         startSourceOnlyPlayback(
@@ -955,14 +1015,23 @@ final class RealtimePlayerController: ObservableObject {
       process.standardError = errorPipe
 
       Task { @MainActor [self] in
-        let prepared: PreparedSourcePlayerItem
-        do {
-          prepared = try await self.prepareSourcePlayerItem(input: input)
-        } catch {
-          guard self.generation == startingGeneration else { return }
-          self.fail("元動画を開けません: \(error.localizedDescription)")
-          self.cleanupSession()
-          return
+        if let retirement {
+          await retirement.value
+        }
+        guard self.generation == startingGeneration else { return }
+        self.workerRetirementTask = nil
+        let prepared: PreparedSourcePlayerItem?
+        if canReuseCurrentSource {
+          prepared = nil
+        } else {
+          do {
+            prepared = try await self.prepareSourcePlayerItem(input: input)
+          } catch {
+            guard self.generation == startingGeneration else { return }
+            self.fail("元動画を開けません: \(error.localizedDescription)")
+            self.cleanupSession()
+            return
+          }
         }
         guard self.generation == startingGeneration, self.state == .loading || self.state == .buffering else {
           return
@@ -971,10 +1040,12 @@ final class RealtimePlayerController: ObservableObject {
         self.workerInput = inputPipe
         self.stdoutPipe = outputPipe
         self.stderrPipe = errorPipe
-        self.sourceResourceLoader = prepared.resourceLoader
-        self.sourcePlayer.replaceCurrentItem(with: prepared.item)
+        if let prepared {
+          self.sourceResourceLoader = prepared.resourceLoader
+          self.sourcePlayer.replaceCurrentItem(with: prepared.item)
+        }
         self.sourcePlayer.volume = self.muted ? 0 : Float(self.volume)
-        if prepared.usesVirtualContainer {
+        if prepared?.usesVirtualContainer == true {
           self.runner?.appendExternalLog(
             "再生: AVFoundation互換の仮想コンテナを使用します（ファイル変換なし）\n"
           )
@@ -990,14 +1061,26 @@ final class RealtimePlayerController: ObservableObject {
           guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
           Task { @MainActor in self?.runner?.appendExternalLog(text) }
         }
-        process.terminationHandler = { [weak self] completed in
+        process.terminationHandler = { [weak self, outputPipe, errorPipe] completed in
           Task { @MainActor in
             guard let self, self.worker === completed else { return }
-            self.stdoutPipe?.fileHandleForReading.readabilityHandler = nil
-            self.stderrPipe?.fileHandleForReading.readabilityHandler = nil
             self.worker = nil
-            if completed.terminationStatus != 0 && self.state != .idle {
-              self.fail("プレビューワーカーが終了しました")
+            // Let readabilityHandler deliver any final segment/error event
+            // already buffered in the pipe before classifying the exit.
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            outputPipe.fileHandleForReading.readabilityHandler = nil
+            errorPipe.fileHandleForReading.readabilityHandler = nil
+            if self.stdoutPipe === outputPipe { self.stdoutPipe = nil }
+            if self.stderrPipe === errorPipe { self.stderrPipe = nil }
+            guard self.sessionDirectory == session, self.worker == nil else { return }
+            if self.state != .idle && self.state != .ended && self.state != .failed
+              && !self.generationReachedEOF
+            {
+              self.fail(
+                completed.terminationStatus == 0
+                  ? "プレビューワーカーとの接続が終了しました"
+                  : "プレビューワーカーが終了しました"
+              )
             }
           }
         }
@@ -1073,8 +1156,12 @@ final class RealtimePlayerController: ObservableObject {
     } else if state == .paused || state == .buffering {
       shouldPlay = true
       if sourceOnlyPlayback {
-        sourcePlayer.play()
-        state = .playing
+        if sourceSeekNeedsBuffer {
+          resumeSourceAfterSeekIfBuffered()
+        } else {
+          sourcePlayer.play()
+          state = .playing
+        }
       } else {
         resumeIfBuffered()
       }
@@ -1122,6 +1209,8 @@ final class RealtimePlayerController: ObservableObject {
       let startingGeneration = generation
       let resumeAfterSeek = state != .paused
       shouldPlay = resumeAfterSeek
+      sourceSeekNeedsBuffer = resumeAfterSeek
+      sourcePlayer.pause()
       state = .seeking
       sourcePlayer.seek(
         to: CMTime(seconds: position, preferredTimescale: 600),
@@ -1132,35 +1221,37 @@ final class RealtimePlayerController: ObservableObject {
           guard let self, self.generation == startingGeneration, self.sourceOnlyPlayback else { return }
           if resumeAfterSeek {
             self.state = .buffering
-            self.sourcePlayer.play()
+            self.playbackDetail = "シーク後のバッファを準備中"
+            self.sourcePlayer.preroll(atRate: 1.0) { [weak self] _ in
+              Task { @MainActor in
+                self?.resumeSourceAfterSeekIfBuffered()
+              }
+            }
           } else {
+            self.sourceSeekNeedsBuffer = false
             self.state = .paused
           }
         }
       }
       return
     }
-    guard worker != nil else {
-      position = seconds
+    let resumeAfterSeek = state != .paused
+    position = min(max(seconds, 0), max(duration, 0.01))
+    guard let runner else {
+      fail("プレビューワーカーを再開できませんでした")
       return
     }
-    shouldPlay = state != .paused
-    sourcePlayer.pause()
-    restoredPlayer.pause()
-    position = min(max(seconds, 0), duration)
-    requestedStartSeconds = position
-    generation += 1
-    nextSequence = 0
-    generationHasStarted = false
-    generationStartPending = false
-    clearRestoredQueue(deleteFiles: true)
-    state = .seeking
-    sourcePlayer.seek(
-      to: CMTime(seconds: position, preferredTimescale: 600),
-      toleranceBefore: .zero,
-      toleranceAfter: .zero
+    // A seek is a generation boundary. Start a fresh worker process instead
+    // of trying to mutate a running restoration pipeline through stdin. This
+    // makes source position, model state, segment files and event generation
+    // a single transaction and prevents stale generations from filling the
+    // buffer while the player waits for the new one.
+    start(
+      runner: runner,
+      at: position,
+      autoPlay: resumeAfterSeek,
+      preserveCurrentSource: true
     )
-    sendCommand(["command": "seek", "position_ns": Int64(position * 1_000_000_000)])
   }
 
   func restartWithCurrentSettings(runner: RestorationRunner) {
@@ -1186,24 +1277,31 @@ final class RealtimePlayerController: ObservableObject {
     sourcePlayer.volume = value ? 0 : Float(volume)
   }
 
-  func stop() {
+  func stop(preserveSourceItem: Bool = false) {
     generation += 1
     sourceItemStatusObservation?.invalidate()
     sourceItemStatusObservation = nil
     sourceTimeControlObservation?.invalidate()
     sourceTimeControlObservation = nil
+    sourceLoadedTimeRangesObservation?.invalidate()
+    sourceLoadedTimeRangesObservation = nil
     sourceOnlyPlayback = false
     shouldPlay = false
     generationHasStarted = false
     generationStartPending = false
+    generationReachedEOF = false
+    sourceSeekNeedsBuffer = false
     sourcePlayer.pause()
-    sourcePlayer.replaceCurrentItem(with: nil)
-    sourceResourceLoader = nil
-    restoredPlayer.pause()
-    if worker != nil {
-      sendCommand(["command": "stop"])
-      worker?.terminate()
+    if !preserveSourceItem {
+      sourcePlayer.replaceCurrentItem(with: nil)
+      sourceResourceLoader = nil
     }
+    restoredPlayer.pause()
+    let retiringWorker = worker
+    if retiringWorker != nil {
+      sendCommand(["command": "stop"])
+    }
+    try? workerInput?.fileHandleForWriting.close()
     stdoutPipe?.fileHandleForReading.readabilityHandler = nil
     stderrPipe?.fileHandleForReading.readabilityHandler = nil
     worker = nil
@@ -1215,6 +1313,36 @@ final class RealtimePlayerController: ObservableObject {
     state = .idle
     bufferedSeconds = 0
     playbackDetail = ""
+    if let retiringWorker {
+      if retiringWorker.isRunning {
+        workerRetirementTask = Task { @MainActor in
+          let processIdentifier = retiringWorker.processIdentifier
+          // Give the worker a bounded grace period to stop its restoration
+          // threads and Core AI children after stdin is closed.
+          for _ in 0..<40 where retiringWorker.isRunning {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+          }
+          if retiringWorker.isRunning {
+            if kill(-processIdentifier, SIGTERM) != 0 {
+              retiringWorker.terminate()
+            }
+          }
+          for _ in 0..<20 where retiringWorker.isRunning {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+          }
+          if retiringWorker.isRunning {
+            _ = kill(-processIdentifier, SIGKILL)
+          }
+          // A new generation must not load Core AI assets until the old process
+          // tree is gone. This is the serialization barrier for repeated seeks.
+          while retiringWorker.isRunning {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+          }
+        }
+      } else {
+        workerRetirementTask = nil
+      }
+    }
   }
 
   private func prepareSourcePlayerItem(input: URL) async throws -> PreparedSourcePlayerItem {
@@ -1265,7 +1393,8 @@ final class RealtimePlayerController: ObservableObject {
     switch event.kind {
     case "ready":
       duration = event.duration ?? 0
-      state = .buffering
+      previewSegmentSeconds = max(0.1, event.segmentSeconds ?? 2.0)
+      state = shouldPlay ? .buffering : .paused
     case "segment":
       guard let sequence = event.sequence,
         let startNs = event.startNs,
@@ -1281,7 +1410,11 @@ final class RealtimePlayerController: ObservableObject {
       enqueue(segment)
       resumeIfBuffered()
     case "ended":
+      generationReachedEOF = true
       if queuedSegments.isEmpty {
+        shouldPlay = false
+        sourcePlayer.pause()
+        restoredPlayer.pause()
         state = .ended
       } else {
         resumeIfBuffered(endOfFile: true)
@@ -1291,6 +1424,16 @@ final class RealtimePlayerController: ObservableObject {
     case "buffer_limit":
       guard let seconds = event.seconds else { return }
       runner?.appendExternalLog("プレビューバッファ上限を適用: \(Int(seconds))秒\n")
+    case "buffer_full":
+      // The worker limits storage by finalized segment count, while the UI
+      // measures the actual timestamp range. Timestamp discontinuities can
+      // therefore report 24.8 s for a physically full 27 s buffer. Once the
+      // worker confirms the current limit is full, waiting for an impossible
+      // extra segment would deadlock playback.
+      let requestedLimit = max(1, runner?.previewBufferLimit ?? 8)
+      guard event.seconds == nil || abs((event.seconds ?? requestedLimit) - requestedLimit) < 0.1
+      else { return }
+      resumeIfBuffered(bufferIsFull: true)
     default:
       break
     }
@@ -1316,26 +1459,43 @@ final class RealtimePlayerController: ObservableObject {
   }
 
   private func finished(item: AVPlayerItem) {
-    guard let segment = itemSegments.removeValue(forKey: ObjectIdentifier(item)) else { return }
-    try? FileManager.default.removeItem(at: segment.url)
-    queuedSegments.removeAll { $0.sequence == segment.sequence }
-    updateBufferedDuration()
+    guard let segment = itemSegments[ObjectIdentifier(item)] else { return }
+    releaseConsumedSegments(through: segment.sequence)
     if queuedSegments.isEmpty && state == .playing {
       sourcePlayer.pause()
       restoredPlayer.pause()
-      state = .buffering
+      if generationReachedEOF {
+        shouldPlay = false
+        state = .ended
+      } else {
+        state = .buffering
+      }
     }
   }
 
-  private func resumeIfBuffered(endOfFile: Bool = false) {
+  private func resumeIfBuffered(
+    endOfFile: Bool = false,
+    bufferIsFull: Bool = false
+  ) {
     guard shouldPlay else { return }
     guard state != .playing, !generationStartPending else { return }
     if state == .paused {
       startPlayersFromCurrentPosition()
       return
     }
-    let required = generationHasStarted ? rebufferSegmentCount : startupSegmentCount
-    guard queuedSegments.count >= required || (endOfFile && !queuedSegments.isEmpty) else {
+    let nominalRequired =
+      Double(generationHasStarted ? rebufferSegmentCount : startupSegmentCount)
+      * previewSegmentSeconds
+    let required = min(
+      nominalRequired,
+      max(0, duration - requestedStartSeconds)
+    )
+    // Segment duration can vary slightly with source timestamps. Decide from
+    // the actual completed time range, not from a nominal segment count.
+    guard bufferedSeconds + 0.1 >= required
+      || (bufferIsFull && !queuedSegments.isEmpty)
+      || (endOfFile && !queuedSegments.isEmpty)
+    else {
       if state != .loading && state != .seeking { state = .buffering }
       return
     }
@@ -1388,6 +1548,17 @@ final class RealtimePlayerController: ObservableObject {
         self.updateSourcePlaybackState(item: item, generation: generation)
       }
     }
+    sourceLoadedTimeRangesObservation = item.observe(
+      \.loadedTimeRanges,
+      options: [.initial, .new]
+    ) { [weak self, weak item] _, _ in
+      Task { @MainActor in
+        guard let self, let item else { return }
+        guard self.generation == generation, self.sourcePlayer.currentItem === item else { return }
+        self.updateSourceBufferedDuration()
+        self.resumeSourceAfterSeekIfBuffered()
+      }
+    }
 
     let token = NotificationCenter.default.addObserver(
       forName: .AVPlayerItemDidPlayToEndTime,
@@ -1418,6 +1589,10 @@ final class RealtimePlayerController: ObservableObject {
       guard shouldPlay else {
         playbackDetail = ""
         state = .paused
+        return
+      }
+      if sourceSeekNeedsBuffer {
+        resumeSourceAfterSeekIfBuffered()
         return
       }
       switch sourcePlayer.timeControlStatus {
@@ -1453,6 +1628,26 @@ final class RealtimePlayerController: ObservableObject {
     }
   }
 
+  private func resumeSourceAfterSeekIfBuffered() {
+    guard sourceOnlyPlayback, sourceSeekNeedsBuffer, shouldPlay else { return }
+    updateSourceBufferedDuration()
+    let remaining = max(0, duration - position)
+    // A seek does not need to fill the entire configured rolling buffer.
+    // Start as soon as a short playable lead is available; AVFoundation keeps
+    // filling toward the configured upper limit while playback continues.
+    let requested = max(1, min(runner?.previewBufferLimit ?? 8, previewSegmentSeconds))
+    let required = min(requested, remaining)
+    guard required <= 0.1 || bufferedSeconds + 0.1 >= required else {
+      playbackDetail = "シーク後のバッファを準備中 \(bufferedSeconds.formatted(.number.precision(.fractionLength(1)))) / \(required.formatted(.number.precision(.fractionLength(1))))秒"
+      state = .buffering
+      return
+    }
+    sourceSeekNeedsBuffer = false
+    playbackDetail = ""
+    sourcePlayer.play()
+    state = .playing
+  }
+
   private func installTimeObserver() {
     if let timeObserver {
       sourcePlayer.removeTimeObserver(timeObserver)
@@ -1467,11 +1662,20 @@ final class RealtimePlayerController: ObservableObject {
 
   private func tick(sourceSeconds: Double) {
     guard sourceSeconds.isFinite else { return }
-    position = sourceSeconds
+    if !sourceOnlyPlayback && !generationHasStarted
+      && (state == .loading || state == .seeking || state == .buffering)
+    {
+      // A paused AVPlayer may briefly report its pre-seek timestamp while the
+      // exact seek is completing. Keep the UI bar pinned to the user's target.
+      position = requestedStartSeconds
+    } else {
+      position = sourceSeconds
+    }
     if sourceOnlyPlayback {
       updateSourceBufferedDuration()
       return
     }
+    retireSegmentsBeforeCurrentItem()
     updateBufferedDuration()
     guard state == .playing,
       let active = queuedSegments.first,
@@ -1512,13 +1716,70 @@ final class RealtimePlayerController: ObservableObject {
     bufferedSeconds = max(0, last.endSeconds - position)
   }
 
-  private func sendCommand(_ payload: [String: Any]) {
+  private func retireSegmentsBeforeCurrentItem() {
+    guard let currentItem = restoredPlayer.currentItem,
+      let activeSegment = itemSegments[ObjectIdentifier(currentItem)]
+    else { return }
+    // AVQueuePlayer can advance even when the per-item end notification is
+    // delayed or dropped. The current item is an independent second source of
+    // truth: every earlier sequence is definitely consumed and can be released.
+    releaseConsumedSegments(through: activeSegment.sequence - 1)
+  }
+
+  private func releaseConsumedSegments(through sequence: Int) {
+    guard sequence >= 0, sequence > releasedThroughSequence else { return }
+    let releasedSegments = queuedSegments.filter { $0.sequence <= sequence }
+    guard !releasedSegments.isEmpty else {
+      releasedThroughSequence = sequence
+      return
+    }
+
+    let releasedIdentifiers = itemSegments.compactMap { identifier, segment in
+      segment.sequence <= sequence ? identifier : nil
+    }
+    for identifier in releasedIdentifiers {
+      itemSegments.removeValue(forKey: identifier)
+    }
+    queuedSegments.removeAll { $0.sequence <= sequence }
+    releasedThroughSequence = sequence
+
+    // The worker owns finalized segment files and acknowledges consumption by
+    // deleting them. This makes its filesystem-based capacity check and the
+    // player's queue advance one transaction. If the worker has already ended,
+    // remove the files locally as a bounded fallback.
+    let accepted = sendCommand([
+      "command": "release_through",
+      "sequence": sequence,
+    ])
+    if !accepted {
+      for segment in releasedSegments {
+        do {
+          try FileManager.default.removeItem(at: segment.url)
+        } catch where (error as NSError).code != NSFileNoSuchFileError {
+          runner?.appendExternalLog(
+            "再生済みバッファを解放できませんでした: \(segment.url.lastPathComponent): \(error.localizedDescription)\n"
+          )
+        } catch {
+          // The worker may have already released this segment.
+        }
+      }
+    }
+    updateBufferedDuration()
+  }
+
+  @discardableResult
+  private func sendCommand(_ payload: [String: Any]) -> Bool {
     guard let handle = workerInput?.fileHandleForWriting,
       let data = try? JSONSerialization.data(withJSONObject: payload),
       var line = String(data: data, encoding: .utf8)?.data(using: .utf8)
-    else { return }
+    else { return false }
     line.append(0x0A)
-    try? handle.write(contentsOf: line)
+    do {
+      try handle.write(contentsOf: line)
+      return true
+    } catch {
+      return false
+    }
   }
 
   private func clearRestoredQueue(deleteFiles: Bool) {
@@ -1530,6 +1791,7 @@ final class RealtimePlayerController: ObservableObject {
     }
     queuedSegments.removeAll()
     itemSegments.removeAll()
+    releasedThroughSequence = -1
     bufferedSeconds = 0
   }
 
@@ -1544,6 +1806,9 @@ final class RealtimePlayerController: ObservableObject {
     sourceItemStatusObservation = nil
     sourceTimeControlObservation?.invalidate()
     sourceTimeControlObservation = nil
+    sourceLoadedTimeRangesObservation?.invalidate()
+    sourceLoadedTimeRangesObservation = nil
+    sourceSeekNeedsBuffer = false
     sourcePlayer.pause()
     restoredPlayer.pause()
     errorMessage = message
@@ -1557,6 +1822,7 @@ struct RealtimePlayerView: View {
   @ObservedObject var controller: RealtimePlayerController
   @ObservedObject var runner: RestorationRunner
   @State private var seekPosition = 0.0
+  @State private var isScrubbing = false
 
   var body: some View {
     VStack(spacing: 12) {
@@ -1568,24 +1834,52 @@ struct RealtimePlayerView: View {
       )
 
       if !controller.isVRVideo {
-        HStack(spacing: 12) {
-          Picker("復元モデル", selection: $runner.previewRestorationModel) {
-            ForEach(runner.restorationModels, id: \.self) { model in
-              Text(L(model)).tag(model)
+        VStack(alignment: .leading, spacing: 8) {
+          HStack(spacing: 12) {
+            Picker("復元モデル", selection: $runner.previewRestorationModel) {
+              ForEach(runner.restorationModels, id: \.self) { model in
+                Text(L(model)).tag(model)
+              }
             }
-          }
-          .frame(maxWidth: 430)
-          if runner.previewRestorationModel == "カスタム" {
-            TextField("モデル名またはパス", text: $runner.previewCustomRestorationModel)
-              .textFieldStyle(.roundedBorder)
-              .frame(maxWidth: 360)
-            Button {
-              runner.choosePath(\.previewCustomRestorationModel)
-            } label: {
-              Image(systemName: "folder")
+            .frame(maxWidth: 430)
+            if runner.previewRestorationModel == "カスタム" {
+              TextField("モデル名またはパス", text: $runner.previewCustomRestorationModel)
+                .textFieldStyle(.roundedBorder)
+                .frame(maxWidth: 360)
+              Button {
+                runner.choosePath(\.previewCustomRestorationModel)
+              } label: {
+                Image(systemName: "folder")
+              }
             }
+            Spacer()
           }
-          Spacer()
+          HStack(spacing: 12) {
+            Picker("再生用検出モデル", selection: $runner.previewDetectionModel) {
+              ForEach(runner.previewDetectionModels, id: \.self) { model in
+                Text(L(model)).tag(model)
+              }
+            }
+            .frame(maxWidth: 430)
+            if runner.previewDetectionModel == "カスタム" {
+              TextField("モデル名またはパス", text: $runner.previewCustomDetectionModel)
+                .textFieldStyle(.roundedBorder)
+                .frame(maxWidth: 360)
+              Button {
+                runner.choosePath(\.previewCustomDetectionModel)
+              } label: {
+                Image(systemName: "folder")
+              }
+            }
+            Toggle("リアルタイム最適化", isOn: $runner.previewRealtimeOptimization)
+              .toggleStyle(.checkbox)
+            Spacer()
+          }
+          if runner.previewRealtimeOptimization {
+            Text("復元は維持し、再生中だけROIエンハンサーと拡大後処理を省略します")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+          }
         }
       }
 
@@ -1593,9 +1887,15 @@ struct RealtimePlayerView: View {
         Color.black
         if runner.previewProjectionMode == "通常" {
           VideoPlayer(player: controller.sourcePlayer)
-            .opacity(controller.showOriginal ? 1 : 0.001)
+            .opacity(
+              controller.showOriginal || controller.showsSourceFrameWhilePreparingRestoration
+                ? 1 : 0.001
+            )
           VideoPlayer(player: controller.restoredPlayer)
-            .opacity(controller.showOriginal ? 0.001 : 1)
+            .opacity(
+              controller.showOriginal || controller.showsSourceFrameWhilePreparingRestoration
+                ? 0.001 : 1
+            )
         } else {
           VRPreviewSceneView(
             playerItem: controller.sourceOnlyPlayback || controller.showOriginal
@@ -1625,12 +1925,19 @@ struct RealtimePlayerView: View {
           .font(.caption.monospacedDigit()).frame(width: 68)
         Slider(
           value: Binding(
-            get: { controller.position },
+            get: { isScrubbing ? seekPosition : controller.position },
             set: { seekPosition = $0 }
           ),
           in: 0...max(controller.duration, 0.01),
           onEditingChanged: { editing in
-            if !editing { controller.seek(to: seekPosition) }
+            if editing {
+              seekPosition = controller.position
+              isScrubbing = true
+            } else {
+              let target = seekPosition
+              isScrubbing = false
+              controller.seek(to: target)
+            }
           }
         )
         Text(time(controller.duration))
@@ -1703,7 +2010,9 @@ struct RealtimePlayerView: View {
         } else {
           Button(action: controller.togglePlayback) { Label("再生", systemImage: "play.fill") }
         }
-        Button(role: .destructive, action: controller.stop) { Label("停止", systemImage: "stop.fill") }
+        Button(role: .destructive, action: { controller.stop() }) {
+          Label("停止", systemImage: "stop.fill")
+        }
           .disabled(controller.state == .idle)
         Toggle("処理前", isOn: $controller.showOriginal).toggleStyle(.switch)
         Spacer()

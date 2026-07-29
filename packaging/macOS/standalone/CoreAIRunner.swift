@@ -17,6 +17,18 @@ struct RunnerDescriptor: Decodable, Sendable {
   let outputs: [TensorDescriptor]
 }
 
+struct InferenceWorkspace {
+  var inputs: [String: NDArray]
+
+  init(descriptor: RunnerDescriptor) {
+    inputs = Dictionary(
+      uniqueKeysWithValues: descriptor.inputs.map {
+        ($0.name, NDArray(shape: $0.shape, scalarType: .float16))
+      }
+    )
+  }
+}
+
 enum RunnerError: LocalizedError {
   case invalidArguments
   case invalidDescriptor(String)
@@ -117,30 +129,29 @@ struct CoreAIRunner {
 
     let input = FileHandle.standardInput
     let responseWriter = ResponseWriter()
-    try await withThrowingTaskGroup(of: Void.self) { group in
-      while true {
-        let slot = Int(try readExactly(1, from: input)[0])
-        if slot == 255 {
-          break
-        }
-        guard slot < descriptor.slotCount else {
-          throw RunnerError.invalidSlot(slot)
-        }
-        group.addTask {
-          do {
-            try await infer(
-              function: function,
-              descriptor: descriptor,
-              slot: slot,
-              mapping: mapping
-            )
-            responseWriter.complete(slot: UInt8(slot))
-          } catch {
-            responseWriter.fail(error)
-          }
-        }
+    var workspaces = (0..<descriptor.slotCount).map { _ in
+      InferenceWorkspace(descriptor: descriptor)
+    }
+    while true {
+      let slot = Int(try readExactly(1, from: input)[0])
+      if slot == 255 {
+        break
       }
-      try await group.waitForAll()
+      guard slot < descriptor.slotCount else {
+        throw RunnerError.invalidSlot(slot)
+      }
+      do {
+        try await infer(
+          function: function,
+          descriptor: descriptor,
+          slot: slot,
+          mapping: mapping,
+          workspace: &workspaces[slot]
+        )
+        responseWriter.complete(slot: UInt8(slot))
+      } catch {
+        responseWriter.fail(error)
+      }
     }
   }
 
@@ -196,20 +207,25 @@ struct CoreAIRunner {
     function: InferenceFunction,
     descriptor: RunnerDescriptor,
     slot: Int,
-    mapping: UnsafeMutableRawPointer
+    mapping: UnsafeMutableRawPointer,
+    workspace: inout InferenceWorkspace
   ) async throws {
     let slotPointer = mapping.advanced(by: slot * descriptor.slotStride)
-    var inputValues: [String: NDArray] = [:]
     for input in descriptor.inputs {
-      var array = NDArray(shape: input.shape, scalarType: .float16)
-      var view = array.mutableView(as: Float16.self)
+      guard var array = workspace.inputs[input.name] else {
+        throw RunnerError.invalidDescriptor("missing input workspace for \(input.name)")
+      }
+      let view = array.mutableView(as: Float16.self)
       _ = view.withUnsafeMutablePointer { pointer, _, _ in
         memcpy(pointer, slotPointer.advanced(by: input.offset), input.byteCount)
       }
-      inputValues[input.name] = array
+      workspace.inputs[input.name] = array
     }
 
-    var resultValues = try await function.run(inputs: inputValues)
+    // Core AI's dynamic output dictionary owns its result NDArrays. Inputs
+    // remain persistent across calls; each completed output is copied exactly
+    // once into the shared mapping before the result dictionary is released.
+    var resultValues = try await function.run(inputs: workspace.inputs)
     for output in descriptor.outputs {
       guard let array = resultValues.remove(output.name)?.ndArray else {
         throw RunnerError.missingOutput(output.name)

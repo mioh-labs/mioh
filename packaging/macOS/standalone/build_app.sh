@@ -37,6 +37,7 @@ COMPILED_COREML_MODELS="${COMPILED_COREML_MODELS:-$BUILD_DIR/compiled-coreml-mod
 FFMPEG_CACHE="${FFMPEG_CACHE:-$BUILD_DIR/ffmpeg-static}"
 VENDORED_MPS_DEFORM_CONV="$PACKAGE_DIR/vendor/mps-deform-conv-0.2.2"
 MPS_DEFORM_BUILD_SOURCE="$BUILD_DIR/mps-deform-conv-source"
+PREVIEW_ENCODER_TARGET="arm64-apple-macosx26.0"
 
 rm -rf "$APP" "$BUILD_DIR/Lada.app"
 rm -f "$DMG" "$BUILD_DIR/Lada-0.11.0-unsigned.dmg" "$BUILD_DIR/mioh-0.11.0-unsigned.dmg"
@@ -71,6 +72,32 @@ xcrun swiftc \
   "$PACKAGE_DIR/MiohApp.swift" \
   "$PACKAGE_DIR/RealtimePlayer.swift" \
   -o "$CONTENTS/MacOS/mioh"
+xcrun swiftc \
+  "${SWIFT_SUBPROCESS_FLAGS[@]}" \
+  -O \
+  -parse-as-library \
+  -target "$PREVIEW_ENCODER_TARGET" \
+  -framework Accelerate \
+  -framework AVFoundation \
+  -framework CoreVideo \
+  -framework VideoToolbox \
+  "$PACKAGE_DIR/PreviewVideoToolboxEncoder.swift" \
+  -o "$RESOURCES/bin/mioh-preview-videotoolbox-encoder"
+xcrun swiftc \
+  "${SWIFT_SUBPROCESS_FLAGS[@]}" \
+  -O \
+  -parse-as-library \
+  -D MIOH_NATIVE_PREVIEW_PIPELINE \
+  -target arm64-apple-macosx27.0 \
+  -framework Accelerate \
+  -framework AVFoundation \
+  -framework CoreAI \
+  -framework CoreImage \
+  -framework CoreVideo \
+  -framework VideoToolbox \
+  "$PACKAGE_DIR/PreviewVideoToolboxEncoder.swift" \
+  "$PACKAGE_DIR/NativePreviewPipeline.swift" \
+  -o "$RESOURCES/bin/mioh-native-coreai-preview"
 xcrun swiftc \
   "${SWIFT_SUBPROCESS_FLAGS[@]}" \
   -O \
@@ -167,9 +194,15 @@ if [[ -d "$MODEL_TOOLS_SOURCE" ]]; then
   mkdir -p "$RESOURCES/model-tools/scripts"
   ditto "$MODEL_TOOLS_SOURCE" "$RESOURCES/model-tools"
   ditto "$ROOT/scripts/apple" "$RESOURCES/model-tools/scripts/apple"
+  # RF-DETR remains a local research prototype. Keep it out of the shipped
+  # application and model-tools bundle until it is deliberately reintroduced.
+  find "$RESOURCES/model-tools/scripts/apple" \
+    -maxdepth 1 -type f -iname '*rfdetr*' -delete
+  find "$RESOURCES/model-tools/scripts/apple" \
+    -type d -name __pycache__ -prune -exec rm -rf {} +
   cp "$ROOT/scripts/download_nomos_roi_enhancers.py" \
     "$RESOURCES/model-tools/scripts/download_nomos_roi_enhancers.py"
-  chmod +x \
+chmod +x \
     "$RESOURCES/model-tools/download-mioh-models.zsh" \
     "$RESOURCES/model-tools/convert-mioh-models.zsh"
 fi
@@ -191,7 +224,17 @@ for asset in "${MODEL_ASSETS[@]}"; do
     ditto "$ROOT/model_weights/$asset" "$RESOURCES/models/$asset"
   fi
 done
-
+if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
+  RFDETR_SOURCE_ASSETS=(
+    rfdetr-v6-576-fp32.aimodel
+    rfdetr-v6-large-768-fp32.aimodel
+  )
+  for asset in "${RFDETR_SOURCE_ASSETS[@]}"; do
+    if [[ -d "$ROOT/model_weights/$asset" ]]; then
+      ditto "$ROOT/model_weights/$asset" "$RESOURCES/models/$asset"
+    fi
+  done
+fi
 COREML_DETECTION_ASSETS=(
   lada_mosaic_detection_model_v2.mlpackage
   lada_mosaic_detection_model_v3.1_fast.mlpackage
@@ -470,8 +513,10 @@ fi
 
 chmod +x "$CONTENTS/MacOS/mioh" "$RESOURCES/runtime/bin/python3.12" \
   "$RESOURCES/bin/ffmpeg" "$RESOURCES/bin/ffprobe" \
+  "$RESOURCES/bin/mioh-preview-videotoolbox-encoder" \
   "$RESOURCES/bin/lada-coreai-runner" \
   "$RESOURCES/bin/lada-basicvsrpp-variable-runner"
+chmod +x "$RESOURCES/bin/mioh-native-coreai-preview"
 if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
   chmod +x "$RESOURCES/bin/lada-basicvsrpp-variable-hq-runner"
 fi
@@ -508,6 +553,12 @@ fi
 
 find "$RESOURCES/runtime" -type d -name '__pycache__' -prune -exec rm -rf {} +
 find "$RESOURCES/runtime" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+# The build environment also serves local RF-DETR experiments. Do not inherit
+# that prototype or its CLI into the production mioh runtime.
+rm -rf \
+  "$RESOURCES/runtime/lib/python3.12/site-packages/rfdetr" \
+  "$RESOURCES/runtime/lib/python3.12/site-packages"/rfdetr-*.dist-info(N)
+rm -f "$RESOURCES/runtime/bin/rfdetr"
 rm -rf \
   "$RESOURCES/runtime/bin/pip" \
   "$RESOURCES/runtime/bin/pip3" \

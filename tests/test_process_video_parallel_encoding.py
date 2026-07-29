@@ -129,9 +129,7 @@ class ProcessVideoParallelEncodingTests(unittest.TestCase):
 
     def test_pre_fps_uses_automatic_options_without_user_overrides(self):
         source = Path(pvp.__file__).read_text()
-        start = source.index(
-            "# pre_fps変換が有効な場合（ローカル変数を使用）"
-        )
+        start = source.index("segments = prepare_processing_segments(")
         split_block = source[
             start:source.index("self.stats['total_segments']", start)
         ]

@@ -19,6 +19,7 @@ def register_all_modules():
     from .multi_optimizer_constructor import MultiOptimWrapperConstructor
     from .perceptual_loss import PerceptualLoss
     from .pixelwise_loss import CharbonnierLoss
+    from .roi_loss import ROIHighFrequencyLoss, ROITemporalDifferenceLoss
     from .real_basicvsr import RealBasicVSR
     from .unet_disc import UNetDiscriminatorWithSpectralNorm
     from .vis_backend import TensorboardVisBackend

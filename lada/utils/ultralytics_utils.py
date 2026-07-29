@@ -73,6 +73,31 @@ def convert_yolo_mask_tensor(yolo_mask: UltralyticsMasks, img_shape) -> torch.Te
     assert mask_img.ndim == 3 and mask_img.shape[2] == 1
     return mask_img
 
+
+def convert_direct_resize_mask_tensor(
+    yolo_mask: UltralyticsMasks,
+    img_shape,
+) -> torch.Tensor:
+    """Resize a non-letterboxed model mask to the source frame.
+
+    Kept as a research utility for the disconnected RF-DETR prototype. The
+    production detector path uses ``convert_yolo_mask_tensor`` exclusively.
+    """
+    data = yolo_mask.data
+    if data.ndim == 2:
+        data = data.unsqueeze(0)
+    if data.ndim != 3 or data.shape[0] != 1:
+        raise ValueError(f"expected one mask, got shape {tuple(data.shape)}")
+    height, width = img_shape[:2]
+    resized = F.interpolate(
+        data[:, None].float(),
+        size=(height, width),
+        mode="bilinear",
+        align_corners=False,
+    )[0, 0]
+    return (resized > 0).to(torch.uint8).mul_(255).unsqueeze(-1)
+
+
 def _to_mask_img_tensor(masks: torch.Tensor, class_val=0, pixel_val=255) -> torch.Tensor:
     masks_tensor = (masks != class_val).to(torch.uint8).mul_(pixel_val)
     return masks_tensor[0]

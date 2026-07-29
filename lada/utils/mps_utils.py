@@ -8,17 +8,22 @@ This module provides utility functions for safe MPS operations,
 including fallback mechanisms for unsupported operations.
 """
 
-import torch
-import torch.nn.functional as F
+import gc
 import logging
 import threading
+import time
 from contextlib import contextmanager
 from functools import wraps
+
 import psutil
+import torch
+import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
 _MPS_EXECUTION_LOCK = threading.RLock()
+_MPS_MAINTENANCE_LOCK = threading.Lock()
+_MPS_LAST_CACHE_RELEASE_AT = 0.0
 
 
 @contextmanager
@@ -87,6 +92,78 @@ def get_mps_available_memory_gb():
     if recommended and driver_allocated is not None:
         return max(0.0, (recommended - driver_allocated) / (1024 ** 3))
     return max(0.0, system_available / (1024 ** 3))
+
+
+def release_mps_memory_if_needed(
+    *,
+    force: bool = False,
+    pressure_threshold: float = 0.82,
+    minimum_system_available_gb: float = 4.0,
+    cooldown_seconds: float = 5.0,
+) -> bool:
+    """
+    Synchronize and release unused MPS allocations only under memory pressure.
+
+    Pipeline workers share one MPS device but run on separate Python threads.
+    Calling ``empty_cache`` unconditionally from those workers can force an
+    allocator synchronization while another worker is submitting commands.
+    This helper makes cache maintenance part of the same serialized execution
+    domain as inference and rate-limits the expensive GC/cache flush cycle.
+
+    Returns ``True`` when maintenance ran.
+    """
+    global _MPS_LAST_CACHE_RELEASE_AT
+
+    if not torch.backends.mps.is_available() or not hasattr(torch.mps, "empty_cache"):
+        return False
+
+    stats = get_mps_memory_stats()
+    pressure_ratio = stats.get("pressure_ratio")
+    available_bytes = stats.get("system_available_bytes")
+    total_bytes = stats.get("system_total_bytes")
+    available_gb = (
+        available_bytes / (1024 ** 3)
+        if isinstance(available_bytes, int)
+        else float("inf")
+    )
+    minimum_available_gb = minimum_system_available_gb
+    if isinstance(total_bytes, int) and total_bytes > 0:
+        minimum_available_gb = max(
+            minimum_available_gb,
+            total_bytes * 0.10 / (1024 ** 3),
+        )
+
+    under_pressure = (
+        pressure_ratio is not None and pressure_ratio >= pressure_threshold
+    ) or available_gb <= minimum_available_gb
+    if not force and not under_pressure:
+        return False
+
+    now = time.monotonic()
+    with _MPS_MAINTENANCE_LOCK:
+        if (
+            not force
+            and cooldown_seconds > 0
+            and now - _MPS_LAST_CACHE_RELEASE_AT < cooldown_seconds
+        ):
+            return False
+        try:
+            with serialized_mps_execution():
+                gc.collect()
+                if hasattr(torch.mps, "synchronize"):
+                    torch.mps.synchronize()
+                torch.mps.empty_cache()
+        except Exception as exc:
+            logger.debug("Could not release MPS cache safely: %s", exc)
+            return False
+        _MPS_LAST_CACHE_RELEASE_AT = time.monotonic()
+    logger.debug(
+        "Released unused MPS cache (force=%s, pressure=%s, system_available=%.1f GiB)",
+        force,
+        f"{pressure_ratio:.2f}" if pressure_ratio is not None else "n/a",
+        available_gb,
+    )
+    return True
 
 
 def configure_mps_runtime(memory_fraction=None, verbose=True):

@@ -117,7 +117,17 @@ def load_models(
             logger.info("Mosaic detection model v2 does not support detecting face mosaics. Use detection models v3 or newer. Ignoring...")
     else:
         classes = None
-    if str(mosaic_detection_model_path).endswith((".aimodel", ".aimodelc")):
+    detection_filename = os.path.basename(str(mosaic_detection_model_path))
+    if detection_filename.startswith("rfdetr-v6-"):
+        from lada.models.rfdetr import RFDETRCoreAISegmentationModel
+        is_large = detection_filename.startswith("rfdetr-v6-large-")
+        mosaic_detection_model = RFDETRCoreAISegmentationModel(
+            mosaic_detection_model_path,
+            device,
+            resolution=768 if is_large else 576,
+            conf=0.40 if is_large else 0.35,
+        )
+    elif str(mosaic_detection_model_path).endswith((".aimodel", ".aimodelc")):
         from lada.models.yolo.yolo11_coreai_segmentation_model import Yolo11CoreAISegmentationModel
         mosaic_detection_model = Yolo11CoreAISegmentationModel(mosaic_detection_model_path, device, classes=classes, conf=0.15)
     elif str(mosaic_detection_model_path).endswith((".mlpackage", ".mlmodelc")):

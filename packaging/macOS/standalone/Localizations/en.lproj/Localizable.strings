@@ -3,6 +3,8 @@
 
 "基本" = "Basic";
 "分割" = "Split";
+"分割しない" = "Do Not Split";
+"元動画をsegmentsへコピーせず、そのまま1本で処理します" = "Processes the original video as one input without copying it into the segments folder.";
 "復元" = "Restore";
 "検出" = "Detection";
 "出力" = "Output";
@@ -45,6 +47,9 @@
 
 "モデル" = "Model";
 "復元モデル" = "Restoration Model";
+"再生用検出モデル" = "Preview Detection Model";
+"リアルタイム最適化" = "Realtime Optimization";
+"復元は維持し、再生中だけROIエンハンサーと拡大後処理を省略します" = "Keeps restoration enabled while skipping the ROI enhancer and upscaled post-processing during playback.";
 "モデルパス" = "Model Path";
 "カスタム" = "Custom";
 "最大クリップ長を指定" = "Specify Maximum Clip Length";

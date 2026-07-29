@@ -1355,8 +1355,46 @@ def split_video(input_video, output_dir, segment_duration=60, force_split=False,
     return segments
 
 
+def prepare_processing_segments(
+    input_video,
+    segments_dir,
+    *,
+    no_split=False,
+    pre_fps=None,
+    encoder_options=None,
+    segment_duration=60,
+    segment_count=None,
+    force_split=False,
+):
+    """Return processing inputs without copying the source in no-split mode."""
+    input_video = Path(input_video)
+    if no_split:
+        print("✓ 分割しない: 元動画をそのまま処理します")
+        if pre_fps:
+            print(
+                "ℹ️  分割しないため事前FPS変換は行わず、"
+                "最終出力時にFPSを適用します"
+            )
+        return [input_video]
+    return split_video(
+        input_video,
+        segments_dir,
+        segment_duration,
+        force_split,
+        pre_fps=pre_fps,
+        encoder_options=encoder_options,
+        segment_count=segment_count,
+    )
+
+
 def is_valid_processed_segment(path: Path) -> bool:
     return path.exists() and path.stat().st_size > 100 * 1024
+
+
+def processed_output_path(processed_dir: Path, index: int, *, no_split: bool) -> Path:
+    """Keep direct-source output separate from split-segment output."""
+    prefix = "processed_nosplit" if no_split else "processed"
+    return Path(processed_dir) / f"{prefix}_{index:03d}.mp4"
 
 
 def has_pending_segment_work(temp_dir: Path) -> bool:
@@ -1719,6 +1757,8 @@ class ParallelVideoProcessor:
         
         # fps変換の検証
         use_pre_fps_conversion = getattr(self.args, 'pre_fps_conversion', False)
+        if getattr(self.args, 'no_split', False) and use_pre_fps_conversion:
+            use_pre_fps_conversion = False
         
         if self.args.fps and use_pre_fps_conversion:
             original_fps = get_video_fps(input_video)
@@ -1782,27 +1822,20 @@ class ParallelVideoProcessor:
             step_start = time.time()
             force_split = getattr(self.args, 'force_split', False)
             
-            # pre_fps変換が有効な場合（ローカル変数を使用）
-            if use_pre_fps_conversion and self.args.fps:
-                # セグメント分割時にfps変換を実行
-                segments = split_video(
-                    input_video, 
-                    segments_dir, 
-                    self.args.segment_duration, 
-                    force_split,
-                    pre_fps=self.args.fps,
-                    encoder_options=self.intermediate_encoder_options,
-                    segment_count=segment_count,
-                )
-            else:
-                # 従来の動作（コピーモード）
-                segments = split_video(
-                    input_video, 
-                    segments_dir, 
-                    self.args.segment_duration, 
-                    force_split,
-                    segment_count=segment_count,
-                )
+            segments = prepare_processing_segments(
+                input_video,
+                segments_dir,
+                no_split=getattr(self.args, 'no_split', False),
+                pre_fps=(
+                    self.args.fps
+                    if use_pre_fps_conversion and self.args.fps
+                    else None
+                ),
+                encoder_options=self.intermediate_encoder_options,
+                segment_duration=self.args.segment_duration,
+                segment_count=segment_count,
+                force_split=force_split,
+            )
             
             self.stats['total_segments'] = len(segments)
             step_times['分割'] = time.time() - step_start
@@ -1813,8 +1846,13 @@ class ParallelVideoProcessor:
             tasks = []
             existing_processed = {}
             
+            no_split = getattr(self.args, 'no_split', False)
             for i, segment in enumerate(segments):
-                output_path_seg = processed_dir / f"processed_{i:03d}.mp4"
+                output_path_seg = processed_output_path(
+                    processed_dir,
+                    i,
+                    no_split=no_split,
+                )
                 
                 # 既存の処理済みセグメントをチェック
                 if output_path_seg.exists() and not self.args.overwrite:
@@ -2305,6 +2343,8 @@ def build_arg_parser():
                         help='入力を分割する長さ（秒）。長いほど時間軸の整合性は保ちやすいが、失敗時のやり直しとメモリ負荷が増える（デフォルト: 60）')
     parser.add_argument('--segment-count', type=int, default=None,
                         help='入力を指定個数に均等分割する。指定時は --segment-duration より優先（例: --segment-count 8）')
+    parser.add_argument('--no-split', action='store_true',
+                        help='入力をコピーせず、元動画をそのまま1本の処理入力として使う')
     parser.add_argument('--merge-encoder', default='copy',
                         help='最終結合時のエンコーダー。copyは再エンコードせず高速・画質劣化なし（デフォルト: copy）')
     parser.add_argument('--delete-segments', action='store_true',
@@ -2471,6 +2511,11 @@ def main():
             "Core AI T90は統一メモリ使用量が大きいため、"
             f"並列数を {requested_workers} から 1 に制限します"
         )
+    if args.no_split and args.parallel_workers != 1:
+        print(
+            f"ℹ️  分割しないため並列数を {args.parallel_workers} から 1 に変更します"
+        )
+        args.parallel_workers = 1
 
     if not args.input:
         parser.error("--input is required unless using --list-*")

@@ -16,10 +16,19 @@ from lada.utils import VideoMetadata, threading_utils, ImageTensor, MaskTensor, 
 from lada.utils import image_utils
 from lada.utils import video_utils
 from lada.utils.box_utils import box_overlap
-from lada.utils.mps_utils import get_mps_available_memory_gb, get_mps_memory_stats
+from lada.utils.mps_utils import (
+    get_mps_available_memory_gb,
+    get_mps_memory_stats,
+    release_mps_memory_if_needed,
+)
 from lada.utils.scene_utils import crop_to_box_v3
 from lada.utils.threading_utils import EOF_MARKER, STOP_MARKER, PipelineQueue, StopMarker, PipelineThread, ErrorMarker
-from lada.utils.ultralytics_utils import convert_yolo_box, convert_yolo_mask_tensor, UltralyticsResults
+from lada.utils.ultralytics_utils import (
+    UltralyticsResults,
+    convert_direct_resize_mask_tensor,
+    convert_yolo_box,
+    convert_yolo_mask_tensor,
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=LOG_LEVEL)
@@ -267,19 +276,30 @@ class MosaicDetector:
 
         # unblock consumer
         threading_utils.put_queue_stop_marker(self.inference_queue)
-        # unblock producer
+        # Unblock both outputs before joining the detector so a seek cannot
+        # leave the old worker blocked while the next generation starts.
         threading_utils.empty_out_queue(self.mosaic_clip_queue)
+        if self.frame_detection_queue is not None:
+            threading_utils.empty_out_queue(self.frame_detection_queue)
         if self.frame_detector_thread:
             self.frame_detector_thread.join()
             logger.debug("MosaicDetector: joined frame_detector_thread")
         self.frame_detector_thread = None
 
-        # garbage collection
+        # Stop has a strict postcondition: no stale item from the stopped
+        # generation remains in any queue. This also closes the small race
+        # where the detector completes one final put after the first drain.
         threading_utils.empty_out_queue(self.frame_feeder_queue)
         threading_utils.empty_out_queue(self.inference_queue)
+        threading_utils.empty_out_queue(self.mosaic_clip_queue)
+        if self.frame_detection_queue is not None:
+            threading_utils.empty_out_queue(self.frame_detection_queue)
 
         assert self.frame_feeder_queue.empty()
         assert self.inference_queue.empty()
+        assert self.mosaic_clip_queue.empty()
+        if self.frame_detection_queue is not None:
+            assert self.frame_detection_queue.empty()
 
         logger.debug(f"MosaicDetector: stopped, took: {time.time() - start}")
 
@@ -306,7 +326,17 @@ class MosaicDetector:
 
     def _create_or_append_scenes_based_on_prediction_result(self, results: UltralyticsResults, scenes: list[Scene], frame_num):
         for i in range(len(results.boxes)):
-            mask = convert_yolo_mask_tensor(results.masks[i], results.orig_shape).to(device=results.orig_img.device)
+            if getattr(results, "_lada_direct_resize_masks", False):
+                mask = convert_direct_resize_mask_tensor(
+                    results.masks[i],
+                    results.orig_shape,
+                )
+            else:
+                mask = convert_yolo_mask_tensor(
+                    results.masks[i],
+                    results.orig_shape,
+                )
+            mask = mask.to(device=results.orig_img.device)
             box = convert_yolo_box(results.boxes[i], results.orig_shape)
 
             current_scene = None
@@ -507,9 +537,8 @@ class MosaicDetector:
                     if queue_marker is STOP_MARKER:
                         break
                     frame_num += 1
-                # Release MPS driver cached memory to prevent unbounded growth
-                if self.device is not None and self.device.type == 'mps' and hasattr(torch.mps, 'empty_cache'):
-                    torch.mps.empty_cache()
+                if self.device is not None and self.device.type == 'mps':
+                    release_mps_memory_if_needed()
         if eof:
             logger.debug("frame detector worker: stopped itself, EOF")
         else:

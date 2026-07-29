@@ -104,6 +104,33 @@ class DetectionBackendSelectionTests(unittest.TestCase):
         torch_model.assert_not_called()
         coreai_model.assert_called_once()
 
+    def test_load_models_configures_jasna_v6_large_for_768px(self):
+        with mock.patch(
+            "lada.models.rfdetr.RFDETRCoreAISegmentationModel"
+        ) as rfdetr_model:
+            with mock.patch(
+                "lada.models.basicvsrpp.inference.load_model"
+            ) as load_model_mock:
+                with mock.patch(
+                    "lada.restorationpipeline.basicvsrpp_mosaic_restorer."
+                    "BasicvsrppMosaicRestorer"
+                ) as restorer_mock:
+                    load_model_mock.return_value = object()
+                    restorer_mock.return_value = object()
+                    load_models(
+                        torch.device("mps"),
+                        "basicvsrpp-v1.2",
+                        "restoration.pth",
+                        None,
+                        "rfdetr-v6-large-768-fp32.aimodel",
+                        False,
+                        False,
+                    )
+
+        rfdetr_model.assert_called_once()
+        self.assertEqual(rfdetr_model.call_args.kwargs["resolution"], 768)
+        self.assertEqual(rfdetr_model.call_args.kwargs["conf"], 0.40)
+
 
 if __name__ == "__main__":
     unittest.main()

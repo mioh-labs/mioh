@@ -150,8 +150,15 @@ class FrameRestorerProvider:
     def _clear_cache(self):
         if self.models_cache is None:
             return
-        if "mosaic_detection_model" in self.models_cache: del self.models_cache["mosaic_detection_model"]
-        if "mosaic_restoration_model" in self.models_cache: del self.models_cache["mosaic_restoration_model"]
+        for key in ("mosaic_detection_model", "mosaic_restoration_model"):
+            model = self.models_cache.get(key)
+            close = getattr(model, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.exception("Failed to close cached model %s", key)
+            self.models_cache.pop(key, None)
         gc.collect()
         try:
             if torch.cuda.is_available():

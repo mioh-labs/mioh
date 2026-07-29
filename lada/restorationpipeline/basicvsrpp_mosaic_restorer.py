@@ -5,6 +5,11 @@ from lada.utils import ImageTensor
 from lada.utils.mps_utils import serialized_mps_execution
 
 class BasicvsrppMosaicRestorer:
+    # Fixed-shape source models may overlap a small number of calls. Variable
+    # Swift/Core AI already executes chunks sequentially, so retaining every
+    # completed output until the final chunk only increases peak memory.
+    stream_model_chunks = False
+
     def __init__(self, model: BasicVSRPlusPlusGan, device: torch.device, fp16: bool):
         self.model = model
         self.device: torch.device = torch.device(device)
@@ -108,11 +113,17 @@ class BasicvsrppMosaicRestorer:
                 start - model_start,
                 end - start,
             ))
-        chunks = [chunk for chunk, _offset, _length in chunk_specs]
-        outputs = self._run_model_chunks(chunks)
-        for chunk_index, (start, output, chunk_spec) in enumerate(
-            zip(starts, outputs, chunk_specs, strict=True)
+        outputs = None
+        if not self.stream_model_chunks:
+            chunks = [chunk for chunk, _offset, _length in chunk_specs]
+            outputs = self._run_model_chunks(chunks)
+        for chunk_index, (start, chunk_spec) in enumerate(
+            zip(starts, chunk_specs, strict=True)
         ):
+            if outputs is None:
+                output = self._run_model_chunks([chunk_spec[0]])[0]
+            else:
+                output = outputs[chunk_index]
             end = min(frame_count, start + max_frames)
             _chunk, output_offset, output_length = chunk_spec
             output = output[:, output_offset:output_offset + output_length]
