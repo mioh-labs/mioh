@@ -5,6 +5,7 @@ import AVFoundation
 import Accelerate
 import CoreAI
 import CoreImage
+import CoreML
 import CoreVideo
 import Darwin
 import Foundation
@@ -15,22 +16,48 @@ private let restorationSize = 256
 private let candidateCount = 8400
 
 private struct NativePreviewConfiguration: Decodable {
+  let mode: String?
   let input: String
   let outputDirectory: String
+  let ffmpegTemporaryDirectory: String?
+  let miohTemporaryDirectory: String?
+  let outputFile: String?
+  let ffmpeg: String?
   let detectionModel: String
   let detectionCandidateChannels: Int
+  let detectionComputeUnits: String?
   let restorationModels: String
   let restorationRunner: String
+  let restorationFrameCount: Int?
   let startNanoseconds: Int64
   let generation: Int
+  let splitMode: String?
+  let segmentCount: Int?
   let segmentSeconds: Double
   let bufferLimitSeconds: Double
   let temporalBatchFrames: Int
+  let temporalOverlap: Int?
   let ringCapacity: Int
   let confidenceThreshold: Float
   let iouThreshold: Float
   let contextFraction: Float
   let blendFeather: Float?
+  let sharpenStrength: Float?
+  let detailBoost: Float?
+  let textureMix: Float?
+  let smoothStrength: Float?
+  let effectUpscale: Int?
+  let detectionEmptyLookahead: Int?
+  let detectFaceMosaics: Bool?
+  let crossfade: Bool?
+  let targetFPS: Int?
+  let preFPSConversion: Bool?
+  let videoCodec: String?
+  let averageBitRate: Int?
+  let bitrateMultiplier: Double?
+  let mp4FastStart: Bool?
+
+  var isExport: Bool { mode == "export" }
 }
 
 private enum NativePreviewError: LocalizedError {
@@ -41,6 +68,7 @@ private enum NativePreviewError: LocalizedError {
   case pixelBuffer(String)
   case detector(String)
   case restorer(String)
+  case export(String)
 
   var errorDescription: String? {
     switch self {
@@ -58,6 +86,8 @@ private enum NativePreviewError: LocalizedError {
       return "native preview detector failed: \(message)"
     case .restorer(let message):
       return "native preview restorer failed: \(message)"
+    case .export(let message):
+      return "native export failed: \(message)"
     }
   }
 }
@@ -68,11 +98,46 @@ private struct VideoDescription {
   let fpsNumerator: Int
   let fpsDenominator: Int
   let durationSeconds: Double
+  let estimatedDataRate: Double
 }
 
 private struct DecodedFrame: @unchecked Sendable {
   let pixelBuffer: CVPixelBuffer
   let ptsNanoseconds: Int64
+}
+
+private struct ProcessedFrame: @unchecked Sendable {
+  let pixelBuffer: CVPixelBuffer
+  let ptsNanoseconds: Int64
+}
+
+/// Selects frames from a VFR or CFR stream using presentation timestamps.
+/// Keeping the original PTS for accepted frames preserves audio sync, while
+/// SegmentWriter emits them at the requested constant output frame rate.
+private struct PTSFrameRateGate: Sendable {
+  private let intervalNanoseconds: Int64
+  private var nextPTS: Int64?
+
+  init(targetFPS: Int) {
+    intervalNanoseconds = max(
+      1,
+      Int64((1_000_000_000.0 / Double(targetFPS)).rounded())
+    )
+  }
+
+  mutating func accepts(_ ptsNanoseconds: Int64) -> Bool {
+    guard let nextPTS else {
+      self.nextPTS = ptsNanoseconds + intervalNanoseconds
+      return true
+    }
+    guard ptsNanoseconds >= nextPTS else { return false }
+    var following = nextPTS
+    repeat {
+      following += intervalNanoseconds
+    } while following <= ptsNanoseconds
+    self.nextPTS = following
+    return true
+  }
 }
 
 /// A bounded producer/consumer ring. CMSampleBuffer-backed CVPixelBuffers are
@@ -173,6 +238,7 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
     let natural = try await track.load(.naturalSize).applying(transform)
     let frameRate = try await track.load(.nominalFrameRate)
     let duration = try await asset.load(.duration)
+    let estimatedDataRate = try await track.load(.estimatedDataRate)
     let fps = max(1.0, Double(frameRate))
     let scale = 1000
     return VideoDescription(
@@ -180,7 +246,8 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
       height: max(1, Int(abs(natural.height).rounded())),
       fpsNumerator: max(1, Int((fps * Double(scale)).rounded())),
       fpsDenominator: scale,
-      durationSeconds: duration.seconds
+      durationSeconds: duration.seconds,
+      estimatedDataRate: Double(estimatedDataRate)
     )
   }
 
@@ -282,7 +349,8 @@ private struct DetectionCandidate {
 }
 
 private final class CoreAIDetector {
-  private let function: InferenceFunction
+  private let function: InferenceFunction?
+  private let coreMLModel: MLModel?
   private let candidateChannels: Int
   private let classCount: Int
   private let context = CIContext(options: [.cacheIntermediates: false])
@@ -292,7 +360,11 @@ private final class CoreAIDetector {
     count: detectorSize * detectorSize * 4
   )
 
-  init(modelURL: URL, candidateChannels: Int) async throws {
+  init(
+    modelURL: URL,
+    candidateChannels: Int,
+    computeUnits: String? = nil
+  ) async throws {
     guard candidateChannels == 37 || candidateChannels == 38 else {
       throw NativePreviewError.invalidConfiguration(
         "detector candidate channels must be 37 or 38"
@@ -300,11 +372,35 @@ private final class CoreAIDetector {
     }
     self.candidateChannels = candidateChannels
     classCount = candidateChannels - 4 - 32
-    let model = try await AIModel(contentsOf: modelURL)
-    guard let function = try model.loadFunction(named: "main") else {
-      throw NativePreviewError.detector("main function is missing")
+    if modelURL.pathExtension == "mlmodelc" {
+      let configuration = MLModelConfiguration()
+      switch (computeUnits ?? "cpuAndGPU").lowercased() {
+      case "all":
+        configuration.computeUnits = .all
+      case "cpuonly":
+        configuration.computeUnits = .cpuOnly
+      case "cpuandneuralengine", "cpuandane":
+        configuration.computeUnits = .cpuAndNeuralEngine
+      case "cpuandgpu":
+        configuration.computeUnits = .cpuAndGPU
+      default:
+        throw NativePreviewError.invalidConfiguration(
+          "unsupported Core ML detector compute units: \(computeUnits ?? "")"
+        )
+      }
+      coreMLModel = try MLModel(
+        contentsOf: modelURL,
+        configuration: configuration
+      )
+      function = nil
+    } else {
+      let model = try await AIModel(contentsOf: modelURL)
+      guard let loadedFunction = try model.loadFunction(named: "main") else {
+        throw NativePreviewError.detector("main function is missing")
+      }
+      function = loadedFunction
+      coreMLModel = nil
     }
-    self.function = function
     detectorPool = try Self.makePool(width: detectorSize, height: detectorSize)
   }
 
@@ -470,21 +566,53 @@ private final class CoreAIDetector {
     iouThreshold: Float
   ) async throws -> [Detection] {
     let (letterboxed, scale, padX, padY) = try letterbox(source)
-    let input = try normalizedNCHW(letterboxed)
-    var outputs = try await function.run(inputs: ["image": input])
-    guard let candidateArray = outputs.remove("candidates")?.ndArray,
-      let prototypeArray = outputs.remove("prototypes")?.ndArray
-    else {
-      throw NativePreviewError.detector("raw output is missing")
+    let candidates: [Float]
+    let prototypes: [Float]
+    if let coreMLModel {
+      let input = try MLDictionaryFeatureProvider(dictionary: [
+        "image": MLFeatureValue(pixelBuffer: letterboxed)
+      ])
+      let prediction = try await coreMLModel.prediction(from: input)
+      let arrays = prediction.featureNames.compactMap {
+        prediction.featureValue(for: $0)?.multiArrayValue
+      }
+      guard let candidateArray = arrays.first(where: {
+        Self.shape($0) == [1, candidateChannels, candidateCount]
+      }), let prototypeArray = arrays.first(where: {
+        Self.shape($0) == [1, 32, prototypeSize, prototypeSize]
+      }) else {
+        throw NativePreviewError.detector(
+          "Core ML detector output shape is unexpected"
+        )
+      }
+      candidates = try readFloat32(
+        candidateArray,
+        expectedShape: [1, candidateChannels, candidateCount]
+      )
+      prototypes = try readFloat32(
+        prototypeArray,
+        expectedShape: [1, 32, prototypeSize, prototypeSize]
+      )
+    } else {
+      guard let function else {
+        throw NativePreviewError.detector("detector backend is unavailable")
+      }
+      let input = try normalizedNCHW(letterboxed)
+      var outputs = try await function.run(inputs: ["image": input])
+      guard let candidateArray = outputs.remove("candidates")?.ndArray,
+        let prototypeArray = outputs.remove("prototypes")?.ndArray
+      else {
+        throw NativePreviewError.detector("raw output is missing")
+      }
+      candidates = try readFloat16(
+        candidateArray,
+        expectedShape: [1, candidateChannels, candidateCount]
+      )
+      prototypes = try readFloat16(
+        prototypeArray,
+        expectedShape: [1, 32, prototypeSize, prototypeSize]
+      )
     }
-    let candidates = try readFloat16(
-      candidateArray,
-      expectedShape: [1, candidateChannels, candidateCount]
-    )
-    let prototypes = try readFloat16(
-      prototypeArray,
-      expectedShape: [1, 32, prototypeSize, prototypeSize]
-    )
     var decoded: [DetectionCandidate] = []
     decoded.reserveCapacity(64)
     for index in 0..<candidateCount {
@@ -552,6 +680,39 @@ private final class CoreAIDetector {
         )
       )
     }
+  }
+
+  private static func shape(_ array: MLMultiArray) -> [Int] {
+    array.shape.map(\.intValue)
+  }
+
+  private func readFloat32(
+    _ array: MLMultiArray,
+    expectedShape: [Int]
+  ) throws -> [Float] {
+    let actualShape = Self.shape(array)
+    guard actualShape == expectedShape else {
+      throw NativePreviewError.detector(
+        "unexpected Core ML output shape \(actualShape), expected \(expectedShape)"
+      )
+    }
+    guard array.dataType == .float32 else {
+      throw NativePreviewError.detector(
+        "unexpected Core ML output type \(array.dataType.rawValue)"
+      )
+    }
+    let expectedStrides = expectedShape.indices.map { index in
+      expectedShape[(index + 1)...].reduce(1, *)
+    }
+    let actualStrides = array.strides.map(\.intValue)
+    guard actualStrides == expectedStrides else {
+      throw NativePreviewError.detector(
+        "Core ML detector output is not contiguous"
+      )
+    }
+    let count = expectedShape.reduce(1, *)
+    let pointer = array.dataPointer.assumingMemoryBound(to: Float.self)
+    return Array(UnsafeBufferPointer(start: pointer, count: count))
   }
 
   private func readFloat16(_ array: NDArray, expectedShape: [Int]) throws
@@ -702,8 +863,13 @@ private struct DetectedFrame {
   let detections: [Detection]
 }
 
+private struct DetectedBatch {
+  let frames: [DetectedFrame]
+  let skipPrefix: Int
+}
+
 private enum DetectionPipelineEvent {
-  case batch([DetectedFrame])
+  case batch(DetectedBatch)
   case finished(
     decodedFrames: Int,
     detectedFrames: Int,
@@ -738,7 +904,11 @@ private struct IntBox {
 /// Swift-to-Swift transport for the validated variable BasicVSR++ runner.
 /// Python is not involved; the mmap exists only because the already-validated
 /// 15-asset runner is a separate Swift executable.
-private final class VariableRestorerBridge {
+private protocol NativeRestoring: AnyObject {
+  func restore(_ frames: [Float16], frameCount: Int) throws -> [Float16]
+}
+
+private final class VariableRestorerBridge: NativeRestoring {
   private let maximumFrames: Int
   private let sequenceBytes: Int
   private let descriptorURL: URL
@@ -856,6 +1026,137 @@ private final class VariableRestorerBridge {
   }
 }
 
+private final class FixedRestorerBridge: NativeRestoring {
+  private let frameCount: Int
+  private let frameElements = 3 * restorationSize * restorationSize
+  private let descriptorURL: URL
+  private let sharedURL: URL
+  private let sharedHandle: FileHandle
+  private let mapping: UnsafeMutableRawPointer
+  private let mappingBytes: Int
+  private let process: Process
+  private let input: FileHandle
+  private let output: FileHandle
+
+  init(runner: URL, model: URL, frameCount: Int) throws {
+    guard frameCount > 0 else {
+      throw NativePreviewError.restorer("fixed frame count must be positive")
+    }
+    self.frameCount = frameCount
+    let tensorBytes = frameCount * frameElements * MemoryLayout<Float16>.stride
+    mappingBytes = tensorBytes * 2
+    let root = FileManager.default.temporaryDirectory
+      .appendingPathComponent("mioh-native-fixed-restorer-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(
+      at: root,
+      withIntermediateDirectories: true
+    )
+    descriptorURL = root.appendingPathComponent("descriptor.json")
+    sharedURL = root.appendingPathComponent("frames.bin")
+    let shape = [1, frameCount, 3, restorationSize, restorationSize]
+    let descriptor: [String: Any] = [
+      "function": "main",
+      "slotCount": 1,
+      "slotStride": mappingBytes,
+      "inputs": [[
+        "name": "frames",
+        "shape": shape,
+        "offset": 0,
+        "byteCount": tensorBytes,
+      ]],
+      "outputs": [[
+        "name": "restored",
+        "shape": shape,
+        "offset": tensorBytes,
+        "byteCount": tensorBytes,
+      ]],
+    ]
+    try JSONSerialization.data(withJSONObject: descriptor)
+      .write(to: descriptorURL, options: .atomic)
+    FileManager.default.createFile(atPath: sharedURL.path, contents: nil)
+    sharedHandle = try FileHandle(forUpdating: sharedURL)
+    try sharedHandle.truncate(atOffset: UInt64(mappingBytes))
+    mapping = mmap(
+      nil,
+      mappingBytes,
+      PROT_READ | PROT_WRITE,
+      MAP_SHARED,
+      sharedHandle.fileDescriptor,
+      0
+    )
+    guard mapping != MAP_FAILED else {
+      throw NativePreviewError.restorer("unable to map fixed shared buffer")
+    }
+    process = Process()
+    let stdinPipe = Pipe()
+    let stdoutPipe = Pipe()
+    let stderrPipe = Pipe()
+    process.executableURL = runner
+    process.arguments = [model.path, descriptorURL.path, sharedURL.path]
+    process.standardInput = stdinPipe
+    process.standardOutput = stdoutPipe
+    process.standardError = stderrPipe
+    try process.run()
+    input = stdinPipe.fileHandleForWriting
+    output = stdoutPipe.fileHandleForReading
+  }
+
+  deinit {
+    try? input.write(contentsOf: Data([255]))
+    try? input.close()
+    if process.isRunning {
+      process.terminate()
+    }
+    process.waitUntilExit()
+    munmap(mapping, mappingBytes)
+    try? sharedHandle.close()
+    try? FileManager.default.removeItem(
+      at: descriptorURL.deletingLastPathComponent()
+    )
+  }
+
+  func restore(_ frames: [Float16], frameCount actualCount: Int) throws
+    -> [Float16]
+  {
+    guard actualCount > 0, actualCount <= frameCount,
+      frames.count == actualCount * frameElements
+    else {
+      throw NativePreviewError.restorer(
+        "invalid fixed restoration input \(actualCount)"
+      )
+    }
+    frames.withUnsafeBytes {
+      memcpy(mapping, $0.baseAddress!, $0.count)
+    }
+    if actualCount < frameCount {
+      let last = mapping.advanced(by: (actualCount - 1) * frameElements * 2)
+      for index in actualCount..<frameCount {
+        memcpy(
+          mapping.advanced(by: index * frameElements * 2),
+          last,
+          frameElements * 2
+        )
+      }
+    }
+    try input.write(contentsOf: Data([0]))
+    guard let response = try output.read(upToCount: 1),
+      response == Data([0])
+    else {
+      throw NativePreviewError.restorer(
+        "fixed runner returned an invalid response"
+      )
+    }
+    let restored = mapping.advanced(by: frameCount * frameElements * 2)
+      .assumingMemoryBound(to: Float16.self)
+    return Array(
+      UnsafeBufferPointer(
+        start: restored,
+        count: actualCount * frameElements
+      )
+    )
+  }
+}
+
 private struct NativeSceneFrame {
   let batchIndex: Int
   let source: CVPixelBuffer
@@ -904,6 +1205,18 @@ private struct NativeClipGeometry {
   let padLeft: Int
 }
 
+private struct NativeRestoreEffects {
+  let sharpen: Float
+  let detail: Float
+  let texture: Float
+  let smoothing: Float
+  let upscale: Int
+
+  var isEnabled: Bool {
+    sharpen > 0 || detail > 0 || texture > 0 || smoothing > 0
+  }
+}
+
 /// Native counterpart of Python's Scene -> Clip -> restore -> unpad ->
 /// per-frame resize -> create_blend_mask -> full-frame composite path.
 ///
@@ -912,8 +1225,11 @@ private struct NativeClipGeometry {
 /// resize scale factors, exactly like ``MosaicDetector.Clip``.
 private final class NativeFrameProcessor {
   private let outputPool: CVPixelBufferPool
-  private let restorer: VariableRestorerBridge
+  private let restorer: any NativeRestoring
   private let blendFeather: Float
+  private let effects: NativeRestoreEffects
+  private let detectionEmptyLookahead: Int
+  private let crossfadeContext = CIContext(options: [.cacheIntermediates: false])
   private(set) var lastRestoredSceneCount = 0
   private(set) var preparationSeconds = 0.0
   private(set) var restorationSeconds = 0.0
@@ -922,11 +1238,15 @@ private final class NativeFrameProcessor {
   init(
     width: Int,
     height: Int,
-    restorer: VariableRestorerBridge,
-    blendFeather: Float
+    restorer: any NativeRestoring,
+    blendFeather: Float,
+    effects: NativeRestoreEffects,
+    detectionEmptyLookahead: Int
   ) throws {
     self.restorer = restorer
     self.blendFeather = max(0, blendFeather)
+    self.effects = effects
+    self.detectionEmptyLookahead = max(0, detectionEmptyLookahead)
     outputPool = try Self.makePool(width: width, height: height)
   }
 
@@ -1011,6 +1331,55 @@ private final class NativeFrameProcessor {
     return outputs
   }
 
+  func crossfade(
+    earlier: CVPixelBuffer,
+    later: CVPixelBuffer,
+    laterWeight: Float
+  ) throws -> CVPixelBuffer {
+    guard CVPixelBufferGetWidth(earlier) == CVPixelBufferGetWidth(later),
+      CVPixelBufferGetHeight(earlier) == CVPixelBufferGetHeight(later)
+    else {
+      throw NativePreviewError.pixelBuffer(
+        "crossfade input dimensions do not match"
+      )
+    }
+    var output: CVPixelBuffer?
+    let status = CVPixelBufferPoolCreatePixelBuffer(
+      kCFAllocatorDefault,
+      outputPool,
+      &output
+    )
+    guard status == kCVReturnSuccess, let output else {
+      throw NativePreviewError.pixelBuffer(
+        "crossfade allocation returned \(status)"
+      )
+    }
+    guard let filter = CIFilter(name: "CIDissolveTransition") else {
+      throw NativePreviewError.pixelBuffer(
+        "CIDissolveTransition is unavailable"
+      )
+    }
+    let extent = CGRect(
+      x: 0,
+      y: 0,
+      width: CVPixelBufferGetWidth(earlier),
+      height: CVPixelBufferGetHeight(earlier)
+    )
+    filter.setValue(CIImage(cvPixelBuffer: earlier), forKey: kCIInputImageKey)
+    filter.setValue(CIImage(cvPixelBuffer: later), forKey: kCIInputTargetImageKey)
+    filter.setValue(
+      max(0, min(1, laterWeight)),
+      forKey: kCIInputTimeKey
+    )
+    guard let image = filter.outputImage?.cropped(to: extent) else {
+      throw NativePreviewError.pixelBuffer(
+        "crossfade filter produced no image"
+      )
+    }
+    crossfadeContext.render(image, to: output)
+    return output
+  }
+
   private func trackScenes(_ detected: [DetectedFrame]) -> [NativeScene] {
     var scenes: [NativeScene] = []
     for (frameIndex, item) in detected.enumerated() {
@@ -1025,7 +1394,7 @@ private final class NativeFrameProcessor {
         for index in scenes.indices {
           guard let lastBox = scenes[index].lastBox,
             let lastFrame = scenes[index].lastFrameIndex,
-            frameIndex - lastFrame <= 1,
+            frameIndex - lastFrame <= detectionEmptyLookahead + 1,
             lastBox.overlaps(box)
           else {
             continue
@@ -1146,11 +1515,20 @@ private final class NativeFrameProcessor {
     }
     preparationSeconds += Date().timeIntervalSince(preparationStart)
     let restorationStart = Date()
-    let restored = try restorer.restore(
+    var restored = try restorer.restore(
       modelInput,
       frameCount: scene.frames.count
     )
     restorationSeconds += Date().timeIntervalSince(restorationStart)
+    if effects.isEnabled {
+      restored = Self.applyRestoreEffects(
+        restored: restored,
+        original: modelInput,
+        geometries: geometries,
+        cropMasks: hardMasks,
+        effects: effects
+      )
+    }
     return (restored, geometries, hardMasks)
   }
 
@@ -1353,6 +1731,553 @@ private final class NativeFrameProcessor {
       }
     }
     return mask
+  }
+
+  /// Swift-native counterpart of ``apply_restore_effect_upscale``. Effects
+  /// operate on the restored 256px clip before it is resized and composited,
+  /// and every stage is gated by the model-space ROI mask so clean context is
+  /// bit-for-bit preserved.
+  private static func applyRestoreEffects(
+    restored: [Float16],
+    original: [Float16],
+    geometries: [NativeClipGeometry],
+    cropMasks: [[Float]],
+    effects: NativeRestoreEffects
+  ) -> [Float16] {
+    let frameElements = 3 * restorationSize * restorationSize
+    guard effects.isEnabled,
+      restored.count == geometries.count * frameElements,
+      original.count == restored.count,
+      cropMasks.count == geometries.count
+    else {
+      return restored
+    }
+    var output = restored
+    for frameIndex in geometries.indices {
+      let offset = frameIndex * frameElements
+      let restoredFrame = restored[offset..<(offset + frameElements)].map {
+        Float($0)
+      }
+      let originalFrame = original[offset..<(offset + frameElements)].map {
+        Float($0)
+      }
+      let mask = modelMask(
+        cropMask: cropMasks[frameIndex],
+        geometry: geometries[frameIndex]
+      )
+      let processed = processEffects(
+        restored: restoredFrame,
+        original: originalFrame,
+        mask: mask,
+        width: restorationSize,
+        height: restorationSize,
+        effects: effects
+      )
+      for index in 0..<frameElements {
+        output[offset + index] = Float16(processed[index])
+      }
+    }
+    return output
+  }
+
+  private static func modelMask(
+    cropMask: [Float],
+    geometry: NativeClipGeometry
+  ) -> [Float] {
+    let cropWidth = geometry.cropBox.width
+    let cropHeight = geometry.cropBox.height
+    guard cropMask.count == cropWidth * cropHeight else {
+      return [Float](repeating: 0, count: restorationSize * restorationSize)
+    }
+    var result = [Float](
+      repeating: 0,
+      count: restorationSize * restorationSize
+    )
+    for modelY in 0..<restorationSize {
+      let resizedY = modelY - geometry.padTop
+      guard resizedY >= 0, resizedY < geometry.resizedHeight else { continue }
+      let cropY = min(
+        cropHeight - 1,
+        max(
+          0,
+          Int(
+            (Float(resizedY) + 0.5) * Float(cropHeight)
+              / Float(geometry.resizedHeight)
+          )
+        )
+      )
+      for modelX in 0..<restorationSize {
+        let resizedX = modelX - geometry.padLeft
+        guard resizedX >= 0, resizedX < geometry.resizedWidth else { continue }
+        let cropX = min(
+          cropWidth - 1,
+          max(
+            0,
+            Int(
+              (Float(resizedX) + 0.5) * Float(cropWidth)
+                / Float(geometry.resizedWidth)
+            )
+          )
+        )
+        result[modelY * restorationSize + modelX] =
+          cropMask[cropY * cropWidth + cropX] > 0.5 ? 1 : 0
+      }
+    }
+    return result
+  }
+
+  private static func processEffects(
+    restored: [Float],
+    original: [Float],
+    mask: [Float],
+    width: Int,
+    height: Int,
+    effects: NativeRestoreEffects
+  ) -> [Float] {
+    guard mask.contains(where: { $0 > 0.5 }) else { return restored }
+    let scale = max(1, min(4, effects.upscale))
+    let workWidth = width * scale
+    let workHeight = height * scale
+    let base: [Float]
+    let source: [Float]
+    let workMask: [Float]
+    if scale == 1 {
+      base = restored
+      source = original
+      workMask = mask
+    } else {
+      base = resizePlanarBilinear(
+        restored,
+        sourceWidth: width,
+        sourceHeight: height,
+        destinationWidth: workWidth,
+        destinationHeight: workHeight
+      )
+      source = resizePlanarBilinear(
+        original,
+        sourceWidth: width,
+        sourceHeight: height,
+        destinationWidth: workWidth,
+        destinationHeight: workHeight
+      )
+      workMask = resizeMaskNearest(
+        mask,
+        sourceWidth: width,
+        sourceHeight: height,
+        destinationWidth: workWidth,
+        destinationHeight: workHeight
+      )
+    }
+    var processed = base
+    if effects.texture > 0 {
+      let small = maskedGaussianPlanar(
+        source,
+        mask: workMask,
+        width: workWidth,
+        height: workHeight,
+        sigma: 0.7
+      )
+      let large = maskedGaussianPlanar(
+        source,
+        mask: workMask,
+        width: workWidth,
+        height: workHeight,
+        sigma: 2
+      )
+      var candidate = processed
+      for index in candidate.indices {
+        candidate[index] = clamp01(
+          processed[index] + (small[index] - large[index]) * effects.texture
+        )
+      }
+      processed = maskedMix(
+        base: processed,
+        processed: candidate,
+        mask: workMask
+      )
+    }
+    if effects.detail > 0 {
+      let candidate = adaptiveLumaContrast(
+        processed,
+        width: workWidth,
+        height: workHeight,
+        strength: effects.detail
+      )
+      processed = maskedMix(
+        base: processed,
+        processed: candidate,
+        mask: workMask
+      )
+    }
+    if effects.sharpen > 0 {
+      let blurred = gaussianPlanar(
+        processed,
+        width: workWidth,
+        height: workHeight,
+        sigma: 1
+      )
+      var candidate = processed
+      for index in candidate.indices {
+        candidate[index] = clamp01(
+          processed[index] * (1 + effects.sharpen)
+            - blurred[index] * effects.sharpen
+        )
+      }
+      processed = maskedMix(
+        base: processed,
+        processed: candidate,
+        mask: workMask
+      )
+    }
+    if effects.smoothing > 0 {
+      let amount = min(1, effects.smoothing)
+      let blurred = gaussianPlanar(
+        processed,
+        width: workWidth,
+        height: workHeight,
+        sigma: 1
+      )
+      var candidate = processed
+      for index in candidate.indices {
+        candidate[index] =
+          processed[index] * (1 - amount) + blurred[index] * amount
+      }
+      processed = maskedMix(
+        base: processed,
+        processed: candidate,
+        mask: workMask
+      )
+    }
+    guard scale > 1 else { return processed }
+    let reduced = downsamplePlanarArea(
+      processed,
+      sourceWidth: workWidth,
+      sourceHeight: workHeight,
+      scale: scale
+    )
+    return maskedMix(base: restored, processed: reduced, mask: mask)
+  }
+
+  private static func maskedMix(
+    base: [Float],
+    processed: [Float],
+    mask: [Float]
+  ) -> [Float] {
+    let plane = mask.count
+    guard base.count == processed.count, base.count == plane * 3 else {
+      return base
+    }
+    var result = base
+    for channel in 0..<3 {
+      let offset = channel * plane
+      for index in 0..<plane {
+        let amount = max(0, min(1, mask[index]))
+        result[offset + index] =
+          base[offset + index] * (1 - amount)
+          + processed[offset + index] * amount
+      }
+    }
+    return result
+  }
+
+  private static func gaussianKernel(sigma: Float) -> [Float] {
+    let radius = max(1, Int(ceil(Double(sigma * 3))))
+    let denominator = 2 * sigma * sigma
+    var kernel = (-radius...radius).map {
+      exp(-Float($0 * $0) / denominator)
+    }
+    let total = kernel.reduce(0, +)
+    for index in kernel.indices {
+      kernel[index] /= total
+    }
+    return kernel
+  }
+
+  private static func gaussianSingle(
+    _ input: [Float],
+    width: Int,
+    height: Int,
+    sigma: Float
+  ) -> [Float] {
+    let kernel = gaussianKernel(sigma: sigma)
+    let radius = kernel.count / 2
+    var horizontal = [Float](repeating: 0, count: input.count)
+    var output = [Float](repeating: 0, count: input.count)
+    for y in 0..<height {
+      for x in 0..<width {
+        var value: Float = 0
+        for tap in kernel.indices {
+          let sourceX = reflected(x + tap - radius, count: width)
+          value += input[y * width + sourceX] * kernel[tap]
+        }
+        horizontal[y * width + x] = value
+      }
+    }
+    for y in 0..<height {
+      for x in 0..<width {
+        var value: Float = 0
+        for tap in kernel.indices {
+          let sourceY = reflected(y + tap - radius, count: height)
+          value += horizontal[sourceY * width + x] * kernel[tap]
+        }
+        output[y * width + x] = value
+      }
+    }
+    return output
+  }
+
+  private static func gaussianPlanar(
+    _ input: [Float],
+    width: Int,
+    height: Int,
+    sigma: Float
+  ) -> [Float] {
+    let plane = width * height
+    var result = [Float](repeating: 0, count: plane * 3)
+    for channel in 0..<3 {
+      let offset = channel * plane
+      let blurred = gaussianSingle(
+        Array(input[offset..<(offset + plane)]),
+        width: width,
+        height: height,
+        sigma: sigma
+      )
+      result.replaceSubrange(offset..<(offset + plane), with: blurred)
+    }
+    return result
+  }
+
+  private static func maskedGaussianPlanar(
+    _ input: [Float],
+    mask: [Float],
+    width: Int,
+    height: Int,
+    sigma: Float
+  ) -> [Float] {
+    let plane = width * height
+    let blurredMask = gaussianSingle(
+      mask,
+      width: width,
+      height: height,
+      sigma: sigma
+    )
+    var result = [Float](repeating: 0, count: plane * 3)
+    for channel in 0..<3 {
+      let offset = channel * plane
+      var weighted = [Float](repeating: 0, count: plane)
+      for index in 0..<plane {
+        weighted[index] = input[offset + index] * mask[index]
+      }
+      let blurred = gaussianSingle(
+        weighted,
+        width: width,
+        height: height,
+        sigma: sigma
+      )
+      for index in 0..<plane {
+        result[offset + index] =
+          blurred[index] / max(blurredMask[index], 1e-6)
+      }
+    }
+    return result
+  }
+
+  /// CLAHE-style 8x8 luminance equalization. Keeping the operation on luma
+  /// preserves chroma while matching the Python detail control's local
+  /// contrast semantics.
+  private static func adaptiveLumaContrast(
+    _ input: [Float],
+    width: Int,
+    height: Int,
+    strength: Float
+  ) -> [Float] {
+    let plane = width * height
+    guard input.count == plane * 3 else { return input }
+    var luma = [Float](repeating: 0, count: plane)
+    for index in 0..<plane {
+      luma[index] =
+        input[index] * 0.2126
+        + input[plane + index] * 0.7152
+        + input[2 * plane + index] * 0.0722
+    }
+    let columns = 8
+    let rows = 8
+    var tables = [Float](
+      repeating: 0,
+      count: columns * rows * 256
+    )
+    let clipLimit = 1 + min(1, max(0, strength)) * 2
+    for tileY in 0..<rows {
+      let top = tileY * height / rows
+      let bottom = (tileY + 1) * height / rows
+      for tileX in 0..<columns {
+        let left = tileX * width / columns
+        let right = (tileX + 1) * width / columns
+        let pixelCount = max(1, (right - left) * (bottom - top))
+        let limit = max(1, Int(clipLimit * Float(pixelCount) / 256))
+        var histogram = [Int](repeating: 0, count: 256)
+        for y in top..<bottom {
+          for x in left..<right {
+            let bin = min(255, max(0, Int(luma[y * width + x] * 255)))
+            histogram[bin] += 1
+          }
+        }
+        var excess = 0
+        for bin in histogram.indices where histogram[bin] > limit {
+          excess += histogram[bin] - limit
+          histogram[bin] = limit
+        }
+        let uniform = excess / 256
+        let remainder = excess % 256
+        for bin in histogram.indices {
+          histogram[bin] += uniform + (bin < remainder ? 1 : 0)
+        }
+        let tableOffset = (tileY * columns + tileX) * 256
+        var cumulative = 0
+        for bin in histogram.indices {
+          cumulative += histogram[bin]
+          tables[tableOffset + bin] =
+            min(1, Float(cumulative) / Float(pixelCount))
+        }
+      }
+    }
+    var result = input
+    let tileWidth = Float(width) / Float(columns)
+    let tileHeight = Float(height) / Float(rows)
+    for y in 0..<height {
+      let tileY = (Float(y) + 0.5) / tileHeight - 0.5
+      let y0 = max(0, min(rows - 1, Int(floor(tileY))))
+      let y1 = min(rows - 1, y0 + 1)
+      let fy = max(0, min(1, tileY - Float(y0)))
+      for x in 0..<width {
+        let tileX = (Float(x) + 0.5) / tileWidth - 0.5
+        let x0 = max(0, min(columns - 1, Int(floor(tileX))))
+        let x1 = min(columns - 1, x0 + 1)
+        let fx = max(0, min(1, tileX - Float(x0)))
+        let index = y * width + x
+        let bin = min(255, max(0, Int(luma[index] * 255)))
+        func table(_ tx: Int, _ ty: Int) -> Float {
+          tables[(ty * columns + tx) * 256 + bin]
+        }
+        let upper = table(x0, y0) * (1 - fx) + table(x1, y0) * fx
+        let lower = table(x0, y1) * (1 - fx) + table(x1, y1) * fx
+        let equalized = upper * (1 - fy) + lower * fy
+        let mixed = luma[index] * (1 - strength) + equalized * strength
+        let delta = mixed - luma[index]
+        result[index] = clamp01(input[index] + delta)
+        result[plane + index] = clamp01(input[plane + index] + delta)
+        result[2 * plane + index] =
+          clamp01(input[2 * plane + index] + delta)
+      }
+    }
+    return result
+  }
+
+  private static func resizePlanarBilinear(
+    _ input: [Float],
+    sourceWidth: Int,
+    sourceHeight: Int,
+    destinationWidth: Int,
+    destinationHeight: Int
+  ) -> [Float] {
+    let sourcePlane = sourceWidth * sourceHeight
+    let destinationPlane = destinationWidth * destinationHeight
+    var output = [Float](repeating: 0, count: destinationPlane * 3)
+    for y in 0..<destinationHeight {
+      let sourceY =
+        (Float(y) + 0.5) * Float(sourceHeight) / Float(destinationHeight)
+        - 0.5
+      let y0 = max(0, min(sourceHeight - 1, Int(floor(sourceY))))
+      let y1 = min(sourceHeight - 1, y0 + 1)
+      let fy = max(0, min(1, sourceY - Float(y0)))
+      for x in 0..<destinationWidth {
+        let sourceX =
+          (Float(x) + 0.5) * Float(sourceWidth) / Float(destinationWidth)
+          - 0.5
+        let x0 = max(0, min(sourceWidth - 1, Int(floor(sourceX))))
+        let x1 = min(sourceWidth - 1, x0 + 1)
+        let fx = max(0, min(1, sourceX - Float(x0)))
+        let destinationIndex = y * destinationWidth + x
+        for channel in 0..<3 {
+          let offset = channel * sourcePlane
+          let upper =
+            input[offset + y0 * sourceWidth + x0] * (1 - fx)
+            + input[offset + y0 * sourceWidth + x1] * fx
+          let lower =
+            input[offset + y1 * sourceWidth + x0] * (1 - fx)
+            + input[offset + y1 * sourceWidth + x1] * fx
+          output[channel * destinationPlane + destinationIndex] =
+            upper * (1 - fy) + lower * fy
+        }
+      }
+    }
+    return output
+  }
+
+  private static func resizeMaskNearest(
+    _ input: [Float],
+    sourceWidth: Int,
+    sourceHeight: Int,
+    destinationWidth: Int,
+    destinationHeight: Int
+  ) -> [Float] {
+    var output = [Float](
+      repeating: 0,
+      count: destinationWidth * destinationHeight
+    )
+    for y in 0..<destinationHeight {
+      let sourceY = min(
+        sourceHeight - 1,
+        y * sourceHeight / destinationHeight
+      )
+      for x in 0..<destinationWidth {
+        let sourceX = min(
+          sourceWidth - 1,
+          x * sourceWidth / destinationWidth
+        )
+        output[y * destinationWidth + x] =
+          input[sourceY * sourceWidth + sourceX]
+      }
+    }
+    return output
+  }
+
+  private static func downsamplePlanarArea(
+    _ input: [Float],
+    sourceWidth: Int,
+    sourceHeight: Int,
+    scale: Int
+  ) -> [Float] {
+    let width = sourceWidth / scale
+    let height = sourceHeight / scale
+    let sourcePlane = sourceWidth * sourceHeight
+    let destinationPlane = width * height
+    var output = [Float](repeating: 0, count: destinationPlane * 3)
+    let divisor = Float(scale * scale)
+    for channel in 0..<3 {
+      let sourceOffset = channel * sourcePlane
+      let destinationOffset = channel * destinationPlane
+      for y in 0..<height {
+        for x in 0..<width {
+          var sum: Float = 0
+          for innerY in 0..<scale {
+            let row = (y * scale + innerY) * sourceWidth
+            for innerX in 0..<scale {
+              sum += input[
+                sourceOffset + row + x * scale + innerX
+              ]
+            }
+          }
+          output[destinationOffset + y * width + x] = sum / divisor
+        }
+      }
+    }
+    return output
+  }
+
+  @inline(__always)
+  private static func clamp01(_ value: Float) -> Float {
+    max(0, min(1, value))
   }
 
   private static func hardMask(
@@ -1714,6 +2639,188 @@ private func emit(_ payload: [String: Any]) {
   fflush(stdout)
 }
 
+private enum NativeExportSupport {
+  static func runProcess(
+    executable: URL,
+    arguments: [String],
+    temporaryDirectory: URL?,
+    failureMessage: String
+  ) throws -> String {
+    let process = Process()
+    let pipe = Pipe()
+    process.executableURL = executable
+    process.arguments = arguments
+    if let temporaryDirectory {
+      var environment = ProcessInfo.processInfo.environment
+      environment["TMPDIR"] = temporaryDirectory.path
+      environment["TEMP"] = temporaryDirectory.path
+      environment["TMP"] = temporaryDirectory.path
+      process.environment = environment
+    }
+    process.standardOutput = pipe
+    process.standardError = pipe
+    try process.run()
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    let output = String(data: data, encoding: .utf8) ?? ""
+    guard process.terminationStatus == 0 else {
+      throw NativePreviewError.export(
+        "\(failureMessage): \(output.trimmingCharacters(in: .whitespacesAndNewlines))"
+      )
+    }
+    return output
+  }
+
+  static func prepareInput(
+    source: URL,
+    ffmpeg: URL?,
+    directory: URL
+  ) async throws -> (url: URL, temporary: URL?) {
+    let directlySupportedExtensions = Set(["mp4", "mov", "m4v"])
+    let asset = AVURLAsset(url: source)
+    let playable = (try? await asset.load(.isPlayable)) ?? false
+    if directlySupportedExtensions.contains(source.pathExtension.lowercased()),
+      playable
+    {
+      return (source, nil)
+    }
+    guard let ffmpeg else {
+      throw NativePreviewError.export(
+        "入力をAVFoundation互換にするffmpegがありません"
+      )
+    }
+    let root = directory.appendingPathComponent(
+      "native-input-\(UUID().uuidString)",
+      isDirectory: true
+    )
+    try FileManager.default.createDirectory(
+      at: root,
+      withIntermediateDirectories: true
+    )
+    let compatible = root.appendingPathComponent("input.mp4")
+    var arguments = [
+      "-hide_banner", "-loglevel", "error", "-y",
+      "-i", source.path,
+      "-map", "0:v:0", "-map", "0:a?",
+      "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+      "-movflags", "+faststart",
+    ]
+    if try isHEVC(
+      source: source,
+      ffmpeg: ffmpeg,
+      temporaryDirectory: directory
+    ) {
+      arguments.append(contentsOf: ["-tag:v", "hvc1"])
+    }
+    arguments.append(compatible.path)
+    do {
+      _ = try runProcess(
+        executable: ffmpeg,
+        arguments: arguments,
+        temporaryDirectory: directory,
+        failureMessage: "入力のremuxに失敗しました"
+      )
+    } catch {
+      _ = try runProcess(
+        executable: ffmpeg,
+        arguments: [
+          "-hide_banner", "-loglevel", "error", "-y",
+          "-i", source.path,
+          "-map", "0:v:0", "-map", "0:a?",
+          "-c:v", "hevc_videotoolbox", "-q:v", "65",
+          "-tag:v", "hvc1",
+          "-c:a", "aac", "-b:a", "192k",
+          "-movflags", "+faststart",
+          compatible.path,
+        ],
+        temporaryDirectory: directory,
+        failureMessage: "入力のVideoToolbox変換に失敗しました"
+      )
+    }
+    return (compatible, root)
+  }
+
+  private static func isHEVC(
+    source: URL,
+    ffmpeg: URL,
+    temporaryDirectory: URL
+  ) throws -> Bool {
+    let ffprobe = ffmpeg.deletingLastPathComponent()
+      .appendingPathComponent("ffprobe")
+    guard FileManager.default.isExecutableFile(atPath: ffprobe.path) else {
+      return false
+    }
+    let output = try runProcess(
+      executable: ffprobe,
+      arguments: [
+        "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        source.path,
+      ],
+      temporaryDirectory: temporaryDirectory,
+      failureMessage: "映像コーデックの確認に失敗しました"
+    )
+    return output.trimmingCharacters(in: .whitespacesAndNewlines) == "hevc"
+  }
+
+  static func finishExport(
+    segments: [SegmentEvent],
+    source: URL,
+    output: URL,
+    ffmpeg: URL,
+    workingDirectory: URL,
+    fastStart: Bool
+  ) throws {
+    guard !segments.isEmpty else {
+      throw NativePreviewError.export("書き出された映像セグメントがありません")
+    }
+    try FileManager.default.createDirectory(
+      at: workingDirectory,
+      withIntermediateDirectories: true
+    )
+    let manifest = workingDirectory.appendingPathComponent(
+      "concat-\(UUID().uuidString).txt"
+    )
+    defer { try? FileManager.default.removeItem(at: manifest) }
+    let contents = segments.sorted { $0.sequence < $1.sequence }.map {
+      let escaped = $0.path.replacingOccurrences(of: "'", with: "'\\''")
+      return "file '\(escaped)'"
+    }.joined(separator: "\n") + "\n"
+    try Data(contents.utf8).write(to: manifest, options: .atomic)
+
+    try FileManager.default.createDirectory(
+      at: output.deletingLastPathComponent(),
+      withIntermediateDirectories: true
+    )
+    let ext = output.pathExtension.isEmpty ? "mp4" : output.pathExtension
+    let part = output.deletingPathExtension()
+      .appendingPathExtension("part")
+      .appendingPathExtension(ext)
+    try? FileManager.default.removeItem(at: part)
+    var arguments = [
+      "-hide_banner", "-loglevel", "error", "-y",
+      "-f", "concat", "-safe", "0", "-i", manifest.path,
+      "-i", source.path,
+      "-map", "0:v:0", "-map", "1:a:0?",
+      "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+      "-map_metadata", "1",
+    ]
+    if fastStart && ext.lowercased() == "mp4" {
+      arguments.append(contentsOf: ["-movflags", "+faststart"])
+    }
+    arguments.append(part.path)
+    _ = try runProcess(
+      executable: ffmpeg,
+      arguments: arguments,
+      temporaryDirectory: workingDirectory,
+      failureMessage: "映像と音声の結合に失敗しました"
+    )
+    try? FileManager.default.removeItem(at: output)
+    try FileManager.default.moveItem(at: part, to: output)
+  }
+}
+
 @main
 private struct NativePreviewPipeline {
   static func main() async {
@@ -1750,43 +2857,138 @@ private struct NativePreviewPipeline {
         "ring capacity must cover the temporal batch"
       )
     }
+    let overlap = config.isExport
+      ? min(max(0, config.temporalOverlap ?? 0), config.temporalBatchFrames - 1)
+      : 0
+    let outputDirectory = URL(
+      fileURLWithPath: config.outputDirectory,
+      isDirectory: true
+    )
+    let ffmpegTemporaryDirectory = config.ffmpegTemporaryDirectory.map {
+      URL(fileURLWithPath: $0, isDirectory: true)
+    } ?? outputDirectory
+    let ffmpegURL = config.ffmpeg.map { URL(fileURLWithPath: $0) }
+    let preparedInput = try await NativeExportSupport.prepareInput(
+      source: URL(fileURLWithPath: config.input),
+      ffmpeg: ffmpegURL,
+      directory: ffmpegTemporaryDirectory
+    )
+    defer {
+      if let temporary = preparedInput.temporary {
+        try? FileManager.default.removeItem(at: temporary)
+      }
+    }
 
     let ring = PixelBufferRing(capacity: config.ringCapacity)
     let decoder = try await ContinuousVideoDecoder(
-      input: URL(fileURLWithPath: config.input),
+      input: preparedInput.url,
       startNanoseconds: config.startNanoseconds,
       ring: ring
     )
     let video = try await decoder.description()
+    let sourceFPS = Double(video.fpsNumerator) / Double(video.fpsDenominator)
+    let targetFPS = config.targetFPS.map { max(1, $0) }
+    if let targetFPS, Double(targetFPS) > sourceFPS + 0.01 {
+      throw NativePreviewError.invalidConfiguration(
+        String(
+          format:
+            "Swift native FPS conversion currently supports down-conversion only (source %.3ffps, requested %dfps)",
+          sourceFPS,
+          targetFPS
+        )
+      )
+    }
+    let outputFPSNumerator = targetFPS ?? video.fpsNumerator
+    let outputFPSDenominator = targetFPS == nil ? video.fpsDenominator : 1
+    let effectiveSegmentSeconds: Double
+    if config.isExport {
+      switch config.splitMode ?? "duration" {
+      case "none":
+        effectiveSegmentSeconds = max(1, video.durationSeconds + 1)
+      case "count":
+        effectiveSegmentSeconds = max(
+          1,
+          video.durationSeconds / Double(max(1, config.segmentCount ?? 1))
+        )
+      default:
+        effectiveSegmentSeconds = max(1, config.segmentSeconds)
+      }
+    } else {
+      effectiveSegmentSeconds = config.segmentSeconds
+    }
     let detector = try await CoreAIDetector(
       modelURL: URL(fileURLWithPath: config.detectionModel),
-      candidateChannels: config.detectionCandidateChannels
+      candidateChannels: config.detectionCandidateChannels,
+      computeUnits: config.detectionComputeUnits
     )
-    let restorer = try VariableRestorerBridge(
-      runner: URL(fileURLWithPath: config.restorationRunner),
-      models: URL(fileURLWithPath: config.restorationModels),
-      maximumFrames: config.temporalBatchFrames
-    )
+    let restorer: any NativeRestoring
+    if let fixedFrames = config.restorationFrameCount {
+      restorer = try FixedRestorerBridge(
+        runner: URL(fileURLWithPath: config.restorationRunner),
+        model: URL(fileURLWithPath: config.restorationModels),
+        frameCount: fixedFrames
+      )
+    } else {
+      restorer = try VariableRestorerBridge(
+        runner: URL(fileURLWithPath: config.restorationRunner),
+        models: URL(fileURLWithPath: config.restorationModels),
+        maximumFrames: config.temporalBatchFrames
+      )
+    }
     let processor = try NativeFrameProcessor(
       width: video.width,
       height: video.height,
       restorer: restorer,
-      blendFeather: config.blendFeather ?? 1
-    )
-    let writer = try SegmentWriter(
-      outputDirectory: URL(
-        fileURLWithPath: config.outputDirectory,
-        isDirectory: true
+      blendFeather: config.blendFeather ?? 1,
+      effects: NativeRestoreEffects(
+        sharpen: max(0, min(2, config.sharpenStrength ?? 0)),
+        detail: max(0, min(1, config.detailBoost ?? 0)),
+        texture: max(0, min(1, config.textureMix ?? 0)),
+        smoothing: max(0, min(1, config.smoothStrength ?? 0)),
+        upscale: max(1, min(4, config.effectUpscale ?? 1))
       ),
+      detectionEmptyLookahead: config.detectionEmptyLookahead ?? 0
+    )
+    let codec: AVVideoCodecType
+    switch config.videoCodec?.lowercased() {
+    case "h264":
+      codec = .h264
+    case "hevc":
+      codec = .hevc
+    default:
+      // Preview configurations predate the export-only codec field and omit
+      // it. Preserve their established low-latency H.264 contract; only a
+      // full-file export defaults to HEVC.
+      codec = config.isExport ? .hevc : .h264
+    }
+    let sourceBasedBitRate: Int? = video.estimatedDataRate > 0
+      ? Int(
+        min(
+          120_000_000,
+          max(
+            2_000_000,
+            video.estimatedDataRate * (config.bitrateMultiplier ?? 3)
+          )
+        )
+      )
+      : nil
+    let writer = try SegmentWriter(
+      outputDirectory: outputDirectory,
       width: video.width,
       height: video.height,
-      fpsNumerator: video.fpsNumerator,
-      fpsDenominator: video.fpsDenominator,
+      fpsNumerator: outputFPSNumerator,
+      fpsDenominator: outputFPSDenominator,
       generation: config.generation,
-      segmentSeconds: config.segmentSeconds
+      segmentSeconds: effectiveSegmentSeconds,
+      codec: codec,
+      averageBitRate: config.averageBitRate ?? sourceBasedBitRate,
+      realTime: !config.isExport,
+      filePrefix: config.isExport ? "export" : "preview"
     )
     let control = PreviewControl(
-      bufferLimitSeconds: config.bufferLimitSeconds
+      bufferLimitSeconds: config.isExport
+        ? Double.greatestFiniteMagnitude
+        : config.bufferLimitSeconds
     )
     let wallStart = Date()
     control.runReader()
@@ -1794,11 +2996,17 @@ private struct NativePreviewPipeline {
       "kind": "ready",
       "generation": config.generation,
       "duration": video.durationSeconds,
-      "fps": Double(video.fpsNumerator) / Double(video.fpsDenominator),
+      "fps": Double(outputFPSNumerator) / Double(outputFPSDenominator),
+      "source_fps": sourceFPS,
+      "fps_conversion_stage": targetFPS == nil
+        ? "none"
+        : ((config.preFPSConversion ?? false) ? "before_restore" : "after_restore"),
       "width": video.width,
       "height": video.height,
-      "segment_seconds": config.segmentSeconds,
-      "pipeline": "swift-cvpixelbuffer-ring-coreai",
+      "segment_seconds": effectiveSegmentSeconds,
+      "pipeline": config.isExport
+        ? "swift-native-export"
+        : "swift-cvpixelbuffer-ring-coreai",
     ])
     try decoder.start()
     var pendingEncoding: Task<([SegmentEvent], Int), Error>?
@@ -1808,6 +3016,13 @@ private struct NativePreviewPipeline {
       var detectedFrames = 0
       var restoredBatches = 0
       var detectionSeconds = 0.0
+      var completedSegments: [SegmentEvent] = []
+      var encodedFrames = 0
+      var deferredCrossfadeTail: [ProcessedFrame] = []
+      var postRestorationFrameRateGate: PTSFrameRateGate? =
+        targetFPS != nil && !(config.preFPSConversion ?? false)
+        ? PTSFrameRateGate(targetFPS: targetFPS ?? 1)
+        : nil
 
       // Keep at most two detected batches resident: one being restored and
       // one being prepared. This overlaps detection CPU/Core AI work with the
@@ -1823,26 +3038,51 @@ private struct NativePreviewPipeline {
             var localDecodedFrames = 0
             var localDetectedFrames = 0
             var localDetectionSeconds = 0.0
+            var batchIndex = 0
+            var newFramesSinceYield = 0
+            var preRestorationFrameRateGate: PTSFrameRateGate? =
+              targetFPS != nil && (config.preFPSConversion ?? false)
+              ? PTSFrameRateGate(targetFPS: targetFPS ?? 1)
+              : nil
 
             func yieldPending() {
-              guard !pending.isEmpty else { return }
+              guard !pending.isEmpty, newFramesSinceYield > 0 else { return }
               availableBatchSlots.wait()
               if control.shouldStop() {
                 availableBatchSlots.signal()
                 return
               }
-              continuation.yield(.batch(pending))
-              pending.removeAll(keepingCapacity: true)
+              let skipPrefix = batchIndex == 0 ? 0 : overlap
+              continuation.yield(
+                .batch(
+                  DetectedBatch(frames: pending, skipPrefix: skipPrefix)
+                )
+              )
+              batchIndex += 1
+              if overlap > 0 {
+                pending = Array(pending.suffix(overlap))
+              } else {
+                pending.removeAll(keepingCapacity: true)
+              }
+              newFramesSinceYield = 0
             }
 
             while !control.shouldStop(), let frame = try ring.pop() {
               localDecodedFrames += 1
+              if var gate = preRestorationFrameRateGate {
+                let accepted = gate.accepts(frame.ptsNanoseconds)
+                preRestorationFrameRateGate = gate
+                if !accepted { continue }
+              }
               let detectionStart = Date()
-              let detections = try await detector.detect(
+              let allDetections = try await detector.detect(
                 frame.pixelBuffer,
                 confidenceThreshold: config.confidenceThreshold,
                 iouThreshold: config.iouThreshold
               )
+              let detections = (config.detectFaceMosaics ?? false)
+                ? allDetections.filter { $0.classIndex == 0 }
+                : allDetections
               localDetectionSeconds += Date().timeIntervalSince(
                 detectionStart
               )
@@ -1852,6 +3092,7 @@ private struct NativePreviewPipeline {
               pending.append(
                 DetectedFrame(frame: frame, detections: detections)
               )
+              newFramesSinceYield += 1
               if pending.count == config.temporalBatchFrames {
                 yieldPending()
               }
@@ -1880,8 +3121,9 @@ private struct NativePreviewPipeline {
 
       for try await event in detectionEvents {
         switch event {
-        case .batch(let batch):
+        case .batch(let detectedBatch):
           do {
+            let batch = detectedBatch.frames
             let outputs = try processor.process(batch)
             restoredBatches += processor.lastRestoredSceneCount
             if let pendingEncoding {
@@ -1889,29 +3131,138 @@ private struct NativePreviewPipeline {
                 try await pendingEncoding.value
               for segment in segments {
                 emitSegment(segment, generation: config.generation)
+                completedSegments.append(segment)
               }
               nextSequence = completedNextSequence
             }
             let startingSequence = nextSequence
+            var framesToEncode: [ProcessedFrame] = []
+            if (config.crossfade ?? false), overlap > 0 {
+              let prefixCount = min(detectedBatch.skipPrefix, outputs.count)
+              let matchedCount = min(prefixCount, deferredCrossfadeTail.count)
+              if matchedCount > 0 {
+                for index in 0..<matchedCount {
+                  framesToEncode.append(
+                    ProcessedFrame(
+                      pixelBuffer: try processor.crossfade(
+                        earlier: deferredCrossfadeTail[index].pixelBuffer,
+                        later: outputs[index],
+                        laterWeight: Float(index + 1)
+                          / Float(matchedCount + 1)
+                      ),
+                      ptsNanoseconds:
+                        deferredCrossfadeTail[index].ptsNanoseconds
+                    )
+                  )
+                }
+              }
+              if deferredCrossfadeTail.count > matchedCount {
+                framesToEncode.append(
+                  contentsOf: deferredCrossfadeTail[matchedCount...]
+                )
+              }
+              if prefixCount > matchedCount {
+                for index in matchedCount..<prefixCount {
+                  framesToEncode.append(
+                    ProcessedFrame(
+                      pixelBuffer: outputs[index],
+                      ptsNanoseconds: batch[index].frame.ptsNanoseconds
+                    )
+                  )
+                }
+              }
+              let uniqueCount = max(0, outputs.count - prefixCount)
+              let tailCount = min(overlap, uniqueCount)
+              let bodyEnd = outputs.count - tailCount
+              if prefixCount < bodyEnd {
+                for index in prefixCount..<bodyEnd {
+                  framesToEncode.append(
+                    ProcessedFrame(
+                      pixelBuffer: outputs[index],
+                      ptsNanoseconds: batch[index].frame.ptsNanoseconds
+                    )
+                  )
+                }
+              }
+              deferredCrossfadeTail = []
+              if tailCount > 0 {
+                for index in bodyEnd..<outputs.count {
+                  deferredCrossfadeTail.append(
+                    ProcessedFrame(
+                      pixelBuffer: outputs[index],
+                      ptsNanoseconds: batch[index].frame.ptsNanoseconds
+                    )
+                  )
+                }
+              }
+            } else {
+              for index in detectedBatch.skipPrefix..<outputs.count {
+                framesToEncode.append(
+                  ProcessedFrame(
+                    pixelBuffer: outputs[index],
+                    ptsNanoseconds: batch[index].frame.ptsNanoseconds
+                  )
+                )
+              }
+            }
+            let acceptedFrames = framesToEncode.filter { frame in
+              guard var gate = postRestorationFrameRateGate else { return true }
+              let accepted = gate.accepts(frame.ptsNanoseconds)
+              postRestorationFrameRateGate = gate
+              return accepted
+            }
             pendingEncoding = Task.detached(priority: .userInitiated) {
               var completedSegments: [SegmentEvent] = []
               var encodingNextSequence = startingSequence
-              for (index, output) in outputs.enumerated() {
-                guard control.waitForCapacity(
-                  nextSequence: encodingNextSequence,
-                  segmentSeconds: config.segmentSeconds
+              for frame in acceptedFrames {
+                guard (
+                  config.isExport
+                    ? !control.shouldStop()
+                    : control.waitForCapacity(
+                      nextSequence: encodingNextSequence,
+                      segmentSeconds: config.segmentSeconds
+                    )
                 ) else {
                   break
                 }
                 if let segment = try await writer.append(
-                  pixelBuffer: output,
-                  ptsNanoseconds: batch[index].frame.ptsNanoseconds
+                  pixelBuffer: frame.pixelBuffer,
+                  ptsNanoseconds: frame.ptsNanoseconds
                 ) {
                   completedSegments.append(segment)
                   encodingNextSequence = segment.sequence + 1
                 }
               }
-              return (completedSegments, encodingNextSequence)
+              return (
+                completedSegments,
+                encodingNextSequence
+              )
+            }
+            encodedFrames += acceptedFrames.count
+            if config.isExport,
+              let last = batch.last
+            {
+              let position = Double(last.frame.ptsNanoseconds) / 1_000_000_000
+              let percent = min(
+                100,
+                max(0, position / max(0.001, video.durationSeconds) * 100)
+              )
+              let elapsed = max(0.001, Date().timeIntervalSince(wallStart))
+              let throughput = Double(encodedFrames) / elapsed
+              let eta = percent > 0
+                ? elapsed * max(0, 100 - percent) / percent
+                : 0
+              emit([
+                "kind": "export_progress",
+                "generation": config.generation,
+                "percent": percent,
+                "position_seconds": position,
+                "duration_seconds": video.durationSeconds,
+                "encoded_frames": encodedFrames,
+                "elapsed_seconds": elapsed,
+                "throughput_fps": throughput,
+                "eta_seconds": eta,
+              ])
             }
             availableBatchSlots.signal()
           } catch {
@@ -1940,12 +3291,55 @@ private struct NativePreviewPipeline {
             try await pendingEncoding.value
           for segment in segments {
             emitSegment(segment, generation: config.generation)
+            completedSegments.append(segment)
           }
           nextSequence = completedNextSequence
         }
+        if !deferredCrossfadeTail.isEmpty {
+          for frame in deferredCrossfadeTail {
+            if var gate = postRestorationFrameRateGate {
+              let accepted = gate.accepts(frame.ptsNanoseconds)
+              postRestorationFrameRateGate = gate
+              if !accepted { continue }
+            }
+            if let segment = try await writer.append(
+              pixelBuffer: frame.pixelBuffer,
+              ptsNanoseconds: frame.ptsNanoseconds
+            ) {
+              emitSegment(segment, generation: config.generation)
+              completedSegments.append(segment)
+              nextSequence = segment.sequence + 1
+            }
+            encodedFrames += 1
+          }
+          deferredCrossfadeTail.removeAll(keepingCapacity: false)
+        }
         if let segment = try await writer.finish() {
           emitSegment(segment, generation: config.generation)
+          completedSegments.append(segment)
           nextSequence = segment.sequence + 1
+        }
+        if config.isExport {
+          guard let outputFile = config.outputFile,
+            let ffmpegURL
+          else {
+            throw NativePreviewError.invalidConfiguration(
+              "export mode requires outputFile and ffmpeg"
+            )
+          }
+          emit([
+            "kind": "export_finalizing",
+            "generation": config.generation,
+            "message": "音声を結合しています",
+          ])
+          try NativeExportSupport.finishExport(
+            segments: completedSegments,
+            source: URL(fileURLWithPath: config.input),
+            output: URL(fileURLWithPath: outputFile),
+            ffmpeg: ffmpegURL,
+            workingDirectory: ffmpegTemporaryDirectory,
+            fastStart: config.mp4FastStart ?? false
+          )
         }
         let elapsed = max(0.001, Date().timeIntervalSince(wallStart))
         emit([
@@ -1954,6 +3348,10 @@ private struct NativePreviewPipeline {
           "decoded_frames": decodedFrames,
           "detected_frames": detectedFrames,
           "restored_batches": restoredBatches,
+          "encoded_frames": encodedFrames,
+          "source_fps": sourceFPS,
+          "output_fps": Double(outputFPSNumerator)
+            / Double(outputFPSDenominator),
           "detection_seconds": detectionSeconds,
           "preparation_seconds": processor.preparationSeconds,
           "restoration_seconds": processor.restorationSeconds,
@@ -1961,7 +3359,14 @@ private struct NativePreviewPipeline {
           "elapsed_seconds": elapsed,
           "throughput_fps": Double(decodedFrames) / elapsed,
         ])
-        emit(["kind": "ended", "generation": config.generation])
+        var ended: [String: Any] = [
+          "kind": "ended",
+          "generation": config.generation,
+        ]
+        if let outputFile = config.outputFile {
+          ended["output"] = outputFile
+        }
+        emit(ended)
       }
     } catch {
       pendingEncoding?.cancel()

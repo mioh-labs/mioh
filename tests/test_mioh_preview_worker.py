@@ -126,6 +126,45 @@ class PreviewProtocolTests(unittest.TestCase):
         self.assertFalse(compatible)
         self.assertIn("postprocessing", reason)
 
+    def test_native_swift_preview_maps_coreai_detector_to_coreml_lane(self):
+        self.assertEqual(
+            self.worker._native_swift_coreml_detector_name(
+                "v4-accurate-coreai"
+            ),
+            "v4-accurate-coreml",
+        )
+        self.assertEqual(
+            self.worker._native_swift_coreml_detector_name("v2-coreai"),
+            "v2-coreml",
+        )
+        self.assertIsNone(
+            self.worker._native_swift_coreml_detector_name(
+                "v4-accurate-coreml"
+            )
+        )
+
+    def test_native_swift_preview_treats_negative_restore_max_frames_as_auto(self):
+        config = SimpleNamespace(
+            restore_max_frames=-1,
+            max_clip_length=180,
+        )
+
+        self.assertEqual(
+            self.worker._native_temporal_frame_count(config, 36),
+            36,
+        )
+
+    def test_native_swift_preview_honors_positive_restore_max_frames(self):
+        config = SimpleNamespace(
+            restore_max_frames=12,
+            max_clip_length=180,
+        )
+
+        self.assertEqual(
+            self.worker._native_temporal_frame_count(config, 36),
+            12,
+        )
+
 
 class SegmentEncoderTests(unittest.TestCase):
     @classmethod

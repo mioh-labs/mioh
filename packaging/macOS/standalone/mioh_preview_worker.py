@@ -655,6 +655,34 @@ def _native_swift_preview_compatibility(config) -> tuple[bool, str]:
     return True, ""
 
 
+def _native_swift_coreml_detector_name(detection_model: str) -> str | None:
+    """Return the matching Core ML detector used by the native preview lane."""
+    if not detection_model.endswith("-coreai"):
+        return None
+    return f"{detection_model[:-len('-coreai')]}-coreml"
+
+
+def _native_temporal_frame_count(config, frame_limit: int) -> int:
+    """Resolve the native preview window without misreading sentinel values.
+
+    ``restore_max_frames`` follows the CLI contract: ``None`` selects adaptive
+    chunking and ``-1`` disables a forced chunk size.  Neither value is a
+    literal temporal window.  The native preview still caps the adaptive
+    window to its measured real-time limit.
+    """
+    forced = getattr(config, "restore_max_frames", None)
+    if forced is not None and int(forced) > 0:
+        requested = int(forced)
+    else:
+        maximum = getattr(config, "max_clip_length", None)
+        requested = (
+            int(maximum)
+            if maximum is not None and int(maximum) > 0
+            else int(frame_limit)
+        )
+    return min(int(frame_limit), max(2, requested))
+
+
 def run_native_swift_preview(config, output_dir: Path) -> int | None:
     """Run the CVPixelBuffer-resident Swift/Core AI preview pipeline.
 
@@ -683,6 +711,32 @@ def run_native_swift_preview(config, output_dir: Path) -> int | None:
     if not restoration_path.is_dir() or not detection_path.is_dir():
         return None
 
+    # Core AI detection and restoration contend for the same execution
+    # resources when a larger temporal restoration batch is used. Keep the
+    # user-selected detector architecture, but run its equivalent Core ML
+    # asset on the ANE. This independent lane makes T36 faster than T18 in the
+    # measured end-to-end preview. If the compiled Core ML asset is absent,
+    # retain the proven Core AI/T18 path rather than silently using a
+    # contention-prone T36 configuration.
+    detection_compute_units: str | None = None
+    temporal_frame_limit = 18
+    coreml_detection_name = _native_swift_coreml_detector_name(
+        config.detection_model
+    )
+    if coreml_detection_name is not None:
+        coreml_detection = ModelFiles.get_detection_model_by_name(
+            coreml_detection_name
+        )
+        if coreml_detection is not None:
+            coreml_detection_path = Path(coreml_detection.path)
+            if (
+                coreml_detection_path.is_dir()
+                and coreml_detection_path.suffix == ".mlmodelc"
+            ):
+                detection_path = coreml_detection_path
+                detection_compute_units = "cpuAndNeuralEngine"
+                temporal_frame_limit = 36
+
     if config.restoration_model.endswith("-variable-hq"):
         restoration_runner = os.environ.get(
             "LADA_VARIABLE_COREAI_HQ_SWIFT_RUNNER"
@@ -699,21 +753,17 @@ def run_native_swift_preview(config, output_dir: Path) -> int | None:
     ):
         return None
 
-    candidate_channels = 37 if detection_path.name.startswith(
-        "lada_mosaic_detection_model_v2-"
-    ) else 38
-    temporal_frames = min(
-        18,
-        max(
-            2,
-            int(config.restore_max_frames or config.max_clip_length or 18),
-        ),
+    candidate_channels = 37 if config.detection_model == "v2-coreai" else 38
+    temporal_frames = _native_temporal_frame_count(
+        config,
+        temporal_frame_limit,
     )
     payload = {
         "input": str(Path(config.input).resolve()),
         "outputDirectory": str(Path(output_dir).resolve()),
         "detectionModel": str(detection_path.resolve()),
         "detectionCandidateChannels": candidate_channels,
+        "detectionComputeUnits": detection_compute_units,
         "restorationModels": str(restoration_path.resolve()),
         "restorationRunner": str(Path(restoration_runner).resolve()),
         "startNanoseconds": int(config.start_ns),
@@ -737,9 +787,14 @@ def run_native_swift_preview(config, output_dir: Path) -> int | None:
         ) as stream:
             json.dump(payload, stream, ensure_ascii=False, separators=(",", ":"))
             config_path = Path(stream.name)
+        detector_lane = (
+            "Core ML ANE detection + Core AI restoration"
+            if detection_compute_units is not None
+            else "Core AI detection + restoration"
+        )
         print(
-            "Realtime preview: Swift CVPixelBuffer ring + Core AI "
-            f"({temporal_frames} frames)",
+            "Realtime preview: Swift CVPixelBuffer ring, "
+            f"{detector_lane} ({temporal_frames} frames)",
             file=sys.stderr,
             flush=True,
         )
