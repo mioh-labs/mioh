@@ -21,22 +21,17 @@ MIOH_MODELESS_DISTRIBUTION="${MIOH_MODELESS_DISTRIBUTION:-0}"
 USER_MANUAL_PDF="${USER_MANUAL_PDF:-$ROOT/output/pdf/mioh-user-manual-ja.pdf}"
 CONTENTS="$APP/Contents"
 RESOURCES="$CONTENTS/Resources"
-PYTHON_SOURCE="${PYTHON_SOURCE:-$HOME/.local/share/uv/python/cpython-3.12-macos-aarch64-none}"
-PYTHON_SOURCE="${PYTHON_SOURCE:A}"
 LADA_STANDALONE_PYTHON_ENV="${LADA_STANDALONE_PYTHON_ENV:-${LADA_STANDALONE_VENV:-$ROOT/.venv-coreai}}"
 LADA_STANDALONE_PYTHON_ENV="${LADA_STANDALONE_PYTHON_ENV:A}"
-SITE_PACKAGES="${SITE_PACKAGES:-$LADA_STANDALONE_PYTHON_ENV/lib/python3.12/site-packages}"
-if [[ ! -d "$SITE_PACKAGES" ]]; then
-  print -u2 "Missing site-packages for standalone build: $SITE_PACKAGES"
-  print -u2 "Set LADA_STANDALONE_PYTHON_ENV to the single Python environment to package."
+if [[ "$MIOH_MODELESS_DISTRIBUTION" != 1 && ! -x "$LADA_STANDALONE_PYTHON_ENV/bin/python" ]]; then
+  print -u2 "Missing build-time Python: $LADA_STANDALONE_PYTHON_ENV/bin/python"
+  print -u2 "Python is used only while exporting/verifying models and is not bundled."
   exit 1
 fi
 COMPILED_MODELS="${COMPILED_MODELS:-$BUILD_DIR/compiled-models}"
 COREAI_ARCHITECTURE="${COREAI_ARCHITECTURE:-h17s}"
 COMPILED_COREML_MODELS="${COMPILED_COREML_MODELS:-$BUILD_DIR/compiled-coreml-models}"
 FFMPEG_CACHE="${FFMPEG_CACHE:-$BUILD_DIR/ffmpeg-static}"
-VENDORED_MPS_DEFORM_CONV="$PACKAGE_DIR/vendor/mps-deform-conv-0.2.2"
-MPS_DEFORM_BUILD_SOURCE="$BUILD_DIR/mps-deform-conv-source"
 PREVIEW_ENCODER_TARGET="arm64-apple-macosx26.0"
 
 rm -rf "$APP" "$BUILD_DIR/Lada.app"
@@ -93,6 +88,7 @@ xcrun swiftc \
   -framework AVFoundation \
   -framework CoreAI \
   -framework CoreImage \
+  -framework CoreML \
   -framework CoreVideo \
   -framework VideoToolbox \
   "$PACKAGE_DIR/PreviewVideoToolboxEncoder.swift" \
@@ -134,43 +130,6 @@ if [[ -d "$PACKAGE_DIR/Localizations" ]]; then
     ditto "$localization" "$RESOURCES/${localization:t}"
   done
 fi
-ditto "$PYTHON_SOURCE" "$RESOURCES/runtime"
-mkdir -p "$RESOURCES/runtime/lib/python3.12/site-packages"
-rsync -a --exclude '.DS_Store' \
-  "$SITE_PACKAGES/" "$RESOURCES/runtime/lib/python3.12/site-packages/"
-rm -f "$RESOURCES/runtime/lib/python3.12/site-packages"/__editable__.lada-*.pth(N)
-rm -f "$RESOURCES/runtime/lib/python3.12/site-packages"/__editable___lada_*_finder.py(N)
-rm -f "$RESOURCES/runtime/lib/python3.12/site-packages/_virtualenv.pth"
-rm -f "$RESOURCES/runtime/lib/python3.12/site-packages/_virtualenv.py"
-rm -rf "$RESOURCES/runtime/lib/python3.12/site-packages"/lada-*.dist-info(N)
-uv pip install \
-  --python "$RESOURCES/runtime/bin/python3.12" \
-  --break-system-packages \
-  --no-deps \
-  --no-build-isolation \
-  --reinstall \
-  "$ROOT"
-rm -rf "$MPS_DEFORM_BUILD_SOURCE"
-ditto "$VENDORED_MPS_DEFORM_CONV" "$MPS_DEFORM_BUILD_SOURCE"
-uv pip install \
-  --python "$RESOURCES/runtime/bin/python3.12" \
-  --break-system-packages \
-  --no-deps \
-  --no-build-isolation \
-  --reinstall \
-  "$MPS_DEFORM_BUILD_SOURCE"
-if [[ "${MIOH_SKIP_HARDWARE_SMOKE:-0}" != "1" ]]; then
-  PYTHONHOME="$RESOURCES/runtime" \
-  PYTHONPATH="$RESOURCES/runtime/lib/python3.12/site-packages" \
-    "$RESOURCES/runtime/bin/python3.12" \
-    "$PACKAGE_DIR/verify_mps_deform_conv.py"
-fi
-cp "$ROOT/process_video_parallel.py" \
-  "$RESOURCES/runtime/lib/python3.12/site-packages/process_video_parallel.py"
-cp "$PACKAGE_DIR/mioh_preview_worker.py" \
-  "$RESOURCES/runtime/lib/python3.12/site-packages/mioh_preview_worker.py"
-rm -f "$RESOURCES/runtime/lib/python3.12/site-packages"/lada-*.dist-info/direct_url.json(N)
-
 mkdir -p "$FFMPEG_CACHE"
 if [[ ! -x "$FFMPEG_CACHE/ffmpeg" ]]; then
   curl -fL --retry 3 \
@@ -385,7 +344,7 @@ for asset in "${COREAI_MODEL_ASSETS[@]}"; do
 
   inspect_file="$BUILD_DIR/${compiled_name}.inspect.json"
   xcrun coreai-build inspect "$compiled_model" --json > "$inspect_file"
-  "$RESOURCES/runtime/bin/python3.12" - "$inspect_file" "$COREAI_ARCHITECTURE" <<'PY'
+  "$LADA_STANDALONE_PYTHON_ENV/bin/python" - "$inspect_file" "$COREAI_ARCHITECTURE" <<'PY'
 import json
 import sys
 
@@ -491,7 +450,6 @@ else
 fi
 cp "$ROOT/LICENSE.md" "$RESOURCES/LICENSE.md"
 ditto "$ROOT/LICENSES" "$RESOURCES/LICENSES"
-cp "$VENDORED_MPS_DEFORM_CONV/LICENSE" "$RESOURCES/LICENSES/mps-deform-conv.txt"
 
 if [[ -n "${MIOH_PREBUILT_APP_ICON:-}" ]]; then
   ditto "$MIOH_PREBUILT_APP_ICON" "$RESOURCES/AppIcon.icns"
@@ -511,7 +469,7 @@ else
   iconutil -c icns "$ICONSET" -o "$RESOURCES/AppIcon.icns"
 fi
 
-chmod +x "$CONTENTS/MacOS/mioh" "$RESOURCES/runtime/bin/python3.12" \
+chmod +x "$CONTENTS/MacOS/mioh" \
   "$RESOURCES/bin/ffmpeg" "$RESOURCES/bin/ffprobe" \
   "$RESOURCES/bin/mioh-preview-videotoolbox-encoder" \
   "$RESOURCES/bin/lada-coreai-runner" \
@@ -526,52 +484,28 @@ if [[ "$MIOH_MODELESS_DISTRIBUTION" == 1 ]]; then
 elif [[ "${MIOH_SKIP_HARDWARE_SMOKE:-0}" == "1" ]]; then
   print "Skipping MPS/Core AI hardware smoke tests by request"
 elif [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
-  PYTHONHOME="$RESOURCES/runtime" \
-  PYTHONPATH="$RESOURCES/runtime/lib/python3.12/site-packages" \
+  PYTHONPATH="$ROOT" \
   LADA_MODEL_WEIGHTS_DIR="$RESOURCES/models" \
   LADA_COREAI_ARCHITECTURE="$COREAI_ARCHITECTURE" \
   LADA_COREAI_SWIFT_RUNNER="$RESOURCES/bin/lada-coreai-runner" \
   LADA_VARIABLE_COREAI_SWIFT_RUNNER="$RESOURCES/bin/lada-basicvsrpp-variable-runner" \
   LADA_VARIABLE_COREAI_HQ_SWIFT_RUNNER="$RESOURCES/bin/lada-basicvsrpp-variable-hq-runner" \
-    "$RESOURCES/runtime/bin/python3.12" \
+    "$LADA_STANDALONE_PYTHON_ENV/bin/python" \
     "$PACKAGE_DIR/verify_coreai_models.py" \
     --resources "$RESOURCES" \
     --distribution "$COREAI_DISTRIBUTION" \
     --architecture "$COREAI_ARCHITECTURE"
 else
   env -u LADA_COREAI_ARCHITECTURE -u LADA_COREAI_SWIFT_RUNNER \
-    PYTHONHOME="$RESOURCES/runtime" \
-    PYTHONPATH="$RESOURCES/runtime/lib/python3.12/site-packages" \
+    PYTHONPATH="$ROOT" \
     LADA_MODEL_WEIGHTS_DIR="$RESOURCES/models" \
-    "$RESOURCES/runtime/bin/python3.12" \
+    "$LADA_STANDALONE_PYTHON_ENV/bin/python" \
     "$PACKAGE_DIR/verify_coreai_models.py" \
     --resources "$RESOURCES" \
     --distribution "$COREAI_DISTRIBUTION" \
     --architecture "$COREAI_ARCHITECTURE" \
     --smoke-model basicvsrpp-v1.2-coreai
 fi
-
-find "$RESOURCES/runtime" -type d -name '__pycache__' -prune -exec rm -rf {} +
-find "$RESOURCES/runtime" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
-# The build environment also serves local RF-DETR experiments. Do not inherit
-# that prototype or its CLI into the production mioh runtime.
-rm -rf \
-  "$RESOURCES/runtime/lib/python3.12/site-packages/rfdetr" \
-  "$RESOURCES/runtime/lib/python3.12/site-packages"/rfdetr-*.dist-info(N)
-rm -f "$RESOURCES/runtime/bin/rfdetr"
-rm -rf \
-  "$RESOURCES/runtime/bin/pip" \
-  "$RESOURCES/runtime/bin/pip3" \
-  "$RESOURCES/runtime/bin/pip3.12" \
-  "$RESOURCES/runtime/lib/python3.12/site-packages/pip" \
-  "$RESOURCES/runtime/lib/python3.12/site-packages"/pip-*.dist-info(N) \
-  "$RESOURCES/runtime/lib/python3.12/site-packages/setuptools" \
-  "$RESOURCES/runtime/lib/python3.12/site-packages"/setuptools-*.dist-info(N) \
-  "$RESOURCES/runtime/lib/python3.12/site-packages/wheel" \
-  "$RESOURCES/runtime/lib/python3.12/site-packages"/wheel-*.dist-info(N) \
-  "$RESOURCES/runtime/lib/python3.12/site-packages/tests" \
-  "$RESOURCES/runtime/lib/python3.12/site-packages/test" \
-  "$RESOURCES/runtime/lib/python3.12/site-packages/yapftests"
 
 codesign --force --deep --sign - "$APP"
 

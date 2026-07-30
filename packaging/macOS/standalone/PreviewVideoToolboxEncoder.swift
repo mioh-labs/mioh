@@ -75,6 +75,10 @@ final class SegmentWriter {
   private let generation: Int
   private let segmentNanoseconds: Int64
   private let frameDurationNanoseconds: Int64
+  private let codec: AVVideoCodecType
+  private let requestedAverageBitRate: Int?
+  private let realTime: Bool
+  private let filePrefix: String
 
   private var sequence = 0
   private var segmentStartNanoseconds: Int64?
@@ -93,7 +97,11 @@ final class SegmentWriter {
     fpsNumerator: Int,
     fpsDenominator: Int,
     generation: Int,
-    segmentSeconds: Double
+    segmentSeconds: Double,
+    codec: AVVideoCodecType = .h264,
+    averageBitRate: Int? = nil,
+    realTime: Bool = true,
+    filePrefix: String = "preview"
   ) throws {
     guard width > 0, height > 0 else {
       throw EncoderError.invalidValue("frame dimensions")
@@ -110,6 +118,10 @@ final class SegmentWriter {
     self.fpsNumerator = fpsNumerator
     self.fpsDenominator = fpsDenominator
     self.generation = generation
+    self.codec = codec
+    requestedAverageBitRate = averageBitRate
+    self.realTime = realTime
+    self.filePrefix = filePrefix
     segmentNanoseconds = Int64(segmentSeconds * 1_000_000_000)
     frameDurationNanoseconds = Int64(
       Double(1_000_000_000 * fpsDenominator) / Double(fpsNumerator)
@@ -126,7 +138,7 @@ final class SegmentWriter {
 
   private func paths(for sequence: Int) -> (working: URL, final: URL) {
     let name = String(
-      format: "preview-g%d-%06d.mp4",
+      format: "\(filePrefix)-g%d-%06d.mp4",
       generation,
       sequence
     )
@@ -145,11 +157,14 @@ final class SegmentWriter {
     let writer = try AVAssetWriter(outputURL: paths.working, fileType: .mp4)
     let frameRate = Double(fpsNumerator) / Double(fpsDenominator)
     let pixelRate = Double(width * height) * frameRate
-    let averageBitRate = Int(
+    let averageBitRate = requestedAverageBitRate ?? Int(
       min(35_000_000, max(4_000_000, pixelRate * 0.10))
     )
+    let profile: String = codec == .hevc
+      ? (kVTProfileLevel_HEVC_Main_AutoLevel as String)
+      : AVVideoProfileLevelH264HighAutoLevel
     let settings: [String: Any] = [
-      AVVideoCodecKey: AVVideoCodecType.h264,
+      AVVideoCodecKey: codec,
       AVVideoWidthKey: width,
       AVVideoHeightKey: height,
       // Prefer VideoToolbox hardware, but do not make preview availability
@@ -169,11 +184,11 @@ final class SegmentWriter {
         AVVideoExpectedSourceFrameRateKey: frameRate,
         AVVideoAllowFrameReorderingKey: false,
         AVVideoMaxKeyFrameIntervalKey: max(1, Int(frameRate * 2)),
-        AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+        AVVideoProfileLevelKey: profile,
       ],
     ]
     let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
-    input.expectsMediaDataInRealTime = true
+    input.expectsMediaDataInRealTime = realTime
     let attributes: [String: Any] = [
       kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
       kCVPixelBufferWidthKey as String: width,
@@ -186,7 +201,7 @@ final class SegmentWriter {
       sourcePixelBufferAttributes: attributes
     )
     guard writer.canAdd(input) else {
-      throw EncoderError.writer("cannot add H.264 input")
+      throw EncoderError.writer("cannot add \(codec.rawValue) input")
     }
     writer.add(input)
     guard writer.startWriting() else {
@@ -353,7 +368,7 @@ final class SegmentWriter {
       startNs: start,
       endNs: endNanoseconds,
       path: finalURL.path,
-      codec: "h264_videotoolbox"
+      codec: codec == .hevc ? "hevc_videotoolbox" : "h264_videotoolbox"
     )
     sequence += 1
     self.writer = nil

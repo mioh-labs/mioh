@@ -234,8 +234,17 @@ private struct PreparedSourcePlayerItem {
   let item: AVPlayerItem
   let duration: Double
   let resourceLoader: HEV1LoopbackServer?
+  let processingInputURL: URL
+  let compatibilityMode: SourceCompatibilityMode
 
   var usesVirtualContainer: Bool { resourceLoader != nil }
+}
+
+private enum SourceCompatibilityMode: Equatable {
+  case direct
+  case virtualHEV1
+  case remuxed
+  case transcoded
 }
 
 private enum SourcePlaybackError: LocalizedError {
@@ -243,6 +252,8 @@ private enum SourcePlaybackError: LocalizedError {
   case incompatibleVirtualContainer
   case invalidFileSize
   case loopbackServerFailed
+  case missingFFmpeg
+  case compatibilityConversionFailed
 
   var errorDescription: String? {
     switch self {
@@ -254,6 +265,58 @@ private enum SourcePlaybackError: LocalizedError {
       return L("動画ファイルの大きさを取得できません")
     case .loopbackServerFailed:
       return L("AVFoundation互換ストリーミングを開始できません")
+    case .missingFFmpeg:
+      return L("互換動画の作成に必要なFFmpegが見つかりません")
+    case .compatibilityConversionFailed:
+      return L("この動画をAVFoundation互換形式に変換できません")
+    }
+  }
+}
+
+/// A cancellable FFmpeg invocation used only when AVFoundation cannot open the
+/// original container.  stderr is streamed to the app log, so a long-running
+/// compatibility conversion never fills a pipe and deadlocks.
+private final class SourceCompatibilityJob {
+  let process = Process()
+  private let errorPipe = Pipe()
+  private let errorHandler: @Sendable (String) -> Void
+
+  init(
+    executable: URL,
+    arguments: [String],
+    errorHandler: @escaping @Sendable (String) -> Void
+  ) {
+    self.errorHandler = errorHandler
+    process.executableURL = executable
+    process.arguments = arguments
+    process.standardInput = FileHandle.nullDevice
+    process.standardOutput = FileHandle.nullDevice
+    process.standardError = errorPipe
+  }
+
+  func run() async throws -> Int32 {
+    errorPipe.fileHandleForReading.readabilityHandler = { [errorHandler] handle in
+      let data = handle.availableData
+      guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+      errorHandler(text)
+    }
+    return try await withCheckedThrowingContinuation { continuation in
+      process.terminationHandler = { [errorPipe] completed in
+        errorPipe.fileHandleForReading.readabilityHandler = nil
+        continuation.resume(returning: completed.terminationStatus)
+      }
+      do {
+        try process.run()
+      } catch {
+        errorPipe.fileHandleForReading.readabilityHandler = nil
+        continuation.resume(throwing: error)
+      }
+    }
+  }
+
+  func cancel() {
+    if process.isRunning {
+      process.terminate()
     }
   }
 }
@@ -844,6 +907,9 @@ struct VRPreviewSceneView: NSViewRepresentable {
 
 @MainActor
 final class RealtimePlayerController: ObservableObject {
+  private static weak var activeRestorationController:
+    RealtimePlayerController?
+
   @Published var state: RealtimePlayerState = .idle
   @Published var previewInputURL: URL?
   @Published var position = 0.0
@@ -882,6 +948,9 @@ final class RealtimePlayerController: ObservableObject {
   private var sourceTimeControlObservation: NSKeyValueObservation?
   private var sourceLoadedTimeRangesObservation: NSKeyValueObservation?
   private var sourceResourceLoader: HEV1LoopbackServer?
+  private var sourceProcessingInputURL: URL?
+  private var sourceCompatibilityDirectory: URL?
+  private var sourceCompatibilityJob: SourceCompatibilityJob?
   private var sessionDirectory: URL?
   private var requestedStartSeconds = 0.0
   private var shouldPlay = true
@@ -904,6 +973,24 @@ final class RealtimePlayerController: ObservableObject {
   }
 
   deinit {
+    try? workerInput?.fileHandleForWriting.close()
+    if let worker, worker.isRunning {
+      let processIdentifier = worker.processIdentifier
+      if kill(-processIdentifier, SIGTERM) != 0 {
+        worker.terminate()
+      }
+      // A controller can disappear when SwiftUI replaces a window/view
+      // without calling the user-facing stop action. Do not leave its Core AI
+      // descendants resident indefinitely if graceful termination stalls.
+      DispatchQueue.global(qos: .utility).asyncAfter(
+        deadline: .now() + 1
+      ) {
+        if kill(processIdentifier, 0) == 0 {
+          _ = kill(-processIdentifier, SIGKILL)
+        }
+      }
+    }
+    sourceCompatibilityJob?.cancel()
     sourceItemStatusObservation?.invalidate()
     sourceTimeControlObservation?.invalidate()
     sourceLoadedTimeRangesObservation?.invalidate()
@@ -921,8 +1008,17 @@ final class RealtimePlayerController: ObservableObject {
     autoPlay: Bool = true,
     preserveCurrentSource: Bool = false
   ) {
+    let previousController = Self.activeRestorationController
+    var previousControllerRetirement: Task<Void, Never>?
+    if let previousController, previousController !== self {
+      previousController.stop()
+      previousControllerRetirement =
+        previousController.workerRetirementTask
+    }
+    Self.activeRestorationController = self
     let canReuseCurrentSource = preserveCurrentSource && sourcePlayer.currentItem != nil
     stop(preserveSourceItem: canReuseCurrentSource)
+    Self.activeRestorationController = self
     let retirement = workerRetirementTask
     guard let input = previewInputURL else {
       fail("再生タブで入力動画を選択してください")
@@ -979,42 +1075,18 @@ final class RealtimePlayerController: ObservableObject {
       if sourceOnlyPlayback {
         startSourceOnlyPlayback(
           input: input,
+          resources: resources,
+          tempRoot: tempRoot,
           generation: startingGeneration,
           startSeconds: startSeconds
         )
         return
       }
 
-      let python = resources.appendingPathComponent("runtime/bin/python3.12")
-      let script = resources.appendingPathComponent(
-        "runtime/lib/python3.12/site-packages/mioh_preview_worker.py"
-      )
-      guard FileManager.default.isExecutableFile(atPath: python.path) else {
-        throw RunnerError.missingResource("Python runtime")
-      }
-      guard FileManager.default.fileExists(atPath: script.path) else {
-        throw RunnerError.missingResource("Realtime preview worker")
-      }
-
-      let process = Process()
-      let inputPipe = Pipe()
-      let outputPipe = Pipe()
-      let errorPipe = Pipe()
-      process.executableURL = python
-      process.arguments = [script.path] + (try runner.previewArguments(
-        resources: resources,
-        outputDirectory: session,
-        input: input
-      )) + [
-        "--start-ns", String(Int64(startSeconds * 1_000_000_000)),
-        "--generation", String(startingGeneration),
-      ]
-      process.environment = runner.environment(resources: resources, python: python)
-      process.standardInput = inputPipe
-      process.standardOutput = outputPipe
-      process.standardError = errorPipe
-
       Task { @MainActor [self] in
+        if let previousControllerRetirement {
+          await previousControllerRetirement.value
+        }
         if let retirement {
           await retirement.value
         }
@@ -1025,29 +1097,74 @@ final class RealtimePlayerController: ObservableObject {
           prepared = nil
         } else {
           do {
-            prepared = try await self.prepareSourcePlayerItem(input: input)
+            prepared = try await self.prepareSourcePlayerItem(
+              input: input,
+              resources: resources,
+              tempRoot: tempRoot
+            )
           } catch {
             guard self.generation == startingGeneration else { return }
             self.fail("元動画を開けません: \(error.localizedDescription)")
             self.cleanupSession()
+            self.cleanupSourceCompatibility()
             return
           }
         }
         guard self.generation == startingGeneration, self.state == .loading || self.state == .buffering else {
           return
         }
+        let processingInput = prepared?.processingInputURL ?? self.sourceProcessingInputURL ?? input
+        let process = Process()
+        let inputPipe = Pipe()
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        do {
+          let invocation = try runner.nativePreviewInvocation(
+            resources: resources,
+            outputDirectory: session,
+            input: processingInput,
+            startNanoseconds: Int64(startSeconds * 1_000_000_000),
+            generation: startingGeneration
+          )
+          let configurationURL = session.appendingPathComponent(
+            "native-preview-configuration.json"
+          )
+          try invocation.configuration.write(
+            to: configurationURL,
+            options: .atomic
+          )
+          process.executableURL = invocation.executable
+          process.arguments = [configurationURL.path]
+          process.environment = invocation.environment
+        } catch {
+          self.fail(error.localizedDescription)
+          self.cleanupSession()
+          return
+        }
+        process.standardInput = inputPipe
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
         self.worker = process
         self.workerInput = inputPipe
         self.stdoutPipe = outputPipe
         self.stderrPipe = errorPipe
         if let prepared {
           self.sourceResourceLoader = prepared.resourceLoader
+          self.sourceProcessingInputURL = prepared.processingInputURL
           self.sourcePlayer.replaceCurrentItem(with: prepared.item)
         }
         self.sourcePlayer.volume = self.muted ? 0 : Float(self.volume)
         if prepared?.usesVirtualContainer == true {
           self.runner?.appendExternalLog(
             "再生: AVFoundation互換の仮想コンテナを使用します（ファイル変換なし）\n"
+          )
+        } else if prepared?.compatibilityMode == .remuxed {
+          self.runner?.appendExternalLog(
+            "再生: AVFoundation互換MP4へremuxした動画を、表示・検出・復元で共有します\n"
+          )
+        } else if prepared?.compatibilityMode == .transcoded {
+          self.runner?.appendExternalLog(
+            "再生: 非対応コーデックをVideoToolboxで互換変換し、表示・検出・復元で共有します\n"
           )
         }
 
@@ -1100,23 +1217,31 @@ final class RealtimePlayerController: ObservableObject {
 
   private func startSourceOnlyPlayback(
     input: URL,
+    resources: URL,
+    tempRoot: URL,
     generation startingGeneration: Int,
     startSeconds: Double
   ) {
     Task { @MainActor [self] in
       let prepared: PreparedSourcePlayerItem
       do {
-        prepared = try await self.prepareSourcePlayerItem(input: input)
+        prepared = try await self.prepareSourcePlayerItem(
+          input: input,
+          resources: resources,
+          tempRoot: tempRoot
+        )
       } catch {
         guard self.generation == startingGeneration, self.sourceOnlyPlayback else { return }
         self.fail("VR動画を開けません: \(error.localizedDescription)")
         self.cleanupSession()
+        self.cleanupSourceCompatibility()
         return
       }
       guard self.generation == startingGeneration, self.sourceOnlyPlayback else { return }
       let item = prepared.item
       item.preferredForwardBufferDuration = max(1, self.runner?.previewBufferLimit ?? 8)
       self.sourceResourceLoader = prepared.resourceLoader
+      self.sourceProcessingInputURL = prepared.processingInputURL
       self.sourcePlayer.replaceCurrentItem(with: item)
       self.sourcePlayer.volume = self.muted ? 0 : Float(self.volume)
       self.bufferedSeconds = 0
@@ -1128,6 +1253,10 @@ final class RealtimePlayerController: ObservableObject {
         self.runner?.appendExternalLog(
           "VR再生: 全編remuxを行わず、AVFoundation互換の仮想コンテナを使用します\n"
         )
+      } else if prepared.compatibilityMode == .remuxed {
+        self.runner?.appendExternalLog("VR再生: MKV/非互換コンテナをMP4へremuxしました\n")
+      } else if prepared.compatibilityMode == .transcoded {
+        self.runner?.appendExternalLog("VR再生: 非対応コーデックをVideoToolboxで互換変換しました\n")
       }
       self.state = .buffering
       if startSeconds > 0 {
@@ -1279,6 +1408,8 @@ final class RealtimePlayerController: ObservableObject {
 
   func stop(preserveSourceItem: Bool = false) {
     generation += 1
+    sourceCompatibilityJob?.cancel()
+    sourceCompatibilityJob = nil
     sourceItemStatusObservation?.invalidate()
     sourceItemStatusObservation = nil
     sourceTimeControlObservation?.invalidate()
@@ -1295,6 +1426,8 @@ final class RealtimePlayerController: ObservableObject {
     if !preserveSourceItem {
       sourcePlayer.replaceCurrentItem(with: nil)
       sourceResourceLoader = nil
+      sourceProcessingInputURL = nil
+      cleanupSourceCompatibility()
     }
     restoredPlayer.pause()
     let retiringWorker = worker
@@ -1343,18 +1476,24 @@ final class RealtimePlayerController: ObservableObject {
         workerRetirementTask = nil
       }
     }
+    if !preserveSourceItem, Self.activeRestorationController === self {
+      Self.activeRestorationController = nil
+    }
   }
 
-  private func prepareSourcePlayerItem(input: URL) async throws -> PreparedSourcePlayerItem {
+  private func prepareSourcePlayerItem(
+    input: URL,
+    resources: URL,
+    tempRoot: URL
+  ) async throws -> PreparedSourcePlayerItem {
     let source = AVURLAsset(url: input)
-    let durationTime = try await source.load(.duration)
-    let durationSeconds = CMTimeGetSeconds(durationTime)
-    let duration = durationSeconds.isFinite ? max(0, durationSeconds) : 0
-    if try await source.load(.isPlayable) {
+    if (try? await source.load(.isPlayable)) == true {
       return PreparedSourcePlayerItem(
         item: AVPlayerItem(asset: source),
-        duration: duration,
-        resourceLoader: nil
+        duration: await sourceDuration(source),
+        resourceLoader: nil,
+        processingInputURL: input,
+        compatibilityMode: .direct
       )
     }
 
@@ -1362,13 +1501,150 @@ final class RealtimePlayerController: ObservableObject {
     // rejects the MP4 sample-entry identifier.  A loopback byte-range server
     // exposes the original file byte-for-byte except for hev1 -> hvc1 inside the
     // moov atom. This preserves random access without modifying or copying it.
-    let resourceLoader = try HEV1LoopbackServer(sourceURL: input)
-    let compatibleAsset = resourceLoader.makeAsset()
-    return PreparedSourcePlayerItem(
-      item: AVPlayerItem(asset: compatibleAsset),
-      duration: duration,
-      resourceLoader: resourceLoader
+    if ["mp4", "m4v", "mov"].contains(input.pathExtension.lowercased()),
+      let resourceLoader = try? HEV1LoopbackServer(sourceURL: input)
+    {
+      let compatibleAsset = resourceLoader.makeAsset()
+      if (try? await compatibleAsset.load(.isPlayable)) == true {
+        return PreparedSourcePlayerItem(
+          item: AVPlayerItem(asset: compatibleAsset),
+          duration: await sourceDuration(compatibleAsset),
+          resourceLoader: resourceLoader,
+          // Native AVAssetReader can generally open the original HEV1 file;
+          // only AVPlayer needs the hvc1 sample-entry view.
+          processingInputURL: input,
+          compatibilityMode: .virtualHEV1
+        )
+      }
+    }
+
+    let ffmpeg = resources.appendingPathComponent("bin/ffmpeg")
+    guard FileManager.default.isExecutableFile(atPath: ffmpeg.path) else {
+      throw SourcePlaybackError.missingFFmpeg
+    }
+    cleanupSourceCompatibility()
+    let compatibilityDirectory = tempRoot.appendingPathComponent(
+      "mioh-source-\(UUID().uuidString)",
+      isDirectory: true
     )
+    try FileManager.default.createDirectory(
+      at: compatibilityDirectory,
+      withIntermediateDirectories: true
+    )
+    sourceCompatibilityDirectory = compatibilityDirectory
+    let compatibleURL = compatibilityDirectory.appendingPathComponent("source-compatible.mp4")
+
+    playbackDetail = "AVFoundation互換MP4へremux中"
+    runner?.appendExternalLog(
+      "再生: \(input.lastPathComponent) を映像再エンコードなしで互換MP4へremuxします\n"
+    )
+    var arguments = [
+      "-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
+      "-i", input.path,
+      "-map", "0:v:0", "-map", "0:a:0?",
+      "-sn", "-dn",
+      "-c:v", "copy",
+      "-c:a", "aac", "-b:a", "192k",
+      "-movflags", "+faststart",
+      "-avoid_negative_ts", "make_zero",
+      compatibleURL.path,
+    ]
+    var status = try await runCompatibilityJob(
+      ffmpeg: ffmpeg,
+      arguments: arguments
+    )
+    if status == 0 {
+      let remuxedAsset = AVURLAsset(url: compatibleURL)
+      if (try? await remuxedAsset.load(.isPlayable)) == true {
+        playbackDetail = ""
+        return PreparedSourcePlayerItem(
+          item: AVPlayerItem(asset: remuxedAsset),
+          duration: await sourceDuration(remuxedAsset),
+          resourceLoader: nil,
+          processingInputURL: compatibleURL,
+          compatibilityMode: .remuxed
+        )
+      }
+    }
+
+    // Some HEVC streams keep a hev1 sample entry after a plain MKV/MP4 remux.
+    // Re-run stream-copy with hvc1 before paying the cost of re-encoding.
+    try? FileManager.default.removeItem(at: compatibleURL)
+    arguments.insert(contentsOf: ["-tag:v", "hvc1"], at: arguments.count - 1)
+    status = try await runCompatibilityJob(ffmpeg: ffmpeg, arguments: arguments)
+    if status == 0 {
+      let taggedAsset = AVURLAsset(url: compatibleURL)
+      if (try? await taggedAsset.load(.isPlayable)) == true {
+        playbackDetail = ""
+        return PreparedSourcePlayerItem(
+          item: AVPlayerItem(asset: taggedAsset),
+          duration: await sourceDuration(taggedAsset),
+          resourceLoader: nil,
+          processingInputURL: compatibleURL,
+          compatibilityMode: .remuxed
+        )
+      }
+    }
+
+    // A genuinely unsupported codec cannot be fixed at the container layer.
+    // This is the last-resort path: VideoToolbox performs the conversion once,
+    // and every downstream consumer shares the resulting local MP4.
+    try? FileManager.default.removeItem(at: compatibleURL)
+    playbackDetail = "非対応コーデックをVideoToolboxで互換変換中"
+    runner?.appendExternalLog(
+      "再生: remuxだけでは開けないため、映像をVideoToolbox HEVCへ互換変換します\n"
+    )
+    arguments = [
+      "-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
+      "-i", input.path,
+      "-map", "0:v:0", "-map", "0:a:0?",
+      "-sn", "-dn",
+      "-c:v", "hevc_videotoolbox", "-q:v", "65", "-tag:v", "hvc1",
+      "-c:a", "aac", "-b:a", "192k",
+      "-movflags", "+faststart",
+      "-avoid_negative_ts", "make_zero",
+      compatibleURL.path,
+    ]
+    status = try await runCompatibilityJob(ffmpeg: ffmpeg, arguments: arguments)
+    guard status == 0 else {
+      throw SourcePlaybackError.compatibilityConversionFailed
+    }
+    let transcodedAsset = AVURLAsset(url: compatibleURL)
+    guard (try? await transcodedAsset.load(.isPlayable)) == true else {
+      throw SourcePlaybackError.compatibilityConversionFailed
+    }
+    playbackDetail = ""
+    return PreparedSourcePlayerItem(
+      item: AVPlayerItem(asset: transcodedAsset),
+      duration: await sourceDuration(transcodedAsset),
+      resourceLoader: nil,
+      processingInputURL: compatibleURL,
+      compatibilityMode: .transcoded
+    )
+  }
+
+  private func sourceDuration(_ asset: AVURLAsset) async -> Double {
+    guard let durationTime = try? await asset.load(.duration) else { return 0 }
+    let seconds = CMTimeGetSeconds(durationTime)
+    return seconds.isFinite ? max(0, seconds) : 0
+  }
+
+  private func runCompatibilityJob(ffmpeg: URL, arguments: [String]) async throws -> Int32 {
+    let job = SourceCompatibilityJob(
+      executable: ffmpeg,
+      arguments: arguments
+    ) { [weak self] text in
+      Task { @MainActor in
+        self?.runner?.appendExternalLog(text)
+      }
+    }
+    sourceCompatibilityJob = job
+    defer {
+      if sourceCompatibilityJob === job {
+        sourceCompatibilityJob = nil
+      }
+    }
+    return try await job.run()
   }
 
   private func consumeWorkerOutput(_ text: String) {
@@ -1801,6 +2077,12 @@ final class RealtimePlayerController: ObservableObject {
     self.sessionDirectory = nil
   }
 
+  private func cleanupSourceCompatibility() {
+    guard let sourceCompatibilityDirectory else { return }
+    try? FileManager.default.removeItem(at: sourceCompatibilityDirectory)
+    self.sourceCompatibilityDirectory = nil
+  }
+
   private func fail(_ message: String) {
     sourceItemStatusObservation?.invalidate()
     sourceItemStatusObservation = nil
@@ -1836,41 +2118,6 @@ struct RealtimePlayerView: View {
       if !controller.isVRVideo {
         VStack(alignment: .leading, spacing: 8) {
           HStack(spacing: 12) {
-            Picker("復元モデル", selection: $runner.previewRestorationModel) {
-              ForEach(runner.restorationModels, id: \.self) { model in
-                Text(L(model)).tag(model)
-              }
-            }
-            .frame(maxWidth: 430)
-            if runner.previewRestorationModel == "カスタム" {
-              TextField("モデル名またはパス", text: $runner.previewCustomRestorationModel)
-                .textFieldStyle(.roundedBorder)
-                .frame(maxWidth: 360)
-              Button {
-                runner.choosePath(\.previewCustomRestorationModel)
-              } label: {
-                Image(systemName: "folder")
-              }
-            }
-            Spacer()
-          }
-          HStack(spacing: 12) {
-            Picker("再生用検出モデル", selection: $runner.previewDetectionModel) {
-              ForEach(runner.previewDetectionModels, id: \.self) { model in
-                Text(L(model)).tag(model)
-              }
-            }
-            .frame(maxWidth: 430)
-            if runner.previewDetectionModel == "カスタム" {
-              TextField("モデル名またはパス", text: $runner.previewCustomDetectionModel)
-                .textFieldStyle(.roundedBorder)
-                .frame(maxWidth: 360)
-              Button {
-                runner.choosePath(\.previewCustomDetectionModel)
-              } label: {
-                Image(systemName: "folder")
-              }
-            }
             Toggle("リアルタイム最適化", isOn: $runner.previewRealtimeOptimization)
               .toggleStyle(.checkbox)
             Spacer()
@@ -2055,6 +2302,7 @@ private extension RealtimePlayerController {
   }
 
   var processingOverlayLabel: String {
+    if !playbackDetail.isEmpty { return L(playbackDetail) }
     if !sourceOnlyPlayback { return L("バッファ中") }
     if state == .seeking { return L("シーク中") }
     return playbackDetail.isEmpty ? L("VR動画を準備中") : L(playbackDetail)
@@ -2068,6 +2316,7 @@ private extension RealtimePlayerController {
       default: return state.label
       }
     }
+    if !playbackDetail.isEmpty { return L(playbackDetail) }
     return state.label
   }
 }

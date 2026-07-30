@@ -162,5 +162,9 @@
 "この動画はAVFoundationで再生できません" = "此影片無法使用 AVFoundation 播放";
 "動画ファイルの大きさを取得できません" = "無法取得影片檔案大小";
 "AVFoundation互換ストリーミングを開始できません" = "無法啟動 AVFoundation 相容串流";
+"互換動画の作成に必要なFFmpegが見つかりません" = "找不到建立相容影片所需的 FFmpeg";
+"この動画をAVFoundation互換形式に変換できません" = "無法將此影片轉換為 AVFoundation 相容格式";
+"AVFoundation互換MP4へremux中" = "正在重新封裝為 AVFoundation 相容 MP4";
+"非対応コーデックをVideoToolboxで互換変換中" = "正在使用 VideoToolbox 轉換不支援的編解碼器";
 
 "mioh ユーザーマニュアル.pdf" = "mioh 使用者手冊.pdf";
