@@ -1229,7 +1229,17 @@ private final class NativeFrameProcessor {
   private let blendFeather: Float
   private let effects: NativeRestoreEffects
   private let detectionEmptyLookahead: Int
-  private let crossfadeContext = CIContext(options: [.cacheIntermediates: false])
+  // Colour management must stay off here. Every other frame reaches the
+  // writer as raw BGRA (`composite` memcpys the decoded bytes, undetected
+  // frames are passed through untouched), so a managed Core Image round trip
+  // would convert the crossfaded overlap frames from the decoder's tagged
+  // space into sRGB and nothing else. That is a visible luma/level jump on
+  // exactly the few frames at each clip boundary.
+  private let crossfadeContext = CIContext(options: [
+    .workingColorSpace: NSNull(),
+    .outputColorSpace: NSNull(),
+    .cacheIntermediates: false,
+  ])
   private(set) var lastRestoredSceneCount = 0
   private(set) var preparationSeconds = 0.0
   private(set) var restorationSeconds = 0.0
@@ -1343,6 +1353,12 @@ private final class NativeFrameProcessor {
         "crossfade input dimensions do not match"
       )
     }
+    // Overlap frames that no scene touched in either batch are literally the
+    // same decoded buffer. Blending one with itself can only lose fidelity,
+    // so hand it straight back.
+    if earlier === later {
+      return earlier
+    }
     var output: CVPixelBuffer?
     let status = CVPixelBufferPoolCreatePixelBuffer(
       kCFAllocatorDefault,
@@ -1377,6 +1393,7 @@ private final class NativeFrameProcessor {
       )
     }
     crossfadeContext.render(image, to: output)
+    CVBufferPropagateAttachments(earlier, output)
     return output
   }
 
@@ -2433,6 +2450,10 @@ private final class NativeFrameProcessor {
         pixel[3] = 255
       }
     }
+    // Pool buffers start untagged. Without the decoder's colour attachments
+    // the writer would treat composited frames differently from the
+    // untouched frames around them and shift their levels.
+    CVBufferPropagateAttachments(source, output)
     return output
   }
 
