@@ -1,5 +1,4 @@
 import AppKit
-import AVFoundation
 import Foundation
 import SwiftUI
 
@@ -369,13 +368,7 @@ struct MiohUserDefaultsSnapshot: Codable {
 
 @MainActor
 final class RestorationRunner: ObservableObject {
-  @Published var inputURL: URL? {
-    didSet {
-      guard inputURL != oldValue else { return }
-      refreshSourceFrameRate(for: inputURL)
-    }
-  }
-  @Published var sourceFrameRate: (numerator: Int, denominator: Int)?
+  @Published var inputURL: URL?
   @Published var outputURL: URL?
   @Published var progress = 0.0
   @Published var status = "待機中"
@@ -531,7 +524,7 @@ final class RestorationRunner: ObservableObject {
   }
 
   var selectedFrameRate: String {
-    get { FrameRateOption(numerator: fps, denominator: max(1, fpsDenominator)).key }
+    get { targetFrameRate.key }
     set {
       guard let option = frameRateOptions.first(where: { $0.key == newValue })
       else { return }
@@ -540,32 +533,14 @@ final class RestorationRunner: ObservableObject {
     }
   }
 
-  /// Conversion is down-only, and a rate never crosses between the NTSC and
-  /// whole-number families: 59.940 halves to 29.970, 60 halves to 30. Once
-  /// the source is known the list is narrowed to what it can actually reach.
+  /// The full table, always. Narrowing it to what a probed source can reach
+  /// only hid the rate the user wanted whenever the probe was wrong, and the
+  /// pipeline already rejects an up-conversion with a clear message.
   var frameRateOptions: [FrameRateOption] {
     var options = Self.standardFrameRates
-    if let source = sourceFrameRate {
-      let sourceValue = Double(source.numerator) / Double(source.denominator)
-      let sourceNTSC = FrameRateOption.isNTSC(
-        numerator: source.numerator,
-        denominator: source.denominator
-      )
-      options = options.filter { option in
-        guard option.value <= sourceValue + 0.001 else { return false }
-        return FrameRateOption.isNTSC(
-          numerator: option.numerator,
-          denominator: option.denominator
-        ) == sourceNTSC
-      }
-    }
     // Never drop the current selection out from under the picker.
-    let current = FrameRateOption(
-      numerator: fps,
-      denominator: max(1, fpsDenominator)
-    )
-    if !options.contains(current) {
-      options.append(current)
+    if !options.contains(targetFrameRate) {
+      options.append(targetFrameRate)
     }
     return options.sorted { $0.value < $1.value }
   }
@@ -573,37 +548,6 @@ final class RestorationRunner: ObservableObject {
   /// process_video_parallel.py takes an integer `--fps`, so the Python engine
   /// gets the nearest whole rate.
   var pythonTargetFPS: Int { max(1, Int(targetFPSValue.rounded())) }
-
-  var sourceFPSDescription: String? {
-    sourceFrameRate.map {
-      FrameRateOption(numerator: $0.numerator, denominator: $0.denominator).label
-    }
-  }
-
-  /// Reads the container's own timebase. `minFrameDuration` keeps 1001/60000
-  /// intact where `nominalFrameRate` would already have rounded it to 59.94.
-  private func refreshSourceFrameRate(for url: URL?) {
-    sourceFrameRate = nil
-    guard let url else { return }
-    Task { [weak self] in
-      let asset = AVURLAsset(url: url)
-      guard
-        let track = try? await asset.loadTracks(withMediaType: .video).first,
-        let duration = try? await track.load(.minFrameDuration),
-        duration.isValid, duration.value > 0, duration.timescale > 0
-      else {
-        return
-      }
-      let rate = (
-        numerator: Int(duration.timescale),
-        denominator: Int(duration.value)
-      )
-      await MainActor.run { [weak self] in
-        guard let self, self.inputURL == url else { return }
-        self.sourceFrameRate = rate
-      }
-    }
-  }
   let enhancerModels = ["none", "realesrgan", "mewzoom", "swinir", "spandrel"]
   private let knownROIEnhancerModelNames: Set<String> = [
     "realesrgan-x2", "realesrgan-x2-coreai",
@@ -2538,15 +2482,9 @@ struct ContentView: View {
           .frame(width: 130)
           .disabled(!runner.useFPS)
         }
-        if let source = runner.sourceFPSDescription {
-          Text("元動画 \(source)fps → \(runner.targetFPSDescription)fps\(runner.targetFPSDetail)で書き出します")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-        } else {
-          Text("入力を選ぶと、その素材で選べるフレームレートだけに絞り込まれます")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-        }
+        Text("\(runner.targetFPSDescription)fps\(runner.targetFPSDetail)で書き出します。元動画より高いレートは指定できません")
+          .font(.caption)
+          .foregroundStyle(.secondary)
         if runner.usesPythonEngine {
           Text("Pythonエンジンは整数FPSのみ対応です（\(runner.pythonTargetFPS)fpsで実行します）")
             .font(.caption)

@@ -794,13 +794,10 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn("NTSCFrameRate.target(", pipeline)
         self.assertIn("sourceNumerator: video.fpsNumerator", pipeline)
 
-        # minFrameDuration keeps 1001/60000; nominalFrameRate is the fallback.
-        self.assertIn(
-            "let minFrameDuration = try await track.load(.minFrameDuration)",
-            pipeline,
-        )
-        self.assertIn("numerator = Int(minFrameDuration.timescale)", pipeline)
-        self.assertIn("denominator = Int(minFrameDuration.value)", pipeline)
+        # minFrameDuration reports the shortest observed gap, which reads far
+        # above the real rate on VFR sources. Never use it as the source rate.
+        self.assertNotIn("load(.minFrameDuration)", pipeline)
+        self.assertIn("let frameRate = try await track.load(.nominalFrameRate)", pipeline)
 
         # The gate steps on an exact rational so 30000/1001 does not drift.
         self.assertIn("init(numerator: Int, denominator: Int) {", pipeline)
@@ -827,15 +824,20 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertNotIn("Stepper(value: $runner.fps", source)
         self.assertIn('return String(format: "%.3f", value)', source)
 
-        # The app probes the chosen input and narrows the list to rates that
-        # source can reach, so no option crosses the NTSC/whole boundary.
-        self.assertIn(
-            "@Published var sourceFrameRate: (numerator: Int, denominator: Int)?",
-            source,
-        )
-        self.assertIn("try? await track.load(.minFrameDuration)", source)
-        self.assertIn("guard option.value <= sourceValue + 0.001 else { return false }", source)
-        self.assertIn(") == sourceNTSC", source)
+        # The table is fixed. Probing the input and filtering by it only hid
+        # the rate the user wanted whenever the probe was wrong.
+        self.assertNotIn("sourceFrameRate", source)
+        self.assertNotIn("minFrameDuration", source)
+        for label in ["23.976", "29.970", "59.940", "119.880"]:
+            numerator = int(round(float(label) * 1.001)) * 1000
+            self.assertIn(
+                f"FrameRateOption(numerator: {numerator}, denominator: 1001)",
+                source,
+            )
+        for whole in [24, 25, 30, 48, 50, 60, 100, 120]:
+            self.assertIn(
+                f"FrameRateOption(numerator: {whole}, denominator: 1)", source
+            )
 
         # The Python CLI only takes an integer --fps.
         self.assertIn(

@@ -284,29 +284,18 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
     let transform = try await track.load(.preferredTransform)
     let natural = try await track.load(.naturalSize).applying(transform)
     let frameRate = try await track.load(.nominalFrameRate)
-    let minFrameDuration = try await track.load(.minFrameDuration)
     let duration = try await asset.load(.duration)
     let estimatedDataRate = try await track.load(.estimatedDataRate)
-    // minFrameDuration carries the container's own timebase, so an NTSC track
-    // reports 1001/60000 rather than a float that has already lost the /1.001.
-    // nominalFrameRate is only the fallback for tracks that omit it.
-    let numerator: Int
-    let denominator: Int
-    if minFrameDuration.isValid, minFrameDuration.value > 0,
-      minFrameDuration.timescale > 0
-    {
-      numerator = Int(minFrameDuration.timescale)
-      denominator = Int(minFrameDuration.value)
-    } else {
-      let fps = max(1.0, Double(frameRate))
-      denominator = 1000
-      numerator = max(1, Int((fps * Double(denominator)).rounded()))
-    }
+    // nominalFrameRate is the track average. minFrameDuration looks more
+    // precise but reports the shortest observed gap, so a VFR clip comes back
+    // well above its real rate; it is not usable here.
+    let fps = max(1.0, Double(frameRate))
+    let scale = 1000
     return VideoDescription(
       width: max(1, Int(abs(natural.width).rounded())),
       height: max(1, Int(abs(natural.height).rounded())),
-      fpsNumerator: max(1, numerator),
-      fpsDenominator: max(1, denominator),
+      fpsNumerator: max(1, Int((fps * Double(scale)).rounded())),
+      fpsDenominator: scale,
       durationSeconds: duration.seconds,
       estimatedDataRate: Double(estimatedDataRate)
     )
