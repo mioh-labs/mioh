@@ -812,6 +812,28 @@ class StandaloneAppOptionTests(unittest.TestCase):
             pipeline,
         )
 
+    def test_basic_tab_reports_the_input_media_details(self):
+        source = APP_SOURCE.read_text()
+
+        self.assertIn("struct SourceMediaInfo: Equatable, Sendable", source)
+        self.assertIn("enum SourceMediaProbe {", source)
+        self.assertIn("struct SourceInfoRow: View {", source)
+        self.assertIn("SourceInfoRow(", source)
+        # Shown right under the input path it describes.
+        self.assertIn(
+            'PathRow(title: "入力", icon: "film", url: runner.inputURL, '
+            "action: runner.chooseInput)\n        if runner.inputURL != nil {",
+            source,
+        )
+        for field in ["解像度", "フレームレート", "長さ", "コーデック", "ビットレート", "音声"]:
+            self.assertIn(f'field("{field}"', source)
+        # The probe reports; it must not feed the pipeline's own decisions.
+        self.assertIn("nominalFrameRate", source)
+        self.assertNotIn("sourceInfo.frameRate", source)
+        self.assertNotIn("targetFPS: sourceInfo", source)
+        # A slow probe must not land on a newer selection.
+        self.assertIn("guard let self, self.inputURL == url else { return }", source)
+
     def test_frame_rate_is_picked_as_an_exact_rate(self):
         source = APP_SOURCE.read_text()
 
