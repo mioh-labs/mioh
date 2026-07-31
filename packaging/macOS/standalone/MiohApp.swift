@@ -53,6 +53,7 @@ private struct NativeExportConfiguration: Encodable {
   let detectFaceMosaics: Bool
   let crossfade: Bool
   let targetFPS: Int?
+  let targetFPSDenominator: Int?
   let preFPSConversion: Bool
   let videoCodec: String
   let averageBitRate: Int?
@@ -168,6 +169,31 @@ struct PlatformCapabilities {
   }
 }
 
+/// A selectable frame rate held as its exact rational, so the value the user
+/// picks is the value the writer stamps — 29.970fps is 30000/1001 throughout.
+struct FrameRateOption: Identifiable, Hashable {
+  let numerator: Int
+  let denominator: Int
+
+  var key: String { "\(numerator)/\(denominator)" }
+  var id: String { key }
+  var value: Double { Double(numerator) / Double(max(1, denominator)) }
+  /// 29.970, not 30. Whole rates stay whole so 25 does not read as 25.000,
+  /// including a source reported as 30000/1000 rather than 30/1.
+  var label: String {
+    if abs(value - value.rounded()) < 0.0005 {
+      return String(Int(value.rounded()))
+    }
+    return String(format: "%.3f", value)
+  }
+
+  static func isNTSC(numerator: Int, denominator: Int) -> Bool {
+    guard numerator > 0, denominator > 0 else { return false }
+    let pulled = Double(numerator) * 1.001 / Double(denominator)
+    return abs(pulled - pulled.rounded()) < 0.001 && pulled.rounded() >= 1
+  }
+}
+
 struct ROIEnhancerModelOption: Identifiable {
   let name: String
   let label: String
@@ -215,6 +241,7 @@ struct MiohUserDefaultsSnapshot: Codable {
   var qmax: Int
   var useFPS: Bool
   var fps: Int
+  var fpsDenominator: Int?
   var preFPSConversion: Bool
   var mp4FastStart: Bool
 
@@ -295,6 +322,7 @@ struct MiohUserDefaultsSnapshot: Codable {
       qmax: 30,
       useFPS: false,
       fps: 30,
+      fpsDenominator: 1,
       preFPSConversion: false,
       mp4FastStart: false,
       restorationModel: capabilities.defaultRestorationModel,
@@ -392,7 +420,9 @@ final class RestorationRunner: ObservableObject {
   @Published var useQMax = false
   @Published var qmax = 30
   @Published var useFPS = false
+  // The target rate is a rational: 29.970fps is 30000/1001, never 30.
   @Published var fps = 30
+  @Published var fpsDenominator = 1
   @Published var preFPSConversion = false
   @Published var mp4FastStart = false
 
@@ -473,30 +503,81 @@ final class RestorationRunner: ObservableObject {
   var supportsPythonEngine: Bool { capabilities.bundlesPythonRuntime }
   var usesPythonEngine: Bool { supportsPythonEngine && restorationEngine == "python" }
 
-  /// The source's own timebase decides the fractional part, so halving a
-  /// 59.94fps clip gives 29.97 and halving a 60fps clip gives 30. Only the
-  /// whole number is a setting. process_video_parallel.py takes an integer
-  /// `--fps`, so the Python engine always lands on the integer rate.
-  var sourceIsNTSC: Bool { sourceFrameRateIsNTSC && !usesPythonEngine }
+  /// The rates a user can actually pick, each as its exact rational. NTSC
+  /// entries are the whole rate over 1.001 — 29.970 is 30000/1001, never 30.
+  static let standardFrameRates: [FrameRateOption] = [
+    FrameRateOption(numerator: 24000, denominator: 1001),
+    FrameRateOption(numerator: 24, denominator: 1),
+    FrameRateOption(numerator: 25, denominator: 1),
+    FrameRateOption(numerator: 30000, denominator: 1001),
+    FrameRateOption(numerator: 30, denominator: 1),
+    FrameRateOption(numerator: 48, denominator: 1),
+    FrameRateOption(numerator: 50, denominator: 1),
+    FrameRateOption(numerator: 60000, denominator: 1001),
+    FrameRateOption(numerator: 60, denominator: 1),
+    FrameRateOption(numerator: 100, denominator: 1),
+    FrameRateOption(numerator: 120000, denominator: 1001),
+    FrameRateOption(numerator: 120, denominator: 1),
+  ]
 
-  /// 29.970 rather than 30 — the rate the writer will actually stamp.
-  var targetFPSDescription: String {
-    guard sourceIsNTSC else { return String(fps) }
-    return String(format: "%.3f", Double(fps) * 1000 / 1001)
+  var targetFrameRate: FrameRateOption {
+    FrameRateOption(numerator: fps, denominator: max(1, fpsDenominator))
   }
+  var targetFPSValue: Double { targetFrameRate.value }
+  var targetFPSDescription: String { targetFrameRate.label }
+  /// "（30000/1001）" for NTSC rates, empty for whole ones.
+  var targetFPSDetail: String {
+    fpsDenominator == 1 ? "" : "（\(fps)/\(fpsDenominator)）"
+  }
+
+  var selectedFrameRate: String {
+    get { FrameRateOption(numerator: fps, denominator: max(1, fpsDenominator)).key }
+    set {
+      guard let option = frameRateOptions.first(where: { $0.key == newValue })
+      else { return }
+      fps = option.numerator
+      fpsDenominator = option.denominator
+    }
+  }
+
+  /// Conversion is down-only, and a rate never crosses between the NTSC and
+  /// whole-number families: 59.940 halves to 29.970, 60 halves to 30. Once
+  /// the source is known the list is narrowed to what it can actually reach.
+  var frameRateOptions: [FrameRateOption] {
+    var options = Self.standardFrameRates
+    if let source = sourceFrameRate {
+      let sourceValue = Double(source.numerator) / Double(source.denominator)
+      let sourceNTSC = FrameRateOption.isNTSC(
+        numerator: source.numerator,
+        denominator: source.denominator
+      )
+      options = options.filter { option in
+        guard option.value <= sourceValue + 0.001 else { return false }
+        return FrameRateOption.isNTSC(
+          numerator: option.numerator,
+          denominator: option.denominator
+        ) == sourceNTSC
+      }
+    }
+    // Never drop the current selection out from under the picker.
+    let current = FrameRateOption(
+      numerator: fps,
+      denominator: max(1, fpsDenominator)
+    )
+    if !options.contains(current) {
+      options.append(current)
+    }
+    return options.sorted { $0.value < $1.value }
+  }
+
+  /// process_video_parallel.py takes an integer `--fps`, so the Python engine
+  /// gets the nearest whole rate.
+  var pythonTargetFPS: Int { max(1, Int(targetFPSValue.rounded())) }
 
   var sourceFPSDescription: String? {
-    guard let rate = sourceFrameRate else { return nil }
-    let value = Double(rate.numerator) / Double(rate.denominator)
-    return sourceFrameRateIsNTSC
-      ? String(format: "%.3f", value)
-      : String(format: "%g", value)
-  }
-
-  private var sourceFrameRateIsNTSC: Bool {
-    guard let rate = sourceFrameRate else { return false }
-    let pulled = Double(rate.numerator) * 1.001 / Double(rate.denominator)
-    return abs(pulled - pulled.rounded()) < 0.001 && pulled.rounded() >= 1
+    sourceFrameRate.map {
+      FrameRateOption(numerator: $0.numerator, denominator: $0.denominator).label
+    }
   }
 
   /// Reads the container's own timebase. `minFrameDuration` keeps 1001/60000
@@ -1010,6 +1091,7 @@ final class RestorationRunner: ObservableObject {
       detectFaceMosaics: detectFaceMosaics,
       crossfade: restoreCrossfade,
       targetFPS: useFPS ? max(1, fps) : nil,
+      targetFPSDenominator: useFPS ? max(1, fpsDenominator) : nil,
       preFPSConversion: preFPSConversion,
       videoCodec: encodingPreset.hasPrefix("h264") ? "h264" : "hevc",
       averageBitRate: nil,
@@ -1176,7 +1258,7 @@ final class RestorationRunner: ObservableObject {
     if useQuality { add(&args, "--quality", quality) }
     if useQMin { add(&args, "--qmin", qmin) }
     if useQMax { add(&args, "--qmax", qmax) }
-    if useFPS { add(&args, "--fps", fps) }
+    if useFPS { add(&args, "--fps", pythonTargetFPS) }
     addFlag(&args, "--pre-fps-conversion", useFPS && preFPSConversion && !noSplit)
     addFlag(&args, "--mp4-fast-start", mp4FastStart)
     args.append(autoOptimize ? "--auto-optimize" : "--no-auto-optimize")
@@ -1588,6 +1670,7 @@ final class RestorationRunner: ObservableObject {
       qmax: qmax,
       useFPS: useFPS,
       fps: fps,
+      fpsDenominator: fpsDenominator,
       preFPSConversion: preFPSConversion,
       mp4FastStart: mp4FastStart,
       restorationModel: restorationModel,
@@ -1685,7 +1768,8 @@ final class RestorationRunner: ObservableObject {
     useQMax = snapshot.useQMax
     qmax = min(max(snapshot.qmax, 0), 51)
     useFPS = snapshot.useFPS
-    fps = min(max(snapshot.fps, 1), 240)
+    fps = max(1, snapshot.fps)
+    fpsDenominator = max(1, snapshot.fpsDenominator ?? 1)
     preFPSConversion = snapshot.preFPSConversion
     mp4FastStart = snapshot.mp4FastStart
 
@@ -2445,30 +2529,26 @@ struct ContentView: View {
         HStack {
           Toggle("FPS", isOn: $runner.useFPS)
           Spacer()
-          Stepper(value: $runner.fps, in: 1...240) {
-            Text(runner.targetFPSDescription)
-              .frame(width: 66, alignment: .trailing)
-              .monospacedDigit()
+          Picker("", selection: $runner.selectedFrameRate) {
+            ForEach(runner.frameRateOptions, id: \.key) { option in
+              Text("\(option.label)fps").tag(option.key)
+            }
           }
+          .labelsHidden()
+          .frame(width: 130)
           .disabled(!runner.useFPS)
         }
         if let source = runner.sourceFPSDescription {
-          if runner.sourceIsNTSC {
-            Text("元動画 \(source)fps（NTSC）→ \(runner.fps * 1000)/1001 = \(runner.targetFPSDescription)fpsで書き出します")
-              .font(.caption)
-              .foregroundStyle(.secondary)
-          } else {
-            Text("元動画 \(source)fps → \(runner.targetFPSDescription)fpsで書き出します")
-              .font(.caption)
-              .foregroundStyle(.secondary)
-          }
+          Text("元動画 \(source)fps → \(runner.targetFPSDescription)fps\(runner.targetFPSDetail)で書き出します")
+            .font(.caption)
+            .foregroundStyle(.secondary)
         } else {
-          Text("小数部は元動画のタイムベースに従います（59.940fps素材で30を選ぶと29.970fps）")
+          Text("入力を選ぶと、その素材で選べるフレームレートだけに絞り込まれます")
             .font(.caption)
             .foregroundStyle(.secondary)
         }
         if runner.usesPythonEngine {
-          Text("NTSCの分数フレームレートはSwiftネイティブ書き出しのみ対応です")
+          Text("Pythonエンジンは整数FPSのみ対応です（\(runner.pythonTargetFPS)fpsで実行します）")
             .font(.caption)
             .foregroundStyle(.secondary)
         }
