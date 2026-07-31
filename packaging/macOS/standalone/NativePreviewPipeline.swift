@@ -115,6 +115,96 @@ private struct ProcessedFrame: @unchecked Sendable {
   let ptsNanoseconds: Int64
 }
 
+/// A CVPixelBufferPool grows to its high-water mark and never shrinks, and a
+/// plain `CVPixelBufferPoolCreatePixelBuffer` will keep minting surfaces for as
+/// long as a caller asks. When one stage of the pipeline stalls, that turns a
+/// bounded queue into an unbounded one: a 1080p export was measured peaking at
+/// 17.1 GB across 2253 IOSurfaces — 11x the ~200 the design calls for — with
+/// 14 GB of it swapped out. RSS hides that, which is why it went unnoticed.
+///
+/// Allocating against a ceiling converts the overflow into back-pressure: the
+/// producer waits for the consumer instead of asking the kernel for more.
+enum PixelBufferPoolSupport {
+  /// Idle surfaces are returned to the system rather than parked in the pool.
+  private static let maximumBufferAgeSeconds = 1.0
+  private static let allocationRetryMicroseconds: UInt32 = 2000
+  private static let allocationTimeoutSeconds = 20.0
+
+  static func makePool(
+    width: Int,
+    height: Int,
+    minimumBuffers: Int
+  ) throws -> CVPixelBufferPool {
+    let pixelBufferAttributes: [String: Any] = [
+      kCVPixelBufferPixelFormatTypeKey as String:
+        Int(kCVPixelFormatType_32BGRA),
+      kCVPixelBufferWidthKey as String: width,
+      kCVPixelBufferHeightKey as String: height,
+      kCVPixelBufferMetalCompatibilityKey as String: true,
+      kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+    ]
+    let poolAttributes: [String: Any] = [
+      kCVPixelBufferPoolMinimumBufferCountKey as String: max(1, minimumBuffers),
+      kCVPixelBufferPoolMaximumBufferAgeKey as String: maximumBufferAgeSeconds,
+    ]
+    var pool: CVPixelBufferPool?
+    let result = CVPixelBufferPoolCreate(
+      kCFAllocatorDefault,
+      poolAttributes as CFDictionary,
+      pixelBufferAttributes as CFDictionary,
+      &pool
+    )
+    guard result == kCVReturnSuccess, let pool else {
+      throw NativePreviewError.pixelBuffer("pool creation returned \(result)")
+    }
+    return pool
+  }
+
+  /// Allocate, waiting rather than growing once `ceiling` surfaces are out.
+  ///
+  /// The ceiling must exceed everything the pipeline legitimately holds at
+  /// once, otherwise the wait is for a buffer only this caller could release.
+  static func allocate(
+    from pool: CVPixelBufferPool,
+    ceiling: Int,
+    label: String
+  ) throws -> CVPixelBuffer {
+    let auxiliaryAttributes: [String: Any] = [
+      kCVPixelBufferPoolAllocationThresholdKey as String: max(1, ceiling)
+    ]
+    let deadline = Date().addingTimeInterval(allocationTimeoutSeconds)
+    while true {
+      var buffer: CVPixelBuffer?
+      let status = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
+        kCFAllocatorDefault,
+        pool,
+        auxiliaryAttributes as CFDictionary,
+        &buffer
+      )
+      if status == kCVReturnSuccess, let buffer {
+        return buffer
+      }
+      guard status == kCVReturnWouldExceedAllocationThreshold else {
+        throw NativePreviewError.pixelBuffer(
+          "\(label) allocation returned \(status)"
+        )
+      }
+      guard Date() < deadline else {
+        throw NativePreviewError.pixelBuffer(
+          "\(label) allocation stalled at the \(ceiling) buffer ceiling"
+        )
+      }
+      usleep(allocationRetryMicroseconds)
+    }
+  }
+
+  /// Hand back surfaces nobody is using. Called at batch boundaries so a spike
+  /// does not become the pool's resting size for the rest of the export.
+  static func flushExcess(_ pool: CVPixelBufferPool) {
+    CVPixelBufferPoolFlush(pool, .excessBuffers)
+  }
+}
+
 /// Frame rates are never converted between the integer and NTSC families.
 /// A 59.94fps source halved is 29.97fps, a 60fps source halved is 30fps, and
 /// the request itself only ever names the whole number.
@@ -451,32 +541,16 @@ private final class CoreAIDetector {
       function = loadedFunction
       coreMLModel = nil
     }
-    detectorPool = try Self.makePool(width: detectorSize, height: detectorSize)
+    detectorPool = try PixelBufferPoolSupport.makePool(
+      width: detectorSize,
+      height: detectorSize,
+      minimumBuffers: 2
+    )
   }
 
-  private static func makePool(width: Int, height: Int) throws
-    -> CVPixelBufferPool
-  {
-    let attributes: [String: Any] = [
-      kCVPixelBufferPixelFormatTypeKey as String:
-        Int(kCVPixelFormatType_32BGRA),
-      kCVPixelBufferWidthKey as String: width,
-      kCVPixelBufferHeightKey as String: height,
-      kCVPixelBufferMetalCompatibilityKey as String: true,
-      kCVPixelBufferIOSurfacePropertiesKey as String: [:],
-    ]
-    var pool: CVPixelBufferPool?
-    let result = CVPixelBufferPoolCreate(
-      kCFAllocatorDefault,
-      nil,
-      attributes as CFDictionary,
-      &pool
-    )
-    guard result == kCVReturnSuccess, let pool else {
-      throw NativePreviewError.pixelBuffer("pool creation returned \(result)")
-    }
-    return pool
-  }
+  /// Detection awaits one frame at a time, so only a couple of letterboxed
+  /// buffers are ever live. The rest is slack.
+  private static let letterboxCeiling = 8
 
   private func letterbox(_ source: CVPixelBuffer)
     throws -> (CVPixelBuffer, Float, Float, Float)
@@ -491,17 +565,11 @@ private final class CoreAIDetector {
     let renderedHeight = sourceHeight * scale
     let padX = (Float(detectorSize) - renderedWidth) * 0.5
     let padY = (Float(detectorSize) - renderedHeight) * 0.5
-    var output: CVPixelBuffer?
-    let result = CVPixelBufferPoolCreatePixelBuffer(
-      kCFAllocatorDefault,
-      detectorPool,
-      &output
+    let output = try PixelBufferPoolSupport.allocate(
+      from: detectorPool,
+      ceiling: Self.letterboxCeiling,
+      label: "detector"
     )
-    guard result == kCVReturnSuccess, let output else {
-      throw NativePreviewError.pixelBuffer(
-        "detector pool allocation returned \(result)"
-      )
-    }
     let background = CIImage(
       color: CIColor(red: 114 / 255, green: 114 / 255, blue: 114 / 255)
     ).cropped(to: CGRect(x: 0, y: 0, width: detectorSize, height: detectorSize))
@@ -1275,6 +1343,7 @@ private struct NativeRestoreEffects {
 /// resize scale factors, exactly like ``MosaicDetector.Clip``.
 private final class NativeFrameProcessor {
   private let outputPool: CVPixelBufferPool
+  private let outputCeiling: Int
   private let restorer: any NativeRestoring
   private let blendFeather: Float
   private let effects: NativeRestoreEffects
@@ -1301,37 +1370,36 @@ private final class NativeFrameProcessor {
     restorer: any NativeRestoring,
     blendFeather: Float,
     effects: NativeRestoreEffects,
-    detectionEmptyLookahead: Int
+    detectionEmptyLookahead: Int,
+    batchFrames: Int,
+    overlapFrames: Int
   ) throws {
     self.restorer = restorer
     self.blendFeather = max(0, blendFeather)
     self.effects = effects
     self.detectionEmptyLookahead = max(0, detectionEmptyLookahead)
-    outputPool = try Self.makePool(width: width, height: height)
+    // Live at once: the batch being composited, the previous batch still
+    // being encoded, the crossfade tail held across the boundary, and one
+    // in-flight buffer per composition worker. The ceiling has to clear all
+    // of that or a worker would wait on a buffer only it could release.
+    outputCeiling = 2 * max(1, batchFrames)
+      + 2 * max(0, overlapFrames)
+      + ProcessInfo.processInfo.activeProcessorCount
+      + 8
+    // A high minimum would defeat the ageing: the pool never drops below it,
+    // so at 4K a batch-sized floor alone would hold gigabytes for the whole
+    // export. Keep just enough to avoid churn and let the rest age out.
+    outputPool = try PixelBufferPoolSupport.makePool(
+      width: width,
+      height: height,
+      minimumBuffers: 8
+    )
   }
 
-  private static func makePool(width: Int, height: Int) throws
-    -> CVPixelBufferPool
-  {
-    let attributes: [String: Any] = [
-      kCVPixelBufferPixelFormatTypeKey as String:
-        Int(kCVPixelFormatType_32BGRA),
-      kCVPixelBufferWidthKey as String: width,
-      kCVPixelBufferHeightKey as String: height,
-      kCVPixelBufferMetalCompatibilityKey as String: true,
-      kCVPixelBufferIOSurfacePropertiesKey as String: [:],
-    ]
-    var pool: CVPixelBufferPool?
-    let status = CVPixelBufferPoolCreate(
-      kCFAllocatorDefault,
-      nil,
-      attributes as CFDictionary,
-      &pool
-    )
-    guard status == kCVReturnSuccess, let pool else {
-      throw NativePreviewError.pixelBuffer("pool creation returned \(status)")
-    }
-    return pool
+  /// Return surfaces the pipeline is no longer using, so a transient stall
+  /// does not leave the pool permanently enlarged.
+  func flushIdleBuffers() {
+    PixelBufferPoolSupport.flushExcess(outputPool)
   }
 
   func process(_ detected: [DetectedFrame]) throws -> [CVPixelBuffer] {
@@ -1409,17 +1477,11 @@ private final class NativeFrameProcessor {
     if earlier === later {
       return earlier
     }
-    var output: CVPixelBuffer?
-    let status = CVPixelBufferPoolCreatePixelBuffer(
-      kCFAllocatorDefault,
-      outputPool,
-      &output
+    let output = try PixelBufferPoolSupport.allocate(
+      from: outputPool,
+      ceiling: outputCeiling,
+      label: "crossfade"
     )
-    guard status == kCVReturnSuccess, let output else {
-      throw NativePreviewError.pixelBuffer(
-        "crossfade allocation returned \(status)"
-      )
-    }
     guard let filter = CIFilter(name: "CIDissolveTransition") else {
       throw NativePreviewError.pixelBuffer(
         "CIDissolveTransition is unavailable"
@@ -2385,17 +2447,11 @@ private final class NativeFrameProcessor {
     geometry: NativeClipGeometry,
     hardMask: [Float]
   ) throws -> CVPixelBuffer {
-    var output: CVPixelBuffer?
-    let status = CVPixelBufferPoolCreatePixelBuffer(
-      kCFAllocatorDefault,
-      outputPool,
-      &output
+    let output = try PixelBufferPoolSupport.allocate(
+      from: outputPool,
+      ceiling: outputCeiling,
+      label: "composite"
     )
-    guard status == kCVReturnSuccess, let output else {
-      throw NativePreviewError.pixelBuffer(
-        "output allocation returned \(status)"
-      )
-    }
     CVPixelBufferLockBaseAddress(source, .readOnly)
     CVPixelBufferLockBaseAddress(output, [])
     defer {
@@ -3031,7 +3087,9 @@ private struct NativePreviewPipeline {
         smoothing: max(0, min(1, config.smoothStrength ?? 0)),
         upscale: max(1, min(4, config.effectUpscale ?? 1))
       ),
-      detectionEmptyLookahead: config.detectionEmptyLookahead ?? 0
+      detectionEmptyLookahead: config.detectionEmptyLookahead ?? 0,
+      batchFrames: config.temporalBatchFrames,
+      overlapFrames: overlap
     )
     let codec: AVVideoCodecType
     switch config.videoCodec?.lowercased() {
@@ -3330,6 +3388,9 @@ private struct NativePreviewPipeline {
               )
             }
             encodedFrames += acceptedFrames.count
+            // The batch's own buffers are now owned by the encoder task, so
+            // anything still parked in the pool is genuinely idle.
+            processor.flushIdleBuffers()
             if config.isExport,
               let last = batch.last
             {
