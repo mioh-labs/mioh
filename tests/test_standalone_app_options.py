@@ -765,33 +765,36 @@ class StandaloneAppOptionTests(unittest.TestCase):
         )
         self.assertIn("-D MIOH_PORTABLE_COREAI", script)
 
-    def test_native_export_supports_ntsc_fractional_frame_rates(self):
+    def test_target_frame_rate_inherits_the_source_timebase(self):
         source = APP_SOURCE.read_text()
         pipeline = NATIVE_PIPELINE_SOURCE.read_text()
 
-        # The rate travels as a rational so 29.970 stays 30000/1001.
-        self.assertIn("@Published var ntscFPS = false", source)
-        self.assertIn(
-            "var targetFPSNumerator: Int { usesNTSCFPS ? fps * 1000 : fps }",
-            source,
-        )
-        self.assertIn(
-            "var targetFPSDenominator: Int { usesNTSCFPS ? 1001 : 1 }", source
-        )
-        self.assertIn("targetFPS: useFPS ? max(1, targetFPSNumerator) : nil", source)
-        self.assertIn(
-            "targetFPSDenominator: useFPS ? targetFPSDenominator : nil", source
-        )
-        # Pull-down is native-only; the Python CLI takes an integer rate.
-        self.assertIn(
-            "var usesNTSCFPS: Bool { ntscFPS && !usesPythonEngine }", source
-        )
-        # The stepper shows the effective rate, not the integer it derives from.
-        self.assertIn("Text(runner.targetFPSDescription)", source)
-        self.assertIn('String(format: "%.3f", targetFPSValue)', source)
-        self.assertIn("Toggle(\"NTSC（1000/1001）\", isOn: $runner.ntscFPS)", source)
+        # Only the whole number is a setting; there is no manual pull-down and
+        # no way to turn a 30fps source into 29.97.
+        self.assertNotIn("ntscFPS", source)
+        self.assertNotIn("targetFPSDenominator", source)
+        self.assertIn("targetFPS: useFPS ? max(1, fps) : nil", source)
 
-        self.assertIn("let targetFPSDenominator: Int?", pipeline)
+        # The source timebase decides the fractional part.
+        self.assertIn("enum NTSCFrameRate {", pipeline)
+        self.assertIn(
+            "static func isNTSC(numerator: Int, denominator: Int) -> Bool",
+            pipeline,
+        )
+        self.assertIn("return (whole * 1000, 1001)", pipeline)
+        self.assertIn("return (whole, 1)", pipeline)
+        self.assertIn("NTSCFrameRate.target(", pipeline)
+        self.assertIn("sourceNumerator: video.fpsNumerator", pipeline)
+
+        # minFrameDuration keeps 1001/60000; nominalFrameRate is the fallback.
+        self.assertIn(
+            "let minFrameDuration = try await track.load(.minFrameDuration)",
+            pipeline,
+        )
+        self.assertIn("numerator = Int(minFrameDuration.timescale)", pipeline)
+        self.assertIn("denominator = Int(minFrameDuration.value)", pipeline)
+
+        # The gate steps on an exact rational so 30000/1001 does not drift.
         self.assertIn("init(numerator: Int, denominator: Int) {", pipeline)
         self.assertIn("intervalRemainder = step % frames", pipeline)
         self.assertIn(
@@ -802,6 +805,22 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "let outputFPSDenominator = targetRate?.denominator "
             "?? video.fpsDenominator",
             pipeline,
+        )
+
+    def test_frame_rate_field_shows_the_effective_rate(self):
+        source = APP_SOURCE.read_text()
+
+        # The app probes the chosen input so the stepper can read 29.970
+        # instead of the 30 it was derived from.
+        self.assertIn("@Published var sourceFrameRate: (numerator: Int, denominator: Int)?", source)
+        self.assertIn("try? await track.load(.minFrameDuration)", source)
+        self.assertIn("Text(runner.targetFPSDescription)", source)
+        self.assertIn('return String(format: "%.3f", Double(fps) * 1000 / 1001)', source)
+        self.assertIn("guard sourceIsNTSC else { return String(fps) }", source)
+        # The Python CLI only takes an integer --fps.
+        self.assertIn(
+            "var sourceIsNTSC: Bool { sourceFrameRateIsNTSC && !usesPythonEngine }",
+            source,
         )
 
     def test_native_export_uses_internal_stage_concurrency(self):

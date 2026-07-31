@@ -50,11 +50,10 @@ private struct NativePreviewConfiguration: Decodable {
   let detectionEmptyLookahead: Int?
   let detectFaceMosaics: Bool?
   let crossfade: Bool?
-  // Rational so NTSC rates stay exact: 29.970fps is 30000/1001, never 30/1.
-  // `targetFPSDenominator` is absent in configurations written before
-  // fractional rates existed, where the numerator alone was the frame rate.
+  // The whole-number rate to convert down to. The fractional part is not the
+  // user's to choose: it comes from the source timebase, so requesting 30
+  // against a 59.94fps source yields 29.97 and against a 60fps source 30.
   let targetFPS: Int?
-  let targetFPSDenominator: Int?
   let preFPSConversion: Bool?
   let videoCodec: String?
   let averageBitRate: Int?
@@ -113,6 +112,31 @@ private struct DecodedFrame: @unchecked Sendable {
 private struct ProcessedFrame: @unchecked Sendable {
   let pixelBuffer: CVPixelBuffer
   let ptsNanoseconds: Int64
+}
+
+/// Frame rates are never converted between the integer and NTSC families.
+/// A 59.94fps source halved is 29.97fps, a 60fps source halved is 30fps, and
+/// the request itself only ever names the whole number.
+enum NTSCFrameRate {
+  /// True when `numerator / denominator` is a whole rate divided by 1.001.
+  static func isNTSC(numerator: Int, denominator: Int) -> Bool {
+    guard numerator > 0, denominator > 0 else { return false }
+    let pulled = Double(numerator) * 1.001 / Double(denominator)
+    return abs(pulled - pulled.rounded()) < 0.001 && pulled.rounded() >= 1
+  }
+
+  static func target(
+    wholeFPS: Int,
+    sourceNumerator: Int,
+    sourceDenominator: Int
+  ) -> (numerator: Int, denominator: Int) {
+    let whole = max(1, wholeFPS)
+    guard isNTSC(numerator: sourceNumerator, denominator: sourceDenominator)
+    else {
+      return (whole, 1)
+    }
+    return (whole * 1000, 1001)
+  }
 }
 
 /// Selects frames from a VFR or CFR stream using presentation timestamps.
@@ -259,15 +283,29 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
     let transform = try await track.load(.preferredTransform)
     let natural = try await track.load(.naturalSize).applying(transform)
     let frameRate = try await track.load(.nominalFrameRate)
+    let minFrameDuration = try await track.load(.minFrameDuration)
     let duration = try await asset.load(.duration)
     let estimatedDataRate = try await track.load(.estimatedDataRate)
-    let fps = max(1.0, Double(frameRate))
-    let scale = 1000
+    // minFrameDuration carries the container's own timebase, so an NTSC track
+    // reports 1001/60000 rather than a float that has already lost the /1.001.
+    // nominalFrameRate is only the fallback for tracks that omit it.
+    let numerator: Int
+    let denominator: Int
+    if minFrameDuration.isValid, minFrameDuration.value > 0,
+      minFrameDuration.timescale > 0
+    {
+      numerator = Int(minFrameDuration.timescale)
+      denominator = Int(minFrameDuration.value)
+    } else {
+      let fps = max(1.0, Double(frameRate))
+      denominator = 1000
+      numerator = max(1, Int((fps * Double(denominator)).rounded()))
+    }
     return VideoDescription(
       width: max(1, Int(abs(natural.width).rounded())),
       height: max(1, Int(abs(natural.height).rounded())),
-      fpsNumerator: max(1, Int((fps * Double(scale)).rounded())),
-      fpsDenominator: scale,
+      fpsNumerator: max(1, numerator),
+      fpsDenominator: max(1, denominator),
       durationSeconds: duration.seconds,
       estimatedDataRate: Double(estimatedDataRate)
     )
@@ -2930,8 +2968,12 @@ private struct NativePreviewPipeline {
     )
     let video = try await decoder.description()
     let sourceFPS = Double(video.fpsNumerator) / Double(video.fpsDenominator)
-    let targetRate: (numerator: Int, denominator: Int)? = config.targetFPS.map {
-      (max(1, $0), max(1, config.targetFPSDenominator ?? 1))
+    let targetRate = config.targetFPS.map {
+      NTSCFrameRate.target(
+        wholeFPS: max(1, $0),
+        sourceNumerator: video.fpsNumerator,
+        sourceDenominator: video.fpsDenominator
+      )
     }
     let targetFPSValue = targetRate.map {
       Double($0.numerator) / Double($0.denominator)
