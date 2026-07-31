@@ -117,7 +117,7 @@ struct PlatformCapabilities {
   }
 
   var previewDetectionModel: String {
-    supportsCoreAI ? "v4-accurate-coreai" : "v4-accurate-coreml"
+    supportsCoreAI ? "v4-fast-coreai" : "v4-fast-coreml"
   }
 
   let baseRestorationModels = ["basicvsrpp-v1.2", "カスタム"]
@@ -2227,15 +2227,30 @@ final class RestorationRunner: ObservableObject {
         let elapsed = payload["elapsed_seconds"] as? Double ?? 0
         let detected = payload["detected_frames"] as? Int ?? 0
         let batches = payload["restored_batches"] as? Int ?? 0
+        let detectionSeconds = payload["detection_seconds"] as? Double ?? 0
+        let preparationSeconds = payload["preparation_seconds"] as? Double ?? 0
+        let restorationSeconds = payload["restoration_seconds"] as? Double ?? 0
+        let compositionSeconds = payload["composition_seconds"] as? Double ?? 0
+        func elapsedPercent(_ seconds: Double) -> Double {
+          elapsed > 0 ? seconds / elapsed * 100 : 0
+        }
         appendLog(
           String(
             format:
-              "処理統計: %dフレーム / 検出対象%dフレーム / 復元%dクリップ / %.1ffps / 経過 %@\n",
+              "処理統計: %dフレーム / 検出対象%dフレーム / 復元%dクリップ / %.1ffps / 経過 %@\n処理内訳（工程は並行するため割合の合計は100%%になりません）: 検出 %.2f秒 (%.1f%%) / 準備 %.2f秒 (%.1f%%) / 復元 %.2f秒 (%.1f%%) / 合成 %.2f秒 (%.1f%%)\n",
             frames,
             detected,
             batches,
             fps,
-            nativeLogDuration(elapsed)
+            nativeLogDuration(elapsed),
+            detectionSeconds,
+            elapsedPercent(detectionSeconds),
+            preparationSeconds,
+            elapsedPercent(preparationSeconds),
+            restorationSeconds,
+            elapsedPercent(restorationSeconds),
+            compositionSeconds,
+            elapsedPercent(compositionSeconds)
           )
         )
         return

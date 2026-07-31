@@ -313,6 +313,14 @@ class StandaloneAppOptionTests(unittest.TestCase):
         ]:
             self.assertIn(contract, app)
 
+    def test_native_preview_uses_fast_v4_detection(self):
+        source = APP_SOURCE.read_text()
+
+        self.assertIn(
+            'supportsCoreAI ? "v4-fast-coreai" : "v4-fast-coreml"',
+            source,
+        )
+
     def test_app_has_user_default_settings_panel(self):
         source = APP_SOURCE.read_text()
 
@@ -1028,6 +1036,18 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn("logHistory", source)
         self.assertIn("rebuildVisibleLog()", source)
 
+    def test_native_stats_log_exposes_stage_timings(self):
+        source = APP_SOURCE.read_text()
+
+        for contract in [
+            'payload["detection_seconds"]',
+            'payload["preparation_seconds"]',
+            'payload["restoration_seconds"]',
+            'payload["composition_seconds"]',
+            "処理内訳（工程は並行するため割合の合計は100%%になりません）",
+        ]:
+            self.assertIn(contract, source)
+
     def test_gui_has_always_visible_multiline_ffmpeg_options(self):
         source = APP_SOURCE.read_text()
 
@@ -1094,6 +1114,21 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn("adaptiveLumaContrast(", pipeline)
         self.assertIn("downsamplePlanarArea(", pipeline)
         self.assertIn("processed = maskedMix(", pipeline)
+
+    def test_native_output_pool_has_swap_safe_backpressure(self):
+        pipeline = NATIVE_PIPELINE_SOURCE.read_text()
+
+        self.assertIn(
+            "CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(",
+            pipeline,
+        )
+        self.assertIn("kCVPixelBufferPoolAllocationThresholdKey", pipeline)
+        self.assertIn("kCVReturnWouldExceedAllocationThreshold", pipeline)
+        self.assertIn(
+            "CVPixelBufferPoolFlush(outputPool, .excessBuffers)",
+            pipeline,
+        )
+        self.assertIn("config.temporalBatchFrames * 3 + overlap * 2 + 16", pipeline)
 
     def test_native_pipeline_keeps_roi_enhancer_disabled(self):
         source = APP_SOURCE.read_text()
