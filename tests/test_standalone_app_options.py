@@ -769,13 +769,21 @@ class StandaloneAppOptionTests(unittest.TestCase):
         source = APP_SOURCE.read_text()
         pipeline = NATIVE_PIPELINE_SOURCE.read_text()
 
-        # Only the whole number is a setting; there is no manual pull-down and
-        # no way to turn a 30fps source into 29.97.
+        # The picked value is the exact rate, carried as a rational end to end.
         self.assertNotIn("ntscFPS", source)
-        self.assertNotIn("targetFPSDenominator", source)
+        self.assertIn("@Published var fpsDenominator = 1", source)
         self.assertIn("targetFPS: useFPS ? max(1, fps) : nil", source)
+        self.assertIn(
+            "targetFPSDenominator: useFPS ? max(1, fpsDenominator) : nil",
+            source,
+        )
+        self.assertIn("let targetFPSDenominator: Int?", pipeline)
+        self.assertIn(
+            "return (max(1, requested), max(1, denominator))", pipeline
+        )
 
-        # The source timebase decides the fractional part.
+        # A configuration without a denominator still resolves against the
+        # source timebase rather than assuming a whole rate.
         self.assertIn("enum NTSCFrameRate {", pipeline)
         self.assertIn(
             "static func isNTSC(numerator: Int, denominator: Int) -> Bool",
@@ -807,21 +815,34 @@ class StandaloneAppOptionTests(unittest.TestCase):
             pipeline,
         )
 
-    def test_frame_rate_field_shows_the_effective_rate(self):
+    def test_frame_rate_is_picked_as_an_exact_rate(self):
         source = APP_SOURCE.read_text()
 
-        # The app probes the chosen input so the stepper can read 29.970
-        # instead of the 30 it was derived from.
-        self.assertIn("@Published var sourceFrameRate: (numerator: Int, denominator: Int)?", source)
-        self.assertIn("try? await track.load(.minFrameDuration)", source)
-        self.assertIn("Text(runner.targetFPSDescription)", source)
-        self.assertIn('return String(format: "%.3f", Double(fps) * 1000 / 1001)', source)
-        self.assertIn("guard sourceIsNTSC else { return String(fps) }", source)
-        # The Python CLI only takes an integer --fps.
+        # A picker over real rates, not an integer stepper reinterpreted later.
+        self.assertIn("struct FrameRateOption: Identifiable, Hashable", source)
+        self.assertIn("FrameRateOption(numerator: 30000, denominator: 1001)", source)
+        self.assertIn("FrameRateOption(numerator: 60000, denominator: 1001)", source)
+        self.assertIn("Picker(\"\", selection: $runner.selectedFrameRate)", source)
+        self.assertIn('Text("\\(option.label)fps").tag(option.key)', source)
+        self.assertNotIn("Stepper(value: $runner.fps", source)
+        self.assertIn('return String(format: "%.3f", value)', source)
+
+        # The app probes the chosen input and narrows the list to rates that
+        # source can reach, so no option crosses the NTSC/whole boundary.
         self.assertIn(
-            "var sourceIsNTSC: Bool { sourceFrameRateIsNTSC && !usesPythonEngine }",
+            "@Published var sourceFrameRate: (numerator: Int, denominator: Int)?",
             source,
         )
+        self.assertIn("try? await track.load(.minFrameDuration)", source)
+        self.assertIn("guard option.value <= sourceValue + 0.001 else { return false }", source)
+        self.assertIn(") == sourceNTSC", source)
+
+        # The Python CLI only takes an integer --fps.
+        self.assertIn(
+            "var pythonTargetFPS: Int { max(1, Int(targetFPSValue.rounded())) }",
+            source,
+        )
+        self.assertIn('add(&args, "--fps", pythonTargetFPS)', source)
 
     def test_native_export_uses_internal_stage_concurrency(self):
         source = APP_SOURCE.read_text()

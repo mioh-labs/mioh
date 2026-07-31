@@ -50,10 +50,11 @@ private struct NativePreviewConfiguration: Decodable {
   let detectionEmptyLookahead: Int?
   let detectFaceMosaics: Bool?
   let crossfade: Bool?
-  // The whole-number rate to convert down to. The fractional part is not the
-  // user's to choose: it comes from the source timebase, so requesting 30
-  // against a 59.94fps source yields 29.97 and against a 60fps source 30.
+  // The exact target rate: 29.970fps arrives as 30000/1001, never as 30.
+  // A configuration written before rational rates omits the denominator, and
+  // the whole-number request is then resolved against the source timebase.
   let targetFPS: Int?
+  let targetFPSDenominator: Int?
   let preFPSConversion: Bool?
   let videoCodec: String?
   let averageBitRate: Int?
@@ -2968,9 +2969,13 @@ private struct NativePreviewPipeline {
     )
     let video = try await decoder.description()
     let sourceFPS = Double(video.fpsNumerator) / Double(video.fpsDenominator)
-    let targetRate = config.targetFPS.map {
-      NTSCFrameRate.target(
-        wholeFPS: max(1, $0),
+    let targetRate: (numerator: Int, denominator: Int)? = config.targetFPS.map {
+      requested in
+      if let denominator = config.targetFPSDenominator {
+        return (max(1, requested), max(1, denominator))
+      }
+      return NTSCFrameRate.target(
+        wholeFPS: max(1, requested),
         sourceNumerator: video.fpsNumerator,
         sourceDenominator: video.fpsDenominator
       )
