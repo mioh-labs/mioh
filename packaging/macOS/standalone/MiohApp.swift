@@ -152,6 +152,19 @@ struct PlatformCapabilities {
     return models
   }
 
+  var previewDetectionModels: [String] {
+    detectionModels.filter { !$0.hasPrefix("jasna-v6") }
+  }
+
+  /// Only the portable/universal package ships `Resources/runtime`, so only it
+  /// can fall back to the Python restoration and preview path.
+  var bundlesPythonRuntime: Bool {
+#if MIOH_PORTABLE_COREAI
+    return true
+#else
+    return false
+#endif
+  }
 }
 
 struct ROIEnhancerModelOption: Identifiable {
@@ -169,6 +182,9 @@ struct MiohUserDefaultsSnapshot: Codable {
   var ffmpegTempDirectory: String
   var ladaTempDirectory: String
   var overwrite: Bool
+
+  // Optional so preferences written before the engine selector still decode.
+  var restorationEngine: String?
 
   var parallelWorkers: Int
   var executor: String
@@ -251,6 +267,7 @@ struct MiohUserDefaultsSnapshot: Codable {
       ffmpegTempDirectory: "",
       ladaTempDirectory: "",
       overwrite: false,
+      restorationEngine: "native",
       parallelWorkers: 1,
       executor: "process",
       useSegmentCount: true,
@@ -336,6 +353,11 @@ final class RestorationRunner: ObservableObject {
   @Published var ladaTempDirectory = ""
   @Published var overwrite = false
 
+  // "native" runs the Swift Core AI pipeline. "python" runs the bundled
+  // interpreter against process_video_parallel.py / mioh_preview_worker.py and
+  // only exists in the portable/universal package.
+  @Published var restorationEngine = "native"
+
   @Published var parallelWorkers = 1
   @Published var executor = "process"
   @Published var useSegmentCount = true
@@ -393,6 +415,10 @@ final class RestorationRunner: ObservableObject {
   @Published var detectFaceMosaics = false
 
   @Published var previewBufferLimit = 8.0
+  @Published var previewRestorationModel: String
+  @Published var previewCustomRestorationModel = ""
+  @Published var previewDetectionModel: String
+  @Published var previewCustomDetectionModel = ""
   @Published var previewRealtimeOptimization = true
   @Published var previewProjectionMode = "通常"
   @Published var previewVideoLayout = "SBS 左右"
@@ -424,6 +450,8 @@ final class RestorationRunner: ObservableObject {
   init(capabilities: PlatformCapabilities = PlatformCapabilities()) {
     self.capabilities = capabilities
     restorationModel = capabilities.defaultRestorationModel
+    previewRestorationModel = capabilities.previewRestorationModel
+    previewDetectionModel = capabilities.previewDetectionModel
     detectionModel = "v2-coreml"
     loadSavedDefaultsOnLaunch()
   }
@@ -434,6 +462,9 @@ final class RestorationRunner: ObservableObject {
   ]
   var restorationModels: [String] { capabilities.restorationModels }
   var detectionModels: [String] { capabilities.detectionModels }
+  var previewDetectionModels: [String] { capabilities.previewDetectionModels }
+  var supportsPythonEngine: Bool { capabilities.bundlesPythonRuntime }
+  var usesPythonEngine: Bool { supportsPythonEngine && restorationEngine == "python" }
   let enhancerModels = ["none", "realesrgan", "mewzoom", "swinir", "spandrel"]
   private let knownROIEnhancerModelNames: Set<String> = [
     "realesrgan-x2", "realesrgan-x2-coreai",
@@ -623,6 +654,16 @@ final class RestorationRunner: ObservableObject {
     do {
       normalizeModelSelections()
       let resources = try resourceDirectory()
+      if usesPythonEngine {
+        let pythonTask = try makePythonExportTask(
+          resources: resources,
+          input: inputURL,
+          output: outputURL
+        )
+        try launch(pythonTask.process, pipe: pythonTask.output)
+        appendPythonExportStartLog(input: inputURL, output: outputURL)
+        return
+      }
       let nativeOutputURL = resolvedOutputFile(
         input: inputURL,
         selectedOutput: outputURL
@@ -944,6 +985,278 @@ final class RestorationRunner: ObservableObject {
     return (task, outputPipe, configuration)
   }
 
+  // MARK: - Bundled Python engine
+  //
+  // Only the portable/universal package carries Resources/runtime. These
+  // entry points drive process_video_parallel.py and mioh_preview_worker.py
+  // through that interpreter, which is the fallback for machines where the
+  // Swift Core AI pipeline is unavailable or produces worse results.
+
+  private func bundledPythonExecutable(resources: URL) throws -> URL {
+    let python = resources.appendingPathComponent("runtime/bin/python3.12")
+    guard capabilities.bundlesPythonRuntime,
+      FileManager.default.isExecutableFile(atPath: python.path)
+    else {
+      throw RunnerError.missingResource("Python runtime")
+    }
+    return python
+  }
+
+  private func makePythonExportTask(
+    resources: URL,
+    input: URL,
+    output: URL
+  ) throws -> (process: Process, output: Pipe) {
+    let python = try bundledPythonExecutable(resources: resources)
+    let processor = resources.appendingPathComponent(
+      "runtime/lib/python3.12/site-packages/process_video_parallel.py"
+    )
+    guard FileManager.default.fileExists(atPath: processor.path) else {
+      throw RunnerError.missingResource("Parallel processor")
+    }
+
+    let task = Process()
+    task.executableURL = python
+    task.currentDirectoryURL = processor.deletingLastPathComponent()
+    task.arguments = [processor.path] + (try processingArguments(
+      resources: resources,
+      input: input,
+      output: output
+    ))
+    task.environment = environment(resources: resources, python: python)
+
+    let pipe = Pipe()
+    task.standardOutput = pipe
+    task.standardError = pipe
+    // The Python runner reports progress as plain text, not the native
+    // pipeline's JSON events, and owns its own temporary directories.
+    runningNativeExport = false
+    processInput = nil
+    return (task, pipe)
+  }
+
+  func previewArguments(
+    resources: URL,
+    outputDirectory: URL,
+    input: URL
+  ) throws -> [String] {
+    normalizeModelSelections()
+    let previewModel = try resolvedPreviewRestorationModel(in: resources)
+    try rejectUnsupportedCoreAIModel(previewModel)
+    let detection = try resolvedPreviewDetectionModel(in: resources)
+    if !previewRealtimeOptimization && roiEnhancer != "none" {
+      try rejectUnsupportedCoreAIModel(roiEnhancerModel)
+    }
+    var args = ["--input", input.path, "--output-dir", outputDirectory.path]
+    add(&args, "--device", device)
+    args.append(fp16 ? "--fp16" : "--no-fp16")
+    add(&args, "--restoration-model", previewModel)
+    add(&args, "--detection-model", detection)
+    let automaticClipLength: Int
+    switch previewModel {
+    case "basicvsrpp-v1.2-coreai": automaticClipLength = 98
+    case "basicvsrpp-v1.2-coreai-t36": automaticClipLength = 104
+    case "basicvsrpp-v1.2-coreai-t90": automaticClipLength = 178
+    case "basicvsrpp-v1.2-coreai-variable":
+      automaticClipLength = previewRealtimeOptimization ? 90 : 180
+    case "basicvsrpp-v1.2-coreai-variable-hq":
+      automaticClipLength = 180
+    default: automaticClipLength = 180
+    }
+    add(&args, "--max-clip-length", useMaxClipLength ? maxClipLength : automaticClipLength)
+    if useRestoreMaxFrames { add(&args, "--restore-max-frames", restoreMaxFrames) }
+    add(&args, "--restore-temporal-overlap", restoreTemporalOverlap)
+    args.append(restoreCrossfade ? "--enable-crossfade" : "--disable-crossfade")
+    add(&args, "--sharpen-strength", sharpenStrength)
+    add(&args, "--detail-boost", detailBoost)
+    add(&args, "--blend-feather", blendFeather)
+    add(&args, "--texture-mix", textureMix)
+    add(&args, "--smooth-strength", smoothStrength)
+    add(&args, "--roi-enhancer", previewRealtimeOptimization ? "none" : roiEnhancer)
+    if !previewRealtimeOptimization {
+      addOptional(&args, "--roi-enhancer-model", roiEnhancerModel)
+    }
+    add(&args, "--roi-enhancer-scale", roiEnhancerScale)
+    add(&args, "--roi-enhancer-strength", previewRealtimeOptimization ? 0 : roiEnhancerStrength)
+    add(&args, "--roi-enhancer-tile", roiEnhancerTile)
+    add(&args, "--effect-upscale", previewRealtimeOptimization ? 1 : effectUpscale)
+    add(&args, "--detection-empty-lookahead", detectionEmptyLookahead)
+    addFlag(&args, "--detect-face-mosaics", detectFaceMosaics)
+    add(&args, "--buffer-limit", previewBufferLimit)
+    if previewRealtimeOptimization { args.append("--realtime-optimize") }
+    return args
+  }
+
+  private func processingArguments(resources: URL, input: URL, output: URL) throws -> [String] {
+    var args = ["--input", input.path, "--output", output.path]
+    add(&args, "--temp-dir", tempDirectory)
+    addOptional(&args, "--ffmpeg-temp-dir", ffmpegTempDirectory)
+    addOptional(&args, "--lada-temp-dir", ladaTempDirectory)
+    add(&args, "--parallel-workers", parallelWorkers)
+    add(&args, "--executor", executor)
+    if noSplit {
+      args.append("--no-split")
+    } else if useSegmentCount {
+      add(&args, "--segment-count", segmentCount)
+    } else {
+      add(&args, "--segment-duration", segmentDuration)
+    }
+    add(&args, "--merge-encoder", mergeEncoder)
+    addFlag(&args, "--delete-segments", deleteSegments)
+    addFlag(&args, "--keep-temp", keepTemp)
+    addFlag(&args, "--force-split", forceSplit)
+    add(&args, "--device", device)
+    args.append(fp16 ? "--fp16" : "--no-fp16")
+
+    if encodingMode == "preset" {
+      add(&args, "--encoding-preset", encodingPreset)
+    } else if encodingMode == "custom" {
+      add(&args, "--encoder", encoder)
+    }
+    addOptional(&args, "--encoder-options", encoderOptions)
+    add(&args, "--bitrate-multiplier", bitrateMultiplier)
+    if useQuality { add(&args, "--quality", quality) }
+    if useQMin { add(&args, "--qmin", qmin) }
+    if useQMax { add(&args, "--qmax", qmax) }
+    if useFPS { add(&args, "--fps", fps) }
+    addFlag(&args, "--pre-fps-conversion", useFPS && preFPSConversion && !noSplit)
+    addFlag(&args, "--mp4-fast-start", mp4FastStart)
+    args.append(autoOptimize ? "--auto-optimize" : "--no-auto-optimize")
+
+    let restoration = try resolvedRestorationModel(in: resources)
+    add(&args, "--mosaic-restoration-model", restoration)
+    if useMaxClipLength { add(&args, "--max-clip-length", maxClipLength) }
+    if useRestoreMaxFrames { add(&args, "--restore-max-frames", restoreMaxFrames) }
+    add(&args, "--restore-temporal-overlap", restoreTemporalOverlap)
+    args.append(restoreCrossfade ? "--enable-crossfade" : "--disable-crossfade")
+    add(&args, "--restore-sharpen-strength", sharpenStrength)
+    add(&args, "--restore-detail-boost", detailBoost)
+    add(&args, "--restore-blend-feather", blendFeather)
+    add(&args, "--restore-texture-mix", textureMix)
+    add(&args, "--restore-smooth-strength", smoothStrength)
+    add(&args, "--restore-effect-upscale", effectUpscale)
+    add(&args, "--restore-roi-enhancer", roiEnhancer)
+    if roiEnhancer != "none" {
+      try rejectUnsupportedCoreAIModel(roiEnhancerModel)
+    }
+    addOptional(&args, "--restore-roi-enhancer-model-path", roiEnhancerModel)
+    add(&args, "--restore-roi-enhancer-scale", roiEnhancerScale)
+    add(&args, "--restore-roi-enhancer-strength", roiEnhancerStrength)
+    add(&args, "--restore-roi-enhancer-tile", roiEnhancerTile)
+
+    add(&args, "--mosaic-detection-model", try resolvedDetectionModel(in: resources))
+    add(&args, "--mosaic-detection-empty-lookahead", detectionEmptyLookahead)
+    args.append(detectFaceMosaics ? "--detect-face-mosaics" : "--no-detect-face-mosaics")
+    add(&args, "--memory-cleanup-interval", memoryCleanupInterval)
+    add(&args, "--cleanup-trigger-gb", cleanupTriggerGB)
+    if useMPSMemoryFraction { add(&args, "--mps-memory-fraction", mpsMemoryFraction) }
+    addFlag(&args, "--log-mps-memory", logMPSMemory)
+    addFlag(&args, "--overwrite", overwrite)
+    return args
+  }
+
+  private func resolvedRestorationModel(in resources: URL) throws -> String {
+    if restorationModel == "カスタム" {
+      guard !customRestorationModel.isEmpty else { throw RunnerError.missingValue("復元モデル") }
+      try rejectUnsupportedCoreAIModel(customRestorationModel)
+      return customRestorationModel
+    }
+    return restorationModel
+  }
+
+  private func resolvedPreviewRestorationModel(in resources: URL) throws -> String {
+    if previewRestorationModel == "カスタム" {
+      guard !previewCustomRestorationModel.isEmpty else {
+        throw RunnerError.missingValue("再生用復元モデル")
+      }
+      try rejectUnsupportedCoreAIModel(previewCustomRestorationModel)
+      return previewCustomRestorationModel
+    }
+    try rejectUnsupportedCoreAIModel(previewRestorationModel)
+    return previewRestorationModel
+  }
+
+  private func resolvedDetectionModel(in resources: URL) throws -> String {
+    if detectionModel == "カスタム" {
+      guard !customDetectionModel.isEmpty else { throw RunnerError.missingValue("検出モデル") }
+      try rejectUnsupportedCoreAIModel(customDetectionModel)
+      return customDetectionModel
+    }
+    return detectionModel
+  }
+
+  private func resolvedPreviewDetectionModel(in resources: URL) throws -> String {
+    if previewDetectionModel == "カスタム" {
+      guard !previewCustomDetectionModel.isEmpty else {
+        throw RunnerError.missingValue("再生用検出モデル")
+      }
+      try rejectUnsupportedCoreAIModel(previewCustomDetectionModel)
+      return previewCustomDetectionModel
+    }
+    try rejectUnsupportedCoreAIModel(previewDetectionModel)
+    return previewDetectionModel
+  }
+
+  func environment(resources: URL, python: URL) -> [String: String] {
+    var result = ProcessInfo.processInfo.environment
+    let sitePackages = resources.appendingPathComponent("runtime/lib/python3.12/site-packages")
+    result["PYTHONHOME"] = resources.appendingPathComponent("runtime").path
+    result["PYTHONPATH"] = sitePackages.path
+    result["LADA_MODEL_WEIGHTS_DIR"] = resources.appendingPathComponent("models").path
+    result["LADA_PREVIEW_VIDEOTOOLBOX_RUNNER"] = resources
+      .appendingPathComponent("bin/mioh-preview-videotoolbox-encoder").path
+    if capabilities.supportsCoreAI {
+      result["LADA_NATIVE_COREAI_PREVIEW_RUNNER"] = resources
+        .appendingPathComponent("bin/mioh-native-coreai-preview").path
+      result["LADA_NATIVE_SWIFT_PREVIEW"] = "1"
+      result["LADA_COREAI_SWIFT_RUNNER"] = resources.appendingPathComponent("bin/lada-coreai-runner").path
+      result["LADA_VARIABLE_COREAI_SWIFT_RUNNER"] = resources.appendingPathComponent("bin/lada-basicvsrpp-variable-runner").path
+#if MIOH_DEDICATED_VARIABLE_HQ
+      result["LADA_VARIABLE_COREAI_HQ_SWIFT_RUNNER"] = resources.appendingPathComponent("bin/lada-basicvsrpp-variable-hq-runner").path
+#endif
+#if MIOH_PORTABLE_COREAI
+      result.removeValue(forKey: "LADA_COREAI_ARCHITECTURE")
+#else
+      result["LADA_COREAI_ARCHITECTURE"] = "h17s"
+#endif
+    } else {
+      result.removeValue(forKey: "LADA_COREAI_PYTHON")
+      result.removeValue(forKey: "LADA_NATIVE_COREAI_PREVIEW_RUNNER")
+      result.removeValue(forKey: "LADA_NATIVE_SWIFT_PREVIEW")
+      result.removeValue(forKey: "LADA_COREAI_SWIFT_RUNNER")
+      result.removeValue(forKey: "LADA_VARIABLE_COREAI_SWIFT_RUNNER")
+      result.removeValue(forKey: "LADA_VARIABLE_COREAI_HQ_SWIFT_RUNNER")
+      result.removeValue(forKey: "LADA_COREAI_ARCHITECTURE")
+    }
+    result["PATH"] = [resources.appendingPathComponent("bin").path, "/usr/bin", "/bin", "/usr/sbin", "/sbin"].joined(separator: ":")
+    result["PYTHONUNBUFFERED"] = "1"
+    result["PYTHONDONTWRITEBYTECODE"] = "1"
+    result["PYTHONWARNINGS"] = "ignore::SyntaxWarning"
+    result["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+    result["LADA_DEFORM_CONV_BACKEND"] = "mps_deform_conv"
+    result["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
+    result["LADA_APP_PROGRESS"] = "1"
+    return result
+  }
+
+  private func appendPythonExportStartLog(input: URL, output: URL) {
+    appendLog(
+      """
+      ======================================================================
+      Python書き出し（バンドルランタイム）
+      ======================================================================
+      入力: \(input.path)
+      出力: \(output.path)
+      復元モデル: \(restorationModel)
+      検出モデル: \(detectionModel)
+      デバイス: \(device) / \(fp16 ? "FP16" : "FP32")
+      並列数: \(parallelWorkers)（\(executor)）
+      ======================================================================
+
+      """
+    )
+  }
+
   private func appendNativeExportStartLog(
     input: URL,
     output: URL,
@@ -1190,6 +1503,7 @@ final class RestorationRunner: ObservableObject {
       ffmpegTempDirectory: ffmpegTempDirectory,
       ladaTempDirectory: ladaTempDirectory,
       overwrite: overwrite,
+      restorationEngine: restorationEngine,
       parallelWorkers: parallelWorkers,
       executor: executor,
       useSegmentCount: useSegmentCount,
@@ -1242,10 +1556,10 @@ final class RestorationRunner: ObservableObject {
       detectionEmptyLookahead: detectionEmptyLookahead,
       detectFaceMosaics: detectFaceMosaics,
       previewBufferLimit: previewBufferLimit,
-      previewRestorationModel: capabilities.previewRestorationModel,
-      previewCustomRestorationModel: "",
-      previewDetectionModel: capabilities.previewDetectionModel,
-      previewCustomDetectionModel: "",
+      previewRestorationModel: previewRestorationModel,
+      previewCustomRestorationModel: previewCustomRestorationModel,
+      previewDetectionModel: previewDetectionModel,
+      previewCustomDetectionModel: previewCustomDetectionModel,
       previewRealtimeOptimization: previewRealtimeOptimization,
       previewProjectionMode: previewProjectionMode,
       previewVideoLayout: previewVideoLayout,
@@ -1266,26 +1580,40 @@ final class RestorationRunner: ObservableObject {
     ffmpegTempDirectory = snapshot.ffmpegTempDirectory
     ladaTempDirectory = snapshot.ladaTempDirectory
     overwrite = snapshot.overwrite
+    restorationEngine = supportsPythonEngine
+      && snapshot.restorationEngine == "python" ? "python" : "native"
 
-    // Kept in the persisted schema for backward-compatible decoding only.
-    // Native export uses one process with an internally pipelined scheduler.
-    parallelWorkers = 1
-    executor = "process"
+    if supportsPythonEngine {
+      parallelWorkers = min(max(snapshot.parallelWorkers, 1), 16)
+      executor = ["process", "thread"].contains(snapshot.executor)
+        ? snapshot.executor : "process"
+    } else {
+      // Kept in the persisted schema for backward-compatible decoding only.
+      // Native export uses one process with an internally pipelined scheduler.
+      parallelWorkers = 1
+      executor = "process"
+    }
     useSegmentCount = snapshot.useSegmentCount
     segmentCount = min(max(snapshot.segmentCount, 1), 128)
     segmentDuration = min(max(snapshot.segmentDuration, 10), 3600)
     noSplit = snapshot.noSplit ?? false
-    mergeEncoder = "copy"
+    mergeEncoder = supportsPythonEngine ? snapshot.mergeEncoder : "copy"
     deleteSegments = snapshot.deleteSegments
     keepTemp = snapshot.keepTemp
     forceSplit = snapshot.forceSplit
 
-    // Native Core AI export has one supported execution contract. Preserve
-    // these fields in the on-disk schema so older preferences still decode,
-    // but never let stale Python-era values make a native export fail.
-    device = "mps"
-    fp16 = true
-    autoOptimize = true
+    if supportsPythonEngine {
+      device = snapshot.device
+      fp16 = snapshot.fp16
+      autoOptimize = snapshot.autoOptimize
+    } else {
+      // Native Core AI export has one supported execution contract. Preserve
+      // these fields in the on-disk schema so older preferences still decode,
+      // but never let stale Python-era values make a native export fail.
+      device = "mps"
+      fp16 = true
+      autoOptimize = true
+    }
 
     encodingMode = ["auto", "preset", "custom"].contains(snapshot.encodingMode) ? snapshot.encodingMode : "preset"
     encodingPreset = encodingPresets.contains(snapshot.encodingPreset) ? snapshot.encodingPreset : "hevc-apple-gpu-balanced"
@@ -1329,6 +1657,14 @@ final class RestorationRunner: ObservableObject {
     detectFaceMosaics = snapshot.detectFaceMosaics
 
     previewBufferLimit = min(max(snapshot.previewBufferLimit, 1), 60)
+    previewRestorationModel = restorationModels.contains(
+      snapshot.previewRestorationModel ?? ""
+    ) ? snapshot.previewRestorationModel! : capabilities.previewRestorationModel
+    previewCustomRestorationModel = snapshot.previewCustomRestorationModel ?? ""
+    previewDetectionModel = previewDetectionModels.contains(
+      snapshot.previewDetectionModel ?? ""
+    ) ? snapshot.previewDetectionModel! : capabilities.previewDetectionModel
+    previewCustomDetectionModel = snapshot.previewCustomDetectionModel ?? ""
     previewRealtimeOptimization = snapshot.previewRealtimeOptimization ?? true
     previewProjectionMode = ["通常", "VR180", "360"].contains(snapshot.previewProjectionMode ?? "")
       ? snapshot.previewProjectionMode!
@@ -1469,8 +1805,17 @@ final class RestorationRunner: ObservableObject {
     if restorationModel == "basicvsrpp-v1.2-coreai-variable-chunk6" {
       restorationModel = "basicvsrpp-v1.2-coreai-variable"
     }
+    if previewRestorationModel == "basicvsrpp-v1.2-coreai-variable-chunk6" {
+      previewRestorationModel = "basicvsrpp-v1.2-coreai-variable"
+    }
     if !restorationModels.contains(restorationModel) {
       restorationModel = capabilities.defaultRestorationModel
+    }
+    if !restorationModels.contains(previewRestorationModel) {
+      previewRestorationModel = capabilities.previewRestorationModel
+    }
+    if !previewDetectionModels.contains(previewDetectionModel) {
+      previewDetectionModel = capabilities.previewDetectionModel
     }
     if !detectionModels.contains(detectionModel) {
       detectionModel = "v2-coreml"
@@ -1845,11 +2190,31 @@ struct ContentView: View {
         PathSettingRow(title: "mioh一時フォルダ", value: $runner.ladaTempDirectory) { runner.choosePath(\.ladaTempDirectory) }
       }
       Section("実行") {
-        LabeledContent("実行エンジン") {
-          Text("Swiftネイティブ / Core AI")
+        if runner.supportsPythonEngine {
+          Picker("実行エンジン", selection: $runner.restorationEngine) {
+            Text("Swiftネイティブ / Core AI").tag("native")
+            Text("Python（バンドルランタイム）").tag("python")
+          }
+          Text(runner.usesPythonEngine
+            ? "バンドルされたPython 3.12でprocess_video_parallel.pyを実行します"
+            : "デコードから書き出しまでを1つのSwiftプロセスで実行します")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        } else {
+          LabeledContent("実行エンジン") {
+            Text("Swiftネイティブ / Core AI")
+          }
         }
-        LabeledContent("精度・最適化") {
-          Text("FP16 / Apple Silicon自動最適化")
+        if runner.usesPythonEngine {
+          Picker("デバイス", selection: $runner.device) {
+            Text("MPS").tag("mps"); Text("CPU").tag("cpu"); Text("CUDA 0").tag("cuda:0")
+          }
+          Toggle("FP16", isOn: $runner.fp16)
+          Toggle("自動最適化", isOn: $runner.autoOptimize)
+        } else {
+          LabeledContent("精度・最適化") {
+            Text("FP16 / Apple Silicon自動最適化")
+          }
         }
         Toggle("既存結果を上書き", isOn: $runner.overwrite)
       }
@@ -1859,12 +2224,19 @@ struct ContentView: View {
   private var processingTab: some View {
     Form {
       Section("並列処理") {
-        LabeledContent("実行方式") {
-          Text("Swiftネイティブ（自動段階並列）")
+        if runner.usesPythonEngine {
+          LabeledContent("並列数") { Stepper(value: $runner.parallelWorkers, in: 1...16) { Text("\(runner.parallelWorkers)") } }
+            .disabled(runner.noSplit)
+          Picker("実行方式", selection: $runner.executor) { Text("プロセス").tag("process"); Text("スレッド").tag("thread") }
+            .disabled(runner.noSplit)
+        } else {
+          LabeledContent("実行方式") {
+            Text("Swiftネイティブ（自動段階並列）")
+          }
+          Text("デコード・検出・復元・エンコードを1プロセス内で並行実行します")
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
-        Text("デコード・検出・復元・エンコードを1プロセス内で並行実行します")
-          .font(.caption)
-          .foregroundStyle(.secondary)
       }
       Section("セグメント") {
         Toggle("分割しない", isOn: $runner.noSplit)
@@ -1882,6 +2254,9 @@ struct ContentView: View {
         } else {
           LabeledContent("長さ（秒）") { Stepper(value: $runner.segmentDuration, in: 10...3600, step: 10) { Text("\(runner.segmentDuration)") } }
             .disabled(runner.noSplit)
+        }
+        if runner.usesPythonEngine {
+          LabeledContent("結合エンコーダー") { TextField("", text: $runner.mergeEncoder).frame(width: 220) }
         }
         Toggle("処理済みセグメントを削除", isOn: $runner.deleteSegments)
         Toggle("一時ファイルを保持", isOn: $runner.keepTemp)
@@ -2011,7 +2386,7 @@ struct ContentView: View {
       Section("フレームレート") {
         optionalInt("FPS", enabled: $runner.useFPS, value: $runner.fps, range: 1...240)
         Toggle("復元前にFPS変換", isOn: $runner.preFPSConversion)
-          .disabled(!runner.useFPS)
+          .disabled(!runner.useFPS || (runner.usesPythonEngine && runner.noSplit))
       }
     }.formStyle(.grouped)
   }

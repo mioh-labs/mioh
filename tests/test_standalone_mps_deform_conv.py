@@ -24,17 +24,36 @@ class StandaloneMPSDeformConvTests(unittest.TestCase):
         self.assertIn("MIT License", license_text)
         self.assertIn("imperatormk", license_text)
 
-    def test_native_app_does_not_bundle_torch_or_mps_deform_conv(self):
+    def test_only_the_portable_build_installs_mps_deform_conv(self):
         script = BUILD_SCRIPT.read_text()
-        self.assertNotIn("VENDORED_MPS_DEFORM_CONV", script)
-        self.assertNotIn("mps-deform-conv.txt", script)
-        self.assertNotIn("verify_mps_deform_conv.py", script)
-        self.assertNotIn("$RESOURCES/runtime", script)
-        self.assertNotIn("site-packages/torch", script)
 
-    def test_gui_uses_native_models_without_a_python_backend_override(self):
+        # torch and the deform-conv extension travel with the bundled Python
+        # runtime, which only the portable/universal package carries.
+        self.assertIn("VENDORED_MPS_DEFORM_CONV", script)
+        self.assertIn("mps-deform-conv.txt", script)
+        self.assertIn("verify_mps_deform_conv.py", script)
+        self.assertIn('if [[ "$MIOH_BUNDLE_PYTHON_RUNTIME" == 1 ]]', script)
+        for guarded in [
+            'ditto "$VENDORED_MPS_DEFORM_CONV" "$MPS_DEFORM_BUILD_SOURCE"',
+            'cp "$VENDORED_MPS_DEFORM_CONV/LICENSE"',
+        ]:
+            self.assertIn(guarded, script)
+        # Nothing may reach the app outside that gate.
+        prologue = script.split(
+            'if [[ "$MIOH_BUNDLE_PYTHON_RUNTIME" == 1 ]]; then', 1
+        )[0]
+        self.assertNotIn("$RESOURCES/runtime", prologue)
+
+    def test_gui_selects_the_deform_conv_backend_for_the_python_engine(self):
         source = APP_SOURCE.read_text()
-        self.assertNotIn("LADA_DEFORM_CONV_BACKEND", source)
+
+        # The override only reaches the bundled interpreter's environment.
+        self.assertIn(
+            'result["LADA_DEFORM_CONV_BACKEND"] = "mps_deform_conv"', source
+        )
+        self.assertNotIn(
+            'nativeEnvironment["LADA_DEFORM_CONV_BACKEND"]', source
+        )
         self.assertIn('"bin/mioh-native-coreai-preview"', source)
         self.assertIn('"basicvsrpp-v1.2"', source)
         self.assertIn('"カスタム"', source)
