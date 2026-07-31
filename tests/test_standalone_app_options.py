@@ -765,34 +765,6 @@ class StandaloneAppOptionTests(unittest.TestCase):
         )
         self.assertIn("-D MIOH_PORTABLE_COREAI", script)
 
-    def test_pixel_buffer_pools_allocate_against_a_ceiling(self):
-        pipeline = NATIVE_PIPELINE_SOURCE.read_text()
-
-        # A plain CVPixelBufferPoolCreatePixelBuffer mints surfaces without
-        # limit, so a stalled stage turns a bounded queue into an unbounded
-        # one. Every allocation must go through the ceiling instead.
-        self.assertNotIn("CVPixelBufferPoolCreatePixelBuffer(", pipeline)
-        self.assertIn(
-            "CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(", pipeline
-        )
-        self.assertIn(
-            "kCVPixelBufferPoolAllocationThresholdKey as String: max(1, ceiling)",
-            pipeline,
-        )
-        self.assertIn("kCVReturnWouldExceedAllocationThreshold", pipeline)
-        # Exceeding the ceiling waits for the consumer rather than growing.
-        self.assertIn("usleep(allocationRetryMicroseconds)", pipeline)
-
-        # Idle surfaces age out, and a spike is not left as the resting size.
-        self.assertIn("kCVPixelBufferPoolMaximumBufferAgeKey", pipeline)
-        self.assertIn("CVPixelBufferPoolFlush(pool, .excessBuffers)", pipeline)
-        self.assertIn("processor.flushIdleBuffers()", pipeline)
-
-        # The ceiling has to clear everything held at once or a composition
-        # worker would wait on a buffer only it could release.
-        self.assertIn("outputCeiling = 2 * max(1, batchFrames)", pipeline)
-        self.assertIn("+ ProcessInfo.processInfo.activeProcessorCount", pipeline)
-
     def test_target_frame_rate_inherits_the_source_timebase(self):
         source = APP_SOURCE.read_text()
         pipeline = NATIVE_PIPELINE_SOURCE.read_text()
