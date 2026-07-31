@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Foundation
 import SwiftUI
 
@@ -165,6 +166,168 @@ struct PlatformCapabilities {
 #else
     return false
 #endif
+  }
+}
+
+/// What the input file actually is, read once when it is selected. This is
+/// reporting only — nothing in the pipeline branches on it, so a container
+/// that misreports a field cannot change how the export runs.
+struct SourceMediaInfo: Equatable, Sendable {
+  var width: Int
+  var height: Int
+  var frameRate: Double
+  var durationSeconds: Double
+  var videoCodec: String
+  var dataRateBitsPerSecond: Double
+  var audio: String?
+  var fileSizeBytes: Int64?
+
+  var resolutionText: String { "\(width)×\(height)" }
+
+  /// Matches the frame rate picker: 29.970 stays 29.970, 30 stays 30.
+  var frameRateText: String {
+    FrameRateOption(
+      numerator: max(1, Int((frameRate * 1000).rounded())),
+      denominator: 1000
+    ).label
+  }
+
+  var durationText: String {
+    guard durationSeconds.isFinite, durationSeconds > 0 else { return "—" }
+    let total = Int(durationSeconds.rounded())
+    let hours = total / 3600
+    let minutes = (total % 3600) / 60
+    let seconds = total % 60
+    return hours > 0
+      ? String(format: "%d:%02d:%02d", hours, minutes, seconds)
+      : String(format: "%d:%02d", minutes, seconds)
+  }
+
+  var bitRateText: String? {
+    guard dataRateBitsPerSecond > 0 else { return nil }
+    let mbps = dataRateBitsPerSecond / 1_000_000
+    return mbps >= 10
+      ? String(format: "%.0f Mbps", mbps)
+      : String(format: "%.1f Mbps", mbps)
+  }
+
+  var fileSizeText: String? {
+    fileSizeBytes.map {
+      ByteCountFormatter.string(fromByteCount: $0, countStyle: .file)
+    }
+  }
+
+  /// The one-line summary shown under the input path.
+  var summary: String {
+    var parts = [
+      resolutionText,
+      "\(frameRateText)fps",
+      videoCodec,
+      durationText,
+    ]
+    if let bitRateText { parts.append(bitRateText) }
+    if let audio { parts.append(audio) }
+    if let fileSizeText { parts.append(fileSizeText) }
+    return parts.joined(separator: " · ")
+  }
+}
+
+enum SourceMediaProbe {
+  enum Outcome: Sendable {
+    case success(SourceMediaInfo)
+    case failure(String)
+  }
+
+  static func read(url: URL) async -> Outcome {
+    let asset = AVURLAsset(url: url)
+    do {
+      guard let track = try await asset.loadTracks(withMediaType: .video).first
+      else {
+        return .failure("映像トラックが見つかりません")
+      }
+      let size = try await track.load(.naturalSize)
+      let transform = try await track.load(.preferredTransform)
+      let oriented = size.applying(transform)
+      let frameRate = try await track.load(.nominalFrameRate)
+      let dataRate = try await track.load(.estimatedDataRate)
+      let duration = try await asset.load(.duration)
+      let formats = try await track.load(.formatDescriptions)
+      let fileSize = (
+        try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize
+      ).flatMap { $0 }
+
+      return .success(
+        SourceMediaInfo(
+          width: max(1, Int(abs(oriented.width).rounded())),
+          height: max(1, Int(abs(oriented.height).rounded())),
+          frameRate: max(0, Double(frameRate)),
+          durationSeconds: duration.seconds,
+          videoCodec: formats.first.map { name(for: $0) } ?? "不明",
+          dataRateBitsPerSecond: max(0, Double(dataRate)),
+          audio: await audioSummary(of: asset),
+          fileSizeBytes: fileSize.map(Int64.init)
+        )
+      )
+    } catch {
+      return .failure(error.localizedDescription)
+    }
+  }
+
+  private static func audioSummary(of asset: AVAsset) async -> String? {
+    guard
+      let track = try? await asset.loadTracks(withMediaType: .audio).first,
+      let formats = try? await track.load(.formatDescriptions),
+      let format = formats.first
+    else {
+      return nil
+    }
+    var parts = [name(for: format)]
+    if let basic = CMAudioFormatDescriptionGetStreamBasicDescription(format)?
+      .pointee
+    {
+      if basic.mChannelsPerFrame > 0 {
+        parts.append("\(basic.mChannelsPerFrame)ch")
+      }
+      if basic.mSampleRate > 0 {
+        parts.append(String(format: "%.1fkHz", basic.mSampleRate / 1000))
+      }
+    }
+    return parts.joined(separator: " ")
+  }
+
+  private static func name(for format: CMFormatDescription) -> String {
+    let subtype = CMFormatDescriptionGetMediaSubType(format)
+    switch subtype {
+    case kCMVideoCodecType_H264: return "H.264"
+    case kCMVideoCodecType_HEVC: return "HEVC"
+    case kCMVideoCodecType_HEVCWithAlpha: return "HEVC+α"
+    case kCMVideoCodecType_AV1: return "AV1"
+    case kCMVideoCodecType_VP9: return "VP9"
+    case kCMVideoCodecType_MPEG4Video: return "MPEG-4"
+    case kCMVideoCodecType_MPEG2Video: return "MPEG-2"
+    case kCMVideoCodecType_AppleProRes422: return "ProRes 422"
+    case kCMVideoCodecType_AppleProRes422HQ: return "ProRes 422 HQ"
+    case kCMVideoCodecType_AppleProRes4444: return "ProRes 4444"
+    case kAudioFormatMPEG4AAC: return "AAC"
+    case kAudioFormatLinearPCM: return "PCM"
+    case kAudioFormatOpus: return "Opus"
+    case kAudioFormatFLAC: return "FLAC"
+    case kAudioFormatAC3: return "AC-3"
+    default:
+      return fourCharCode(subtype)
+    }
+  }
+
+  private static func fourCharCode(_ value: FourCharCode) -> String {
+    let bytes = [
+      UInt8((value >> 24) & 0xFF),
+      UInt8((value >> 16) & 0xFF),
+      UInt8((value >> 8) & 0xFF),
+      UInt8(value & 0xFF),
+    ]
+    let text = String(bytes: bytes, encoding: .ascii) ?? ""
+    let trimmed = text.trimmingCharacters(in: .whitespaces)
+    return trimmed.isEmpty ? "不明" : trimmed
   }
 }
 
@@ -368,7 +531,14 @@ struct MiohUserDefaultsSnapshot: Codable {
 
 @MainActor
 final class RestorationRunner: ObservableObject {
-  @Published var inputURL: URL?
+  @Published var inputURL: URL? {
+    didSet {
+      guard inputURL != oldValue else { return }
+      refreshSourceInfo(for: inputURL)
+    }
+  }
+  @Published var sourceInfo: SourceMediaInfo?
+  @Published var sourceInfoFailure: String?
   @Published var outputURL: URL?
   @Published var progress = 0.0
   @Published var status = "待機中"
@@ -548,6 +718,25 @@ final class RestorationRunner: ObservableObject {
   /// process_video_parallel.py takes an integer `--fps`, so the Python engine
   /// gets the nearest whole rate.
   var pythonTargetFPS: Int { max(1, Int(targetFPSValue.rounded())) }
+
+  private func refreshSourceInfo(for url: URL?) {
+    sourceInfo = nil
+    sourceInfoFailure = nil
+    guard let url else { return }
+    Task { [weak self] in
+      let probed = await SourceMediaProbe.read(url: url)
+      await MainActor.run { [weak self] in
+        // A slow probe must not overwrite a newer selection.
+        guard let self, self.inputURL == url else { return }
+        switch probed {
+        case .success(let info):
+          self.sourceInfo = info
+        case .failure(let message):
+          self.sourceInfoFailure = message
+        }
+      }
+    }
+  }
   let enhancerModels = ["none", "realesrgan", "mewzoom", "swinir", "spandrel"]
   private let knownROIEnhancerModelNames: Set<String> = [
     "realesrgan-x2", "realesrgan-x2-coreai",
@@ -2201,6 +2390,55 @@ struct PathRow: View {
   }
 }
 
+/// The input file's own numbers, shown next to the path that produced them.
+struct SourceInfoRow: View {
+  let info: SourceMediaInfo?
+  let failure: String?
+
+  var body: some View {
+    HStack(alignment: .top, spacing: 12) {
+      Image(systemName: "info.circle")
+        .frame(width: 20)
+        .foregroundStyle(.secondary)
+      if let info {
+        VStack(alignment: .leading, spacing: 4) {
+          HStack(spacing: 18) {
+            field("解像度", info.resolutionText)
+            field("フレームレート", "\(info.frameRateText)fps")
+            field("長さ", info.durationText)
+          }
+          HStack(spacing: 18) {
+            field("コーデック", info.videoCodec)
+            if let bitRate = info.bitRateText { field("ビットレート", bitRate) }
+            if let size = info.fileSizeText { field("サイズ", size) }
+            field("音声", info.audio ?? "なし")
+          }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+      } else if let failure {
+        Text("入力情報を読み取れません: \(failure)")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+          .frame(maxWidth: .infinity, alignment: .leading)
+      } else {
+        HStack(spacing: 8) {
+          ProgressView().controlSize(.small)
+          Text("入力情報を読み取り中…").font(.caption).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+      }
+    }
+    .frame(minHeight: 42)
+  }
+
+  private func field(_ title: String, _ value: String) -> some View {
+    VStack(alignment: .leading, spacing: 1) {
+      Text(L(title)).font(.caption2).foregroundStyle(.secondary)
+      Text(value).font(.caption).monospacedDigit()
+    }
+  }
+}
+
 struct PathSettingRow: View {
   let title: String
   @Binding var value: String
@@ -2270,6 +2508,12 @@ struct ContentView: View {
     Form {
       Section("ファイル") {
         PathRow(title: "入力", icon: "film", url: runner.inputURL, action: runner.chooseInput)
+        if runner.inputURL != nil {
+          SourceInfoRow(
+            info: runner.sourceInfo,
+            failure: runner.sourceInfoFailure
+          )
+        }
         PathRow(title: "出力", icon: "externaldrive", url: runner.outputURL, action: runner.chooseOutput)
         PathSettingRow(title: "一時フォルダ", value: $runner.tempDirectory) { runner.choosePath(\.tempDirectory) }
         PathSettingRow(title: "FFmpeg一時フォルダ", value: $runner.ffmpegTempDirectory) { runner.choosePath(\.ffmpegTempDirectory) }
