@@ -52,6 +52,7 @@ private struct NativeExportConfiguration: Encodable {
   let detectFaceMosaics: Bool
   let crossfade: Bool
   let targetFPS: Int?
+  let targetFPSDenominator: Int?
   let preFPSConversion: Bool
   let videoCodec: String
   let averageBitRate: Int?
@@ -214,6 +215,7 @@ struct MiohUserDefaultsSnapshot: Codable {
   var qmax: Int
   var useFPS: Bool
   var fps: Int
+  var ntscFPS: Bool?
   var preFPSConversion: Bool
   var mp4FastStart: Bool
 
@@ -294,6 +296,7 @@ struct MiohUserDefaultsSnapshot: Codable {
       qmax: 30,
       useFPS: false,
       fps: 30,
+      ntscFPS: false,
       preFPSConversion: false,
       mp4FastStart: false,
       restorationModel: capabilities.defaultRestorationModel,
@@ -386,6 +389,9 @@ final class RestorationRunner: ObservableObject {
   @Published var qmax = 30
   @Published var useFPS = false
   @Published var fps = 30
+  // NTSC pull-down: the selected rate is divided by 1.001, so 30 becomes
+  // 29.970 and 60 becomes 59.940. Kept as a rational everywhere downstream.
+  @Published var ntscFPS = false
   @Published var preFPSConversion = false
   @Published var mp4FastStart = false
 
@@ -465,6 +471,21 @@ final class RestorationRunner: ObservableObject {
   var previewDetectionModels: [String] { capabilities.previewDetectionModels }
   var supportsPythonEngine: Bool { capabilities.bundlesPythonRuntime }
   var usesPythonEngine: Bool { supportsPythonEngine && restorationEngine == "python" }
+
+  /// process_video_parallel.py takes an integer rate, so pull-down is a
+  /// native-engine capability even when the preference is set.
+  var usesNTSCFPS: Bool { ntscFPS && !usesPythonEngine }
+  var targetFPSNumerator: Int { usesNTSCFPS ? fps * 1000 : fps }
+  var targetFPSDenominator: Int { usesNTSCFPS ? 1001 : 1 }
+  var targetFPSValue: Double {
+    Double(targetFPSNumerator) / Double(targetFPSDenominator)
+  }
+  /// 29.970 rather than 30 — the exact rate the writer will stamp.
+  var targetFPSDescription: String {
+    usesNTSCFPS
+      ? String(format: "%.3f", targetFPSValue)
+      : String(fps)
+  }
   let enhancerModels = ["none", "realesrgan", "mewzoom", "swinir", "spandrel"]
   private let knownROIEnhancerModelNames: Set<String> = [
     "realesrgan-x2", "realesrgan-x2-coreai",
@@ -951,7 +972,8 @@ final class RestorationRunner: ObservableObject {
       detectionEmptyLookahead: max(0, detectionEmptyLookahead),
       detectFaceMosaics: detectFaceMosaics,
       crossfade: restoreCrossfade,
-      targetFPS: useFPS ? max(1, fps) : nil,
+      targetFPS: useFPS ? max(1, targetFPSNumerator) : nil,
+      targetFPSDenominator: useFPS ? targetFPSDenominator : nil,
       preFPSConversion: preFPSConversion,
       videoCodec: encodingPreset.hasPrefix("h264") ? "h264" : "hevc",
       averageBitRate: nil,
@@ -1293,7 +1315,7 @@ final class RestorationRunner: ObservableObject {
       ROIエンハンサー: 無効
       空検出先読み: \(configuration.detectionEmptyLookahead)フレーム
       顔モザイク検出: \(configuration.detectFaceMosaics ? "有効" : "無効")
-      FPS変換: \(configuration.targetFPS.map { "\($0)fps（\(configuration.preFPSConversion ? "復元前" : "復元後")）" } ?? "なし")
+      FPS変換: \(configuration.targetFPS == nil ? "なし" : "\(targetFPSDescription)fps（\(configuration.preFPSConversion ? "復元前" : "復元後")）")
       エンコーダー: \(codec) VideoToolbox
       ビットレート倍率: \(String(format: "%.1f", configuration.bitrateMultiplier))倍
       一時フォルダ: \(configuration.outputDirectory)
@@ -1530,6 +1552,7 @@ final class RestorationRunner: ObservableObject {
       qmax: qmax,
       useFPS: useFPS,
       fps: fps,
+      ntscFPS: ntscFPS,
       preFPSConversion: preFPSConversion,
       mp4FastStart: mp4FastStart,
       restorationModel: restorationModel,
@@ -1628,6 +1651,7 @@ final class RestorationRunner: ObservableObject {
     qmax = min(max(snapshot.qmax, 0), 51)
     useFPS = snapshot.useFPS
     fps = min(max(snapshot.fps, 1), 240)
+    ntscFPS = snapshot.ntscFPS ?? false
     preFPSConversion = snapshot.preFPSConversion
     mp4FastStart = snapshot.mp4FastStart
 
@@ -2384,7 +2408,27 @@ struct ContentView: View {
         optionalInt("Qmax", enabled: $runner.useQMax, value: $runner.qmax, range: 0...51)
       }
       Section("フレームレート") {
-        optionalInt("FPS", enabled: $runner.useFPS, value: $runner.fps, range: 1...240)
+        HStack {
+          Toggle("FPS", isOn: $runner.useFPS)
+          Spacer()
+          Stepper(value: $runner.fps, in: 1...240) {
+            Text(runner.targetFPSDescription)
+              .frame(width: 66, alignment: .trailing)
+              .monospacedDigit()
+          }
+          .disabled(!runner.useFPS)
+        }
+        Toggle("NTSC（1000/1001）", isOn: $runner.ntscFPS)
+          .disabled(!runner.useFPS || runner.usesPythonEngine)
+        if runner.usesPythonEngine {
+          Text("NTSCの分数フレームレートはSwiftネイティブ書き出しのみ対応です")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        } else if runner.usesNTSCFPS {
+          Text("\(runner.fps * 1000)/1001 = \(runner.targetFPSDescription)fpsで書き出します")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
         Toggle("復元前にFPS変換", isOn: $runner.preFPSConversion)
           .disabled(!runner.useFPS || (runner.usesPythonEngine && runner.noSplit))
       }

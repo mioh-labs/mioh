@@ -765,6 +765,45 @@ class StandaloneAppOptionTests(unittest.TestCase):
         )
         self.assertIn("-D MIOH_PORTABLE_COREAI", script)
 
+    def test_native_export_supports_ntsc_fractional_frame_rates(self):
+        source = APP_SOURCE.read_text()
+        pipeline = NATIVE_PIPELINE_SOURCE.read_text()
+
+        # The rate travels as a rational so 29.970 stays 30000/1001.
+        self.assertIn("@Published var ntscFPS = false", source)
+        self.assertIn(
+            "var targetFPSNumerator: Int { usesNTSCFPS ? fps * 1000 : fps }",
+            source,
+        )
+        self.assertIn(
+            "var targetFPSDenominator: Int { usesNTSCFPS ? 1001 : 1 }", source
+        )
+        self.assertIn("targetFPS: useFPS ? max(1, targetFPSNumerator) : nil", source)
+        self.assertIn(
+            "targetFPSDenominator: useFPS ? targetFPSDenominator : nil", source
+        )
+        # Pull-down is native-only; the Python CLI takes an integer rate.
+        self.assertIn(
+            "var usesNTSCFPS: Bool { ntscFPS && !usesPythonEngine }", source
+        )
+        # The stepper shows the effective rate, not the integer it derives from.
+        self.assertIn("Text(runner.targetFPSDescription)", source)
+        self.assertIn('String(format: "%.3f", targetFPSValue)', source)
+        self.assertIn("Toggle(\"NTSC（1000/1001）\", isOn: $runner.ntscFPS)", source)
+
+        self.assertIn("let targetFPSDenominator: Int?", pipeline)
+        self.assertIn("init(numerator: Int, denominator: Int) {", pipeline)
+        self.assertIn("intervalRemainder = step % frames", pipeline)
+        self.assertIn(
+            "let outputFPSNumerator = targetRate?.numerator ?? video.fpsNumerator",
+            pipeline,
+        )
+        self.assertIn(
+            "let outputFPSDenominator = targetRate?.denominator "
+            "?? video.fpsDenominator",
+            pipeline,
+        )
+
     def test_native_export_uses_internal_stage_concurrency(self):
         source = APP_SOURCE.read_text()
 
