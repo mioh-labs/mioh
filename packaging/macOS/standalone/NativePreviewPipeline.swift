@@ -50,7 +50,11 @@ private struct NativePreviewConfiguration: Decodable {
   let detectionEmptyLookahead: Int?
   let detectFaceMosaics: Bool?
   let crossfade: Bool?
+  // Rational so NTSC rates stay exact: 29.970fps is 30000/1001, never 30/1.
+  // `targetFPSDenominator` is absent in configurations written before
+  // fractional rates existed, where the numerator alone was the frame rate.
   let targetFPS: Int?
+  let targetFPSDenominator: Int?
   let preFPSConversion: Bool?
   let videoCodec: String?
   let averageBitRate: Int?
@@ -114,26 +118,44 @@ private struct ProcessedFrame: @unchecked Sendable {
 /// Selects frames from a VFR or CFR stream using presentation timestamps.
 /// Keeping the original PTS for accepted frames preserves audio sync, while
 /// SegmentWriter emits them at the requested constant output frame rate.
+/// The step is carried as an exact rational (whole nanoseconds plus a
+/// remainder over the numerator) so an NTSC rate such as 30000/1001 does not
+/// accumulate the ~0.33ns per frame that rounding 33.3667ms would.
 private struct PTSFrameRateGate: Sendable {
-  private let intervalNanoseconds: Int64
+  private let numerator: Int64
+  private let intervalWhole: Int64
+  private let intervalRemainder: Int64
   private var nextPTS: Int64?
+  private var carry: Int64 = 0
 
-  init(targetFPS: Int) {
-    intervalNanoseconds = max(
-      1,
-      Int64((1_000_000_000.0 / Double(targetFPS)).rounded())
-    )
+  init(numerator: Int, denominator: Int) {
+    let frames = Int64(max(1, numerator))
+    let seconds = Int64(max(1, denominator))
+    let step = seconds * 1_000_000_000
+    self.numerator = frames
+    intervalWhole = max(1, step / frames)
+    intervalRemainder = step % frames
+  }
+
+  private mutating func advance(_ pts: Int64) -> Int64 {
+    var next = pts + intervalWhole
+    carry += intervalRemainder
+    if carry >= numerator {
+      carry -= numerator
+      next += 1
+    }
+    return next
   }
 
   mutating func accepts(_ ptsNanoseconds: Int64) -> Bool {
     guard let nextPTS else {
-      self.nextPTS = ptsNanoseconds + intervalNanoseconds
+      self.nextPTS = advance(ptsNanoseconds)
       return true
     }
     guard ptsNanoseconds >= nextPTS else { return false }
     var following = nextPTS
     repeat {
-      following += intervalNanoseconds
+      following = advance(following)
     } while following <= ptsNanoseconds
     self.nextPTS = following
     return true
@@ -2908,19 +2930,24 @@ private struct NativePreviewPipeline {
     )
     let video = try await decoder.description()
     let sourceFPS = Double(video.fpsNumerator) / Double(video.fpsDenominator)
-    let targetFPS = config.targetFPS.map { max(1, $0) }
-    if let targetFPS, Double(targetFPS) > sourceFPS + 0.01 {
+    let targetRate: (numerator: Int, denominator: Int)? = config.targetFPS.map {
+      (max(1, $0), max(1, config.targetFPSDenominator ?? 1))
+    }
+    let targetFPSValue = targetRate.map {
+      Double($0.numerator) / Double($0.denominator)
+    }
+    if let targetFPSValue, targetFPSValue > sourceFPS + 0.01 {
       throw NativePreviewError.invalidConfiguration(
         String(
           format:
-            "Swift native FPS conversion currently supports down-conversion only (source %.3ffps, requested %dfps)",
+            "Swift native FPS conversion currently supports down-conversion only (source %.3ffps, requested %.3ffps)",
           sourceFPS,
-          targetFPS
+          targetFPSValue
         )
       )
     }
-    let outputFPSNumerator = targetFPS ?? video.fpsNumerator
-    let outputFPSDenominator = targetFPS == nil ? video.fpsDenominator : 1
+    let outputFPSNumerator = targetRate?.numerator ?? video.fpsNumerator
+    let outputFPSDenominator = targetRate?.denominator ?? video.fpsDenominator
     let effectiveSegmentSeconds: Double
     if config.isExport {
       switch config.splitMode ?? "duration" {
@@ -3019,7 +3046,7 @@ private struct NativePreviewPipeline {
       "duration": video.durationSeconds,
       "fps": Double(outputFPSNumerator) / Double(outputFPSDenominator),
       "source_fps": sourceFPS,
-      "fps_conversion_stage": targetFPS == nil
+      "fps_conversion_stage": targetRate == nil
         ? "none"
         : ((config.preFPSConversion ?? false) ? "before_restore" : "after_restore"),
       "width": video.width,
@@ -3041,9 +3068,11 @@ private struct NativePreviewPipeline {
       var encodedFrames = 0
       var deferredCrossfadeTail: [ProcessedFrame] = []
       var postRestorationFrameRateGate: PTSFrameRateGate? =
-        targetFPS != nil && !(config.preFPSConversion ?? false)
-        ? PTSFrameRateGate(targetFPS: targetFPS ?? 1)
-        : nil
+        (config.preFPSConversion ?? false)
+        ? nil
+        : targetRate.map {
+          PTSFrameRateGate(numerator: $0.numerator, denominator: $0.denominator)
+        }
 
       // Keep at most two detected batches resident: one being restored and
       // one being prepared. This overlaps detection CPU/Core AI work with the
@@ -3062,8 +3091,13 @@ private struct NativePreviewPipeline {
             var batchIndex = 0
             var newFramesSinceYield = 0
             var preRestorationFrameRateGate: PTSFrameRateGate? =
-              targetFPS != nil && (config.preFPSConversion ?? false)
-              ? PTSFrameRateGate(targetFPS: targetFPS ?? 1)
+              (config.preFPSConversion ?? false)
+              ? targetRate.map {
+                PTSFrameRateGate(
+                  numerator: $0.numerator,
+                  denominator: $0.denominator
+                )
+              }
               : nil
 
             func yieldPending() {
