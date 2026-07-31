@@ -91,7 +91,10 @@ class StandaloneAppOptionTests(unittest.TestCase):
             'Toggle("復元前にFPS変換", isOn: $runner.preFPSConversion)',
             app,
         )
-        self.assertIn(".disabled(!runner.useFPS)", app)
+        self.assertIn(
+            ".disabled(!runner.useFPS || (runner.usesPythonEngine && runner.noSplit))",
+            app,
+        )
 
     def test_coreai_runner_is_descriptor_driven(self):
         source = COREAI_RUNNER_SOURCE.read_text()
@@ -517,10 +520,16 @@ class StandaloneAppOptionTests(unittest.TestCase):
         )
         self.assertIn("model: previewModel", source)
         self.assertIn("model: previewDetectionModel", source)
-        self.assertNotIn("@Published var previewRestorationModel", source)
-        self.assertNotIn("@Published var previewDetectionModel", source)
-        self.assertNotIn('Picker("復元モデル"', player)
-        self.assertNotIn('Picker("再生用検出モデル"', player)
+        # The pickers exist again for the bundled Python worker, but the
+        # native preview still resolves its assets from capabilities alone.
+        self.assertIn("@Published var previewRestorationModel: String", source)
+        self.assertIn("@Published var previewDetectionModel: String", source)
+        self.assertIn(
+            'if runner.usesPythonEngine {\n            HStack(spacing: 12) {\n'
+            '              Picker("復元モデル"',
+            player,
+        )
+        self.assertIn('Picker("再生用検出モデル"', player)
         self.assertIn(
             'Toggle("リアルタイム最適化", isOn: $runner.previewRealtimeOptimization)',
             player,
@@ -600,7 +609,12 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn("rfdetr-v6-576-fp32.aimodel", build_script)
         self.assertIn("rfdetr-v6-large-768-fp32.aimodel", build_script)
         self.assertIn("-iname '*rfdetr*' -delete", build_script)
-        self.assertNotIn('site-packages/rfdetr"', build_script)
+        # The bundled runtime inherits the build venv, so RF-DETR has to be
+        # stripped back out of it rather than merely never copied.
+        self.assertIn(
+            '"$RESOURCES/runtime/lib/python3.12/site-packages/rfdetr" \\',
+            build_script,
+        )
         self.assertNotIn('site-packages/lada/models/rfdetr"', build_script)
         self.assertNotIn("calculate_frame_detection_queue_size", restorer)
         self.assertNotIn("pipeline_queue_depth", detector)
@@ -610,8 +624,17 @@ class StandaloneAppOptionTests(unittest.TestCase):
         source = APP_SOURCE.read_text()
 
         self.assertIn("guard capabilities.supportsCoreAI else", source)
-        self.assertNotIn("LADA_COREAI_PYTHON", source)
-        self.assertNotIn("LADA_COREAI_SWIFT_RUNNER", source)
+        # The Python engine environment only advertises the Core AI helpers on
+        # a machine that can actually load them, and strips them otherwise.
+        self.assertIn("if capabilities.supportsCoreAI {", source)
+        self.assertIn(
+            'result.removeValue(forKey: "LADA_COREAI_PYTHON")',
+            source,
+        )
+        self.assertIn(
+            'result.removeValue(forKey: "LADA_COREAI_SWIFT_RUNNER")',
+            source,
+        )
         self.assertIn('"bin/mioh-native-coreai-preview"', source)
         self.assertIn("try rejectUnsupportedCoreAIModel(previewModel)", source)
 
@@ -619,7 +642,18 @@ class StandaloneAppOptionTests(unittest.TestCase):
         script = BUILD_SCRIPT.read_text()
 
         self.assertIn('COREAI_ARCHITECTURE="${COREAI_ARCHITECTURE:-h17s}"', script)
-        self.assertNotIn("LADA_COREAI_ARCHITECTURE", APP_SOURCE.read_text())
+        # The app only names the architecture inside the Python engine's
+        # environment, and the portable build strips it there.
+        source = APP_SOURCE.read_text()
+        self.assertIn(
+            '#if MIOH_PORTABLE_COREAI\n      result.removeValue('
+            'forKey: "LADA_COREAI_ARCHITECTURE")\n#else\n'
+            '      result["LADA_COREAI_ARCHITECTURE"] = "h17s"',
+            source,
+        )
+        self.assertNotIn(
+            'nativeEnvironment["LADA_COREAI_ARCHITECTURE"]', source
+        )
 
     def test_build_targets_only_m5_pro_coreai_specialization(self):
         script = BUILD_SCRIPT.read_text()
@@ -656,20 +690,41 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn('--distribution "$COREAI_DISTRIBUTION"', script)
         self.assertIn('--smoke-model basicvsrpp-v1.2-coreai', script)
 
-    def test_build_does_not_bundle_a_python_runtime(self):
+    def test_only_the_portable_build_bundles_a_python_runtime(self):
         script = BUILD_SCRIPT.read_text()
 
-        for forbidden in [
-            "$RESOURCES/runtime",
-            "site-packages/mioh_preview_worker.py",
-            "process_video_parallel.py",
-            "python3.12",
-        ]:
-            self.assertNotIn(forbidden, script)
+        # The dedicated package is Core AI only; the portable/universal one
+        # still ships the interpreter that drives the Python fallback.
         self.assertIn(
-            "Python is used only while exporting/verifying models and is not bundled.",
+            'if [[ "$COREAI_DISTRIBUTION" == "portable" ]]; then\n'
+            '  MIOH_BUNDLE_PYTHON_RUNTIME="${MIOH_BUNDLE_PYTHON_RUNTIME:-1}"\n'
+            "else\n"
+            '  MIOH_BUNDLE_PYTHON_RUNTIME="${MIOH_BUNDLE_PYTHON_RUNTIME:-0}"',
             script,
         )
+        for guarded in [
+            'ditto "$PYTHON_SOURCE" "$RESOURCES/runtime"',
+            'cp "$ROOT/process_video_parallel.py" \\',
+            'cp "$PACKAGE_DIR/mioh_preview_worker.py" \\',
+            'chmod +x "$RESOURCES/runtime/bin/python3.12"',
+        ]:
+            self.assertIn(guarded, script)
+        # Every runtime block must sit behind the bundling flag.
+        for block in script.split('if [[ "$MIOH_BUNDLE_PYTHON_RUNTIME" == 1 ]]; then')[
+            :1
+        ]:
+            self.assertNotIn('ditto "$PYTHON_SOURCE"', block)
+
+    def test_build_time_python_is_required_for_models_or_bundling(self):
+        script = BUILD_SCRIPT.read_text()
+
+        self.assertIn(
+            'if [[ "$MIOH_BUNDLE_PYTHON_RUNTIME" == 1 '
+            '|| "$MIOH_MODELESS_DISTRIBUTION" != 1 ]]',
+            script,
+        )
+        self.assertIn("Missing build-time Python:", script)
+        self.assertIn("Missing interpreter to bundle:", script)
 
     def test_mioh_keeps_only_one_mewzoom_coreml_asset(self):
         script = BUILD_SCRIPT.read_text()
@@ -703,7 +758,11 @@ class StandaloneAppOptionTests(unittest.TestCase):
         script = BUILD_SCRIPT.read_text()
 
         self.assertIn("#if !MIOH_PORTABLE_COREAI", source)
-        self.assertNotIn("LADA_COREAI_ARCHITECTURE", source)
+        self.assertIn(
+            '#if MIOH_PORTABLE_COREAI\n      result.removeValue('
+            'forKey: "LADA_COREAI_ARCHITECTURE")',
+            source,
+        )
         self.assertIn("-D MIOH_PORTABLE_COREAI", script)
 
     def test_native_export_uses_internal_stage_concurrency(self):
@@ -716,16 +775,44 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn("Swiftネイティブ（自動段階並列）", source)
         self.assertIn("デコード・検出・復元・エンコードを1プロセス内で並行実行します", source)
 
-    def test_native_export_normalizes_removed_python_runtime_options(self):
+    def test_native_engine_normalizes_python_only_options(self):
         source = APP_SOURCE.read_text()
 
-        self.assertNotIn('Picker("デバイス"', source)
-        self.assertNotIn('Toggle("FP16"', source)
-        self.assertNotIn('Toggle("自動最適化"', source)
+        # The device/precision controls exist again, but only the bundled
+        # Python engine may show them; the native engine pins its contract.
+        self.assertIn("if runner.usesPythonEngine {\n          Picker(\"デバイス\"", source)
+        self.assertIn('Toggle("FP16", isOn: $runner.fp16)', source)
+        self.assertIn('Toggle("自動最適化", isOn: $runner.autoOptimize)', source)
         self.assertIn('device = "mps"', source)
         self.assertIn("fp16 = true", source)
         self.assertIn("autoOptimize = true", source)
         self.assertIn("Swiftネイティブ / Core AI", source)
+        self.assertIn(
+            "var usesPythonEngine: Bool { supportsPythonEngine "
+            '&& restorationEngine == "python" }',
+            source,
+        )
+
+    def test_python_engine_is_portable_only(self):
+        source = APP_SOURCE.read_text()
+        player = PLAYER_SOURCE.read_text()
+
+        self.assertIn("var bundlesPythonRuntime: Bool {\n#if MIOH_PORTABLE_COREAI", source)
+        self.assertIn(
+            "var supportsPythonEngine: Bool { capabilities.bundlesPythonRuntime }",
+            source,
+        )
+        # Both the export and the preview honour the same switch.
+        self.assertIn("if usesPythonEngine {\n        let pythonTask =", source)
+        self.assertIn("if runner.usesPythonEngine {", player)
+        self.assertIn(
+            '"runtime/lib/python3.12/site-packages/mioh_preview_worker.py"',
+            player,
+        )
+        self.assertIn(
+            '"runtime/lib/python3.12/site-packages/process_video_parallel.py"',
+            source,
+        )
 
     def test_product_is_named_mioh(self):
         self.assertTrue(APP_SOURCE.is_file(), "MiohApp.swift must be the app entry source")
@@ -792,10 +879,13 @@ class StandaloneAppOptionTests(unittest.TestCase):
         ]:
             self.assertIn(contract, source)
 
-    def test_app_uses_native_swift_export_without_parallel_python_processor(self):
+    def test_app_defaults_to_native_swift_export(self):
         script = BUILD_SCRIPT.read_text()
-        self.assertNotIn("process_video_parallel.py", script)
+        source = APP_SOURCE.read_text()
+
         self.assertIn('"$PACKAGE_DIR/NativePreviewPipeline.swift"', script)
+        self.assertIn('@Published var restorationEngine = "native"', source)
+        self.assertIn('restorationEngine: "native"', source)
 
     def test_app_bundles_realtime_player_and_native_preview_worker(self):
         script = BUILD_SCRIPT.read_text()
@@ -804,7 +894,6 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn("-framework AVFoundation", script)
         self.assertIn("-framework AVKit", script)
         self.assertIn("-framework Network", script)
-        self.assertNotIn("mioh_preview_worker.py", script)
         self.assertIn('"$PACKAGE_DIR/NativePreviewPipeline.swift"', script)
         self.assertIn(
             '"$RESOURCES/bin/mioh-native-coreai-preview"',

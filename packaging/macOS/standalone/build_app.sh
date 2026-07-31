@@ -23,15 +23,43 @@ CONTENTS="$APP/Contents"
 RESOURCES="$CONTENTS/Resources"
 LADA_STANDALONE_PYTHON_ENV="${LADA_STANDALONE_PYTHON_ENV:-${LADA_STANDALONE_VENV:-$ROOT/.venv-coreai}}"
 LADA_STANDALONE_PYTHON_ENV="${LADA_STANDALONE_PYTHON_ENV:A}"
-if [[ "$MIOH_MODELESS_DISTRIBUTION" != 1 && ! -x "$LADA_STANDALONE_PYTHON_ENV/bin/python" ]]; then
-  print -u2 "Missing build-time Python: $LADA_STANDALONE_PYTHON_ENV/bin/python"
-  print -u2 "Python is used only while exporting/verifying models and is not bundled."
-  exit 1
+# The dedicated build targets Core AI hardware and runs entirely inside the
+# Swift pipeline, so it bundles no interpreter. The portable/universal build
+# still ships the Python restoration and preview path for machines without a
+# usable Core AI restorer, so it carries a full runtime in Resources/runtime.
+if [[ "$COREAI_DISTRIBUTION" == "portable" ]]; then
+  MIOH_BUNDLE_PYTHON_RUNTIME="${MIOH_BUNDLE_PYTHON_RUNTIME:-1}"
+else
+  MIOH_BUNDLE_PYTHON_RUNTIME="${MIOH_BUNDLE_PYTHON_RUNTIME:-0}"
+fi
+if [[ "$MIOH_BUNDLE_PYTHON_RUNTIME" == 1 || "$MIOH_MODELESS_DISTRIBUTION" != 1 ]]; then
+  if [[ ! -x "$LADA_STANDALONE_PYTHON_ENV/bin/python" ]]; then
+    print -u2 "Missing build-time Python: $LADA_STANDALONE_PYTHON_ENV/bin/python"
+    print -u2 "Set LADA_STANDALONE_PYTHON_ENV to the environment to package."
+    exit 1
+  fi
+fi
+PYTHON_SOURCE="${PYTHON_SOURCE:-$HOME/.local/share/uv/python/cpython-3.12-macos-aarch64-none}"
+PYTHON_SOURCE="${PYTHON_SOURCE:A}"
+SITE_PACKAGES="${SITE_PACKAGES:-$LADA_STANDALONE_PYTHON_ENV/lib/python3.12/site-packages}"
+if [[ "$MIOH_BUNDLE_PYTHON_RUNTIME" == 1 ]]; then
+  if [[ ! -d "$PYTHON_SOURCE" ]]; then
+    print -u2 "Missing interpreter to bundle: $PYTHON_SOURCE"
+    print -u2 "Set PYTHON_SOURCE, or install it with: uv python install 3.12"
+    exit 1
+  fi
+  if [[ ! -d "$SITE_PACKAGES" ]]; then
+    print -u2 "Missing site-packages for standalone build: $SITE_PACKAGES"
+    print -u2 "Set LADA_STANDALONE_PYTHON_ENV to the single Python environment to package."
+    exit 1
+  fi
 fi
 COMPILED_MODELS="${COMPILED_MODELS:-$BUILD_DIR/compiled-models}"
 COREAI_ARCHITECTURE="${COREAI_ARCHITECTURE:-h17s}"
 COMPILED_COREML_MODELS="${COMPILED_COREML_MODELS:-$BUILD_DIR/compiled-coreml-models}"
 FFMPEG_CACHE="${FFMPEG_CACHE:-$BUILD_DIR/ffmpeg-static}"
+VENDORED_MPS_DEFORM_CONV="$PACKAGE_DIR/vendor/mps-deform-conv-0.2.2"
+MPS_DEFORM_BUILD_SOURCE="$BUILD_DIR/mps-deform-conv-source"
 PREVIEW_ENCODER_TARGET="arm64-apple-macosx26.0"
 
 rm -rf "$APP" "$BUILD_DIR/Lada.app"
@@ -129,6 +157,44 @@ if [[ -d "$PACKAGE_DIR/Localizations" ]]; then
   for localization in "$PACKAGE_DIR/Localizations"/*.lproj(N); do
     ditto "$localization" "$RESOURCES/${localization:t}"
   done
+fi
+if [[ "$MIOH_BUNDLE_PYTHON_RUNTIME" == 1 ]]; then
+  ditto "$PYTHON_SOURCE" "$RESOURCES/runtime"
+  mkdir -p "$RESOURCES/runtime/lib/python3.12/site-packages"
+  rsync -a --exclude '.DS_Store' \
+    "$SITE_PACKAGES/" "$RESOURCES/runtime/lib/python3.12/site-packages/"
+  rm -f "$RESOURCES/runtime/lib/python3.12/site-packages"/__editable__.lada-*.pth(N)
+  rm -f "$RESOURCES/runtime/lib/python3.12/site-packages"/__editable___lada_*_finder.py(N)
+  rm -f "$RESOURCES/runtime/lib/python3.12/site-packages/_virtualenv.pth"
+  rm -f "$RESOURCES/runtime/lib/python3.12/site-packages/_virtualenv.py"
+  rm -rf "$RESOURCES/runtime/lib/python3.12/site-packages"/lada-*.dist-info(N)
+  uv pip install \
+    --python "$RESOURCES/runtime/bin/python3.12" \
+    --break-system-packages \
+    --no-deps \
+    --no-build-isolation \
+    --reinstall \
+    "$ROOT"
+  rm -rf "$MPS_DEFORM_BUILD_SOURCE"
+  ditto "$VENDORED_MPS_DEFORM_CONV" "$MPS_DEFORM_BUILD_SOURCE"
+  uv pip install \
+    --python "$RESOURCES/runtime/bin/python3.12" \
+    --break-system-packages \
+    --no-deps \
+    --no-build-isolation \
+    --reinstall \
+    "$MPS_DEFORM_BUILD_SOURCE"
+  if [[ "${MIOH_SKIP_HARDWARE_SMOKE:-0}" != "1" ]]; then
+    PYTHONHOME="$RESOURCES/runtime" \
+    PYTHONPATH="$RESOURCES/runtime/lib/python3.12/site-packages" \
+      "$RESOURCES/runtime/bin/python3.12" \
+      "$PACKAGE_DIR/verify_mps_deform_conv.py"
+  fi
+  cp "$ROOT/process_video_parallel.py" \
+    "$RESOURCES/runtime/lib/python3.12/site-packages/process_video_parallel.py"
+  cp "$PACKAGE_DIR/mioh_preview_worker.py" \
+    "$RESOURCES/runtime/lib/python3.12/site-packages/mioh_preview_worker.py"
+  rm -f "$RESOURCES/runtime/lib/python3.12/site-packages"/lada-*.dist-info/direct_url.json(N)
 fi
 mkdir -p "$FFMPEG_CACHE"
 if [[ ! -x "$FFMPEG_CACHE/ffmpeg" ]]; then
@@ -450,6 +516,9 @@ else
 fi
 cp "$ROOT/LICENSE.md" "$RESOURCES/LICENSE.md"
 ditto "$ROOT/LICENSES" "$RESOURCES/LICENSES"
+if [[ "$MIOH_BUNDLE_PYTHON_RUNTIME" == 1 ]]; then
+  cp "$VENDORED_MPS_DEFORM_CONV/LICENSE" "$RESOURCES/LICENSES/mps-deform-conv.txt"
+fi
 
 if [[ -n "${MIOH_PREBUILT_APP_ICON:-}" ]]; then
   ditto "$MIOH_PREBUILT_APP_ICON" "$RESOURCES/AppIcon.icns"
@@ -478,6 +547,9 @@ chmod +x "$RESOURCES/bin/mioh-native-coreai-preview"
 if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
   chmod +x "$RESOURCES/bin/lada-basicvsrpp-variable-hq-runner"
 fi
+if [[ "$MIOH_BUNDLE_PYTHON_RUNTIME" == 1 ]]; then
+  chmod +x "$RESOURCES/runtime/bin/python3.12"
+fi
 
 if [[ "$MIOH_MODELESS_DISTRIBUTION" == 1 ]]; then
   print "Skipping model smoke tests for modeless distribution"
@@ -505,6 +577,30 @@ else
     --distribution "$COREAI_DISTRIBUTION" \
     --architecture "$COREAI_ARCHITECTURE" \
     --smoke-model basicvsrpp-v1.2-coreai
+fi
+
+if [[ "$MIOH_BUNDLE_PYTHON_RUNTIME" == 1 ]]; then
+  find "$RESOURCES/runtime" -type d -name '__pycache__' -prune -exec rm -rf {} +
+  find "$RESOURCES/runtime" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+  # The build environment also serves local RF-DETR experiments. Do not inherit
+  # that prototype or its CLI into the production mioh runtime.
+  rm -rf \
+    "$RESOURCES/runtime/lib/python3.12/site-packages/rfdetr" \
+    "$RESOURCES/runtime/lib/python3.12/site-packages"/rfdetr-*.dist-info(N)
+  rm -f "$RESOURCES/runtime/bin/rfdetr"
+  rm -rf \
+    "$RESOURCES/runtime/bin/pip" \
+    "$RESOURCES/runtime/bin/pip3" \
+    "$RESOURCES/runtime/bin/pip3.12" \
+    "$RESOURCES/runtime/lib/python3.12/site-packages/pip" \
+    "$RESOURCES/runtime/lib/python3.12/site-packages"/pip-*.dist-info(N) \
+    "$RESOURCES/runtime/lib/python3.12/site-packages/setuptools" \
+    "$RESOURCES/runtime/lib/python3.12/site-packages"/setuptools-*.dist-info(N) \
+    "$RESOURCES/runtime/lib/python3.12/site-packages/wheel" \
+    "$RESOURCES/runtime/lib/python3.12/site-packages"/wheel-*.dist-info(N) \
+    "$RESOURCES/runtime/lib/python3.12/site-packages/tests" \
+    "$RESOURCES/runtime/lib/python3.12/site-packages/test" \
+    "$RESOURCES/runtime/lib/python3.12/site-packages/yapftests"
 fi
 
 codesign --force --deep --sign - "$APP"

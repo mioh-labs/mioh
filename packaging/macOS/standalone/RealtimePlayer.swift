@@ -1119,23 +1119,53 @@ final class RealtimePlayerController: ObservableObject {
         let outputPipe = Pipe()
         let errorPipe = Pipe()
         do {
-          let invocation = try runner.nativePreviewInvocation(
-            resources: resources,
-            outputDirectory: session,
-            input: processingInput,
-            startNanoseconds: Int64(startSeconds * 1_000_000_000),
-            generation: startingGeneration
-          )
-          let configurationURL = session.appendingPathComponent(
-            "native-preview-configuration.json"
-          )
-          try invocation.configuration.write(
-            to: configurationURL,
-            options: .atomic
-          )
-          process.executableURL = invocation.executable
-          process.arguments = [configurationURL.path]
-          process.environment = invocation.environment
+          if runner.usesPythonEngine {
+            // The bundled interpreter speaks the same stdout event protocol as
+            // the Swift pipeline, so only the launch differs.
+            let python = resources.appendingPathComponent(
+              "runtime/bin/python3.12"
+            )
+            let script = resources.appendingPathComponent(
+              "runtime/lib/python3.12/site-packages/mioh_preview_worker.py"
+            )
+            guard FileManager.default.isExecutableFile(atPath: python.path) else {
+              throw RunnerError.missingResource("Python runtime")
+            }
+            guard FileManager.default.fileExists(atPath: script.path) else {
+              throw RunnerError.missingResource("Realtime preview worker")
+            }
+            process.executableURL = python
+            process.arguments = [script.path] + (try runner.previewArguments(
+              resources: resources,
+              outputDirectory: session,
+              input: processingInput
+            )) + [
+              "--start-ns", String(Int64(startSeconds * 1_000_000_000)),
+              "--generation", String(startingGeneration),
+            ]
+            process.environment = runner.environment(
+              resources: resources,
+              python: python
+            )
+          } else {
+            let invocation = try runner.nativePreviewInvocation(
+              resources: resources,
+              outputDirectory: session,
+              input: processingInput,
+              startNanoseconds: Int64(startSeconds * 1_000_000_000),
+              generation: startingGeneration
+            )
+            let configurationURL = session.appendingPathComponent(
+              "native-preview-configuration.json"
+            )
+            try invocation.configuration.write(
+              to: configurationURL,
+              options: .atomic
+            )
+            process.executableURL = invocation.executable
+            process.arguments = [configurationURL.path]
+            process.environment = invocation.environment
+          }
         } catch {
           self.fail(error.localizedDescription)
           self.cleanupSession()
@@ -2117,6 +2147,48 @@ struct RealtimePlayerView: View {
 
       if !controller.isVRVideo {
         VStack(alignment: .leading, spacing: 8) {
+          // The Swift native preview picks its own Core AI assets. Only the
+          // bundled Python worker takes these selections.
+          if runner.usesPythonEngine {
+            HStack(spacing: 12) {
+              Picker("復元モデル", selection: $runner.previewRestorationModel) {
+                ForEach(runner.restorationModels, id: \.self) { model in
+                  Text(L(model)).tag(model)
+                }
+              }
+              .frame(maxWidth: 430)
+              if runner.previewRestorationModel == "カスタム" {
+                TextField("モデル名またはパス", text: $runner.previewCustomRestorationModel)
+                  .textFieldStyle(.roundedBorder)
+                  .frame(maxWidth: 360)
+                Button {
+                  runner.choosePath(\.previewCustomRestorationModel)
+                } label: {
+                  Image(systemName: "folder")
+                }
+              }
+              Spacer()
+            }
+            HStack(spacing: 12) {
+              Picker("再生用検出モデル", selection: $runner.previewDetectionModel) {
+                ForEach(runner.previewDetectionModels, id: \.self) { model in
+                  Text(L(model)).tag(model)
+                }
+              }
+              .frame(maxWidth: 430)
+              if runner.previewDetectionModel == "カスタム" {
+                TextField("モデル名またはパス", text: $runner.previewCustomDetectionModel)
+                  .textFieldStyle(.roundedBorder)
+                  .frame(maxWidth: 360)
+                Button {
+                  runner.choosePath(\.previewCustomDetectionModel)
+                } label: {
+                  Image(systemName: "folder")
+                }
+              }
+              Spacer()
+            }
+          }
           HStack(spacing: 12) {
             Toggle("リアルタイム最適化", isOn: $runner.previewRealtimeOptimization)
               .toggleStyle(.checkbox)
