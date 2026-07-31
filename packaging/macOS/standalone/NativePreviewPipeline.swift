@@ -1275,6 +1275,8 @@ private struct NativeRestoreEffects {
 /// resize scale factors, exactly like ``MosaicDetector.Clip``.
 private final class NativeFrameProcessor {
   private let outputPool: CVPixelBufferPool
+  private let outputAllocationAttributes: CFDictionary
+  private let outputBufferLimit: Int
   private let restorer: any NativeRestoring
   private let blendFeather: Float
   private let effects: NativeRestoreEffects
@@ -1301,13 +1303,57 @@ private final class NativeFrameProcessor {
     restorer: any NativeRestoring,
     blendFeather: Float,
     effects: NativeRestoreEffects,
+    outputBufferLimit: Int,
     detectionEmptyLookahead: Int
   ) throws {
     self.restorer = restorer
     self.blendFeather = max(0, blendFeather)
     self.effects = effects
+    self.outputBufferLimit = max(16, outputBufferLimit)
+    outputAllocationAttributes = [
+      kCVPixelBufferPoolAllocationThresholdKey as String:
+        max(16, outputBufferLimit)
+    ] as CFDictionary
     self.detectionEmptyLookahead = max(0, detectionEmptyLookahead)
     outputPool = try Self.makePool(width: width, height: height)
+  }
+
+  deinit {
+    CVPixelBufferPoolFlush(outputPool, .excessBuffers)
+  }
+
+  /// The normal path is a single CoreVideo allocation call. Waiting only
+  /// begins after the pool reaches the pipeline-derived live-buffer ceiling,
+  /// replacing swap-producing growth with backpressure without taxing normal
+  /// throughput.
+  private func allocateOutputBuffer(context: String) throws -> CVPixelBuffer {
+    let deadline = Date().addingTimeInterval(60)
+    while true {
+      var output: CVPixelBuffer?
+      let status = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
+        kCFAllocatorDefault,
+        outputPool,
+        outputAllocationAttributes,
+        &output
+      )
+      if status == kCVReturnSuccess, let output {
+        return output
+      }
+      guard status == kCVReturnWouldExceedAllocationThreshold else {
+        throw NativePreviewError.pixelBuffer(
+          "\(context) allocation returned \(status)"
+        )
+      }
+      // Only unused buffers are released; buffers owned by the encoder,
+      // current batch or crossfade tail remain valid.
+      CVPixelBufferPoolFlush(outputPool, .excessBuffers)
+      guard Date() < deadline else {
+        throw NativePreviewError.pixelBuffer(
+          "\(context) waited 60 seconds for the \(outputBufferLimit)-buffer pool"
+        )
+      }
+      Thread.sleep(forTimeInterval: 0.001)
+    }
   }
 
   private static func makePool(width: Int, height: Int) throws
@@ -1409,17 +1455,7 @@ private final class NativeFrameProcessor {
     if earlier === later {
       return earlier
     }
-    var output: CVPixelBuffer?
-    let status = CVPixelBufferPoolCreatePixelBuffer(
-      kCFAllocatorDefault,
-      outputPool,
-      &output
-    )
-    guard status == kCVReturnSuccess, let output else {
-      throw NativePreviewError.pixelBuffer(
-        "crossfade allocation returned \(status)"
-      )
-    }
+    let output = try allocateOutputBuffer(context: "crossfade")
     guard let filter = CIFilter(name: "CIDissolveTransition") else {
       throw NativePreviewError.pixelBuffer(
         "CIDissolveTransition is unavailable"
@@ -2385,17 +2421,7 @@ private final class NativeFrameProcessor {
     geometry: NativeClipGeometry,
     hardMask: [Float]
   ) throws -> CVPixelBuffer {
-    var output: CVPixelBuffer?
-    let status = CVPixelBufferPoolCreatePixelBuffer(
-      kCFAllocatorDefault,
-      outputPool,
-      &output
-    )
-    guard status == kCVReturnSuccess, let output else {
-      throw NativePreviewError.pixelBuffer(
-        "output allocation returned \(status)"
-      )
-    }
+    let output = try allocateOutputBuffer(context: "composite")
     CVPixelBufferLockBaseAddress(source, .readOnly)
     CVPixelBufferLockBaseAddress(output, [])
     defer {
@@ -3031,6 +3057,13 @@ private struct NativePreviewPipeline {
         smoothing: max(0, min(1, config.smoothStrength ?? 0)),
         upscale: max(1, min(4, config.effectUpscale ?? 1))
       ),
+      // One batch may be in VideoToolbox, one remains the current output,
+      // and one temporary generation can exist while an overlapping scene
+      // replaces that output. Crossfade owns at most two overlap tails.
+      outputBufferLimit: max(
+        64,
+        config.temporalBatchFrames * 3 + overlap * 2 + 16
+      ),
       detectionEmptyLookahead: config.detectionEmptyLookahead ?? 0
     )
     let codec: AVVideoCodecType
@@ -3088,6 +3121,10 @@ private struct NativePreviewPipeline {
       "width": video.width,
       "height": video.height,
       "segment_seconds": effectiveSegmentSeconds,
+      "output_buffer_limit": max(
+        64,
+        config.temporalBatchFrames * 3 + overlap * 2 + 16
+      ),
       "pipeline": config.isExport
         ? "swift-native-export"
         : "swift-cvpixelbuffer-ring-coreai",
