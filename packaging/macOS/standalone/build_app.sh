@@ -238,6 +238,7 @@ MODEL_ASSETS=(
   lada_mosaic_restoration_model_generic_v1.2.pth
   RealESRGAN_x2plus.pth
   RealESRGAN_x4plus.pth
+  RealESRGAN_x2plus_256.mlpackage
   RealESRGAN_x4plus_256.mlpackage
   realesr-general-x4v3_256.mlpackage
   MewZoom-V1-4X-Unet_256.mlpackage
@@ -271,6 +272,29 @@ COREML_DETECTION_ASSETS=(
 mkdir -p "$COMPILED_COREML_MODELS"
 for package in "${COREML_DETECTION_ASSETS[@]}"; do
   source_model="$ROOT/model_weights/$package"
+  compiled_name="${package:r}.mlmodelc"
+  compiled_model="$COMPILED_COREML_MODELS/$compiled_name"
+  if [[ ! -d "$compiled_model" || "$source_model" -nt "$compiled_model" ]]; then
+    rm -rf "$compiled_model"
+    xcrun coremlcompiler compile "$source_model" "$COMPILED_COREML_MODELS"
+  fi
+  ditto "$compiled_model" "$RESOURCES/models/$compiled_name"
+done
+
+# ROI enhancers are image-to-image Core ML programs. Ship their compiled
+# form for immediate native use while retaining the source package for the
+# portable model-management workflow. Missing optional models are skipped.
+COREML_ENHANCER_ASSETS=(
+  RealESRGAN_x2plus_256.mlpackage
+  RealESRGAN_x4plus_256.mlpackage
+  realesr-general-x4v3_256.mlpackage
+  MewZoom-V1-4X-Unet_256.mlpackage
+  swinir-real-x4_256.mlpackage
+  4xNomosWebPhoto_RealPLKSR_256.mlpackage
+)
+for package in "${COREML_ENHANCER_ASSETS[@]}"; do
+  source_model="$ROOT/model_weights/$package"
+  [[ -d "$source_model" ]] || continue
   compiled_name="${package:r}.mlmodelc"
   compiled_model="$COMPILED_COREML_MODELS/$compiled_name"
   if [[ ! -d "$compiled_model" || "$source_model" -nt "$compiled_model" ]]; then

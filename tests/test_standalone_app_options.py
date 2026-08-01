@@ -1133,12 +1133,16 @@ class StandaloneAppOptionTests(unittest.TestCase):
         )
         self.assertIn("config.temporalBatchFrames * 3 + overlap * 2 + 16", pipeline)
 
-    def test_native_pipeline_keeps_roi_enhancer_disabled(self):
+    def test_native_pipeline_supports_bounded_roi_enhancement(self):
         source = APP_SOURCE.read_text()
+        pipeline = NATIVE_PIPELINE_SOURCE.read_text()
 
-        self.assertIn('guard roiEnhancer == "none"', source)
-        self.assertIn("abs(roiEnhancerStrength) < 1e-9", source)
-        self.assertIn("ROIエンハンサー: 無効", source)
+        self.assertIn("nativeROIEnhancerAsset(", source)
+        self.assertIn("roiEnhancerModel: nativeEnhancer?.url.path", source)
+        self.assertIn("private final class NativeROIEnhancer", pipeline)
+        self.assertIn("restored = try await roiEnhancer.enhance", pipeline)
+        self.assertIn("CVPixelBufferPoolFlush(sourcePool", pipeline)
+        self.assertNotIn('guard roiEnhancer == "none"', source)
 
     def test_spandrel_realplksr_coreai_is_available_in_mioh(self):
         source = APP_SOURCE.read_text()

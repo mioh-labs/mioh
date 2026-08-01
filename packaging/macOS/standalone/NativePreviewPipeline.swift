@@ -47,6 +47,9 @@ private struct NativePreviewConfiguration: Decodable {
   let textureMix: Float?
   let smoothStrength: Float?
   let effectUpscale: Int?
+  let roiEnhancerModel: String?
+  let roiEnhancerStrength: Float?
+  let roiEnhancerScale: Int?
   let detectionEmptyLookahead: Int?
   let detectFaceMosaics: Bool?
   let crossfade: Bool?
@@ -1255,6 +1258,428 @@ private struct NativeClipGeometry {
   let padLeft: Int
 }
 
+/// Fixed-shape ROI enhancer used by the all-Swift pipeline. Core AI models
+/// consume/produce planar FP16 directly. Core ML image models use a pair of
+/// small, bounded CVPixelBuffer pools and are immediately reduced back to the
+/// 256px restoration grid, so no upscaled frame is retained by the pipeline.
+private final class NativeROIEnhancer {
+  private let function: InferenceFunction?
+  private var coreMLModel: MLModel?
+  private var compiledModelURL: URL?
+  private var inputName: String?
+  private var outputName: String?
+  private var inputWidth: Int
+  private var inputHeight: Int
+  private let scale: Int
+  private let strength: Float
+  private let imageContext = CIContext(options: [
+    .workingColorSpace: NSNull(),
+    .outputColorSpace: NSNull(),
+    .cacheIntermediates: false,
+  ])
+  private var sourcePool: CVPixelBufferPool?
+  private var modelInputPool: CVPixelBufferPool?
+  private var reducedPool: CVPixelBufferPool?
+
+  init(modelURL: URL, scale: Int, strength: Float) async throws {
+    self.scale = max(1, min(8, scale))
+    self.strength = max(0, min(1, strength))
+    inputWidth = restorationSize
+    inputHeight = restorationSize
+    inputName = nil
+    outputName = nil
+    sourcePool = nil
+    modelInputPool = nil
+    reducedPool = nil
+    coreMLModel = nil
+    compiledModelURL = nil
+
+    if ["aimodel", "aimodelc"].contains(
+      modelURL.pathExtension.lowercased()
+    ) {
+      let model = try await AIModel(contentsOf: modelURL)
+      guard let loadedFunction = try model.loadFunction(named: "main") else {
+        throw NativePreviewError.restorer(
+          "ROI enhancer main function is missing"
+        )
+      }
+      function = loadedFunction
+      return
+    }
+
+    function = nil
+    let loadURL: URL
+    if modelURL.pathExtension.lowercased() == "mlpackage" {
+      loadURL = try await Task.detached(priority: .userInitiated) {
+        try MLModel.compileModel(at: modelURL)
+      }.value
+      compiledModelURL = loadURL
+    } else {
+      loadURL = modelURL
+    }
+    let configuration = MLModelConfiguration()
+    configuration.computeUnits = .cpuAndNeuralEngine
+    let loaded = try MLModel(contentsOf: loadURL, configuration: configuration)
+    let imageInputs = loaded.modelDescription.inputDescriptionsByName.filter {
+      $0.value.type == .image
+    }
+    let imageOutputs = loaded.modelDescription.outputDescriptionsByName.filter {
+      $0.value.type == .image
+    }
+    guard let input = imageInputs.first,
+      let output = imageOutputs.first,
+      let constraint = input.value.imageConstraint
+    else {
+      throw NativePreviewError.invalidConfiguration(
+        "ROI enhancer must expose one image input and one image output"
+      )
+    }
+    coreMLModel = loaded
+    inputName = input.key
+    outputName = output.key
+    inputWidth = constraint.pixelsWide
+    inputHeight = constraint.pixelsHigh
+    guard inputWidth > 0, inputHeight > 0 else {
+      throw NativePreviewError.invalidConfiguration(
+        "ROI enhancer input dimensions are invalid"
+      )
+    }
+    sourcePool = try Self.makePool(
+      width: restorationSize,
+      height: restorationSize
+    )
+    modelInputPool = (inputWidth == restorationSize
+      && inputHeight == restorationSize)
+      ? nil
+      : try Self.makePool(width: inputWidth, height: inputHeight)
+    reducedPool = try Self.makePool(
+      width: restorationSize,
+      height: restorationSize
+    )
+  }
+
+  deinit {
+    if let sourcePool { CVPixelBufferPoolFlush(sourcePool, .excessBuffers) }
+    if let modelInputPool {
+      CVPixelBufferPoolFlush(modelInputPool, .excessBuffers)
+    }
+    if let reducedPool { CVPixelBufferPoolFlush(reducedPool, .excessBuffers) }
+    coreMLModel = nil
+    if let compiledModelURL {
+      try? FileManager.default.removeItem(at: compiledModelURL)
+    }
+  }
+
+  func enhance(_ restored: [Float16], masks: [[Float]]) async throws
+    -> [Float16]
+  {
+    let plane = restorationSize * restorationSize
+    let frameElements = plane * 3
+    guard strength > 0,
+      restored.count == masks.count * frameElements
+    else { return restored }
+    var result = restored
+    for frameIndex in masks.indices {
+      guard masks[frameIndex].contains(where: { $0 > 0.5 }) else { continue }
+      let offset = frameIndex * frameElements
+      let enhanced: [Float16]
+      if let function {
+        enhanced = try await enhanceCoreAI(
+          function: function,
+          restored: restored,
+          offset: offset
+        )
+      } else {
+        enhanced = try enhanceCoreML(restored: restored, offset: offset)
+      }
+      guard enhanced.count == frameElements else {
+        throw NativePreviewError.restorer(
+          "ROI enhancer returned \(enhanced.count) elements; expected \(frameElements)"
+        )
+      }
+      let mask = masks[frameIndex]
+      for channel in 0..<3 {
+        let channelOffset = channel * plane
+        for pixel in 0..<plane where mask[pixel] > 0.5 {
+          let destination = offset + channelOffset + pixel
+          let base = Float(restored[destination])
+          let detail = Float(enhanced[channelOffset + pixel])
+          result[destination] = Float16(
+            max(0, min(1, base + (detail - base) * strength))
+          )
+        }
+      }
+    }
+    return result
+  }
+
+  private func enhanceCoreAI(
+    function: InferenceFunction,
+    restored: [Float16],
+    offset: Int
+  ) async throws -> [Float16] {
+    let plane = restorationSize * restorationSize
+    let frameElements = plane * 3
+    var input = NDArray(
+      shape: [1, 3, restorationSize, restorationSize],
+      scalarType: .float16
+    )
+    var inputView = input.mutableView(as: Float16.self)
+    _ = inputView.withUnsafeMutablePointer { destination, _, _ in
+      restored.withUnsafeBytes { source in
+        memcpy(
+          destination,
+          source.baseAddress!.advanced(
+            by: offset * MemoryLayout<Float16>.stride
+          ),
+          frameElements * MemoryLayout<Float16>.stride
+        )
+      }
+    }
+    var outputs = try await function.run(inputs: ["image": input])
+    guard let output = outputs.remove("enhanced")?.ndArray else {
+      throw NativePreviewError.restorer(
+        "Core AI ROI enhancer output is missing"
+      )
+    }
+    let outputSize = restorationSize * scale
+    let expectedShape = [1, 3, outputSize, outputSize]
+    let view = output.view(as: Float16.self)
+    guard view.isContiguous else {
+      throw NativePreviewError.restorer(
+        "Core AI ROI enhancer output is not contiguous"
+      )
+    }
+    return try view.withUnsafePointer { pointer, shape, _ in
+      let actualShape = (0..<shape.count).map { shape[$0] }
+      guard actualShape == expectedShape else {
+        throw NativePreviewError.restorer(
+          "Core AI ROI enhancer output shape \(actualShape), expected \(expectedShape)"
+        )
+      }
+      var reduced = [Float16](repeating: 0, count: frameElements)
+      let highPlane = outputSize * outputSize
+      let divisor = Float(scale * scale)
+      for channel in 0..<3 {
+        for y in 0..<restorationSize {
+          for x in 0..<restorationSize {
+            var sum: Float = 0
+            for subY in 0..<scale {
+              let sourceY = y * scale + subY
+              let row = channel * highPlane + sourceY * outputSize
+              for subX in 0..<scale {
+                let value = max(
+                  0,
+                  min(1, Float(pointer[row + x * scale + subX]))
+                )
+                // The Python backend converts the upscaled result to uint8
+                // before INTER_AREA reduction. Preserve that contract.
+                sum += Float(Int((value * 255).rounded())) / 255
+              }
+            }
+            reduced[channel * plane + y * restorationSize + x] =
+              Float16(sum / divisor)
+          }
+        }
+      }
+      return reduced
+    }
+  }
+
+  private func enhanceCoreML(restored: [Float16], offset: Int) throws
+    -> [Float16]
+  {
+    guard let model = coreMLModel,
+      let inputName,
+      let outputName,
+      let sourcePool,
+      let reducedPool
+    else {
+      throw NativePreviewError.restorer(
+        "Core ML ROI enhancer backend is unavailable"
+      )
+    }
+    return try autoreleasepool {
+      let source = try Self.allocate(from: sourcePool, label: "enhancer input")
+      try Self.writePlanarRGB(
+        restored,
+        offset: offset,
+        to: source
+      )
+      let modelInput: CVPixelBuffer
+      if let modelInputPool {
+        modelInput = try Self.allocate(
+          from: modelInputPool,
+          label: "enhancer resized input"
+        )
+        let image = CIImage(cvPixelBuffer: source).transformed(
+          by: CGAffineTransform(
+            scaleX: CGFloat(inputWidth) / CGFloat(restorationSize),
+            y: CGFloat(inputHeight) / CGFloat(restorationSize)
+          )
+        )
+        imageContext.render(
+          image,
+          to: modelInput,
+          bounds: CGRect(x: 0, y: 0, width: inputWidth, height: inputHeight),
+          colorSpace: nil
+        )
+      } else {
+        modelInput = source
+      }
+      let provider = try MLDictionaryFeatureProvider(dictionary: [
+        inputName: MLFeatureValue(pixelBuffer: modelInput)
+      ])
+      let prediction = try model.prediction(from: provider)
+      guard let enhanced = prediction.featureValue(
+        for: outputName
+      )?.imageBufferValue else {
+        throw NativePreviewError.restorer(
+          "Core ML ROI enhancer image output is missing"
+        )
+      }
+      let reduced = try Self.allocate(
+        from: reducedPool,
+        label: "enhancer reduced output"
+      )
+      let outputWidth = CVPixelBufferGetWidth(enhanced)
+      let outputHeight = CVPixelBufferGetHeight(enhanced)
+      let image = CIImage(cvPixelBuffer: enhanced).transformed(
+        by: CGAffineTransform(
+          scaleX: CGFloat(restorationSize) / CGFloat(outputWidth),
+          y: CGFloat(restorationSize) / CGFloat(outputHeight)
+        )
+      )
+      imageContext.render(
+        image,
+        to: reduced,
+        bounds: CGRect(
+          x: 0,
+          y: 0,
+          width: restorationSize,
+          height: restorationSize
+        ),
+        colorSpace: nil
+      )
+      return try Self.readPlanarRGB(from: reduced)
+    }
+  }
+
+  private static func makePool(width: Int, height: Int) throws
+    -> CVPixelBufferPool
+  {
+    let poolAttributes: [String: Any] = [
+      kCVPixelBufferPoolMinimumBufferCountKey as String: 1,
+      kCVPixelBufferPoolMaximumBufferAgeKey as String: 1,
+    ]
+    let pixelAttributes: [String: Any] = [
+      kCVPixelBufferPixelFormatTypeKey as String:
+        Int(kCVPixelFormatType_32BGRA),
+      kCVPixelBufferWidthKey as String: width,
+      kCVPixelBufferHeightKey as String: height,
+      kCVPixelBufferMetalCompatibilityKey as String: true,
+      kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+    ]
+    var pool: CVPixelBufferPool?
+    let status = CVPixelBufferPoolCreate(
+      kCFAllocatorDefault,
+      poolAttributes as CFDictionary,
+      pixelAttributes as CFDictionary,
+      &pool
+    )
+    guard status == kCVReturnSuccess, let pool else {
+      throw NativePreviewError.pixelBuffer(
+        "ROI enhancer pool creation returned \(status)"
+      )
+    }
+    return pool
+  }
+
+  private static func allocate(
+    from pool: CVPixelBufferPool,
+    label: String
+  ) throws -> CVPixelBuffer {
+    var buffer: CVPixelBuffer?
+    let status = CVPixelBufferPoolCreatePixelBuffer(
+      kCFAllocatorDefault,
+      pool,
+      &buffer
+    )
+    guard status == kCVReturnSuccess, let buffer else {
+      throw NativePreviewError.pixelBuffer(
+        "\(label) allocation returned \(status)"
+      )
+    }
+    return buffer
+  }
+
+  private static func writePlanarRGB(
+    _ source: [Float16],
+    offset: Int,
+    to pixelBuffer: CVPixelBuffer
+  ) throws {
+    CVPixelBufferLockBaseAddress(pixelBuffer, [])
+    defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+    guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+      throw NativePreviewError.pixelBuffer(
+        "ROI enhancer input base address unavailable"
+      )
+    }
+    let width = CVPixelBufferGetWidth(pixelBuffer)
+    let height = CVPixelBufferGetHeight(pixelBuffer)
+    guard width == restorationSize, height == restorationSize else {
+      throw NativePreviewError.pixelBuffer(
+        "ROI enhancer source buffer must be 256x256"
+      )
+    }
+    let rowBytes = CVPixelBufferGetBytesPerRow(pixelBuffer)
+    let pixels = base.assumingMemoryBound(to: UInt8.self)
+    let plane = restorationSize * restorationSize
+    for y in 0..<restorationSize {
+      let row = pixels.advanced(by: y * rowBytes)
+      for x in 0..<restorationSize {
+        let pixel = y * restorationSize + x
+        row[x * 4] = UInt8(
+          max(0, min(255, Int((Float(source[offset + 2 * plane + pixel]) * 255).rounded())))
+        )
+        row[x * 4 + 1] = UInt8(
+          max(0, min(255, Int((Float(source[offset + plane + pixel]) * 255).rounded())))
+        )
+        row[x * 4 + 2] = UInt8(
+          max(0, min(255, Int((Float(source[offset + pixel]) * 255).rounded())))
+        )
+        row[x * 4 + 3] = 255
+      }
+    }
+  }
+
+  private static func readPlanarRGB(from pixelBuffer: CVPixelBuffer) throws
+    -> [Float16]
+  {
+    CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+    guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+      throw NativePreviewError.pixelBuffer(
+        "ROI enhancer output base address unavailable"
+      )
+    }
+    let rowBytes = CVPixelBufferGetBytesPerRow(pixelBuffer)
+    let pixels = base.assumingMemoryBound(to: UInt8.self)
+    let plane = restorationSize * restorationSize
+    var result = [Float16](repeating: 0, count: plane * 3)
+    for y in 0..<restorationSize {
+      let row = pixels.advanced(by: y * rowBytes)
+      for x in 0..<restorationSize {
+        let pixel = y * restorationSize + x
+        result[pixel] = Float16(Float(row[x * 4 + 2]) / 255)
+        result[plane + pixel] = Float16(Float(row[x * 4 + 1]) / 255)
+        result[2 * plane + pixel] = Float16(Float(row[x * 4]) / 255)
+      }
+    }
+    return result
+  }
+}
+
 private struct NativeRestoreEffects {
   let sharpen: Float
   let detail: Float
@@ -1278,6 +1703,7 @@ private final class NativeFrameProcessor {
   private let outputAllocationAttributes: CFDictionary
   private let outputBufferLimit: Int
   private let restorer: any NativeRestoring
+  private let roiEnhancer: NativeROIEnhancer?
   private let blendFeather: Float
   private let effects: NativeRestoreEffects
   private let detectionEmptyLookahead: Int
@@ -1301,12 +1727,14 @@ private final class NativeFrameProcessor {
     width: Int,
     height: Int,
     restorer: any NativeRestoring,
+    roiEnhancer: NativeROIEnhancer?,
     blendFeather: Float,
     effects: NativeRestoreEffects,
     outputBufferLimit: Int,
     detectionEmptyLookahead: Int
   ) throws {
     self.restorer = restorer
+    self.roiEnhancer = roiEnhancer
     self.blendFeather = max(0, blendFeather)
     self.effects = effects
     self.outputBufferLimit = max(16, outputBufferLimit)
@@ -1380,7 +1808,7 @@ private final class NativeFrameProcessor {
     return pool
   }
 
-  func process(_ detected: [DetectedFrame]) throws -> [CVPixelBuffer] {
+  func process(_ detected: [DetectedFrame]) async throws -> [CVPixelBuffer] {
     guard !detected.isEmpty else { return [] }
     var outputs = detected.map { $0.frame.pixelBuffer }
     let scenes = trackScenes(detected)
@@ -1388,7 +1816,7 @@ private final class NativeFrameProcessor {
     for scene in scenes.sorted(by: {
       ($0.frames.first?.batchIndex ?? 0) < ($1.frames.first?.batchIndex ?? 0)
     }) {
-      let (restored, geometries, masks) = try restore(scene)
+      let (restored, geometries, masks) = try await restore(scene)
       let compositionStart = Date()
       let restoredFrameElements =
         3 * restorationSize * restorationSize
@@ -1527,7 +1955,7 @@ private final class NativeFrameProcessor {
 
   private func restore(
     _ scene: NativeScene
-  ) throws -> ([Float16], [NativeClipGeometry], [[Float]]) {
+  ) async throws -> ([Float16], [NativeClipGeometry], [[Float]]) {
     let preparationStart = Date()
     let width = CVPixelBufferGetWidth(scene.frames[0].source)
     let height = CVPixelBufferGetHeight(scene.frames[0].source)
@@ -1622,6 +2050,15 @@ private final class NativeFrameProcessor {
       modelInput,
       frameCount: scene.frames.count
     )
+    if let roiEnhancer {
+      let modelMasks = geometries.indices.map {
+        Self.modelMask(
+          cropMask: hardMasks[$0],
+          geometry: geometries[$0]
+        )
+      }
+      restored = try await roiEnhancer.enhance(restored, masks: modelMasks)
+    }
     restorationSeconds += Date().timeIntervalSince(restorationStart)
     if effects.isEnabled {
       restored = Self.applyRestoreEffects(
@@ -3045,10 +3482,23 @@ private struct NativePreviewPipeline {
         maximumFrames: config.temporalBatchFrames
       )
     }
+    let roiEnhancer: NativeROIEnhancer?
+    if let modelPath = config.roiEnhancerModel,
+      (config.roiEnhancerStrength ?? 0) > 0
+    {
+      roiEnhancer = try await NativeROIEnhancer(
+        modelURL: URL(fileURLWithPath: modelPath),
+        scale: config.roiEnhancerScale ?? 4,
+        strength: config.roiEnhancerStrength ?? 0
+      )
+    } else {
+      roiEnhancer = nil
+    }
     let processor = try NativeFrameProcessor(
       width: video.width,
       height: video.height,
       restorer: restorer,
+      roiEnhancer: roiEnhancer,
       blendFeather: config.blendFeather ?? 1,
       effects: NativeRestoreEffects(
         sharpen: max(0, min(2, config.sharpenStrength ?? 0)),
@@ -3252,7 +3702,7 @@ private struct NativePreviewPipeline {
         case .batch(let detectedBatch):
           do {
             let batch = detectedBatch.frames
-            let outputs = try processor.process(batch)
+            let outputs = try await processor.process(batch)
             restoredBatches += processor.lastRestoredSceneCount
             if let pendingEncoding {
               let (segments, completedNextSequence) =
