@@ -65,6 +65,48 @@ runtime. The command writes a 76 MB `.aimodel` and an adjacent report containing
 the checkpoint SHA-256, package versions, stage timings, custom kernels, and
 exported operator counts.
 
+## Metal kernel execution smoke test
+
+The unit tests verify the PyTorch references and Core AI conversion graph. Run
+the compiled-kernel smoke test after an Xcode/Core AI beta update to execute the
+actual Metal 4 grid-sample and TensorOps DCNv2 kernels on this Mac:
+
+```bash
+.venv-coreai/bin/python \
+  scripts/apple/smoke_test_basicvsrpp_coreai_kernels.py \
+  --operation all \
+  --runner build/macos-standalone/mioh.app/Contents/Resources/bin/lada-coreai-runner
+```
+
+The command fails when either kernel exceeds `0.002` maximum absolute error
+against the FP16 PyTorch reference. On the M5 Pro with Xcode 27 build
+27A5228h, grid sample at `[1,64,64,64]` measured 116.30 dB and 0.81 ms median.
+DCNv2 with the production BasicVSR++ shape `[1,128,64,64] -> [1,64,64,64]`
+measured 84.46 dB and 2.16 ms median. Both had `0.00048828125` maximum absolute
+error.
+
+### Experimental fused flow warp (not adopted)
+
+`--fuse-flow-warp` is a research-only export option. It combines the
+meshgrid, flow addition, coordinate normalization, and bilinear sampling into
+one Metal kernel. The fixed-T18 graph became 29.2% smaller and an isolated
+random-input fixed model ran 13.7% faster, so the optimization looked
+promising in a synthetic probe.
+
+The recurrent and real-video gates rejected it. With the iter9000 weights and
+the production chunk6 Swift runner, the current model measured 109.11 fps at
+T18 and 114.13 fps at T90. The fused model measured 99.06 and 103.84 fps. On
+five real validation clips, median full-frame parity against MPS fell from
+73.30 to 44.75 dB and median mosaic-ROI parity fell from 66.61 to 38.61 dB.
+The standalone fused kernel itself remained numerically valid at 105.02 dB
+against its high-precision reference; the failure is the small rounding change
+being amplified by recurrent propagation, not a broken Metal sampler.
+
+The normal fixed and variable exporters therefore retain the validated
+grid-construction plus grid-sample path. The standalone app build does not pass
+`--fuse-flow-warp`. Keep the option only for future Core AI/compiler canaries;
+it must pass the real-video recurrent gate before it can become a default.
+
 ## Ahead-of-time Compilation
 
 ```bash
@@ -87,8 +129,21 @@ modulated-deform-convolution calls. Neither
 
 The deformable-convolution kernel samples eight output pixels into an 18 KiB
 FP16 threadgroup tile, then multiplies that `[8, K]` tile by the `[K, 64]`
-weight matrix with Metal 4 TensorOps and eight SIMD groups. Bias addition and
-the final NCHW reshape stay in the Core AI graph.
+weight matrix with Metal 4 TensorOps and eight SIMD groups. Offset, mask and
+bilinear-coordinate calculations are shared across the eight input channels
+in each production deform group; the previous kernel repeated those operations
+for every channel. Bias addition and the final NCHW reshape stay in the Core AI
+graph.
+
+On the M5 Pro, a 50-run same-environment comparison at the production
+`[1,128,64,64] -> [1,64,64,64]` shape reduced median DCNv2 latency from
+2.63 ms to 2.16 ms (17.8%). An ABBA comparison of the complete iter9000
+chunk6 model improved T18 throughput from 99.45 to 108.07 fps (8.7%) and T90
+from 105.02 to 109.85 fps (4.6%). Outputs were bit-identical at T18 and T90,
+including all five real-video validation clips. A 12-row TensorOps tile is not
+valid because the Metal primitive requires its M dimension to be a multiple of
+8 or 16; a 16-row tile would exceed the 32 KiB threadgroup-memory budget with
+the 1152-element reduction, so the validated 8-row tile remains intentional.
 
 On this Mac, random T18 runs measured about 15.2 seconds for first-load
 specialization and 1.36 to 5.73 seconds for inference. The output was FP16 with

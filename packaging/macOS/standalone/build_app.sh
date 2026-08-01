@@ -337,7 +337,10 @@ VARIABLE_COREAI_STEP1_ASSETS=(
 needs_variable_export=0
 for name in "${VARIABLE_COREAI_ASSETS[@]}"; do
   source_asset="$VARIABLE_COREAI_SOURCE_MODELS/basicvsrpp-variable-$name.aimodel"
-  if [[ ! -d "$source_asset" || "$VARIABLE_COREAI_CHECKPOINT" -nt "$source_asset" ]]; then
+  if [[ ! -d "$source_asset" \
+        || "$VARIABLE_COREAI_CHECKPOINT" -nt "$source_asset" \
+        || "$ROOT/scripts/apple/basicvsrpp_coreai_kernels.py" -nt "$source_asset" \
+        || "$ROOT/scripts/apple/export_basicvsrpp_variable_chunk6.py" -nt "$source_asset" ]]; then
     needs_variable_export=1
     break
   fi
@@ -354,7 +357,10 @@ if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
   needs_step1_export=0
   for name in "${VARIABLE_COREAI_STEP1_ASSETS[@]}"; do
     source_asset="$VARIABLE_COREAI_STEP1_SOURCE_MODELS/basicvsrpp-variable-$name.aimodel"
-    if [[ ! -d "$source_asset" || "$VARIABLE_COREAI_CHECKPOINT" -nt "$source_asset" ]]; then
+    if [[ ! -d "$source_asset" \
+          || "$VARIABLE_COREAI_CHECKPOINT" -nt "$source_asset" \
+          || "$ROOT/scripts/apple/basicvsrpp_coreai_kernels.py" -nt "$source_asset" \
+          || "$ROOT/scripts/apple/benchmark_basicvsrpp_variable_coreai.py" -nt "$source_asset" ]]; then
       needs_step1_export=1
       break
     fi
