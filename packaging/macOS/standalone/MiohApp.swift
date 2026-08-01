@@ -49,6 +49,9 @@ private struct NativeExportConfiguration: Encodable {
   let textureMix: Float
   let smoothStrength: Float
   let effectUpscale: Int
+  let roiEnhancerModel: String?
+  let roiEnhancerStrength: Float
+  let roiEnhancerScale: Int
   let detectionEmptyLookahead: Int
   let detectFaceMosaics: Bool
   let crossfade: Bool
@@ -88,6 +91,9 @@ private struct NativePreviewLaunchConfiguration: Encodable {
   let textureMix: Float
   let smoothStrength: Float
   let effectUpscale: Int
+  let roiEnhancerModel: String?
+  let roiEnhancerStrength: Float
+  let roiEnhancerScale: Int
   let detectionEmptyLookahead: Int
   let detectFaceMosaics: Bool
   let videoCodec: String = "h264"
@@ -1075,14 +1081,6 @@ final class RestorationRunner: ObservableObject {
     // precision, worker count, executor and merge strategy belonged to the
     // removed Python runtime, so they are normalized while loading defaults
     // instead of becoming runtime failure conditions.
-    guard roiEnhancer == "none",
-      abs(roiEnhancerStrength) < 1e-9
-    else {
-      throw RunnerError.unsupportedFeature(
-        "ROIエンハンサーはSwiftネイティブ書き出しでは無効です。"
-          + "「none・強度0」に設定してください"
-      )
-    }
     guard encodingMode == "preset",
       encoderOptions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
       !useQuality, !useQMin, !useQMax,
@@ -1126,6 +1124,21 @@ final class RestorationRunner: ObservableObject {
       throw RunnerError.missingResource(
         "Swift native restoration model: \(restorationModel)"
       )
+    }
+    let nativeEnhancer: (url: URL, scale: Int)?
+    if roiEnhancer != "none", roiEnhancerStrength > 0 {
+      guard let resolved = nativeROIEnhancerAsset(
+        resources: resources,
+        model: roiEnhancerModel,
+        requestedScale: roiEnhancerScale
+      ) else {
+        throw RunnerError.missingResource(
+          "Swift native ROI enhancer: \(roiEnhancerModel)"
+        )
+      }
+      nativeEnhancer = resolved
+    } else {
+      nativeEnhancer = nil
     }
     let restorationRunner = resources.appendingPathComponent(
       "bin/\(restoration.runnerName)"
@@ -1220,6 +1233,9 @@ final class RestorationRunner: ObservableObject {
       textureMix: Float(textureMix),
       smoothStrength: Float(smoothStrength),
       effectUpscale: effectUpscale,
+      roiEnhancerModel: nativeEnhancer?.url.path,
+      roiEnhancerStrength: nativeEnhancer == nil ? 0 : Float(roiEnhancerStrength),
+      roiEnhancerScale: nativeEnhancer?.scale ?? max(1, roiEnhancerScale),
       detectionEmptyLookahead: max(0, detectionEmptyLookahead),
       detectFaceMosaics: detectFaceMosaics,
       crossfade: restoreCrossfade,
@@ -1563,7 +1579,7 @@ final class RestorationRunner: ObservableObject {
       テクスチャ: \(String(format: "%.2f", configuration.textureMix))
       スムージング: \(String(format: "%.2f", configuration.smoothStrength))
       エフェクト倍率: \(configuration.effectUpscale)x
-      ROIエンハンサー: 無効
+      ROIエンハンサー: \(configuration.roiEnhancerModel == nil ? "無効" : "有効（\(roiEnhancerModel)、強度 \(String(format: "%.2f", configuration.roiEnhancerStrength))）")
       空検出先読み: \(configuration.detectionEmptyLookahead)フレーム
       顔モザイク検出: \(configuration.detectFaceMosaics ? "有効" : "無効")
       FPS変換: \(configuration.targetFPS == nil ? "なし" : "\(targetFPSDescription)fps（\(configuration.preFPSConversion ? "復元前" : "復元後")）")
@@ -1674,6 +1690,103 @@ final class RestorationRunner: ObservableObject {
       suffix: ".aimodelc"
     ) {
       return (coreAI, candidateChannels, nil)
+    }
+    return nil
+  }
+
+  /// Resolve the selected UI model to a backend the Swift pipeline can load.
+  /// Core AI selections stay on Core AI when a compiled asset is available;
+  /// Core ML and legacy PyTorch labels resolve to the equivalent Core ML
+  /// export. This keeps the user's chosen model semantics without bringing
+  /// Python back into the native pipeline.
+  private func nativeROIEnhancerAsset(
+    resources: URL,
+    model: String,
+    requestedScale: Int
+  ) -> (url: URL, scale: Int)? {
+    let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+    let custom = URL(fileURLWithPath: trimmed)
+    if custom.isFileURL,
+      FileManager.default.fileExists(atPath: custom.path),
+      ["aimodel", "aimodelc", "mlpackage", "mlmodelc"].contains(
+        custom.pathExtension.lowercased()
+      )
+    {
+      return (custom, max(1, min(8, requestedScale)))
+    }
+
+    let models = resources.appendingPathComponent("models", isDirectory: true)
+    let scale: Int
+    let coreAIPrefixes: [String]
+    let coreMLPrefixes: [String]
+    switch trimmed {
+    case "realesrgan-x2-coreai":
+      scale = 2
+      coreAIPrefixes = ["RealESRGAN_x2plus-256-fp16"]
+      coreMLPrefixes = ["RealESRGAN_x2plus_256"]
+    case "realesrgan-x2":
+      scale = 2
+      coreAIPrefixes = []
+      coreMLPrefixes = ["RealESRGAN_x2plus_256"]
+    case "realesrgan-x4-coreai":
+      scale = 4
+      coreAIPrefixes = ["RealESRGAN_x4plus-256-fp16"]
+      coreMLPrefixes = ["RealESRGAN_x4plus_256"]
+    case "realesrgan-x4", "realesrgan-x4-coreml":
+      scale = 4
+      coreAIPrefixes = []
+      coreMLPrefixes = ["RealESRGAN_x4plus_256"]
+    case "realesr-general-x4v3-coreai":
+      scale = 4
+      coreAIPrefixes = ["realesr-general-x4v3-256-fp16"]
+      coreMLPrefixes = ["realesr-general-x4v3_256"]
+    case "realesr-general-x4v3-coreml":
+      scale = 4
+      coreAIPrefixes = []
+      coreMLPrefixes = ["realesr-general-x4v3_256"]
+    case "mewzoom-x4-coreml":
+      scale = 4
+      coreAIPrefixes = []
+      coreMLPrefixes = ["MewZoom-V1-4X-Unet_256"]
+    case "mewzoom-x4-coreml-512":
+      scale = 4
+      coreAIPrefixes = []
+      coreMLPrefixes = ["MewZoom-V1-4X-Unet_512"]
+    case "swinir-x4-coreml", "swinir-real-x4-coreml":
+      scale = 4
+      coreAIPrefixes = []
+      coreMLPrefixes = ["swinir-real-x4_256"]
+    case "nomos-webphoto-realplksr-x4-coreai":
+      scale = 4
+      coreAIPrefixes = ["4xNomosWebPhoto_RealPLKSR-256-fp16"]
+      coreMLPrefixes = ["4xNomosWebPhoto_RealPLKSR_256"]
+    case "nomos-webphoto-realplksr-x4",
+      "nomos-webphoto-realplksr-x4-coreml":
+      scale = 4
+      coreAIPrefixes = []
+      coreMLPrefixes = ["4xNomosWebPhoto_RealPLKSR_256"]
+    default:
+      return nil
+    }
+
+    for suffix in [".aimodelc", ".aimodel"] where !coreAIPrefixes.isEmpty {
+      if let asset = firstModelAsset(
+        in: models,
+        prefixes: coreAIPrefixes,
+        suffix: suffix
+      ) {
+        return (asset, scale)
+      }
+    }
+    for suffix in [".mlmodelc", ".mlpackage"] {
+      if let asset = firstModelAsset(
+        in: models,
+        prefixes: coreMLPrefixes,
+        suffix: suffix
+      ) {
+        return (asset, scale)
+      }
     }
     return nil
   }
@@ -1981,13 +2094,6 @@ final class RestorationRunner: ObservableObject {
       ? 0
       : roiEnhancerStrength
     let effectiveUpscale = previewRealtimeOptimization ? 1 : effectUpscale
-    guard abs(effectiveEnhancerStrength) < 1e-9
-    else {
-      throw RunnerError.unsupportedFeature(
-        "リアルタイム再生のROIエンハンサーは無効です。"
-          + "強度を0に設定してください"
-      )
-    }
     let executable = resources.appendingPathComponent(
       "bin/mioh-native-coreai-preview"
     )
@@ -2018,6 +2124,21 @@ final class RestorationRunner: ObservableObject {
       throw RunnerError.missingResource(
         "Swift native detection model: \(previewDetectionModel)"
       )
+    }
+    let nativeEnhancer: (url: URL, scale: Int)?
+    if roiEnhancer != "none", effectiveEnhancerStrength > 0 {
+      guard let resolved = nativeROIEnhancerAsset(
+        resources: resources,
+        model: roiEnhancerModel,
+        requestedScale: roiEnhancerScale
+      ) else {
+        throw RunnerError.missingResource(
+          "Swift native ROI enhancer: \(roiEnhancerModel)"
+        )
+      }
+      nativeEnhancer = resolved
+    } else {
+      nativeEnhancer = nil
     }
     let temporalLimit = detection.computeUnits == nil ? 18 : 36
     var requestedFrames = useMaxClipLength ? maxClipLength : temporalLimit
@@ -2058,6 +2179,9 @@ final class RestorationRunner: ObservableObject {
       textureMix: Float(textureMix),
       smoothStrength: Float(smoothStrength),
       effectUpscale: effectiveUpscale,
+      roiEnhancerModel: nativeEnhancer?.url.path,
+      roiEnhancerStrength: nativeEnhancer == nil ? 0 : Float(effectiveEnhancerStrength),
+      roiEnhancerScale: nativeEnhancer?.scale ?? max(1, roiEnhancerScale),
       detectionEmptyLookahead: max(0, detectionEmptyLookahead),
       detectFaceMosaics: detectFaceMosaics
     )
