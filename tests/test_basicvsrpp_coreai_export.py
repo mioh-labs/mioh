@@ -28,6 +28,13 @@ class BasicVSRPPCoreAIArgumentTests(unittest.TestCase):
         self.assertEqual(args.model, exporter.DEFAULT_MODEL)
         self.assertEqual(args.output, exporter.DEFAULT_OUTPUT)
         self.assertFalse(args.skip_reference_inference)
+        self.assertFalse(args.fuse_flow_warp)
+
+    def test_fused_flow_warp_can_be_enabled_explicitly(self):
+        args = exporter.parse_args(["--fuse-flow-warp"])
+
+        self.assertTrue(args.fuse_flow_warp)
+        self.assertTrue(exporter.new_report(args)["fused_flow_warp"])
 
     def test_reference_inference_can_be_skipped_for_conversion_diagnostics(self):
         args = exporter.parse_args(["--skip-reference-inference"])
@@ -222,6 +229,24 @@ class BasicVSRPPCoreAIProbeTests(unittest.TestCase):
         self.assertIs(actual, expected)
         self.assertIs(flow_warp_module.safe_mps_grid_sample, original)
         kernel.assert_called_once()
+
+    def test_flow_warp_override_is_scoped_to_export(self):
+        basicvsrpp_module = importlib.import_module(
+            "lada.models.basicvsrpp.mmagic.basicvsr_plusplus_net"
+        )
+        original = basicvsrpp_module.flow_warp
+        image = torch.zeros((1, 2, 3, 4), dtype=torch.float16)
+        flow = torch.zeros((1, 3, 4, 2), dtype=torch.float16)
+        expected = torch.ones_like(image)
+        kernel = mock.Mock(return_value=expected)
+
+        with exporter.use_flow_warp_metal_kernel(kernel):
+            actual = basicvsrpp_module.flow_warp(image, flow)
+
+        self.assertIs(actual, expected)
+        self.assertIs(basicvsrpp_module.flow_warp, original)
+        kernel.assert_called_once()
+        self.assertEqual(kernel.call_args.args[1].shape, (1, 2, 3, 4))
 
     def test_deform_conv_override_is_scoped_to_export(self):
         basicvsrpp_module = importlib.import_module(
