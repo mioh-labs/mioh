@@ -490,7 +490,7 @@ struct MiohUserDefaultsSnapshot: Codable {
       restorationModel: capabilities.defaultRestorationModel,
       customRestorationModel: "",
       useMaxClipLength: false,
-      maxClipLength: 178,
+      maxClipLength: 180,
       useRestoreMaxFrames: false,
       restoreMaxFrames: -1,
       restoreTemporalOverlap: 8,
@@ -592,7 +592,7 @@ final class RestorationRunner: ObservableObject {
   @Published var restorationModel: String
   @Published var customRestorationModel = ""
   @Published var useMaxClipLength = false
-  @Published var maxClipLength = 178
+  @Published var maxClipLength = 180
   @Published var useRestoreMaxFrames = false
   @Published var restoreMaxFrames = -1
   @Published var restoreTemporalOverlap = 8
