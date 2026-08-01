@@ -22,6 +22,14 @@ class CoreAIKernelReferenceTests(unittest.TestCase):
         self.assertIn("threadgroup_barrier", kernels.DEFORM_CONV_METAL_SOURCE)
         self.assertIn("matmul2d", kernels.DEFORM_CONV_METAL_SOURCE)
         self.assertIn("execution_simdgroups<8>", kernels.DEFORM_CONV_METAL_SOURCE)
+        self.assertIn(
+            "coordinate_count = tile_rows * deform_groups * kernel_size",
+            kernels.DEFORM_CONV_METAL_SOURCE,
+        )
+        self.assertIn(
+            "channel_in_group < channels_per_deform_group",
+            kernels.DEFORM_CONV_METAL_SOURCE,
+        )
 
     def test_deform_kernel_dispatches_eight_simdgroups_per_eight_output_rows(self):
         image = torch.zeros((1, 2, 4, 4), dtype=torch.float16)
@@ -57,6 +65,62 @@ class CoreAIKernelReferenceTests(unittest.TestCase):
             kernel.call_args.kwargs["threads_per_thread_group"], (16, 16, 1)
         )
 
+    def test_flow_warp_dispatches_sixteen_by_sixteen_threadgroups(self):
+        image = torch.zeros((1, 2, 4, 5), dtype=torch.float16)
+        flow = torch.zeros((1, 2, 4, 5), dtype=torch.float16)
+        kernel = mock.Mock(return_value=torch.zeros((1, 2, 4, 5)))
+
+        kernels.run_flow_warp_kernel(kernel, image, flow)
+
+        self.assertEqual(kernel.call_args.kwargs["threads_per_grid"], (5, 4, 2))
+        self.assertEqual(
+            kernel.call_args.kwargs["threads_per_thread_group"], (16, 16, 1)
+        )
+        self.assertTrue(kernel.call_args.args[1].is_contiguous())
+
+    def test_flow_warp_reference_keeps_coordinate_math_in_float32(self):
+        image = torch.arange(40, dtype=torch.float16).reshape(1, 2, 4, 5) / 40
+        flow_nhwc = torch.tensor(
+            [
+                [
+                    [[0.0, 0.0], [0.5, 0.0], [0.0, -0.5], [1.0, 0.0], [0.0, 0.0]],
+                    [[0.0, 0.5], [-0.5, 0.0], [0.25, 0.25], [0.0, 0.0], [1.0, 0.0]],
+                    [[0.0, 0.0], [0.0, 0.0], [-0.25, 0.5], [0.0, -1.0], [0.0, 0.0]],
+                    [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.5, 0.5], [1.0, 1.0]],
+                ]
+            ],
+            dtype=torch.float16,
+        )
+        flow = flow_nhwc.permute(0, 3, 1, 2).contiguous()
+        height, width = image.shape[-2:]
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(height, dtype=torch.float32),
+            torch.arange(width, dtype=torch.float32),
+            indexing="ij",
+        )
+        grid_flow = (
+            torch.stack((grid_x, grid_y), dim=-1)
+            + flow.permute(0, 2, 3, 1).float()
+        )
+        grid = torch.stack(
+            (
+                2.0 * grid_flow[..., 0] / (width - 1) - 1.0,
+                2.0 * grid_flow[..., 1] / (height - 1) - 1.0,
+            ),
+            dim=-1,
+        )
+        expected = F.grid_sample(
+            image.float(),
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        ).half()
+
+        actual = kernels.flow_warp_reference(image, flow, False)
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     def test_deform_kernel_rejects_grouped_convolution_weights(self):
         image = torch.zeros((1, 4, 4, 4), dtype=torch.float16)
         offset = torch.zeros((1, 18, 4, 4), dtype=torch.float16)
@@ -66,6 +130,46 @@ class CoreAIKernelReferenceTests(unittest.TestCase):
         kernel = mock.Mock()
 
         with self.assertRaisesRegex(ValueError, "groups=1"):
+            kernels.run_deform_conv_kernel(
+                kernel,
+                image,
+                offset,
+                weight,
+                bias,
+                mask,
+            )
+
+        kernel.assert_not_called()
+
+    def test_deform_kernel_requires_channels_divisible_by_deform_groups(self):
+        image = torch.zeros((1, 6, 4, 4), dtype=torch.float16)
+        offset = torch.zeros((1, 4 * 2 * 9, 4, 4), dtype=torch.float16)
+        weight = torch.zeros((3, 6, 3, 3), dtype=torch.float16)
+        bias = torch.zeros(3, dtype=torch.float16)
+        mask = torch.ones((1, 4 * 9, 4, 4), dtype=torch.float16)
+        kernel = mock.Mock()
+
+        with self.assertRaisesRegex(ValueError, "divisible by deform groups"):
+            kernels.run_deform_conv_kernel(
+                kernel,
+                image,
+                offset,
+                weight,
+                bias,
+                mask,
+            )
+
+        kernel.assert_not_called()
+
+    def test_deform_kernel_requires_matching_mask_channels(self):
+        image = torch.zeros((1, 8, 4, 4), dtype=torch.float16)
+        offset = torch.zeros((1, 4 * 2 * 9, 4, 4), dtype=torch.float16)
+        weight = torch.zeros((3, 8, 3, 3), dtype=torch.float16)
+        bias = torch.zeros(3, dtype=torch.float16)
+        mask = torch.ones((1, 9, 4, 4), dtype=torch.float16)
+        kernel = mock.Mock()
+
+        with self.assertRaisesRegex(ValueError, "mask channels"):
             kernels.run_deform_conv_kernel(
                 kernel,
                 image,
@@ -198,6 +302,48 @@ class CoreAIMetalKernelTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "grid-sample.aimodel"
+            program.save_asset(output)
+            self.assertTrue(output.exists())
+
+    def test_flow_warp_kernel_exports_and_converts_to_coreai(self):
+        import coreai_torch
+
+        kernel = kernels.build_flow_warp_kernel(coreai_torch)
+
+        class FlowWarpModel(torch.nn.Module):
+            def forward(self, image, flow):
+                return kernels.run_flow_warp_kernel(kernel, image, flow)
+
+        model = FlowWarpModel().eval()
+        image = torch.arange(40, dtype=torch.float16).reshape(1, 2, 4, 5) / 40
+        flow = torch.zeros((1, 2, 4, 5), dtype=torch.float16)
+        flow[:, :, 1:3, 1:4] = 0.5
+
+        exported = torch.export.export(model, (image, flow))
+        exported = exported.run_decompositions(coreai_torch.get_decomp_table())
+        targets = {
+            str(node.target)
+            for node in exported.graph.nodes
+            if node.op == "call_function"
+        }
+        self.assertIn(
+            "coreai_metal_kernels.flow_warp_nchw_bilinear_align_corners.default",
+            targets,
+        )
+        self.assertNotIn("aten.grid_sampler_2d.default", targets)
+
+        converter = coreai_torch.TorchConverter()
+        converter.register_custom_kernels([kernel])
+        converter.add_exported_program(
+            exported,
+            input_names=["image", "flow"],
+            output_names=["warped"],
+        )
+        program = converter.to_coreai()
+        program.optimize()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "flow-warp.aimodel"
             program.save_asset(output)
             self.assertTrue(output.exists())
 

@@ -1935,7 +1935,13 @@ final class RealtimePlayerController: ObservableObject {
   }
 
   private func resumeSourceAfterSeekIfBuffered() {
-    guard sourceOnlyPlayback, sourceSeekNeedsBuffer, shouldPlay else { return }
+    // Do not let a loaded-time-range notification from the pre-seek position
+    // start playback before AVPlayer has completed the exact seek. The seek
+    // completion moves the state from .seeking to .buffering; only then may
+    // buffered media satisfy this transaction.
+    guard sourceOnlyPlayback, sourceSeekNeedsBuffer, shouldPlay, state == .buffering else {
+      return
+    }
     updateSourceBufferedDuration()
     let remaining = max(0, duration - position)
     // A seek does not need to fill the entire configured rolling buffer.
@@ -1979,6 +1985,11 @@ final class RealtimePlayerController: ObservableObject {
     }
     if sourceOnlyPlayback {
       updateSourceBufferedDuration()
+      // AVPlayer does not guarantee another loadedTimeRanges or preroll
+      // callback after the threshold has been crossed. Reconcile the seek on
+      // the same periodic clock that updates the displayed lead time so the UI
+      // and playback state cannot disagree indefinitely.
+      resumeSourceAfterSeekIfBuffered()
       return
     }
     retireSegmentsBeforeCurrentItem()
