@@ -24,6 +24,7 @@ import torch
 try:
     from .basicvsrpp_coreai_kernels import (
         build_deform_conv_kernel,
+        build_flow_warp_kernel,
         build_grid_sample_kernel,
     )
     from .benchmark_basicvsrpp_variable_coreai import (
@@ -43,11 +44,13 @@ try:
         load_generator,
         save_program_asset,
         use_deform_conv_metal_kernel,
+        use_flow_warp_metal_kernel,
         use_grid_sample_metal_kernel,
     )
 except ImportError:
     from basicvsrpp_coreai_kernels import (  # type: ignore[import-not-found]
         build_deform_conv_kernel,
+        build_flow_warp_kernel,
         build_grid_sample_kernel,
     )
     from benchmark_basicvsrpp_variable_coreai import (  # type: ignore[import-not-found]
@@ -67,6 +70,7 @@ except ImportError:
         load_generator,
         save_program_asset,
         use_deform_conv_metal_kernel,
+        use_flow_warp_metal_kernel,
         use_grid_sample_metal_kernel,
     )
 
@@ -235,10 +239,20 @@ def build_chunk_specs(generator: torch.nn.Module) -> list[ChunkAssetSpec]:
     return specs
 
 
-def export_assets(checkpoint: Path, output_dir: Path, *, overwrite: bool) -> None:
+def export_assets(
+    checkpoint: Path,
+    output_dir: Path,
+    *,
+    overwrite: bool,
+    fuse_flow_warp: bool = False,
+) -> None:
     _coreai, coreai_torch = import_coreai()
     generator = load_generator(checkpoint).generator
-    grid_kernel = build_grid_sample_kernel(coreai_torch)
+    sampling_kernel = (
+        build_flow_warp_kernel(coreai_torch)
+        if fuse_flow_warp
+        else build_grid_sample_kernel(coreai_torch)
+    )
     deform_kernel = build_deform_conv_kernel(coreai_torch)
     output_dir.mkdir(parents=True, exist_ok=True)
     for spec in build_chunk_specs(generator):
@@ -250,12 +264,16 @@ def export_assets(checkpoint: Path, output_dir: Path, *, overwrite: bool) -> Non
         module = spec.module.half().eval()
         started = time.perf_counter()
         with torch.no_grad(), ExitStack() as stack:
-            stack.enter_context(use_grid_sample_metal_kernel(grid_kernel))
+            stack.enter_context(
+                use_flow_warp_metal_kernel(sampling_kernel)
+                if fuse_flow_warp
+                else use_grid_sample_metal_kernel(sampling_kernel)
+            )
             stack.enter_context(use_deform_conv_metal_kernel(deform_kernel))
             exported = torch.export.export(module, spec.examples)
             exported = exported.run_decompositions(coreai_torch.get_decomp_table())
         converter = coreai_torch.TorchConverter()
-        converter.register_custom_kernels([grid_kernel, deform_kernel])
+        converter.register_custom_kernels([sampling_kernel, deform_kernel])
         converter.add_exported_program(
             exported,
             input_names=list(spec.input_names),
@@ -269,7 +287,7 @@ def export_assets(checkpoint: Path, output_dir: Path, *, overwrite: bool) -> Non
         )
 
 
-def main() -> int:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--checkpoint",
@@ -278,8 +296,26 @@ def main() -> int:
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--overwrite", action="store_true")
-    args = parser.parse_args()
-    export_assets(args.checkpoint, args.output_dir, overwrite=args.overwrite)
+    parser.add_argument(
+        "--fuse-flow-warp",
+        action="store_true",
+        help=(
+            "EXPERIMENTAL: fuse BasicVSR++ flow-grid construction and bilinear "
+            "sampling into one Metal kernel. Recurrent real-video validation "
+            "currently rejects this path; do not use for production exports."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main() -> int:
+    args = parse_args()
+    export_assets(
+        args.checkpoint,
+        args.output_dir,
+        overwrite=args.overwrite,
+        fuse_flow_warp=args.fuse_flow_warp,
+    )
     return 0
 
 

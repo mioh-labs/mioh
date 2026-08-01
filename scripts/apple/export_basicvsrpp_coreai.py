@@ -13,11 +13,12 @@ import json
 import platform
 import re
 import shutil
+import sys
 import time
 import traceback
 from collections import Counter
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -26,15 +27,19 @@ import torch
 if __package__:
     from .basicvsrpp_coreai_kernels import (
         build_deform_conv_kernel,
+        build_flow_warp_kernel,
         build_grid_sample_kernel,
         run_deform_conv_kernel,
+        run_flow_warp_kernel,
         run_grid_sample_kernel,
     )
 else:
     from basicvsrpp_coreai_kernels import (  # type: ignore[import-not-found]
         build_deform_conv_kernel,
+        build_flow_warp_kernel,
         build_grid_sample_kernel,
         run_deform_conv_kernel,
+        run_flow_warp_kernel,
         run_grid_sample_kernel,
     )
 
@@ -63,6 +68,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--report", type=Path)
     parser.add_argument("--allow-overwrite", action="store_true")
+    parser.add_argument(
+        "--fuse-flow-warp",
+        action="store_true",
+        help=(
+            "EXPERIMENTAL: fuse BasicVSR++ flow-grid construction and bilinear "
+            "sampling into one Metal kernel. Recurrent real-video validation "
+            "currently rejects this path; do not use for production exports."
+        ),
+    )
     parser.add_argument(
         "--skip-reference-inference",
         action="store_true",
@@ -116,6 +130,7 @@ def new_report(args: argparse.Namespace) -> dict[str, Any]:
         },
         "checkpoint": None,
         "output": str(args.output),
+        "fused_flow_warp": args.fuse_flow_warp,
         "versions": {
             "macos": platform.mac_ver()[0],
             "python": platform.python_version(),
@@ -301,6 +316,50 @@ def use_grid_sample_metal_kernel(kernel: Any):
 
 
 @contextmanager
+def use_flow_warp_metal_kernel(kernel: Any):
+    """Replace complete BasicVSR++ flow warps during Core AI export only."""
+
+    def flow_warp(
+        image,
+        flow,
+        interpolation="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    ):
+        if interpolation != "bilinear" or not align_corners:
+            raise ValueError(
+                "Core AI flow warp supports only bilinear, align_corners=True"
+            )
+        # The normal flow_warp API receives NHWC. Undo that view and give the
+        # custom kernel the original contiguous NCHW flow tensor.
+        return run_flow_warp_kernel(
+            kernel,
+            image,
+            flow.permute(0, 3, 1, 2),
+            padding_mode,
+        )
+
+    targets: list[tuple[Any, Any]] = []
+    module_names = (
+        "lada.models.basicvsrpp.mmagic.basicvsr_plusplus_net",
+        "scripts.apple.benchmark_basicvsrpp_variable_coreai",
+        "benchmark_basicvsrpp_variable_coreai",
+    )
+    for module_name in module_names:
+        module = sys.modules.get(module_name)
+        if module is None and module_name == module_names[0]:
+            module = importlib.import_module(module_name)
+        if module is not None and hasattr(module, "flow_warp"):
+            targets.append((module, module.flow_warp))
+            module.flow_warp = flow_warp
+    try:
+        yield
+    finally:
+        for module, original in reversed(targets):
+            module.flow_warp = original
+
+
+@contextmanager
 def use_deform_conv_metal_kernel(kernel: Any):
     basicvsrpp_module = importlib.import_module(
         "lada.models.basicvsrpp.mmagic.basicvsr_plusplus_net"
@@ -358,12 +417,16 @@ def run_probe(args: argparse.Namespace) -> int:
             report,
             stage,
             lambda: [
-                build_grid_sample_kernel(coreai_torch),
+                (
+                    build_flow_warp_kernel(coreai_torch)
+                    if args.fuse_flow_warp
+                    else build_grid_sample_kernel(coreai_torch)
+                ),
                 build_deform_conv_kernel(coreai_torch),
             ],
             verbose=args.verbose,
         )
-        grid_sample_kernel, deform_conv_kernel = custom_kernels
+        sampling_kernel, deform_conv_kernel = custom_kernels
         report["custom_kernels"] = [str(kernel.name) for kernel in custom_kernels]
 
         stage = "load_model"
@@ -392,10 +455,15 @@ def run_probe(args: argparse.Namespace) -> int:
         stage = "torch_export"
 
         def export_model():
-            with (
-                use_grid_sample_metal_kernel(grid_sample_kernel),
-                use_deform_conv_metal_kernel(deform_conv_kernel),
-            ):
+            with ExitStack() as stack:
+                stack.enter_context(
+                    use_flow_warp_metal_kernel(sampling_kernel)
+                    if args.fuse_flow_warp
+                    else use_grid_sample_metal_kernel(sampling_kernel)
+                )
+                stack.enter_context(
+                    use_deform_conv_metal_kernel(deform_conv_kernel)
+                )
                 return torch.export.export(wrapper, (example,))
 
         exported = _run_stage(
