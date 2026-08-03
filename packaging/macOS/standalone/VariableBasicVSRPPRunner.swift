@@ -203,21 +203,27 @@ struct VariableBasicVSRPPRunner {
       names.append("\(branch.name)_later")
     }
     var functions: [String: InferenceFunction] = [:]
+    let directoryEntries = try FileManager.default.contentsOfDirectory(
+      at: directory,
+      includingPropertiesForKeys: nil,
+      options: [.skipsHiddenFiles]
+    )
     for name in names {
-      let compiledFilename = "basicvsrpp-variable-\(name).h17s.aimodelc"
       let sourceFilename = "basicvsrpp-variable-\(name).aimodel"
-      let compiledURL = directory.appendingPathComponent(
-        compiledFilename, isDirectory: true)
       let sourceURL = directory.appendingPathComponent(
         sourceFilename, isDirectory: true)
       let url: URL
-      if FileManager.default.fileExists(atPath: compiledURL.path) {
+      if let compiledURL = directoryEntries.first(where: {
+        let filename = $0.lastPathComponent
+        return filename.hasPrefix("basicvsrpp-variable-\(name).")
+          && filename.hasSuffix(".aimodelc")
+      }) {
         url = compiledURL
       } else if FileManager.default.fileExists(atPath: sourceURL.path) {
         url = sourceURL
       } else {
         throw VariableRunnerError.missingAsset(
-          "\(compiledFilename) or \(sourceFilename)")
+          "compiled basicvsrpp-variable-\(name).*.aimodelc or \(sourceFilename)")
       }
       let model = try await AIModel(contentsOf: url)
       guard let function = try model.loadFunction(named: "main") else {

@@ -19,13 +19,19 @@ def register_all_modules():
     from .multi_optimizer_constructor import MultiOptimWrapperConstructor
     from .perceptual_loss import PerceptualLoss
     from .pixelwise_loss import CharbonnierLoss
-    from .roi_loss import ROIHighFrequencyLoss, ROITemporalDifferenceLoss
+    from .roi_loss import (
+        ROIHighFrequencyLoss,
+        ROIPixelLoss,
+        ROITemporalDifferenceLoss,
+    )
     from .real_basicvsr import RealBasicVSR
     from .unet_disc import UNetDiscriminatorWithSpectralNorm
     from .vis_backend import TensorboardVisBackend
     from .visualization_hook import VisualizationHook
     from .evaluator import Evaluator
     from .psnr import PSNR
+    from .roi_laplacian_error import ROILaplacianError
+    from .roi_psnr import ROIPSNR
     from .ssim import SSIM
     from .multi_loops import MultiValLoop
 

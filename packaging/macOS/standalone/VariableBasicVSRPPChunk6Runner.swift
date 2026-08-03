@@ -165,13 +165,20 @@ struct Chunk6Runner {
       names.append("\(branch.name)_continue6")
     }
     var result: [String: InferenceFunction] = [:]
+    let directoryEntries = try FileManager.default.contentsOfDirectory(
+      at: directory,
+      includingPropertiesForKeys: nil,
+      options: [.skipsHiddenFiles]
+    )
     for name in names {
-      let compiled = directory.appendingPathComponent(
-        "basicvsrpp-variable-\(name).h17s.aimodelc", isDirectory: true)
       let source = directory.appendingPathComponent(
         "basicvsrpp-variable-\(name).aimodel", isDirectory: true)
       let url: URL
-      if FileManager.default.fileExists(atPath: compiled.path) { url = compiled }
+      if let compiled = directoryEntries.first(where: {
+        let filename = $0.lastPathComponent
+        return filename.hasPrefix("basicvsrpp-variable-\(name).")
+          && filename.hasSuffix(".aimodelc")
+      }) { url = compiled }
       else if FileManager.default.fileExists(atPath: source.path) { url = source }
       else { throw RunnerError.missingAsset(name) }
       let model = try await AIModel(contentsOf: url)

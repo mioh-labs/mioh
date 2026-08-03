@@ -80,7 +80,8 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "outputFPSNumerator",
             'case "none":',
             'case "count":',
-            "effectiveSegmentSeconds",
+            "requestedSegmentSeconds",
+            "writerSegmentSeconds",
             "detectionEmptyLookahead + 1",
             "allDetections.filter { $0.classIndex == 0 }",
         ]:
@@ -626,10 +627,49 @@ class StandaloneAppOptionTests(unittest.TestCase):
             '"$RESOURCES/runtime/lib/python3.12/site-packages/rfdetr" \\',
             build_script,
         )
-        self.assertNotIn('site-packages/lada/models/rfdetr"', build_script)
+        self.assertIn(
+            '"$RESOURCES/runtime/lib/python3.12/site-packages/lada/models/rfdetr"',
+            build_script,
+        )
         self.assertNotIn("calculate_frame_detection_queue_size", restorer)
         self.assertNotIn("pipeline_queue_depth", detector)
         self.assertIn("maxsize=8", detector)
+
+    def test_dedicated_rfdetr_uses_native_swift_detection_contract(self):
+        app = APP_SOURCE.read_text()
+        pipeline = NATIVE_PIPELINE_SOURCE.read_text()
+
+        # Dedicated export resolves each Jasna choice directly to the matching
+        # fixed-shape Core AI asset. Universal and realtime preview continue to
+        # exclude RF-DETR by policy.
+        self.assertIn('if base == "jasna-v6" || base == "jasna-v6-large"', app)
+        self.assertIn('"rfdetr-v6-576-fp32"', app)
+        self.assertIn('"rfdetr-v6-large-768-fp32"', app)
+        self.assertIn('large ? 768 : 576', app)
+        self.assertIn('large ? 0.40 : 0.35', app)
+        self.assertIn(
+            'detectionModels.filter { !$0.hasPrefix("jasna-v6") }', app
+        )
+
+        # RF-DETR has different preprocessing and output semantics from YOLO:
+        # direct square resize, ImageNet-normalized FP32 NCHW input, per-query
+        # logits/masks, and direct mask projection without letterboxing.
+        self.assertIn(
+            'private final class RFDETRCoreAIDetector: NativeDetecting',
+            pipeline,
+        )
+        self.assertIn('config.detectionBackend == "rfdetr"', pipeline)
+        self.assertIn('shape: [1, 3, resolution, resolution]', pipeline)
+        self.assertIn('scalarType: .float32', pipeline)
+        self.assertIn('expectedShape: [1, queries, 4]', pipeline)
+        self.assertIn(
+            'expectedShape: [1, queries, logitClasses]', pipeline
+        )
+        self.assertIn(
+            'expectedShape: [1, queries, maskSize, maskSize]', pipeline
+        )
+        self.assertIn('maskProjection: .directResize', pipeline)
+        self.assertIn('maskThreshold: 0', pipeline)
 
     def test_coreai_helper_environment_is_only_exported_when_supported(self):
         source = APP_SOURCE.read_text()
@@ -700,6 +740,20 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn('ditto "$source_model" "$RESOURCES/models/$asset"', script)
         self.assertIn('--distribution "$COREAI_DISTRIBUTION"', script)
         self.assertIn('--smoke-model basicvsrpp-v1.2-coreai', script)
+
+    def test_build_records_variable_restoration_checkpoint_provenance(self):
+        script = BUILD_SCRIPT.read_text()
+
+        self.assertIn(
+            'basicvsrpp-v1.2-variable-coreai.provenance.json', script
+        )
+        self.assertIn('"checkpoint_sha256": digest.hexdigest()', script)
+        self.assertIn('"checkpoint_filename": checkpoint.name', script)
+        self.assertIn('"chunk_asset_count": 11', script)
+        self.assertIn(
+            '"hq_asset_count": 15 if distribution == "dedicated" else 0',
+            script,
+        )
 
     def test_only_the_portable_build_bundles_a_python_runtime(self):
         script = BUILD_SCRIPT.read_text()
@@ -1119,6 +1173,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn("processed = maskedMix(", pipeline)
 
     def test_native_output_pool_has_swap_safe_backpressure(self):
+        app = APP_SOURCE.read_text()
         pipeline = NATIVE_PIPELINE_SOURCE.read_text()
 
         self.assertIn(
@@ -1132,6 +1187,26 @@ class StandaloneAppOptionTests(unittest.TestCase):
             pipeline,
         )
         self.assertIn("config.temporalBatchFrames * 3 + overlap * 2 + 16", pipeline)
+        self.assertIn("private let miohMaximumClipFrames = 180", app)
+        self.assertIn("in: 1...miohMaximumClipFrames", app)
+        self.assertIn("private let maximumTemporalBatchFrames = 180", pipeline)
+        self.assertIn(
+            "config.temporalBatchFrames <= maximumTemporalBatchFrames",
+            pipeline,
+        )
+        self.assertIn("maximumInternalExportSegmentSeconds = 60.0", pipeline)
+        self.assertIn(
+            "min(maximumInternalExportSegmentSeconds, requestedSegmentSeconds)",
+            pipeline,
+        )
+        self.assertIn('"internal_segment_seconds": writerSegmentSeconds', pipeline)
+        self.assertIn("pendingEncoding = nil", pipeline)
+        self.assertIn(
+            'CIFilter(name: "CIDissolveTransition")',
+            pipeline,
+        )
+        self.assertIn("try autoreleasepool {", pipeline)
+        self.assertNotIn("vImagePremultipliedConstAlphaBlend_ARGB8888(", pipeline)
 
     def test_native_pipeline_supports_bounded_roi_enhancement(self):
         source = APP_SOURCE.read_text()
@@ -1143,6 +1218,36 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn("restored = try await roiEnhancer.enhance", pipeline)
         self.assertIn("CVPixelBufferPoolFlush(sourcePool", pipeline)
         self.assertNotIn('guard roiEnhancer == "none"', source)
+
+    def test_universal_model_tools_keep_all_recovered_fixes(self):
+        tools = ROOT / "packaging" / "macOS" / "standalone" / "model-tools"
+        download = (tools / "download-mioh-models.zsh").read_text()
+        convert = (tools / "convert-mioh-models.zsh").read_text()
+
+        self.assertIn("releases/download/$MIOH_RELEASE_TAG", download)
+        self.assertIn("91fe7a48b0e9edf51361918c8a30f752", download)
+        self.assertIn("v0.2.5.0/realesr-general-x4v3.pth", download)
+        self.assertIn("network_swinir.py", download)
+        self.assertIn("--retry-all-errors", download)
+        self.assertNotIn("--continue-at", download)
+        self.assertIn("The following downloads failed", download)
+
+        self.assertIn("OS_MAJOR=", convert)
+        self.assertIn("export_realesrgan_coreml.py", convert)
+        self.assertIn("export_srvgg_coreml.py", convert)
+        self.assertIn("export_swinir_coreml.py", convert)
+        self.assertIn("export_spandrel_coreml.py", convert)
+        self.assertIn("expected 11 assets", convert)
+        self.assertIn("basicvsrpp-v1.2-variable-coreai.$ARCHITECTURE.aimodelc", convert)
+
+    def test_native_model_resolution_accepts_portable_conversion_outputs(self):
+        source = APP_SOURCE.read_text()
+        pipeline = NATIVE_PIPELINE_SOURCE.read_text()
+
+        self.assertIn('for suffix in [".aimodelc", ".aimodel"]', source)
+        self.assertIn('for suffix in [".mlmodelc", ".mlpackage"]', source)
+        self.assertIn('modelExtension == "mlmodelc" || modelExtension == "mlpackage"', pipeline)
+        self.assertIn("MLModel.compileModel(at: modelURL)", pipeline)
 
     def test_spandrel_realplksr_coreai_is_available_in_mioh(self):
         source = APP_SOURCE.read_text()

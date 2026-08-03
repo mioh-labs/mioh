@@ -72,6 +72,7 @@
 "一覧にない対応モデルを選択" = "Choose a supported model not in the list";
 
 "検出モデル" = "Detection Model";
+"無検出時の判定間隔" = "No-Detection Probe Interval";
 "空検出先読み" = "Empty Detection Lookahead";
 "顔モザイクを検出" = "Detect Face Mosaics";
 

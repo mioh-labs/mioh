@@ -63,6 +63,13 @@ class ExportRealESRGANArgsTests(unittest.TestCase):
         self.assertEqual(args.imgsz, 256)
         self.assertEqual(args.scale, 4)
 
+    def test_exporter_uses_vendored_rrdbnet_without_basicsr(self):
+        import inspect
+
+        source = inspect.getsource(export_mod.build_rrdbnet)
+        self.assertIn("build_vendored_rrdbnet", source)
+        self.assertNotIn("from basicsr", source)
+
 
 class ExportMewZoomArgsTests(unittest.TestCase):
     def test_defaults(self):
@@ -84,6 +91,13 @@ class ExportSwinIRArgsTests(unittest.TestCase):
         self.assertEqual(args.imgsz, 256)
         self.assertEqual(args.scale, 4)
         self.assertEqual(args.arch, "medium")
+
+    def test_exporter_has_standalone_timm_compatibility(self):
+        import inspect
+        from scripts.apple import export_swinir_coreml as swinir_mod
+
+        source = inspect.getsource(swinir_mod._install_timm_layers_compat)
+        self.assertIn('sys.modules["timm.models.layers"]', source)
 
 
 class ExportSpandrelArgsTests(unittest.TestCase):

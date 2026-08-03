@@ -30,7 +30,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def build_rrdbnet(scale: int):
     import torch
-    from basicsr.archs.rrdbnet_arch import RRDBNet
+    from export_realesrgan_coreai import build_rrdbnet as build_vendored_rrdbnet
 
     class ImageWrapper(torch.nn.Module):
         """Maps the 0..1 float output to 0..255 for a Core ML image output."""
@@ -42,16 +42,16 @@ def build_rrdbnet(scale: int):
         def forward(self, x):
             return self.net(x).clamp(0.0, 1.0) * 255.0
 
-    net = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=scale)
+    # Keep the architecture local to mioh. The Universal application does not
+    # ship basicsr, and its torchvision import compatibility has repeatedly
+    # broken otherwise-correct offline conversions.
+    net = build_vendored_rrdbnet(scale)
     return net, ImageWrapper(net)
 
 
 def export_model(model_path: Path, output_dir: Path, imgsz: int, scale: int, allow_overwrite: bool = False) -> Path:
     import coremltools as ct
     import torch
-
-    from lada.restorationpipeline.frame_restorer import _install_torchvision_functional_tensor_compat
-    _install_torchvision_functional_tensor_compat()
 
     if not model_path.exists():
         raise FileNotFoundError(model_path)
@@ -62,7 +62,10 @@ def export_model(model_path: Path, output_dir: Path, imgsz: int, scale: int, all
 
     net, wrapper = build_rrdbnet(scale)
     state = torch.load(str(model_path), map_location="cpu", weights_only=True)
-    net.load_state_dict(state.get("params_ema") or state["params"], strict=True)
+    net.load_state_dict(
+        state.get("params_ema") or state.get("params") or state,
+        strict=True,
+    )
     wrapper.eval()
 
     example = torch.rand(1, 3, imgsz, imgsz)
@@ -74,6 +77,10 @@ def export_model(model_path: Path, output_dir: Path, imgsz: int, scale: int, all
         outputs=[ct.ImageType(name="enhanced", color_layout=ct.colorlayout.RGB)],
         convert_to="mlprogram",
         compute_precision=ct.precision.FLOAT16,
+        # RRDBNet x2 starts with pixel_unshuffle, which was added to the MIL
+        # iOS16/macOS13 opset. Without an explicit target coremltools defaults
+        # to iOS15 and fails after tracing the entire network.
+        minimum_deployment_target=ct.target.iOS16,
     )
     mlmodel.user_defined_metadata["lada.enhancer"] = "realesrgan"
     mlmodel.user_defined_metadata["lada.scale"] = str(scale)

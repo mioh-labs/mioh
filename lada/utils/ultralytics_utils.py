@@ -78,11 +78,7 @@ def convert_direct_resize_mask_tensor(
     yolo_mask: UltralyticsMasks,
     img_shape,
 ) -> torch.Tensor:
-    """Resize a non-letterboxed model mask to the source frame.
-
-    Kept as a research utility for the disconnected RF-DETR prototype. The
-    production detector path uses ``convert_yolo_mask_tensor`` exclusively.
-    """
+    """Resize an RF-DETR non-letterboxed logit mask to the source frame."""
     data = yolo_mask.data
     if data.ndim == 2:
         data = data.unsqueeze(0)

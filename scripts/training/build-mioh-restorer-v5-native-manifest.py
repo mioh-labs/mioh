@@ -46,6 +46,15 @@ def parse_args() -> argparse.Namespace:
         default=256,
         help="largest native training tile; larger ROIs become overlapping tiles",
     )
+    parser.add_argument(
+        "--fixed-bucket",
+        type=int,
+        choices=V5_BUCKETS,
+        help=(
+            "force every native crop to this size without resampling; intended "
+            "for fixed-shape Native-HF training"
+        ),
+    )
     parser.add_argument("--limit", type=int)
     return parser.parse_args()
 
@@ -77,6 +86,7 @@ def entries_for_metadata(
     context_fraction: float,
     tile_overlap: int,
     maximum_bucket: int,
+    fixed_bucket: int | None = None,
 ):
     metadata = RestorationDatasetMetadataV2.from_json_file(metadata_path)
     target = (metadata_path.parent / metadata.relative_nsfw_video_path).resolve()
@@ -99,7 +109,7 @@ def entries_for_metadata(
             maximum_height,
             context_fraction=context_fraction,
         )
-        bucket = min(selected_bucket, maximum_bucket)
+        bucket = fixed_bucket or min(selected_bucket, maximum_bucket)
         window_centres = centres[start : start + NUM_INPUT_FRAMES]
         offsets = native_tile_offsets(
             maximum_width,
@@ -144,7 +154,8 @@ def main() -> int:
         raise ValueError("stride must be positive")
     if args.context_fraction < 0:
         raise ValueError("context fraction must be non-negative")
-    if args.tile_overlap < 0 or args.tile_overlap >= args.maximum_bucket:
+    effective_bucket = args.fixed_bucket or args.maximum_bucket
+    if args.tile_overlap < 0 or args.tile_overlap >= effective_bucket:
         raise ValueError("tile overlap must be smaller than maximum-bucket")
     metadata_paths: list[Path] = []
     for root in args.metadata_root:
@@ -169,6 +180,7 @@ def main() -> int:
                     context_fraction=args.context_fraction,
                     tile_overlap=args.tile_overlap,
                     maximum_bucket=args.maximum_bucket,
+                    fixed_bucket=args.fixed_bucket,
                 ):
                     serializable = dict(entry)
                     serializable["target_video"] = relative_or_absolute(entry["target_video"], args.output)
@@ -206,6 +218,7 @@ def main() -> int:
                 "skipped_metadata": skipped_metadata,
                 "resized_frames": 0,
                 "maximum_bucket": args.maximum_bucket,
+                "fixed_bucket": args.fixed_bucket,
             },
             ensure_ascii=False,
             indent=2,

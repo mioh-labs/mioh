@@ -53,6 +53,14 @@ The result is written to `output/pdf/mioh-user-manual-ja.pdf`.
 DMG if this file is missing, so a universal package cannot silently omit the
 manual.
 
+### mioh-universal build and release
+
+The complete model-free Universal build, verification, public-repository sync,
+and GitHub Release procedure is recorded in
+[`docs/mioh-universal-build-release-runbook.md`](../../docs/mioh-universal-build-release-runbook.md).
+Use that runbook for every Universal release; in particular, reconcile the
+`lada` and `lada_git` histories before copying model-tool scripts.
+
 Output:
 
 * **CLI:** `dist/cli/` — contains `lada-cli` and `_internal/`

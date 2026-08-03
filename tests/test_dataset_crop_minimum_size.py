@@ -103,3 +103,14 @@ def test_continue_confidence_cannot_exceed_start_confidence():
                 "0.6",
             ]
         )
+
+
+def test_video_collection_ignores_appledouble_and_partial_files(tmp_path):
+    script = load_dataset_script()
+    complete = tmp_path / "clip.mkv"
+    appledouble = tmp_path / "._clip.mkv"
+    partial = tmp_path / ".clip.part.mkv"
+    for path in (complete, appledouble, partial):
+        path.touch()
+
+    assert script.collect_video_files([tmp_path]) == [complete.resolve()]
