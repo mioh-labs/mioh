@@ -115,6 +115,34 @@ private struct VideoDescription {
   let estimatedDataRate: Double
 }
 
+private enum SourceFrameRate {
+  static func rational(_ fps: Double) -> (numerator: Int, denominator: Int) {
+    guard fps.isFinite, fps > 0 else { return (1, 1) }
+    let ntscWhole = max(1, Int((fps * 1.001).rounded()))
+    let ntsc = Double(ntscWhole) * 1000.0 / 1001.0
+    if abs(fps - ntsc) < 0.001 {
+      return (ntscWhole * 1000, 1001)
+    }
+    let whole = max(1, Int(fps.rounded()))
+    if abs(fps - Double(whole)) < 0.001 {
+      return (whole, 1)
+    }
+    let denominator = 1000
+    let numerator = max(1, Int((fps * Double(denominator)).rounded()))
+    let divisor = greatestCommonDivisor(numerator, denominator)
+    return (numerator / divisor, denominator / divisor)
+  }
+
+  private static func greatestCommonDivisor(_ a: Int, _ b: Int) -> Int {
+    var x = abs(a)
+    var y = abs(b)
+    while y != 0 {
+      (x, y) = (y, x % y)
+    }
+    return max(1, x)
+  }
+}
+
 private struct DecodedFrame: @unchecked Sendable {
   let pixelBuffer: CVPixelBuffer
   let ptsNanoseconds: Int64
@@ -264,13 +292,441 @@ private final class PixelBufferRing: @unchecked Sendable {
   }
 }
 
+private struct H264BitReader {
+  let bytes: [UInt8]
+  private var bitPosition = 0
+
+  mutating func unsignedExpGolomb() -> Int? {
+    var leadingZeros = 0
+    while true {
+      guard let value = readBit() else { return nil }
+      if value == 1 { break }
+      leadingZeros += 1
+      guard leadingZeros <= 31 else { return nil }
+    }
+    var result = (1 << leadingZeros) - 1
+    for index in 0..<leadingZeros {
+      guard let value = readBit() else { return nil }
+      result += value << (leadingZeros - 1 - index)
+    }
+    return result
+  }
+
+  mutating func signedExpGolomb() -> Int? {
+    guard let value = unsignedExpGolomb() else { return nil }
+    return value.isMultiple(of: 2) ? -(value / 2) : (value + 1) / 2
+  }
+
+  mutating func fixedBits(_ count: Int) -> Int? {
+    guard count >= 0 else { return nil }
+    var result = 0
+    for _ in 0..<count {
+      guard let value = readBit() else { return nil }
+      result = (result << 1) | value
+    }
+    return result
+  }
+
+  private mutating func readBit() -> Int? {
+    guard bitPosition < bytes.count * 8 else { return nil }
+    let value = Int(
+      (bytes[bitPosition / 8] >> (7 - bitPosition % 8)) & 1
+    )
+    bitPosition += 1
+    return value
+  }
+}
+
+private enum H264SequenceParameters {
+  static func maximumReorderFrames(
+    bytes: UnsafePointer<UInt8>,
+    count: Int
+  ) -> Int? {
+    guard count > 1 else { return nil }
+    let nal = Array(UnsafeBufferPointer(start: bytes, count: count))
+    guard nal[0] & 0x1f == 7 else { return nil }
+    var rbsp: [UInt8] = []
+    rbsp.reserveCapacity(count - 1)
+    var zeroCount = 0
+    for byte in nal.dropFirst() {
+      if zeroCount >= 2, byte == 3 {
+        zeroCount = 0
+        continue
+      }
+      rbsp.append(byte)
+      zeroCount = byte == 0 ? zeroCount + 1 : 0
+    }
+    var reader = H264BitReader(bytes: rbsp)
+    guard let profile = reader.fixedBits(8),
+      reader.fixedBits(8) != nil,
+      reader.fixedBits(8) != nil,
+      reader.unsignedExpGolomb() != nil
+    else {
+      return nil
+    }
+
+    let extendedProfiles: Set<Int> = [
+      44, 83, 86, 100, 110, 118, 122, 128, 134, 135, 138, 139, 244,
+    ]
+    if extendedProfiles.contains(profile) {
+      guard let chromaFormat = reader.unsignedExpGolomb() else { return nil }
+      if chromaFormat == 3, reader.fixedBits(1) == nil { return nil }
+      guard reader.unsignedExpGolomb() != nil,
+        reader.unsignedExpGolomb() != nil,
+        reader.fixedBits(1) != nil,
+        let scalingMatrixPresent = reader.fixedBits(1)
+      else {
+        return nil
+      }
+      if scalingMatrixPresent == 1 {
+        let listCount = chromaFormat == 3 ? 12 : 8
+        for index in 0..<listCount {
+          guard let present = reader.fixedBits(1) else { return nil }
+          if present == 1,
+            !skipScalingList(
+              index < 6 ? 16 : 64,
+              reader: &reader
+            )
+          {
+            return nil
+          }
+        }
+      }
+    }
+
+    guard reader.unsignedExpGolomb() != nil,
+      let pictureOrderCountType = reader.unsignedExpGolomb()
+    else {
+      return nil
+    }
+    if pictureOrderCountType == 0 {
+      guard reader.unsignedExpGolomb() != nil else { return nil }
+    } else if pictureOrderCountType == 1 {
+      guard reader.fixedBits(1) != nil,
+        reader.signedExpGolomb() != nil,
+        reader.signedExpGolomb() != nil,
+        let cycleCount = reader.unsignedExpGolomb()
+      else {
+        return nil
+      }
+      for _ in 0..<cycleCount {
+        guard reader.signedExpGolomb() != nil else { return nil }
+      }
+    } else if pictureOrderCountType != 2 {
+      return nil
+    }
+
+    guard reader.unsignedExpGolomb() != nil,
+      reader.fixedBits(1) != nil,
+      reader.unsignedExpGolomb() != nil,
+      reader.unsignedExpGolomb() != nil,
+      let frameOnly = reader.fixedBits(1)
+    else {
+      return nil
+    }
+    // The recovery buffer below operates on complete progressive frames.
+    // Do not infer display order for field-coded/interlaced H.264.
+    guard frameOnly == 1 else { return nil }
+    guard reader.fixedBits(1) != nil,
+      let cropping = reader.fixedBits(1)
+    else {
+      return nil
+    }
+    if cropping == 1 {
+      for _ in 0..<4 {
+        guard reader.unsignedExpGolomb() != nil else { return nil }
+      }
+    }
+    guard let vuiPresent = reader.fixedBits(1) else { return nil }
+    guard vuiPresent == 1 else { return 0 }
+    return parseVUI(reader: &reader)
+  }
+
+  private static func skipScalingList(
+    _ size: Int,
+    reader: inout H264BitReader
+  ) -> Bool {
+    var lastScale = 8
+    var nextScale = 8
+    for _ in 0..<size {
+      if nextScale != 0 {
+        guard let delta = reader.signedExpGolomb() else { return false }
+        nextScale = (lastScale + delta + 256) % 256
+      }
+      if nextScale != 0 { lastScale = nextScale }
+    }
+    return true
+  }
+
+  private static func parseVUI(reader: inout H264BitReader) -> Int? {
+    guard let aspectRatioPresent = reader.fixedBits(1) else { return nil }
+    if aspectRatioPresent == 1 {
+      guard let aspectRatio = reader.fixedBits(8) else { return nil }
+      if aspectRatio == 255,
+        (reader.fixedBits(16) == nil || reader.fixedBits(16) == nil)
+      {
+        return nil
+      }
+    }
+    guard let overscanPresent = reader.fixedBits(1) else { return nil }
+    if overscanPresent == 1, reader.fixedBits(1) == nil { return nil }
+    guard let videoSignalPresent = reader.fixedBits(1) else { return nil }
+    if videoSignalPresent == 1 {
+      guard reader.fixedBits(3) != nil,
+        reader.fixedBits(1) != nil,
+        let colourDescriptionPresent = reader.fixedBits(1)
+      else {
+        return nil
+      }
+      if colourDescriptionPresent == 1,
+        (reader.fixedBits(8) == nil
+          || reader.fixedBits(8) == nil
+          || reader.fixedBits(8) == nil)
+      {
+        return nil
+      }
+    }
+    guard let chromaLocationPresent = reader.fixedBits(1) else { return nil }
+    if chromaLocationPresent == 1,
+      (reader.unsignedExpGolomb() == nil
+        || reader.unsignedExpGolomb() == nil)
+    {
+      return nil
+    }
+    guard let timingPresent = reader.fixedBits(1) else { return nil }
+    if timingPresent == 1,
+      (reader.fixedBits(32) == nil
+        || reader.fixedBits(32) == nil
+        || reader.fixedBits(1) == nil)
+    {
+      return nil
+    }
+    guard let nalHRDPresent = reader.fixedBits(1) else { return nil }
+    if nalHRDPresent == 1, !skipHRD(reader: &reader) { return nil }
+    guard let vclHRDPresent = reader.fixedBits(1) else { return nil }
+    if vclHRDPresent == 1, !skipHRD(reader: &reader) { return nil }
+    if (nalHRDPresent == 1 || vclHRDPresent == 1),
+      reader.fixedBits(1) == nil
+    {
+      return nil
+    }
+    guard reader.fixedBits(1) != nil,
+      let restrictionPresent = reader.fixedBits(1)
+    else {
+      return nil
+    }
+    guard restrictionPresent == 1 else { return 0 }
+    guard reader.fixedBits(1) != nil,
+      reader.unsignedExpGolomb() != nil,
+      reader.unsignedExpGolomb() != nil,
+      reader.unsignedExpGolomb() != nil,
+      reader.unsignedExpGolomb() != nil,
+      let maximumReorderFrames = reader.unsignedExpGolomb(),
+      reader.unsignedExpGolomb() != nil
+    else {
+      return nil
+    }
+    return maximumReorderFrames
+  }
+
+  private static func skipHRD(reader: inout H264BitReader) -> Bool {
+    guard let countMinusOne = reader.unsignedExpGolomb(),
+      reader.fixedBits(4) != nil,
+      reader.fixedBits(4) != nil
+    else {
+      return false
+    }
+    for _ in 0...countMinusOne {
+      guard reader.unsignedExpGolomb() != nil,
+        reader.unsignedExpGolomb() != nil,
+        reader.fixedBits(1) != nil
+      else {
+        return false
+      }
+    }
+    return reader.fixedBits(5) != nil
+      && reader.fixedBits(5) != nil
+      && reader.fixedBits(5) != nil
+      && reader.fixedBits(5) != nil
+  }
+}
+
+private struct H264SliceClassification {
+  let isBFrame: Bool
+  let isReference: Bool
+  let ptsNanoseconds: Int64
+}
+
+private enum H264SampleOrder {
+  static func isDoNotDisplay(_ sample: CMSampleBuffer) -> Bool {
+    guard
+      let attachments = CMSampleBufferGetSampleAttachmentsArray(
+        sample,
+        createIfNecessary: false
+      ) as? [[CFString: Any]],
+      let dictionary = attachments.first
+    else {
+      return false
+    }
+    return (dictionary[kCMSampleAttachmentKey_DoNotDisplay] as? Bool) == true
+  }
+
+  static func classification(
+    _ sample: CMSampleBuffer,
+    nalLengthBytes: Int
+  ) -> H264SliceClassification? {
+    guard (1...4).contains(nalLengthBytes),
+      let block = CMSampleBufferGetDataBuffer(sample)
+    else {
+      return nil
+    }
+    let byteCount = CMBlockBufferGetDataLength(block)
+    guard byteCount > 0 else { return nil }
+    var bytes = [UInt8](repeating: 0, count: byteCount)
+    let copyStatus = bytes.withUnsafeMutableBytes { storage in
+      CMBlockBufferCopyDataBytes(
+        block,
+        atOffset: 0,
+        dataLength: byteCount,
+        destination: storage.baseAddress!
+      )
+    }
+    guard copyStatus == kCMBlockBufferNoErr else {
+      return nil
+    }
+
+    var offset = 0
+    var pictureClassification: H264SliceClassification?
+    while offset + nalLengthBytes <= bytes.count {
+      var nalLength = 0
+      for index in 0..<nalLengthBytes {
+        nalLength = (nalLength << 8) | Int(bytes[offset + index])
+      }
+      offset += nalLengthBytes
+      guard nalLength > 0, offset + nalLength <= bytes.count else {
+        return nil
+      }
+      let nalType = bytes[offset] & 0x1f
+      if nalType == 1 || nalType == 5 {
+        // Only the first two Exp-Golomb values are needed. Keep a small RBSP
+        // prefix and remove H.264 emulation-prevention bytes on the way.
+        var rbsp: [UInt8] = []
+        rbsp.reserveCapacity(min(nalLength, 64))
+        var zeroCount = 0
+        for byte in bytes[(offset + 1)..<(offset + nalLength)] {
+          if zeroCount >= 2, byte == 3 {
+            zeroCount = 0
+            continue
+          }
+          rbsp.append(byte)
+          zeroCount = byte == 0 ? zeroCount + 1 : 0
+          if rbsp.count >= 64 { break }
+        }
+        var reader = H264BitReader(bytes: rbsp)
+        guard reader.unsignedExpGolomb() != nil,
+          let sliceType = reader.unsignedExpGolomb()
+        else {
+          return nil
+        }
+        let classification = H264SliceClassification(
+          isBFrame: sliceType % 5 == 1,
+          isReference: (bytes[offset] >> 5) & 0x03 != 0,
+          ptsNanoseconds: Int64(
+            (
+              CMSampleBufferGetPresentationTimeStamp(sample).seconds
+                * 1_000_000_000
+            ).rounded()
+          )
+        )
+        if let pictureClassification,
+          pictureClassification.isBFrame != classification.isBFrame
+            || pictureClassification.isReference
+              != classification.isReference
+        {
+          return nil
+        }
+        pictureClassification = classification
+      }
+      offset += nalLength
+    }
+    return pictureClassification
+  }
+}
+
+private struct MalformedH264FrameReorderBuffer {
+  private var heldReference: DecodedFrame?
+  private var bFrames: [DecodedFrame] = []
+  private var timelinePTS: [Int64] = []
+
+  mutating func accept(
+    _ frame: DecodedFrame,
+    isBFrame: Bool,
+    emit: (DecodedFrame) -> Bool
+  ) -> Bool {
+    timelinePTS.append(frame.ptsNanoseconds)
+    if isBFrame {
+      bFrames.append(frame)
+      return true
+    }
+    let pendingBFrames = bFrames
+    bFrames.removeAll(keepingCapacity: true)
+    for bFrame in pendingBFrames {
+      if !emitWithNextPTS(bFrame, emit: emit) { return false }
+    }
+    if let heldReference,
+      !emitWithNextPTS(heldReference, emit: emit)
+    {
+      return false
+    }
+    heldReference = frame
+    return true
+  }
+
+  mutating func finish(emit: (DecodedFrame) -> Bool) -> Bool {
+    let pendingBFrames = bFrames
+    bFrames.removeAll(keepingCapacity: true)
+    for bFrame in pendingBFrames {
+      if !emitWithNextPTS(bFrame, emit: emit) { return false }
+    }
+    if let heldReference,
+      !emitWithNextPTS(heldReference, emit: emit)
+    {
+      return false
+    }
+    heldReference = nil
+    return timelinePTS.isEmpty
+  }
+
+  private mutating func emitWithNextPTS(
+    _ frame: DecodedFrame,
+    emit: (DecodedFrame) -> Bool
+  ) -> Bool {
+    guard !timelinePTS.isEmpty else { return false }
+    let pts = timelinePTS.removeFirst()
+    return emit(
+      DecodedFrame(pixelBuffer: frame.pixelBuffer, ptsNanoseconds: pts)
+    )
+  }
+}
+
 private final class ContinuousVideoDecoder: @unchecked Sendable {
   private let asset: AVURLAsset
   private let track: AVAssetTrack
   private let ring: PixelBufferRing
   private let startTime: CMTime
+  // Some malformed H.264 files contain B-slices while declaring PTS == DTS.
+  // AVFoundation then reports requiresFrameReordering=false and returns the
+  // decoded pixels in coding order. A second compressed reader supplies only
+  // the slice type so those same zero-copy pixel buffers can be emitted in
+  // display order.
+  private let malformedH264NALLength: Int?
   private var reader: AVAssetReader?
+  private var orderingReader: AVAssetReader?
   private var task: Task<Void, Never>?
+
+  var repairsMalformedH264DisplayOrder: Bool {
+    malformedH264NALLength != nil
+  }
 
   init(
     input: URL,
@@ -284,6 +740,48 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
     }
     self.track = track
     self.ring = ring
+    let requiresFrameReordering = try await track.load(
+      .requiresFrameReordering
+    )
+    let formats = try await track.load(.formatDescriptions)
+    if !requiresFrameReordering,
+      let format = formats.first,
+      CMFormatDescriptionGetMediaSubType(format) == kCMVideoCodecType_H264
+    {
+      var parameterSet: UnsafePointer<UInt8>?
+      var parameterSetSize = 0
+      var nalLength: Int32 = 0
+      let status = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+        format,
+        parameterSetIndex: 0,
+        parameterSetPointerOut: &parameterSet,
+        parameterSetSizeOut: &parameterSetSize,
+        parameterSetCountOut: nil,
+        nalUnitHeaderLengthOut: &nalLength
+      )
+      let maximumReorderFrames = parameterSet.flatMap {
+        H264SequenceParameters.maximumReorderFrames(
+          bytes: $0,
+          count: parameterSetSize
+        )
+      }
+      if let maximumReorderFrames, maximumReorderFrames > 1 {
+        throw NativePreviewError.reader(
+          "H.264 display recovery supports one reorder frame"
+        )
+      }
+      // Enable recovery only for the contradictory stream description that
+      // causes this bug: the H.264 SPS requires display reordering while
+      // AVFoundation claims the track does not. Low-delay B streams advertise
+      // zero reorder frames and therefore stay on the untouched fast path.
+      malformedH264NALLength = status == noErr
+        && (1...4).contains(Int(nalLength))
+        && maximumReorderFrames == 1
+        ? Int(nalLength)
+        : nil
+    } else {
+      malformedH264NALLength = nil
+    }
     startTime = CMTime(
       value: max(0, startNanoseconds),
       timescale: 1_000_000_000
@@ -300,26 +798,34 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
     // precise but reports the shortest observed gap, so a VFR clip comes back
     // well above its real rate; it is not usable here.
     let fps = max(1.0, Double(frameRate))
-    let scale = 1000
-    return VideoDescription(
+    let rate = SourceFrameRate.rational(fps)
+    let description = VideoDescription(
       width: max(1, Int(abs(natural.width).rounded())),
       height: max(1, Int(abs(natural.height).rounded())),
-      fpsNumerator: max(1, Int((fps * Double(scale)).rounded())),
-      fpsDenominator: scale,
+      fpsNumerator: rate.numerator,
+      fpsDenominator: rate.denominator,
       durationSeconds: duration.seconds,
       estimatedDataRate: Double(estimatedDataRate)
     )
+    return description
   }
 
   func start() throws {
     let reader = try AVAssetReader(asset: asset)
+    var decodeRange: CMTimeRange?
     if startTime > .zero {
       let duration = asset.duration - startTime
-      reader.timeRange = CMTimeRange(
+      let range = CMTimeRange(
         start: startTime,
         duration: max(duration, .zero)
       )
+      reader.timeRange = range
+      decodeRange = range
     }
+    let decodeEndNanoseconds = Int64(
+      (((decodeRange?.end ?? asset.duration).seconds) * 1_000_000_000)
+        .rounded()
+    )
     let settings: [String: Any] = [
       kCVPixelBufferPixelFormatTypeKey as String:
         Int(kCVPixelFormatType_32BGRA),
@@ -338,29 +844,210 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
       throw NativePreviewError.reader("cannot add video output")
     }
     reader.add(output)
+
+    var compressedReader: AVAssetReader?
+    var compressedOutput: AVAssetReaderTrackOutput?
+    if malformedH264NALLength != nil {
+      let sidecarReader = try AVAssetReader(asset: asset)
+      if let decodeRange {
+        sidecarReader.timeRange = decodeRange
+      }
+      let sidecarOutput = AVAssetReaderTrackOutput(
+        track: track,
+        outputSettings: nil
+      )
+      sidecarOutput.alwaysCopiesSampleData = false
+      guard sidecarReader.canAdd(sidecarOutput) else {
+        throw NativePreviewError.reader(
+          "cannot add H.264 display-order sidecar"
+        )
+      }
+      sidecarReader.add(sidecarOutput)
+      guard sidecarReader.startReading() else {
+        throw NativePreviewError.reader(
+          sidecarReader.error?.localizedDescription
+            ?? "H.264 display-order sidecar failed to start"
+        )
+      }
+      compressedReader = sidecarReader
+      compressedOutput = sidecarOutput
+      orderingReader = sidecarReader
+    }
     guard reader.startReading() else {
+      compressedReader?.cancelReading()
       throw NativePreviewError.reader(
         reader.error?.localizedDescription ?? "startReading failed"
       )
     }
     self.reader = reader
+    let nalLength = malformedH264NALLength
     task = Task.detached(priority: .userInitiated) { [ring] in
+      var reorderBuffer = MalformedH264FrameReorderBuffer()
+      var failure: Error?
+      var decodedReachedEnd = false
+      var droppedSyntheticTail = false
+      var pairedSampleCount = 0
+      var previousDecodedPTS: Int64?
+      var previousCompressedPTS: Int64?
+
+      func nextVisibleClassification() throws -> H264SliceClassification? {
+        guard let compressedOutput, let nalLength else {
+          throw NativePreviewError.reader(
+            "H.264 display-order sidecar is unavailable"
+          )
+        }
+        while let sample = compressedOutput.copyNextSampleBuffer() {
+          let sampleCount = CMSampleBufferGetNumSamples(sample)
+          if sampleCount == 0 || H264SampleOrder.isDoNotDisplay(sample) {
+            continue
+          }
+          guard sampleCount == 1 else {
+            throw NativePreviewError.reader(
+              "compressed H.264 sample count is not one"
+            )
+          }
+          guard let classification = H264SampleOrder.classification(
+            sample,
+            nalLengthBytes: nalLength
+          ) else {
+            throw NativePreviewError.reader(
+              "cannot parse H.264 slice type for display ordering"
+            )
+          }
+          return classification
+        }
+        if compressedReader?.status == .failed {
+          throw NativePreviewError.reader(
+            compressedReader?.error?.localizedDescription
+              ?? "H.264 display-order sidecar failed"
+          )
+        }
+        return nil
+      }
+
       while !Task.isCancelled {
-        guard let sample = output.copyNextSampleBuffer() else { break }
+        guard let sample = output.copyNextSampleBuffer() else {
+          decodedReachedEnd = true
+          break
+        }
+        if nalLength != nil, CMSampleBufferGetNumSamples(sample) != 1 {
+          failure = NativePreviewError.reader(
+            "decoded H.264 sample count is not one"
+          )
+          break
+        }
         guard let image = CMSampleBufferGetImageBuffer(sample) else {
+          if nalLength != nil {
+            failure = NativePreviewError.reader(
+              "decoded H.264 sample has no image buffer"
+            )
+            break
+          }
           continue
         }
         let pts = CMSampleBufferGetPresentationTimeStamp(sample)
         let ptsNanoseconds = Int64(
           (pts.seconds * 1_000_000_000).rounded()
         )
-        if !ring.push(
-          DecodedFrame(pixelBuffer: image, ptsNanoseconds: ptsNanoseconds)
-        ) {
+        let frame = DecodedFrame(
+          pixelBuffer: image,
+          ptsNanoseconds: ptsNanoseconds
+        )
+        if nalLength != nil {
+          do {
+            guard let classification = try nextVisibleClassification() else {
+              // AVAssetReader can synthesize one final decoded image beyond
+              // the compressed sample count to fill an edit-list duration.
+              // It has no slice to classify and must not enter the output.
+              // Tolerate exactly that one tail image only after proving that
+              // both readers are at EOF. This cannot hide an earlier count
+              // mismatch or drop a run of valid decoded frames.
+              let atDeclaredTail = decodeEndNanoseconds
+                - frame.ptsNanoseconds <= 250_000_000
+              let noAdditionalDecodedFrame = output.copyNextSampleBuffer()
+                == nil
+              if atDeclaredTail,
+                compressedReader?.status == .completed,
+                noAdditionalDecodedFrame,
+                reader.status == .completed
+              {
+                decodedReachedEnd = true
+                droppedSyntheticTail = true
+                break
+              }
+              throw NativePreviewError.reader(
+                "H.264 display-order sidecar ended before decoded video"
+              )
+            }
+            if classification.isBFrame && classification.isReference {
+              throw NativePreviewError.reader(
+                "H.264 reference-B display recovery is unsupported"
+              )
+            }
+            if pairedSampleCount >= 2,
+              let previousDecodedPTS, let previousCompressedPTS
+            {
+              let decodedDelta = frame.ptsNanoseconds
+                - previousDecodedPTS
+              let compressedDelta = classification.ptsNanoseconds
+                - previousCompressedPTS
+              if abs(decodedDelta - compressedDelta) > 1_000_000 {
+                throw NativePreviewError.reader(
+                  "H.264 display-order readers lost sample synchronization"
+                )
+              }
+            }
+            previousDecodedPTS = frame.ptsNanoseconds
+            previousCompressedPTS = classification.ptsNanoseconds
+            pairedSampleCount += 1
+            if !reorderBuffer.accept(
+              frame,
+              isBFrame: classification.isBFrame,
+              emit: { ring.push($0) }
+            ) {
+              break
+            }
+          } catch {
+            failure = error
+            break
+          }
+        } else if !ring.push(frame) {
           break
         }
       }
-      if reader.status == .failed {
+      if failure == nil, nalLength != nil, !Task.isCancelled,
+        decodedReachedEnd, !droppedSyntheticTail
+      {
+        do {
+          if try nextVisibleClassification() != nil {
+            failure = NativePreviewError.reader(
+              "H.264 display-order sidecar has an extra visible sample"
+            )
+          } else if compressedReader?.status != .completed {
+            failure = NativePreviewError.reader(
+              "H.264 display-order sidecar did not reach EOF"
+            )
+          }
+        } catch {
+          failure = error
+        }
+      }
+      if failure == nil, nalLength != nil, !Task.isCancelled,
+        !reorderBuffer.finish(emit: { ring.push($0) })
+      {
+        failure = NativePreviewError.reader(
+          "H.264 display-order buffer could not be flushed"
+        )
+      }
+      if failure == nil, compressedReader?.status == .failed {
+        failure = NativePreviewError.reader(
+          compressedReader?.error?.localizedDescription
+            ?? "H.264 display-order sidecar failed"
+        )
+      }
+      if let failure {
+        ring.complete(failure)
+      } else if reader.status == .failed {
         ring.complete(
           NativePreviewError.reader(
             reader.error?.localizedDescription ?? "decode failed"
@@ -375,10 +1062,12 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
   func stop() async {
     task?.cancel()
     reader?.cancelReading()
+    orderingReader?.cancelReading()
     ring.stop()
     await task?.value
     task = nil
     reader = nil
+    orderingReader = nil
   }
 }
 
@@ -3883,6 +4572,8 @@ private struct NativePreviewPipeline {
         64,
         config.temporalBatchFrames * 3 + overlap * 2 + 16
       ),
+      "h264_display_order_recovery":
+        decoder.repairsMalformedH264DisplayOrder,
       "pipeline": config.isExport
         ? "swift-native-export"
         : "swift-cvpixelbuffer-ring-coreai",
