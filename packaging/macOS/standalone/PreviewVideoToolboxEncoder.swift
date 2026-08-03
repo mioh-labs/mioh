@@ -188,6 +188,15 @@ final class SegmentWriter {
       ],
     ]
     let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+    // AVAssetWriter otherwise chooses a coarse track time scale (observed as
+    // 19,200), which cannot represent NTSC frame durations exactly. That
+    // turns 1001/30000 into a repeating run of 33.333 ms frames followed by
+    // a 35 ms frame. Use the frame-rate numerator so every presentation time
+    // below is an exact integer tick (1001 ticks at 29.97 fps, 1001 ticks at
+    // 59.94 fps) and playback cadence stays uniform.
+    let exactTimeScale = CMTimeScale(fpsNumerator)
+    writer.movieTimeScale = exactTimeScale
+    input.mediaTimeScale = exactTimeScale
     input.expectsMediaDataInRealTime = realTime
     let attributes: [String: Any] = [
       kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),

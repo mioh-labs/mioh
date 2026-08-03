@@ -877,6 +877,51 @@ class StandaloneAppOptionTests(unittest.TestCase):
             pipeline,
         )
 
+        # VideoToolbox must retain that exact rational in the encoded track.
+        # Its default 19,200 time scale quantizes 29.97fps into periodic
+        # 35-millisecond frames and adds visible cadence jitter.
+        encoder = PREVIEW_ENCODER_SOURCE.read_text()
+        self.assertIn("let exactTimeScale = CMTimeScale(fpsNumerator)", encoder)
+        self.assertIn("writer.movieTimeScale = exactTimeScale", encoder)
+        self.assertIn("input.mediaTimeScale = exactTimeScale", encoder)
+
+    def test_native_decoder_recovers_malformed_h264_display_order(self):
+        pipeline = NATIVE_PIPELINE_SOURCE.read_text()
+
+        # Some H.264 files in the field contain B-slices while advertising
+        # PTS == DTS. AVFoundation then yields decoded pixels in coding order.
+        # The native lane must inspect a separate compressed sidecar and put
+        # those zero-copy pixel buffers back into display order.
+        self.assertIn("track.load(\n      .requiresFrameReordering", pipeline)
+        self.assertIn("AVAssetReaderTrackOutput(\n        track: track,\n        outputSettings: nil", pipeline)
+        self.assertIn("CMSampleBufferGetSampleAttachmentsArray", pipeline)
+        self.assertIn("kCMSampleAttachmentKey_DoNotDisplay", pipeline)
+        self.assertIn("H264SequenceParameters.maximumReorderFrames", pipeline)
+        self.assertIn("H264SampleOrder.classification", pipeline)
+        self.assertIn("MalformedH264FrameReorderBuffer", pipeline)
+        self.assertIn("timelinePTS.append(frame.ptsNanoseconds)", pipeline)
+        self.assertIn("reorderBuffer.finish", pipeline)
+        self.assertIn('"H.264 reference-B display recovery is unsupported"', pipeline)
+        self.assertIn('"h264_display_order_recovery":', pipeline)
+
+        # AVAssetReader seek preroll can contain empty or non-display samples;
+        # consuming either as a visible frame desynchronizes the two readers.
+        self.assertIn("if sampleCount == 0", pipeline)
+        self.assertIn("guard sampleCount == 1", pipeline)
+
+        # Recovery is deliberately limited to the progressive, one-frame
+        # reorder structure that the fixed buffer can reproduce exactly.
+        self.assertIn("guard frameOnly == 1", pipeline)
+        self.assertIn("maximumReorderFrames == 1", pipeline)
+        self.assertIn(
+            '"H.264 display-order readers lost sample synchronization"',
+            pipeline,
+        )
+        self.assertIn(
+            '"H.264 display-order sidecar has an extra visible sample"',
+            pipeline,
+        )
+
     def test_basic_tab_reports_the_input_media_details(self):
         source = APP_SOURCE.read_text()
 
