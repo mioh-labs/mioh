@@ -1,5 +1,10 @@
 # mioh model tools
 
+The maintainer build and release procedure is documented in
+[`docs/mioh-universal-build-release-runbook.md`](../../../../docs/mioh-universal-build-release-runbook.md).
+It includes the required bundled-runtime conversion checks and the clean-Mac
+acceptance test.
+
 The universal DMG does not bundle model weights. Install the app first, then run
 these scripts from the mounted DMG or from this folder.
 

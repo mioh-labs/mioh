@@ -128,7 +128,15 @@ def collect_video_files(input_paths: list[Path]) -> list[Path]:
     for input_path in input_paths:
         candidates = input_path.rglob("*") if input_path.is_dir() else [input_path]
         for candidate in candidates:
-            if not candidate.is_file() or not video_utils.is_video_file(candidate):
+            # Finder creates AppleDouble files such as ``._clip.mkv`` on
+            # external volumes.  Atomic producers also use hidden ``.part``
+            # videos.  Neither is a complete training source, even though the
+            # suffix passes ``is_video_file``.
+            if (
+                candidate.name.startswith(".")
+                or not candidate.is_file()
+                or not video_utils.is_video_file(candidate)
+            ):
                 continue
             absolute_path = candidate.absolute()
             files_by_path[str(absolute_path)] = absolute_path

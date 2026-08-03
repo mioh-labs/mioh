@@ -10,10 +10,47 @@ from lada.models.basicvsrpp.mmagic.real_basicvsr import RealBasicVSR
 @MODELS.register_module()
 class BasicVSRPlusPlusGanNet(BasicVSRPlusPlusNet):
     def __init__(self,
+                trainable_modules=None,
                 **kwargs):
 
         super().__init__(**kwargs)
         self.spynet.requires_grad_(False)
+
+        self.trainable_module_names = None
+        if trainable_modules is not None:
+            requested = tuple(str(name) for name in trainable_modules)
+            if not requested:
+                raise ValueError('trainable_modules cannot be empty')
+            if len(set(requested)) != len(requested):
+                raise ValueError('trainable_modules contains duplicates')
+
+            available = set(dict(self.named_children()))
+            unknown = sorted(set(requested) - available)
+            if unknown:
+                raise ValueError(
+                    'unknown BasicVSR++ trainable modules: '
+                    + ', '.join(unknown)
+                )
+            if 'spynet' in requested:
+                raise ValueError('SPyNet cannot be enabled by trainable_modules')
+
+            # A real freeze is required here.  An lr multiplier of zero still
+            # builds the backward graph through flow warp/DCNv2 and allocates
+            # optimizer state.  Fine-tuning only the reconstruction tail keeps
+            # the deployed alignment and four propagation branches bit-stable.
+            self.requires_grad_(False)
+            for name in requested:
+                getattr(self, name).requires_grad_(True)
+            self.trainable_module_names = requested
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.trainable_module_names is not None:
+            trainable = set(self.trainable_module_names)
+            for name, module in self.named_children():
+                if name not in trainable:
+                    module.eval()
+        return self
 
 
     def forward(self, lqs, return_lqs=False):
@@ -91,6 +128,12 @@ class BasicVSRPlusPlusGan(RealBasicVSR):
             init_cfg=init_cfg,
             data_preprocessor=data_preprocessor)
 
+        # EMA is an inference shadow, never an optimization target.  Keeping
+        # requires_grad enabled doubles the apparent trainable count and can
+        # accidentally admit EMA tensors into broad optimizer selectors.
+        if self.generator_ema is not None:
+            self.generator_ema.requires_grad_(False)
+
 
     def extract_gt_data(self, data_samples):
         gt = data_samples.gt_img
@@ -113,6 +156,7 @@ class BasicVSRPlusPlusSharpGan(BasicVSRPlusPlusGan):
         discriminator=None,
         gan_loss=None,
         pixel_loss=None,
+        roi_pixel_loss=None,
         perceptual_loss=None,
         high_frequency_loss=None,
         temporal_loss=None,
@@ -129,6 +173,9 @@ class BasicVSRPlusPlusSharpGan(BasicVSRPlusPlusGan):
         )
         self.high_frequency_loss = (
             MODELS.build(high_frequency_loss) if high_frequency_loss else None
+        )
+        self.roi_pixel_loss = (
+            MODELS.build(roi_pixel_loss) if roi_pixel_loss else None
         )
         self.temporal_loss = MODELS.build(temporal_loss) if temporal_loss else None
         self.roi_dilation = roi_dilation
@@ -173,6 +220,10 @@ class BasicVSRPlusPlusSharpGan(BasicVSRPlusPlusGan):
         losses = {}
         if self.pixel_loss:
             losses['loss_pix'] = self.pixel_loss(fake_output, gt_pixel)
+        if self.roi_pixel_loss:
+            losses['loss_pixel_roi'] = self.roi_pixel_loss(
+                fake_output, gt_pixel, mask
+            )
         if self.perceptual_loss:
             loss_percep, loss_style = self.perceptual_loss(fake_roi, gt_percep)
             if loss_percep is not None:

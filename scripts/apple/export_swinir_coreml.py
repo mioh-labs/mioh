@@ -7,15 +7,18 @@ SwinIR is a Swin Transformer image restoration model. This exporter targets
 the official real-world x4 checkpoints and wraps them in the same fixed-size
 image contract used by Lada's other Core ML ROI enhancers.
 
-The official SwinIR architecture is large and depends on timm, so this script
-loads it from a local checkout of https://github.com/JingyunLiang/SwinIR
-instead of vendoring the full model into Lada.
+The official SwinIR architecture is loaded from a local checkout of
+https://github.com/JingyunLiang/SwinIR instead of vendoring the full model
+into Lada. Its only timm dependencies are three small layer helpers; a local
+compatibility module is installed when timm is unavailable so the standalone
+mioh runtime remains self-contained.
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+import types
 from pathlib import Path
 
 DEFAULT_MODEL = Path("model_weights/003_realSR_BSRGAN_DFO_s64w8_SwinIR-M_x4_GAN.pth")
@@ -25,6 +28,61 @@ DEFAULT_MODEL_URL = (
     "https://github.com/JingyunLiang/SwinIR/releases/download/v0.0/"
     "003_realSR_BSRGAN_DFO_s64w8_SwinIR-M_x4_GAN.pth"
 )
+
+
+def _install_timm_layers_compat(torch) -> None:
+    """Provide the three timm helpers used by the pinned SwinIR source.
+
+    The Universal app intentionally does not ship the full timm package. The
+    pinned official ``network_swinir.py`` imports only ``DropPath``,
+    ``to_2tuple`` and ``trunc_normal_`` from it, so compatible local
+    definitions avoid adding an unrelated training dependency to the app.
+    Existing timm installations are left untouched.
+    """
+
+    try:
+        from timm.models.layers import DropPath, to_2tuple, trunc_normal_  # noqa: F401
+        return
+    except ModuleNotFoundError as exc:
+        if exc.name != "timm":
+            raise
+
+    def to_2tuple(value):
+        if isinstance(value, tuple):
+            return value
+        return (value, value)
+
+    def drop_path(x, drop_prob: float = 0.0, training: bool = False, scale_by_keep: bool = True):
+        if drop_prob == 0.0 or not training:
+            return x
+        keep_prob = 1.0 - drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
+        if keep_prob > 0.0 and scale_by_keep:
+            random_tensor.div_(keep_prob)
+        return x * random_tensor
+
+    class DropPath(torch.nn.Module):
+        def __init__(self, drop_prob: float = 0.0, scale_by_keep: bool = True):
+            super().__init__()
+            self.drop_prob = drop_prob
+            self.scale_by_keep = scale_by_keep
+
+        def forward(self, x):
+            return drop_path(x, self.drop_prob, self.training, self.scale_by_keep)
+
+    layers = types.ModuleType("timm.models.layers")
+    layers.DropPath = DropPath
+    layers.to_2tuple = to_2tuple
+    layers.trunc_normal_ = torch.nn.init.trunc_normal_
+
+    models = types.ModuleType("timm.models")
+    models.layers = layers
+    timm = types.ModuleType("timm")
+    timm.models = models
+    sys.modules["timm"] = timm
+    sys.modules["timm.models"] = models
+    sys.modules["timm.models.layers"] = layers
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -41,9 +99,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def build_swinir(repo_dir: Path, imgsz: int, scale: int, arch: str):
+    import torch
+
     repo_dir = repo_dir.resolve()
     if not (repo_dir / "models" / "network_swinir.py").exists():
         raise FileNotFoundError(repo_dir / "models" / "network_swinir.py")
+    _install_timm_layers_compat(torch)
     sys.path.insert(0, str(repo_dir))
     try:
         from models.network_swinir import SwinIR

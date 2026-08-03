@@ -4,6 +4,7 @@ import Foundation
 import SwiftUI
 
 private let appProgressPrefix = "@@LADA_PROGRESS@@"
+private let miohMaximumClipFrames = 180
 
 func L(_ key: String) -> String {
   NSLocalizedString(key, comment: "")
@@ -26,7 +27,12 @@ private struct NativeExportConfiguration: Encodable {
   let outputFile: String
   let ffmpeg: String
   let detectionModel: String
+  let detectionBackend: String
+  let detectionInputSize: Int
   let detectionCandidateChannels: Int
+  let detectionQueries: Int
+  let detectionLogitClasses: Int
+  let detectionMaxDet: Int
   let detectionComputeUnits: String?
   let restorationModels: String
   let restorationRunner: String
@@ -40,7 +46,7 @@ private struct NativeExportConfiguration: Encodable {
   let temporalBatchFrames: Int
   let temporalOverlap: Int
   let ringCapacity: Int
-  let confidenceThreshold: Float = 0.25
+  let confidenceThreshold: Float
   let iouThreshold: Float = 0.7
   let contextFraction: Float = 0.30
   let blendFeather: Float
@@ -71,7 +77,12 @@ private struct NativePreviewLaunchConfiguration: Encodable {
   let miohTemporaryDirectory: String?
   let ffmpeg: String
   let detectionModel: String
+  let detectionBackend: String
+  let detectionInputSize: Int
   let detectionCandidateChannels: Int
+  let detectionQueries: Int
+  let detectionLogitClasses: Int
+  let detectionMaxDet: Int
   let detectionComputeUnits: String?
   let restorationModels: String
   let restorationRunner: String
@@ -82,7 +93,7 @@ private struct NativePreviewLaunchConfiguration: Encodable {
   let bufferLimitSeconds: Double
   let temporalBatchFrames: Int
   let ringCapacity: Int
-  let confidenceThreshold: Float = 0.25
+  let confidenceThreshold: Float
   let iouThreshold: Float = 0.7
   let contextFraction: Float = 0.30
   let blendFeather: Float
@@ -1069,8 +1080,7 @@ final class RestorationRunner: ObservableObject {
       )
     }
     guard restorationModel != "カスタム",
-      detectionModel != "カスタム",
-      !detectionModel.hasPrefix("jasna-")
+      detectionModel != "カスタム"
     else {
       throw RunnerError.unsupportedFeature(
         "Swiftネイティブ書き出しに未対応のモデル指定です"
@@ -1193,14 +1203,23 @@ final class RestorationRunner: ObservableObject {
     nativeExportDirectoryURL = exportDirectory
     nativeExportFFmpegDirectoryURL = ffmpegWorkDirectory
     nativeExportMiohDirectoryURL = miohWorkDirectory
-    var requestedClipFrames = useMaxClipLength
-      ? max(1, maxClipLength)
-      : (restoration.fixedFrameCount ?? 180)
+    var requestedClipFrames = min(
+      miohMaximumClipFrames,
+      useMaxClipLength
+        ? max(1, maxClipLength)
+        : (restoration.fixedFrameCount ?? miohMaximumClipFrames)
+    )
     if useRestoreMaxFrames, restoreMaxFrames > 0 {
-      requestedClipFrames = min(requestedClipFrames, restoreMaxFrames)
+      requestedClipFrames = min(
+        requestedClipFrames,
+        min(miohMaximumClipFrames, restoreMaxFrames)
+      )
     }
     let clipFrames = min(
-      restoration.fixedFrameCount ?? requestedClipFrames,
+      min(
+        restoration.fixedFrameCount ?? requestedClipFrames,
+        miohMaximumClipFrames
+      ),
       requestedClipFrames
     )
     let overlap = min(
@@ -1216,7 +1235,12 @@ final class RestorationRunner: ObservableObject {
       outputFile: output.path,
       ffmpeg: ffmpeg.path,
       detectionModel: detection.url.path,
+      detectionBackend: detection.backend,
+      detectionInputSize: detection.inputSize,
       detectionCandidateChannels: detection.candidateChannels,
+      detectionQueries: detection.queries,
+      detectionLogitClasses: detection.logitClasses,
+      detectionMaxDet: detection.maxDetections,
       detectionComputeUnits: detection.computeUnits,
       restorationModels: restoration.url.path,
       restorationRunner: restorationRunner.path,
@@ -1227,6 +1251,7 @@ final class RestorationRunner: ObservableObject {
       temporalBatchFrames: clipFrames,
       temporalOverlap: overlap,
       ringCapacity: max(clipFrames + overlap + 8, 32),
+      confidenceThreshold: detection.confidenceThreshold,
       blendFeather: Float(blendFeather),
       sharpenStrength: Float(sharpenStrength),
       detailBoost: Float(detailBoost),
@@ -1352,8 +1377,23 @@ final class RestorationRunner: ObservableObject {
       automaticClipLength = 180
     default: automaticClipLength = 180
     }
-    add(&args, "--max-clip-length", useMaxClipLength ? maxClipLength : automaticClipLength)
-    if useRestoreMaxFrames { add(&args, "--restore-max-frames", restoreMaxFrames) }
+    add(
+      &args,
+      "--max-clip-length",
+      min(
+        miohMaximumClipFrames,
+        useMaxClipLength ? maxClipLength : automaticClipLength
+      )
+    )
+    if useRestoreMaxFrames {
+      add(
+        &args,
+        "--restore-max-frames",
+        restoreMaxFrames > 0
+          ? min(miohMaximumClipFrames, restoreMaxFrames)
+          : restoreMaxFrames
+      )
+    }
     add(&args, "--restore-temporal-overlap", restoreTemporalOverlap)
     args.append(restoreCrossfade ? "--enable-crossfade" : "--disable-crossfade")
     add(&args, "--sharpen-strength", sharpenStrength)
@@ -1414,8 +1454,18 @@ final class RestorationRunner: ObservableObject {
 
     let restoration = try resolvedRestorationModel(in: resources)
     add(&args, "--mosaic-restoration-model", restoration)
-    if useMaxClipLength { add(&args, "--max-clip-length", maxClipLength) }
-    if useRestoreMaxFrames { add(&args, "--restore-max-frames", restoreMaxFrames) }
+    if useMaxClipLength {
+      add(&args, "--max-clip-length", min(miohMaximumClipFrames, maxClipLength))
+    }
+    if useRestoreMaxFrames {
+      add(
+        &args,
+        "--restore-max-frames",
+        restoreMaxFrames > 0
+          ? min(miohMaximumClipFrames, restoreMaxFrames)
+          : restoreMaxFrames
+      )
+    }
     add(&args, "--restore-temporal-overlap", restoreTemporalOverlap)
     args.append(restoreCrossfade ? "--enable-crossfade" : "--disable-crossfade")
     add(&args, "--restore-sharpen-strength", sharpenStrength)
@@ -1644,24 +1694,62 @@ final class RestorationRunner: ObservableObject {
     default:
       return nil
     }
-    guard let url = firstModelAsset(
-      in: models,
-      prefixes: [prefix],
-      suffix: ".aimodelc"
-    ) else {
-      return nil
+    for suffix in [".aimodelc", ".aimodel"] {
+      if let url = firstModelAsset(
+        in: models,
+        prefixes: [prefix],
+        suffix: suffix
+      ) {
+        return (url, fixedFrameCount, runnerName)
+      }
     }
-    return (url, fixedFrameCount, runnerName)
+    return nil
   }
 
   private func nativeDetectionAsset(
     resources: URL,
     model: String
-  ) -> (url: URL, candidateChannels: Int, computeUnits: String?)? {
+  ) -> (
+    url: URL,
+    backend: String,
+    inputSize: Int,
+    candidateChannels: Int,
+    queries: Int,
+    logitClasses: Int,
+    maxDetections: Int,
+    confidenceThreshold: Float,
+    computeUnits: String?
+  )? {
     let models = resources.appendingPathComponent("models", isDirectory: true)
     let base = model
       .replacingOccurrences(of: "-coreai", with: "")
       .replacingOccurrences(of: "-coreml", with: "")
+    if base == "jasna-v6" || base == "jasna-v6-large" {
+      let large = base == "jasna-v6-large"
+      let stem = large
+        ? "rfdetr-v6-large-768-fp32"
+        : "rfdetr-v6-576-fp32"
+      for suffix in [".aimodelc", ".aimodel"] {
+        if let coreAI = firstModelAsset(
+          in: models,
+          prefixes: [stem],
+          suffix: suffix
+        ) {
+          return (
+            coreAI,
+            "rfdetr",
+            large ? 768 : 576,
+            0,
+            200,
+            3,
+            16,
+            large ? 0.40 : 0.35,
+            nil
+          )
+        }
+      }
+      return nil
+    }
     let stem: String
     switch base {
     case "v2": stem = "lada_mosaic_detection_model_v2"
@@ -1677,19 +1765,29 @@ final class RestorationRunner: ObservableObject {
     let candidateChannels = base == "v2" ? 37 : 38
     // Detection on Core ML/ANE and restoration on Core AI avoids resource
     // contention and was faster in the measured native preview pipeline.
-    if let coreML = firstModelAsset(
-      in: models,
-      prefixes: [stem],
-      suffix: ".mlmodelc"
-    ) {
-      return (coreML, candidateChannels, "cpuAndNeuralEngine")
+    for suffix in [".mlmodelc", ".mlpackage"] {
+      if let coreML = firstModelAsset(
+        in: models,
+        prefixes: [stem],
+        suffix: suffix
+      ) {
+        return (
+          coreML, "yolo", 640, candidateChannels,
+          0, 0, 0, 0.25, "cpuAndNeuralEngine"
+        )
+      }
     }
-    if let coreAI = firstModelAsset(
-      in: models,
-      prefixes: ["\(stem)-fp16", stem],
-      suffix: ".aimodelc"
-    ) {
-      return (coreAI, candidateChannels, nil)
+    for suffix in [".aimodelc", ".aimodel"] {
+      if let coreAI = firstModelAsset(
+        in: models,
+        prefixes: ["\(stem)-fp16", stem],
+        suffix: suffix
+      ) {
+        return (
+          coreAI, "yolo", 640, candidateChannels,
+          0, 0, 0, 0.25, nil
+        )
+      }
     }
     return nil
   }
@@ -2022,9 +2120,11 @@ final class RestorationRunner: ObservableObject {
     restorationModel = restorationModels.contains(snapshot.restorationModel) ? snapshot.restorationModel : capabilities.defaultRestorationModel
     customRestorationModel = snapshot.customRestorationModel
     useMaxClipLength = snapshot.useMaxClipLength
-    maxClipLength = min(max(snapshot.maxClipLength, 1), 3600)
+    maxClipLength = min(max(snapshot.maxClipLength, 1), miohMaximumClipFrames)
     useRestoreMaxFrames = snapshot.useRestoreMaxFrames
-    restoreMaxFrames = snapshot.restoreMaxFrames
+    restoreMaxFrames = snapshot.restoreMaxFrames > 0
+      ? min(snapshot.restoreMaxFrames, miohMaximumClipFrames)
+      : snapshot.restoreMaxFrames
     restoreTemporalOverlap = min(max(snapshot.restoreTemporalOverlap ?? 8, 0), 120)
     restoreCrossfade = snapshot.restoreCrossfade ?? true
     sharpenStrength = min(max(snapshot.sharpenStrength, 0), 2)
@@ -2141,9 +2241,12 @@ final class RestorationRunner: ObservableObject {
       nativeEnhancer = nil
     }
     let temporalLimit = detection.computeUnits == nil ? 18 : 36
-    var requestedFrames = useMaxClipLength ? maxClipLength : temporalLimit
+    var requestedFrames = min(
+      miohMaximumClipFrames,
+      useMaxClipLength ? maxClipLength : temporalLimit
+    )
     if useRestoreMaxFrames, restoreMaxFrames > 0 {
-      requestedFrames = restoreMaxFrames
+      requestedFrames = min(miohMaximumClipFrames, restoreMaxFrames)
     }
     let temporalFrames = min(temporalLimit, max(2, requestedFrames))
     let ffmpeg = resources.appendingPathComponent("bin/ffmpeg")
@@ -2163,7 +2266,12 @@ final class RestorationRunner: ObservableObject {
       miohTemporaryDirectory: miohTemporary,
       ffmpeg: ffmpeg.path,
       detectionModel: detection.url.path,
+      detectionBackend: detection.backend,
+      detectionInputSize: detection.inputSize,
       detectionCandidateChannels: detection.candidateChannels,
+      detectionQueries: detection.queries,
+      detectionLogitClasses: detection.logitClasses,
+      detectionMaxDet: detection.maxDetections,
       detectionComputeUnits: detection.computeUnits,
       restorationModels: restoration.url.path,
       restorationRunner: restorationRunner.path,
@@ -2173,6 +2281,7 @@ final class RestorationRunner: ObservableObject {
       bufferLimitSeconds: previewBufferLimit,
       temporalBatchFrames: temporalFrames,
       ringCapacity: max(temporalFrames * 2, 24),
+      confidenceThreshold: detection.confidenceThreshold,
       blendFeather: Float(blendFeather),
       sharpenStrength: Float(sharpenStrength),
       detailBoost: Float(detailBoost),
@@ -2746,7 +2855,7 @@ struct ContentView: View {
         }
         Toggle("最大クリップ長を指定", isOn: $runner.useMaxClipLength)
         if runner.useMaxClipLength {
-          LabeledContent("最大クリップ長") { Stepper(value: $runner.maxClipLength, in: 1...3600) { Text("\(runner.maxClipLength)") } }
+          LabeledContent("最大クリップ長") { Stepper(value: $runner.maxClipLength, in: 1...miohMaximumClipFrames) { Text("\(runner.maxClipLength)") } }
         }
         Toggle("復元チャンク数を指定", isOn: $runner.useRestoreMaxFrames)
         if runner.useRestoreMaxFrames {
@@ -2810,7 +2919,7 @@ struct ContentView: View {
         if runner.detectionModel == "カスタム" {
           PathSettingRow(title: "モデルパス", value: $runner.customDetectionModel) { runner.choosePath(\.customDetectionModel) }
         }
-        LabeledContent("空検出先読み") {
+        LabeledContent("無検出時の判定間隔") {
           Stepper(value: $runner.detectionEmptyLookahead, in: 0...300) { Text("\(runner.detectionEmptyLookahead)") }
         }
         Toggle("顔モザイクを検出", isOn: $runner.detectFaceMosaics)

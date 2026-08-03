@@ -111,6 +111,7 @@ xcrun swiftc \
   -O \
   -parse-as-library \
   -D MIOH_NATIVE_PREVIEW_PIPELINE \
+  "${APP_SWIFT_FLAGS[@]}" \
   -target arm64-apple-macosx27.0 \
   -framework Accelerate \
   -framework AVFoundation \
@@ -541,6 +542,41 @@ else
     ditto "$source_asset" "$variable_source_collection/${source_asset:t}"
   done
 fi
+
+# Keep the exact variable-restoration checkpoint auditable after the model has
+# been split into eleven (and, for dedicated builds, fifteen HQ) compiled
+# assets. The absolute build-machine path is intentionally omitted.
+"$LADA_STANDALONE_PYTHON_ENV/bin/python" - \
+  "$VARIABLE_COREAI_CHECKPOINT" \
+  "$RESOURCES/models/basicvsrpp-v1.2-variable-coreai.provenance.json" \
+  "$COREAI_DISTRIBUTION" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+checkpoint = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+distribution = sys.argv[3]
+digest = hashlib.sha256()
+with checkpoint.open("rb") as handle:
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
+payload = {
+    "format_version": 1,
+    "checkpoint_filename": checkpoint.name,
+    "checkpoint_sha256": digest.hexdigest(),
+    "checkpoint_size": checkpoint.stat().st_size,
+    "distribution": distribution,
+    "chunk_size": 6,
+    "chunk_asset_count": 11,
+    "hq_asset_count": 15 if distribution == "dedicated" else 0,
+}
+destination.write_text(
+    json.dumps(payload, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+PY
 else
   print "Modeless distribution: skipping bundled model assets and Core ML/Core AI exports"
 fi
@@ -616,6 +652,7 @@ if [[ "$MIOH_BUNDLE_PYTHON_RUNTIME" == 1 ]]; then
   # that prototype or its CLI into the production mioh runtime.
   rm -rf \
     "$RESOURCES/runtime/lib/python3.12/site-packages/rfdetr" \
+    "$RESOURCES/runtime/lib/python3.12/site-packages/lada/models/rfdetr" \
     "$RESOURCES/runtime/lib/python3.12/site-packages"/rfdetr-*.dist-info(N)
   rm -f "$RESOURCES/runtime/bin/rfdetr"
   rm -rf \
@@ -651,6 +688,8 @@ if [[ "$INCLUDE_USER_MANUAL" == 1 ]]; then
 fi
 if [[ -d "$RESOURCES/model-tools" ]]; then
   ditto "$RESOURCES/model-tools" "$DMG_ROOT/model-tools"
+  ln -s "model-tools/download-mioh-models.zsh" "$DMG_ROOT/download-mioh-models.zsh"
+  ln -s "model-tools/convert-mioh-models.zsh" "$DMG_ROOT/convert-mioh-models.zsh"
 fi
 diskutil image create from \
   --volumeName "$APP_BASENAME" \

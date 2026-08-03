@@ -133,16 +133,22 @@ class NormalizedShiftCorrelation(nn.Module):
         channels: int,
         initial_temperature: float = 0.5,
         center_bias: float = 1.0,
+        minimum_temperature: float = MINIMUM_TEMPERATURE,
+        maximum_temperature: float = MAXIMUM_TEMPERATURE,
     ) -> None:
         super().__init__()
         if not offsets:
             raise ValueError("correlation needs at least one shift")
-        if not self.MINIMUM_TEMPERATURE < initial_temperature < self.MAXIMUM_TEMPERATURE:
+        if not 0 < minimum_temperature < maximum_temperature:
+            raise ValueError("invalid correlation temperature bounds")
+        if not minimum_temperature < initial_temperature < maximum_temperature:
             raise ValueError("initial temperature is outside the supported range")
+        self.minimum_temperature = float(minimum_temperature)
+        self.maximum_temperature = float(maximum_temperature)
         self.offsets = tuple((int(y), int(x)) for y, x in offsets)
         fraction = (
-            (initial_temperature - self.MINIMUM_TEMPERATURE)
-            / (self.MAXIMUM_TEMPERATURE - self.MINIMUM_TEMPERATURE)
+            (initial_temperature - self.minimum_temperature)
+            / (self.maximum_temperature - self.minimum_temperature)
         )
         self.raw_temperature = nn.Parameter(
             torch.tensor(math.log(fraction / (1.0 - fraction)))
@@ -156,8 +162,8 @@ class NormalizedShiftCorrelation(nn.Module):
 
     @property
     def temperature(self) -> torch.Tensor:
-        span = self.MAXIMUM_TEMPERATURE - self.MINIMUM_TEMPERATURE
-        return self.MINIMUM_TEMPERATURE + span * torch.sigmoid(self.raw_temperature)
+        span = self.maximum_temperature - self.minimum_temperature
+        return self.minimum_temperature + span * torch.sigmoid(self.raw_temperature)
 
     @staticmethod
     def _normalize(values: torch.Tensor) -> torch.Tensor:

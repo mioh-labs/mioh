@@ -30,6 +30,39 @@ def _dilate(mask: torch.Tensor, radius: int) -> torch.Tensor:
 
 
 @MODELS.register_module()
+class ROIPixelLoss(nn.Module):
+    """Charbonnier reconstruction loss normalized by the restoration ROI.
+
+    A full-frame reconstruction loss is dominated by the already-clean area
+    outside the mosaic.  This loss gives every sample comparable weight based
+    on the affected pixels while retaining a configurable guard band around
+    the mask edge.
+    """
+
+    def __init__(
+        self,
+        loss_weight: float = 1.0,
+        mask_dilation: int = 4,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.loss_weight = loss_weight
+        self.mask_dilation = mask_dilation
+        self.eps = eps
+
+    def forward(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        mask = _dilate(mask, self.mask_dilation)
+        return self.loss_weight * _masked_charbonnier(
+            prediction, target, mask, self.eps
+        )
+
+
+@MODELS.register_module()
 class ROIHighFrequencyLoss(nn.Module):
     """Match gradients and Laplacian detail inside the restoration ROI."""
 

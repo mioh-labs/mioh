@@ -14,6 +14,8 @@ private let detectorSize = 640
 private let prototypeSize = 160
 private let restorationSize = 256
 private let candidateCount = 8400
+private let maximumTemporalBatchFrames = 180
+private let maximumInternalExportSegmentSeconds = 60.0
 
 private struct NativePreviewConfiguration: Decodable {
   let mode: String?
@@ -24,7 +26,12 @@ private struct NativePreviewConfiguration: Decodable {
   let outputFile: String?
   let ffmpeg: String?
   let detectionModel: String
+  let detectionBackend: String?
+  let detectionInputSize: Int?
   let detectionCandidateChannels: Int
+  let detectionQueries: Int?
+  let detectionLogitClasses: Int?
+  let detectionMaxDet: Int?
   let detectionComputeUnits: String?
   let restorationModels: String
   let restorationRunner: String
@@ -375,6 +382,11 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
   }
 }
 
+private enum DetectionMaskProjection {
+  case yoloLetterbox
+  case directResize
+}
+
 private struct Detection {
   let left: Int
   let top: Int
@@ -382,9 +394,13 @@ private struct Detection {
   let bottom: Int
   let confidence: Float
   let classIndex: Int
-  /// This is the same 640x640 hard mask produced by Ultralytics
-  /// ``process_mask(..., upsample=True)`` before letterbox removal.
-  let detectorMask: [UInt8]
+  /// YOLO stores a 640px letterboxed binary mask. RF-DETR stores the selected
+  /// query's model-space mask logits and resizes them directly to the source.
+  let detectorMask: [Float]
+  let maskWidth: Int
+  let maskHeight: Int
+  let maskProjection: DetectionMaskProjection
+  let maskThreshold: Float
 
   var area: Int {
     max(0, right - left + 1) * max(0, bottom - top + 1)
@@ -401,9 +417,18 @@ private struct DetectionCandidate {
   let coefficients: [Float]
 }
 
-private final class CoreAIDetector {
+private protocol NativeDetecting: AnyObject {
+  func detect(
+    _ source: CVPixelBuffer,
+    confidenceThreshold: Float,
+    iouThreshold: Float
+  ) async throws -> [Detection]
+}
+
+private final class CoreAIDetector: NativeDetecting {
   private let function: InferenceFunction?
   private let coreMLModel: MLModel?
+  private var temporaryCompiledModelURL: URL?
   private let candidateChannels: Int
   private let classCount: Int
   private let context = CIContext(options: [.cacheIntermediates: false])
@@ -425,7 +450,8 @@ private final class CoreAIDetector {
     }
     self.candidateChannels = candidateChannels
     classCount = candidateChannels - 4 - 32
-    if modelURL.pathExtension == "mlmodelc" {
+    let modelExtension = modelURL.pathExtension.lowercased()
+    if modelExtension == "mlmodelc" || modelExtension == "mlpackage" {
       let configuration = MLModelConfiguration()
       switch (computeUnits ?? "cpuAndGPU").lowercased() {
       case "all":
@@ -441,8 +467,15 @@ private final class CoreAIDetector {
           "unsupported Core ML detector compute units: \(computeUnits ?? "")"
         )
       }
+      let loadURL: URL
+      if modelExtension == "mlpackage" {
+        loadURL = try await MLModel.compileModel(at: modelURL)
+        temporaryCompiledModelURL = loadURL
+      } else {
+        loadURL = modelURL
+      }
       coreMLModel = try MLModel(
-        contentsOf: modelURL,
+        contentsOf: loadURL,
         configuration: configuration
       )
       function = nil
@@ -455,6 +488,13 @@ private final class CoreAIDetector {
       coreMLModel = nil
     }
     detectorPool = try Self.makePool(width: detectorSize, height: detectorSize)
+  }
+
+  deinit {
+    if let temporaryCompiledModelURL {
+      try? FileManager.default.removeItem(at: temporaryCompiledModelURL)
+    }
+    CVPixelBufferPoolFlush(detectorPool, .excessBuffers)
   }
 
   private static func makePool(width: Int, height: Int) throws
@@ -730,7 +770,11 @@ private final class CoreAIDetector {
             detectorRight,
             detectorBottom
           )
-        )
+        ),
+        maskWidth: detectorSize,
+        maskHeight: detectorSize,
+        maskProjection: .yoloLetterbox,
+        maskThreshold: 0.5
       )
     }
   }
@@ -864,11 +908,11 @@ private final class CoreAIDetector {
     coefficients: [Float],
     prototypes: [Float],
     box: (Float, Float, Float, Float)
-  ) -> [UInt8] {
+  ) -> [Float] {
     var logits = [Float](repeating: 0, count: prototypeSize * prototypeSize)
     let plane = prototypeSize * prototypeSize
     guard coefficients.count == 32, prototypes.count == 32 * plane else {
-      return [UInt8](repeating: 0, count: detectorSize * detectorSize)
+      return [Float](repeating: 0, count: detectorSize * detectorSize)
     }
     coefficients.withUnsafeBufferPointer { coefficientBuffer in
       prototypes.withUnsafeBufferPointer { prototypeBuffer in
@@ -882,7 +926,7 @@ private final class CoreAIDetector {
         }
       }
     }
-    var mask = [UInt8](repeating: 0, count: detectorSize * detectorSize)
+    var mask = [Float](repeating: 0, count: detectorSize * detectorSize)
     let left = max(0, Int(floor(box.0)))
     let top = max(0, Int(floor(box.1)))
     let right = min(detectorSize, Int(ceil(box.2)))
@@ -910,6 +954,230 @@ private final class CoreAIDetector {
     return mask
   }
 }
+
+/// Native RF-DETR Seg adapter for the dedicated mioh build. The model uses a
+/// direct square resize, ImageNet normalization, normalized cx/cy/w/h boxes,
+/// and one low-resolution logit mask per query. This intentionally does not
+/// share YOLO's letterbox or prototype-mask postprocessing.
+#if !MIOH_PORTABLE_COREAI
+private final class RFDETRCoreAIDetector: NativeDetecting {
+  private let function: InferenceFunction
+  private let resolution: Int
+  private let queries: Int
+  private let logitClasses: Int
+  private let maxDetections: Int
+
+  init(
+    modelURL: URL,
+    resolution: Int,
+    queries: Int,
+    logitClasses: Int,
+    maxDetections: Int
+  ) async throws {
+    guard resolution > 0, resolution % 4 == 0,
+      queries > 0, logitClasses > 0, maxDetections > 0
+    else {
+      throw NativePreviewError.invalidConfiguration(
+        "invalid RF-DETR deployment shape"
+      )
+    }
+    let model = try await AIModel(contentsOf: modelURL)
+    guard let loadedFunction = try model.loadFunction(named: "main") else {
+      throw NativePreviewError.detector(
+        "RF-DETR main function is missing"
+      )
+    }
+    function = loadedFunction
+    self.resolution = resolution
+    self.queries = queries
+    self.logitClasses = logitClasses
+    self.maxDetections = maxDetections
+  }
+
+  private func normalizedNCHW(_ source: CVPixelBuffer) throws -> NDArray {
+    CVPixelBufferLockBaseAddress(source, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(source, .readOnly) }
+    guard let base = CVPixelBufferGetBaseAddress(source) else {
+      throw NativePreviewError.pixelBuffer(
+        "RF-DETR source base address unavailable"
+      )
+    }
+    let sourceWidth = CVPixelBufferGetWidth(source)
+    let sourceHeight = CVPixelBufferGetHeight(source)
+    let rowBytes = CVPixelBufferGetBytesPerRow(source)
+    let pixels = base.assumingMemoryBound(to: UInt8.self)
+    var array = NDArray(
+      shape: [1, 3, resolution, resolution],
+      scalarType: .float32
+    )
+    let view = array.mutableView(as: Float.self)
+    view.withUnsafeMutablePointer { destination, _, _ in
+      let plane = resolution * resolution
+      let mean: [Float] = [0.485, 0.456, 0.406]
+      let inverseStd: [Float] = [
+        1 / 0.229, 1 / 0.224, 1 / 0.225,
+      ]
+      var x0 = [Int](repeating: 0, count: resolution)
+      var x1 = [Int](repeating: 0, count: resolution)
+      var xFraction = [Float](repeating: 0, count: resolution)
+      for x in 0..<resolution {
+        let sourceX = (Float(x) + 0.5)
+          * Float(sourceWidth) / Float(resolution) - 0.5
+        let clamped = max(0, min(Float(sourceWidth - 1), sourceX))
+        x0[x] = Int(floor(clamped))
+        x1[x] = min(sourceWidth - 1, x0[x] + 1)
+        xFraction[x] = clamped - Float(x0[x])
+      }
+      for y in 0..<resolution {
+        let sourceY = (Float(y) + 0.5)
+          * Float(sourceHeight) / Float(resolution) - 0.5
+        let clampedY = max(0, min(Float(sourceHeight - 1), sourceY))
+        let y0 = Int(floor(clampedY))
+        let y1 = min(sourceHeight - 1, y0 + 1)
+        let fy = clampedY - Float(y0)
+        let upperRow = y0 * rowBytes
+        let lowerRow = y1 * rowBytes
+        for x in 0..<resolution {
+          let fx = xFraction[x]
+          let upperLeft = upperRow + x0[x] * 4
+          let upperRight = upperRow + x1[x] * 4
+          let lowerLeft = lowerRow + x0[x] * 4
+          let lowerRight = lowerRow + x1[x] * 4
+          let index = y * resolution + x
+          for channel in 0..<3 {
+            let bgraChannel = 2 - channel
+            let upper = Float(pixels[upperLeft + bgraChannel]) * (1 - fx)
+              + Float(pixels[upperRight + bgraChannel]) * fx
+            let lower = Float(pixels[lowerLeft + bgraChannel]) * (1 - fx)
+              + Float(pixels[lowerRight + bgraChannel]) * fx
+            let unit = (upper * (1 - fy) + lower * fy) / 255
+            destination[channel * plane + index] =
+              (unit - mean[channel]) * inverseStd[channel]
+          }
+        }
+      }
+    }
+    return array
+  }
+
+  private func readFloat32(_ array: NDArray, expectedShape: [Int]) throws
+    -> [Float]
+  {
+    let view = array.view(as: Float.self)
+    guard view.isContiguous else {
+      throw NativePreviewError.detector(
+        "RF-DETR output is not contiguous"
+      )
+    }
+    return try view.withUnsafePointer { pointer, shape, _ in
+      let actualShape = (0..<shape.count).map { shape[$0] }
+      guard actualShape == expectedShape else {
+        throw NativePreviewError.detector(
+          "unexpected RF-DETR output shape \(actualShape), expected \(expectedShape)"
+        )
+      }
+      return Array(
+        UnsafeBufferPointer(
+          start: pointer,
+          count: expectedShape.reduce(1, *)
+        )
+      )
+    }
+  }
+
+  @inline(__always)
+  private static func sigmoid(_ value: Float) -> Float {
+    1 / (1 + exp(-max(-80, min(80, value))))
+  }
+
+  func detect(
+    _ source: CVPixelBuffer,
+    confidenceThreshold: Float,
+    iouThreshold: Float
+  ) async throws -> [Detection] {
+    _ = iouThreshold
+    let input = try normalizedNCHW(source)
+    var outputs = try await function.run(inputs: ["image": input])
+    guard let boxesArray = outputs.remove("boxes")?.ndArray,
+      let logitsArray = outputs.remove("logits")?.ndArray,
+      let masksArray = outputs.remove("masks")?.ndArray
+    else {
+      throw NativePreviewError.detector(
+        "RF-DETR output is missing boxes, logits, or masks"
+      )
+    }
+    let maskSize = resolution / 4
+    let maskPlane = maskSize * maskSize
+    let boxes = try readFloat32(
+      boxesArray,
+      expectedShape: [1, queries, 4]
+    )
+    let logits = try readFloat32(
+      logitsArray,
+      expectedShape: [1, queries, logitClasses]
+    )
+    let masks = try readFloat32(
+      masksArray,
+      expectedShape: [1, queries, maskSize, maskSize]
+    )
+    let ranked = (0..<queries).map { query -> (Int, Float) in
+      var best = -Float.infinity
+      for classIndex in 0..<logitClasses {
+        best = max(best, logits[query * logitClasses + classIndex])
+      }
+      return (query, best)
+    }.sorted { $0.1 > $1.1 }
+
+    let sourceWidth = CVPixelBufferGetWidth(source)
+    let sourceHeight = CVPixelBufferGetHeight(source)
+    var detections: [Detection] = []
+    detections.reserveCapacity(maxDetections)
+    for (query, bestLogit) in ranked.prefix(maxDetections) {
+      let confidence = Self.sigmoid(bestLogit)
+      guard confidence > confidenceThreshold else { continue }
+      let boxOffset = query * 4
+      let centerX = boxes[boxOffset]
+      let centerY = boxes[boxOffset + 1]
+      let boxWidth = boxes[boxOffset + 2]
+      let boxHeight = boxes[boxOffset + 3]
+      let left = Int(
+        max(0, min(1, centerX - boxWidth * 0.5)
+          * Float(sourceWidth))
+      )
+      let top = Int(
+        max(0, min(1, centerY - boxHeight * 0.5)
+          * Float(sourceHeight))
+      )
+      let right = Int(
+        max(0, min(1, centerX + boxWidth * 0.5) * Float(sourceWidth))
+      )
+      let bottom = Int(
+        max(0, min(1, centerY + boxHeight * 0.5) * Float(sourceHeight))
+      )
+      guard right > left, bottom > top else { continue }
+      let maskOffset = query * maskPlane
+      detections.append(
+        Detection(
+          left: min(sourceWidth - 1, left),
+          top: min(sourceHeight - 1, top),
+          right: min(sourceWidth - 1, right),
+          bottom: min(sourceHeight - 1, bottom),
+          confidence: confidence,
+          classIndex: 0,
+          detectorMask: Array(
+            masks[maskOffset..<(maskOffset + maskPlane)]
+          ),
+          maskWidth: maskSize,
+          maskHeight: maskSize,
+          maskProjection: .directResize,
+          maskThreshold: 0
+        )
+      )
+    }
+    return detections
+  }
+}
+#endif
 
 private struct DetectedFrame {
   let frame: DecodedFrame
@@ -1707,12 +1975,9 @@ private final class NativeFrameProcessor {
   private let blendFeather: Float
   private let effects: NativeRestoreEffects
   private let detectionEmptyLookahead: Int
-  // Colour management must stay off here. Every other frame reaches the
-  // writer as raw BGRA (`composite` memcpys the decoded bytes, undetected
-  // frames are passed through untouched), so a managed Core Image round trip
-  // would convert the crossfaded overlap frames from the decoder's tagged
-  // space into sRGB and nothing else. That is a visible luma/level jump on
-  // exactly the few frames at each clip boundary.
+  // Crossfade frames use the same un-managed BGRA values as the rest of the
+  // native pipeline. Keep this GPU context, but bound every CIImage/filter
+  // lifetime with an autorelease pool in crossfade().
   private let crossfadeContext = CIContext(options: [
     .workingColorSpace: NSNull(),
     .outputColorSpace: NSNull(),
@@ -1884,29 +2149,33 @@ private final class NativeFrameProcessor {
       return earlier
     }
     let output = try allocateOutputBuffer(context: "crossfade")
-    guard let filter = CIFilter(name: "CIDissolveTransition") else {
-      throw NativePreviewError.pixelBuffer(
-        "CIDissolveTransition is unavailable"
+    try autoreleasepool {
+      guard let filter = CIFilter(name: "CIDissolveTransition") else {
+        throw NativePreviewError.pixelBuffer(
+          "CIDissolveTransition is unavailable"
+        )
+      }
+      let extent = CGRect(
+        x: 0,
+        y: 0,
+        width: CVPixelBufferGetWidth(earlier),
+        height: CVPixelBufferGetHeight(earlier)
       )
-    }
-    let extent = CGRect(
-      x: 0,
-      y: 0,
-      width: CVPixelBufferGetWidth(earlier),
-      height: CVPixelBufferGetHeight(earlier)
-    )
-    filter.setValue(CIImage(cvPixelBuffer: earlier), forKey: kCIInputImageKey)
-    filter.setValue(CIImage(cvPixelBuffer: later), forKey: kCIInputTargetImageKey)
-    filter.setValue(
-      max(0, min(1, laterWeight)),
-      forKey: kCIInputTimeKey
-    )
-    guard let image = filter.outputImage?.cropped(to: extent) else {
-      throw NativePreviewError.pixelBuffer(
-        "crossfade filter produced no image"
+      let earlierImage = CIImage(cvPixelBuffer: earlier)
+      let laterImage = CIImage(cvPixelBuffer: later)
+      filter.setValue(earlierImage, forKey: kCIInputImageKey)
+      filter.setValue(laterImage, forKey: kCIInputTargetImageKey)
+      filter.setValue(
+        max(0, min(1, laterWeight)),
+        forKey: kCIInputTimeKey
       )
+      guard let image = filter.outputImage?.cropped(to: extent) else {
+        throw NativePreviewError.pixelBuffer(
+          "crossfade filter produced no image"
+        )
+      }
+      crossfadeContext.render(image, to: output)
     }
-    crossfadeContext.render(image, to: output)
     CVBufferPropagateAttachments(earlier, output)
     return output
   }
@@ -2827,28 +3096,38 @@ private final class NativeFrameProcessor {
     imageWidth: Int,
     imageHeight: Int
   ) -> Bool {
-    let scale = min(
-      Float(detectorSize) / Float(imageHeight),
-      Float(detectorSize) / Float(imageWidth)
-    )
-    let padX = (Float(detectorSize) - Float(imageWidth) * scale) / 2
-    let padY = (Float(detectorSize) - Float(imageHeight) * scale) / 2
-    let left = Int(round(padX - 0.1))
-    let top = Int(round(padY - 0.1))
-    let right = detectorSize - Int(round(padX + 0.1))
-    let bottom = detectorSize - Int(round(padY + 0.1))
-    let detectorX = Float(left)
-      + (Float(sourceX) + 0.5) * Float(right - left) / Float(imageWidth) - 0.5
-    let detectorY = Float(top)
-      + (Float(sourceY) + 0.5) * Float(bottom - top) / Float(imageHeight) - 0.5
+    let detectorX: Float
+    let detectorY: Float
+    switch detection.maskProjection {
+    case .yoloLetterbox:
+      let scale = min(
+        Float(detectorSize) / Float(imageHeight),
+        Float(detectorSize) / Float(imageWidth)
+      )
+      let padX = (Float(detectorSize) - Float(imageWidth) * scale) / 2
+      let padY = (Float(detectorSize) - Float(imageHeight) * scale) / 2
+      let left = Int(round(padX - 0.1))
+      let top = Int(round(padY - 0.1))
+      let right = detectorSize - Int(round(padX + 0.1))
+      let bottom = detectorSize - Int(round(padY + 0.1))
+      detectorX = Float(left)
+        + (Float(sourceX) + 0.5) * Float(right - left) / Float(imageWidth) - 0.5
+      detectorY = Float(top)
+        + (Float(sourceY) + 0.5) * Float(bottom - top) / Float(imageHeight) - 0.5
+    case .directResize:
+      detectorX = (Float(sourceX) + 0.5)
+        * Float(detection.maskWidth) / Float(imageWidth) - 0.5
+      detectorY = (Float(sourceY) + 0.5)
+        * Float(detection.maskHeight) / Float(imageHeight) - 0.5
+    }
     let value = bilinearScalar(
       detection.detectorMask,
-      width: detectorSize,
-      height: detectorSize,
+      width: detection.maskWidth,
+      height: detection.maskHeight,
       x: detectorX,
       y: detectorY
     )
-    return value > 0.5
+    return value > detection.maskThreshold
   }
 
   private func composite(
@@ -3028,7 +3307,7 @@ private final class NativeFrameProcessor {
 
   @inline(__always)
   private static func bilinearScalar(
-    _ values: [UInt8],
+    _ values: [Float],
     width: Int,
     height: Int,
     x: Float,
@@ -3042,10 +3321,10 @@ private final class NativeFrameProcessor {
     let y1 = min(height - 1, y0 + 1)
     let fx = clampedX - Float(x0)
     let fy = clampedY - Float(y0)
-    let upper = Float(values[y0 * width + x0]) * (1 - fx)
-      + Float(values[y0 * width + x1]) * fx
-    let lower = Float(values[y1 * width + x0]) * (1 - fx)
-      + Float(values[y1 * width + x1]) * fx
+    let upper = values[y0 * width + x0] * (1 - fx)
+      + values[y0 * width + x1] * fx
+    let lower = values[y1 * width + x0] * (1 - fx)
+      + values[y1 * width + x1] * fx
     return upper * (1 - fy) + lower * fy
   }
 
@@ -3385,10 +3664,11 @@ private struct NativePreviewPipeline {
 
   private static func run(config: NativePreviewConfiguration) async throws {
     guard config.temporalBatchFrames > 0,
+      config.temporalBatchFrames <= maximumTemporalBatchFrames,
       config.ringCapacity >= config.temporalBatchFrames
     else {
       throw NativePreviewError.invalidConfiguration(
-        "ring capacity must cover the temporal batch"
+        "temporal batch must be 1...\(maximumTemporalBatchFrames) frames and fit in the ring"
       )
     }
     let overlap = config.isExport
@@ -3447,27 +3727,53 @@ private struct NativePreviewPipeline {
     }
     let outputFPSNumerator = targetRate?.numerator ?? video.fpsNumerator
     let outputFPSDenominator = targetRate?.denominator ?? video.fpsDenominator
-    let effectiveSegmentSeconds: Double
+    let requestedSegmentSeconds: Double
     if config.isExport {
       switch config.splitMode ?? "duration" {
       case "none":
-        effectiveSegmentSeconds = max(1, video.durationSeconds + 1)
+        requestedSegmentSeconds = max(1, video.durationSeconds + 1)
       case "count":
-        effectiveSegmentSeconds = max(
+        requestedSegmentSeconds = max(
           1,
           video.durationSeconds / Double(max(1, config.segmentCount ?? 1))
         )
       default:
-        effectiveSegmentSeconds = max(1, config.segmentSeconds)
+        requestedSegmentSeconds = max(1, config.segmentSeconds)
       }
     } else {
-      effectiveSegmentSeconds = config.segmentSeconds
+      requestedSegmentSeconds = config.segmentSeconds
     }
-    let detector = try await CoreAIDetector(
+    // A user-visible "no split" export still closes the internal
+    // AVAssetWriter regularly. The completed files are concatenated into one
+    // final output by finishExport(), while VideoToolbox releases its retained
+    // IOSurfaces at each internal boundary.
+    let writerSegmentSeconds = config.isExport
+      ? min(maximumInternalExportSegmentSeconds, requestedSegmentSeconds)
+      : requestedSegmentSeconds
+    let detector: any NativeDetecting
+#if MIOH_PORTABLE_COREAI
+    detector = try await CoreAIDetector(
       modelURL: URL(fileURLWithPath: config.detectionModel),
       candidateChannels: config.detectionCandidateChannels,
       computeUnits: config.detectionComputeUnits
     )
+#else
+    if config.detectionBackend == "rfdetr" {
+      detector = try await RFDETRCoreAIDetector(
+        modelURL: URL(fileURLWithPath: config.detectionModel),
+        resolution: config.detectionInputSize ?? 576,
+        queries: config.detectionQueries ?? 200,
+        logitClasses: config.detectionLogitClasses ?? 3,
+        maxDetections: config.detectionMaxDet ?? 16
+      )
+    } else {
+      detector = try await CoreAIDetector(
+        modelURL: URL(fileURLWithPath: config.detectionModel),
+        candidateChannels: config.detectionCandidateChannels,
+        computeUnits: config.detectionComputeUnits
+      )
+    }
+#endif
     let restorer: any NativeRestoring
     if let fixedFrames = config.restorationFrameCount {
       restorer = try FixedRestorerBridge(
@@ -3546,7 +3852,7 @@ private struct NativePreviewPipeline {
       fpsNumerator: outputFPSNumerator,
       fpsDenominator: outputFPSDenominator,
       generation: config.generation,
-      segmentSeconds: effectiveSegmentSeconds,
+      segmentSeconds: writerSegmentSeconds,
       codec: codec,
       averageBitRate: config.averageBitRate ?? sourceBasedBitRate,
       realTime: !config.isExport,
@@ -3570,7 +3876,9 @@ private struct NativePreviewPipeline {
         : ((config.preFPSConversion ?? false) ? "before_restore" : "after_restore"),
       "width": video.width,
       "height": video.height,
-      "segment_seconds": effectiveSegmentSeconds,
+      "segment_seconds": writerSegmentSeconds,
+      "requested_segment_seconds": requestedSegmentSeconds,
+      "internal_segment_seconds": writerSegmentSeconds,
       "output_buffer_limit": max(
         64,
         config.temporalBatchFrames * 3 + overlap * 2 + 16
@@ -3613,6 +3921,12 @@ private struct NativePreviewPipeline {
             var localDetectionSeconds = 0.0
             var batchIndex = 0
             var newFramesSinceYield = 0
+            let emptyLookaheadFrames = max(
+              1,
+              config.detectionEmptyLookahead ?? 0
+            )
+            var lookaheadWindow: [DecodedFrame] = []
+            lookaheadWindow.reserveCapacity(emptyLookaheadFrames)
             var preRestorationFrameRateGate: PTSFrameRateGate? =
               (config.preFPSConversion ?? false)
               ? targetRate.map {
@@ -3645,25 +3959,27 @@ private struct NativePreviewPipeline {
               newFramesSinceYield = 0
             }
 
-            while !control.shouldStop(), let frame = try ring.pop() {
-              localDecodedFrames += 1
-              if var gate = preRestorationFrameRateGate {
-                let accepted = gate.accepts(frame.ptsNanoseconds)
-                preRestorationFrameRateGate = gate
-                if !accepted { continue }
-              }
+            func inferDetections(
+              _ frame: DecodedFrame
+            ) async throws -> [Detection] {
               let detectionStart = Date()
               let allDetections = try await detector.detect(
                 frame.pixelBuffer,
                 confidenceThreshold: config.confidenceThreshold,
                 iouThreshold: config.iouThreshold
               )
-              let detections = (config.detectFaceMosaics ?? false)
-                ? allDetections.filter { $0.classIndex == 0 }
-                : allDetections
               localDetectionSeconds += Date().timeIntervalSince(
                 detectionStart
               )
+              return (config.detectFaceMosaics ?? false)
+                ? allDetections.filter { $0.classIndex == 0 }
+                : allDetections
+            }
+
+            func appendDetectedFrame(
+              _ frame: DecodedFrame,
+              detections: [Detection]
+            ) {
               if !detections.isEmpty {
                 localDetectedFrames += 1
               }
@@ -3675,7 +3991,93 @@ private struct NativePreviewPipeline {
                 yieldPending()
               }
             }
+
+            func processLookaheadWindow() async throws {
+              guard !lookaheadWindow.isEmpty else { return }
+              if lookaheadWindow.count == 1 {
+                let detections = try await inferDetections(
+                  lookaheadWindow[0]
+                )
+                appendDetectedFrame(
+                  lookaheadWindow[0],
+                  detections: detections
+                )
+                lookaheadWindow.removeAll(keepingCapacity: true)
+                return
+              }
+
+              // Match Python's empty-lookahead contract: sample the first and
+              // last frame. Only when both are empty may the whole range skip
+              // inference. If either is positive, infer every middle frame;
+              // reuse the endpoint results instead of evaluating them twice.
+              let firstDetections = try await inferDetections(
+                lookaheadWindow[0]
+              )
+              let lastIndex = lookaheadWindow.count - 1
+              if !firstDetections.isEmpty {
+                // A positive first frame already commits this range to full
+                // inference. Do not preflight the last frame and then infer
+                // it a second time as part of the full range.
+                appendDetectedFrame(
+                  lookaheadWindow[0],
+                  detections: firstDetections
+                )
+                for index in 1...lastIndex {
+                  let detections = try await inferDetections(
+                    lookaheadWindow[index]
+                  )
+                  appendDetectedFrame(
+                    lookaheadWindow[index],
+                    detections: detections
+                  )
+                }
+                lookaheadWindow.removeAll(keepingCapacity: true)
+                return
+              }
+
+              let lastDetections = try await inferDetections(
+                lookaheadWindow[lastIndex]
+              )
+              if lastDetections.isEmpty {
+                for frame in lookaheadWindow {
+                  appendDetectedFrame(frame, detections: [])
+                }
+              } else {
+                for index in lookaheadWindow.indices {
+                  let detections: [Detection]
+                  if index == 0 {
+                    detections = firstDetections
+                  } else if index == lastIndex {
+                    detections = lastDetections
+                  } else {
+                    detections = try await inferDetections(
+                      lookaheadWindow[index]
+                    )
+                  }
+                  appendDetectedFrame(
+                    lookaheadWindow[index],
+                    detections: detections
+                  )
+                }
+              }
+              lookaheadWindow.removeAll(keepingCapacity: true)
+            }
+
+            while !control.shouldStop(), let frame = try ring.pop() {
+              localDecodedFrames += 1
+              if var gate = preRestorationFrameRateGate {
+                let accepted = gate.accepts(frame.ptsNanoseconds)
+                preRestorationFrameRateGate = gate
+                if !accepted { continue }
+              }
+              lookaheadWindow.append(frame)
+              if lookaheadWindow.count == emptyLookaheadFrames {
+                try await processLookaheadWindow()
+              }
+            }
             if !control.shouldStop() {
+              // Process the final partial range using the same endpoint rule.
+              try await processLookaheadWindow()
               yieldPending()
               continuation.yield(
                 .finished(
@@ -3704,15 +4106,19 @@ private struct NativePreviewPipeline {
             let batch = detectedBatch.frames
             let outputs = try await processor.process(batch)
             restoredBatches += processor.lastRestoredSceneCount
-            if let pendingEncoding {
+            if let encodingTask = pendingEncoding {
               let (segments, completedNextSequence) =
-                try await pendingEncoding.value
+                try await encodingTask.value
               for segment in segments {
                 emitSegment(segment, generation: config.generation)
                 completedSegments.append(segment)
               }
               nextSequence = completedNextSequence
             }
+            // A completed detached Task retains its captured frame array until
+            // the handle is released. Drop it before crossfade allocates the
+            // next generation of pixel buffers.
+            pendingEncoding = nil
             let startingSequence = nextSequence
             var framesToEncode: [ProcessedFrame] = []
             if (config.crossfade ?? false), overlap > 0 {
@@ -3864,15 +4270,16 @@ private struct NativePreviewPipeline {
         pendingEncoding = nil
       }
       if !control.shouldStop() {
-        if let pendingEncoding {
+        if let encodingTask = pendingEncoding {
           let (segments, completedNextSequence) =
-            try await pendingEncoding.value
+            try await encodingTask.value
           for segment in segments {
             emitSegment(segment, generation: config.generation)
             completedSegments.append(segment)
           }
           nextSequence = completedNextSequence
         }
+        pendingEncoding = nil
         if !deferredCrossfadeTail.isEmpty {
           for frame in deferredCrossfadeTail {
             if var gate = postRestorationFrameRateGate {

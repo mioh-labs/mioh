@@ -181,3 +181,19 @@ The final model-space-to-source mask resize intentionally remains `float32`.
 Changing that boundary operation to `float16` or nearest-neighbor reduces a
 temporary allocation but can move mask edges, so it is not part of the
 quality-approved optimization.
+
+## Swift-native deployment
+
+The dedicated mioh build can run both RF-DETR assets directly from the Swift
+export pipeline. The Swift adapter preserves the production Python contract:
+
+- direct square bilinear resize with `align_corners=False` coordinates;
+- FP32 RGB ImageNet normalization;
+- normalized `cx, cy, width, height` boxes;
+- one selection per query using the maximum of the three logits;
+- direct low-resolution logit-mask projection to the source frame; and
+- confidence thresholds `0.35` for v6 and `0.40` for v6 Large.
+
+RF-DETR remains dedicated-build and offline-export only. The Universal build
+does not bundle either asset, and realtime preview continues to use the
+measured `v4-fast` path so that RF-DETR cannot reduce playback throughput.
