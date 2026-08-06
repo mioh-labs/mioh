@@ -169,3 +169,21 @@
 "非対応コーデックをVideoToolboxで互換変換中" = "Converting an unsupported codec with VideoToolbox";
 
 "mioh ユーザーマニュアル.pdf" = "mioh User Manual.pdf";
+
+"ローカルネットワーク操作" = "Local Network Control";
+"Webリモコンを有効にする" = "Enable Web Remote";
+"ポート" = "Port";
+"状態" = "Status";
+"同じLANから接続できるアドレスを確認中です。" = "Checking addresses available on the same LAN.";
+"接続URL" = "Connection URL";
+"アクセスコード" = "Access Code";
+"コピー" = "Copy";
+"開く" = "Open";
+"再生成" = "Regenerate";
+"接続先のブラウザで12文字のアクセスコードを入力してください。大文字小文字・ハイフンの有無は問いません。信頼できる家庭・社内LAN専用です。" = "Enter the 12-character access code in the connecting browser. Letter case and hyphens are optional. Use only on a trusted home or office LAN.";
+"無効" = "Off";
+"待受中" = "Listening";
+"開始中" = "Starting";
+"待受中（トークンをKeychainへ保存できませんでした）" = "Listening (the token could not be saved to Keychain)";
+"ポート番号が正しくありません" = "The port number is invalid";
+"起動失敗" = "Startup failed";

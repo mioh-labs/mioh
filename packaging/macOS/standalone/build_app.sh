@@ -90,10 +90,16 @@ xcrun swiftc \
   -framework AVKit \
   -framework Metal \
   -framework Network \
+  -framework Security \
   -framework SceneKit \
   "${APP_SWIFT_FLAGS[@]}" \
   "$PACKAGE_DIR/MiohApp.swift" \
   "$PACKAGE_DIR/RealtimePlayer.swift" \
+  "$PACKAGE_DIR/RemoteControlServer.swift" \
+  "$PACKAGE_DIR/RemoteStreamingCoordinator.swift" \
+  "$PACKAGE_DIR/RemoteClusterService.swift" \
+  "$PACKAGE_DIR/RemoteClusterHTTPTransfer.swift" \
+  "$PACKAGE_DIR/MiohClusterController.swift" \
   -o "$CONTENTS/MacOS/mioh"
 xcrun swiftc \
   "${SWIFT_SUBPROCESS_FLAGS[@]}" \
@@ -120,6 +126,7 @@ xcrun swiftc \
   -framework CoreML \
   -framework CoreVideo \
   -framework VideoToolbox \
+  "$ROOT/packages/MiohRemoteKit/Sources/MiohRemoteKit/MiohHTTPRangeAsset.swift" \
   "$PACKAGE_DIR/PreviewVideoToolboxEncoder.swift" \
   "$PACKAGE_DIR/NativePreviewPipeline.swift" \
   -o "$RESOURCES/bin/mioh-native-coreai-preview"
@@ -341,7 +348,16 @@ COREAI_MODEL_ASSETS=(
   4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel
 )
 VARIABLE_COREAI_SOURCE_MODELS="${VARIABLE_COREAI_SOURCE_MODELS:-$BUILD_DIR/variable-basicvsrpp-source}"
-VARIABLE_COREAI_CHECKPOINT="${VARIABLE_COREAI_CHECKPOINT:-$ROOT/model_weights/lada_mosaic_restoration_model_generic_v1.2.pth}"
+if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
+  default_variable_checkpoint="$ROOT/model_weights/hf2500-plus-fc2-500-ema.pth"
+else
+  default_variable_checkpoint="$ROOT/model_weights/lada_mosaic_restoration_model_generic_v1.2.pth"
+fi
+VARIABLE_COREAI_CHECKPOINT="${VARIABLE_COREAI_CHECKPOINT:-$default_variable_checkpoint}"
+if [[ ! -f "$VARIABLE_COREAI_CHECKPOINT" ]]; then
+  print -u2 "Missing variable restoration checkpoint: $VARIABLE_COREAI_CHECKPOINT"
+  exit 1
+fi
 VARIABLE_COREAI_ASSETS=(
   spatial6 flow6
   backward_1_start6 backward_1_continue6
@@ -580,6 +596,204 @@ PY
 else
   print "Modeless distribution: skipping bundled model assets and Core ML/Core AI exports"
 fi
+
+# Cluster identity is derived from portable source assets, never from the
+# machine-specific compiled .aimodelc/.mlmodelc layout. Dedicated Macs and
+# portable iPad/Mac Workers can therefore compare the same model identity.
+# The variable restorer is one logical model made from exactly eleven source
+# assets; its digest is the tree digest of that virtual collection.
+CANONICAL_MODEL_MANIFEST="$RESOURCES/models/mioh-cluster-model-identities-v1.json"
+VARIABLE_COREAI_SOURCE_MODELS="${VARIABLE_COREAI_SOURCE_MODELS:-$BUILD_DIR/variable-basicvsrpp-source}"
+if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
+  canonical_default_checkpoint="$ROOT/model_weights/hf2500-plus-fc2-500-ema.pth"
+else
+  canonical_default_checkpoint="$ROOT/model_weights/lada_mosaic_restoration_model_generic_v1.2.pth"
+fi
+VARIABLE_COREAI_CHECKPOINT="${VARIABLE_COREAI_CHECKPOINT:-$canonical_default_checkpoint}"
+CANONICAL_VARIABLE_ASSETS=(
+  spatial6 flow6
+  backward_1_start6 backward_1_continue6
+  forward_1_start6 forward_1_continue6
+  backward_2_start6 backward_2_continue6
+  forward_2_start6 forward_2_continue6
+  reconstruction6
+)
+needs_canonical_variable_export=0
+for name in "${CANONICAL_VARIABLE_ASSETS[@]}"; do
+  canonical_source_asset="$VARIABLE_COREAI_SOURCE_MODELS/basicvsrpp-variable-$name.aimodel"
+  if [[ ! -d "$canonical_source_asset" \
+        || "$VARIABLE_COREAI_CHECKPOINT" -nt "$canonical_source_asset" \
+        || "$ROOT/scripts/apple/basicvsrpp_coreai_kernels.py" -nt "$canonical_source_asset" \
+        || "$ROOT/scripts/apple/export_basicvsrpp_variable_chunk6.py" -nt "$canonical_source_asset" ]]; then
+    needs_canonical_variable_export=1
+    break
+  fi
+done
+if (( needs_canonical_variable_export )); then
+  if [[ ! -f "$VARIABLE_COREAI_CHECKPOINT" ]]; then
+    print -u2 "Missing checkpoint required for cluster identity manifest: $VARIABLE_COREAI_CHECKPOINT"
+    exit 1
+  fi
+  mkdir -p "$VARIABLE_COREAI_SOURCE_MODELS"
+  PYTHONPATH="$ROOT" "$LADA_STANDALONE_PYTHON_ENV/bin/python" \
+    "$ROOT/scripts/apple/export_basicvsrpp_variable_chunk6.py" \
+    --checkpoint "$VARIABLE_COREAI_CHECKPOINT" \
+    --output-dir "$VARIABLE_COREAI_SOURCE_MODELS" \
+    --overwrite
+fi
+
+"$LADA_STANDALONE_PYTHON_ENV/bin/python" - \
+  "$ROOT/model_weights" \
+  "$VARIABLE_COREAI_SOURCE_MODELS" \
+  "$CANONICAL_MODEL_MANIFEST" <<'PY'
+import hashlib
+import json
+import sys
+import unicodedata
+from pathlib import Path
+
+weights = Path(sys.argv[1])
+variable_root = Path(sys.argv[2])
+destination = Path(sys.argv[3])
+
+
+def update_file(digest, path):
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+
+
+def tree_digest(root):
+    if root.is_symlink():
+        raise SystemExit(f"canonical model asset contains symlink: {root}")
+    digest = hashlib.sha256()
+    if root.is_file():
+        update_file(digest, root)
+        return digest.hexdigest()
+    if not root.is_dir():
+        raise SystemExit(f"canonical model asset is missing: {root}")
+    entries = []
+    for candidate in root.rglob("*"):
+        if candidate.is_symlink():
+            raise SystemExit(f"canonical model asset contains symlink: {candidate}")
+        if candidate.is_file():
+            relative = unicodedata.normalize("NFC", candidate.relative_to(root).as_posix())
+            entries.append((relative, candidate))
+    entries.sort(key=lambda item: item[0].encode("utf-8"))
+    if len({relative for relative, _ in entries}) != len(entries):
+        raise SystemExit(f"canonical model asset has duplicate normalized paths: {root}")
+    for relative, candidate in entries:
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        update_file(digest, candidate)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def collection_digest(assets):
+    digest = hashlib.sha256()
+    entries = []
+    for asset in assets:
+        if asset.is_symlink() or not asset.is_dir():
+            raise SystemExit(f"canonical variable asset is invalid: {asset}")
+        for candidate in asset.rglob("*"):
+            if candidate.is_symlink():
+                raise SystemExit(f"canonical variable asset contains symlink: {candidate}")
+            if candidate.is_file():
+                relative = unicodedata.normalize(
+                    "NFC", f"{asset.name}/{candidate.relative_to(asset).as_posix()}"
+                )
+                entries.append((relative, candidate))
+    entries.sort(key=lambda item: item[0].encode("utf-8"))
+    if len({relative for relative, _ in entries}) != len(entries):
+        raise SystemExit("canonical variable collection has duplicate normalized paths")
+    for relative, candidate in entries:
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        update_file(digest, candidate)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+models = {}
+
+
+def add(model_id, source, *, required=True, asset_type="source-tree"):
+    path = weights / source
+    if not path.exists():
+        if required:
+            raise SystemExit(f"canonical source asset is missing for {model_id}: {path}")
+        return
+    models[model_id] = {
+        "sha256": tree_digest(path),
+        "asset_type": asset_type,
+        "source_assets": [source],
+    }
+
+
+add("basicvsrpp-v1.2-coreai", "basicvsrpp-v1.2-t18-fp16.aimodel")
+add("basicvsrpp-v1.2-coreai-t36", "basicvsrpp-v1.2-t36-fp16.aimodel")
+add("basicvsrpp-v1.2-coreai-t90", "basicvsrpp-v1.2-t90-fp16.aimodel")
+
+variable_names = [
+    "spatial6", "flow6",
+    "backward_1_start6", "backward_1_continue6",
+    "forward_1_start6", "forward_1_continue6",
+    "backward_2_start6", "backward_2_continue6",
+    "forward_2_start6", "forward_2_continue6",
+    "reconstruction6",
+]
+variable_assets = [variable_root / f"basicvsrpp-variable-{name}.aimodel" for name in variable_names]
+models["basicvsrpp-v1.2-coreai-variable"] = {
+    "sha256": collection_digest(variable_assets),
+    "asset_type": "source-collection",
+    "source_assets": [asset.name for asset in variable_assets],
+}
+
+detection_stems = {
+    "v2": "lada_mosaic_detection_model_v2",
+    "v3.1-fast": "lada_mosaic_detection_model_v3.1_fast",
+    "v3.1-accurate": "lada_mosaic_detection_model_v3.1_accurate",
+    "v4-fast": "lada_mosaic_detection_model_v4_fast",
+    "v4-accurate": "lada_mosaic_detection_model_v4_accurate",
+    "vr-v2-accurate": "lada_mosaic_detection_model_vr_v2_accurate",
+}
+for model_id, stem in detection_stems.items():
+    add(f"{model_id}-coreai", f"{stem}-fp16.aimodel")
+    add(f"{model_id}-coreml", f"{stem}.mlpackage")
+
+optional_assets = {
+    "realesrgan-x2-coreai": "RealESRGAN_x2plus-256-fp16.aimodel",
+    "realesrgan-x2": "RealESRGAN_x2plus_256.mlpackage",
+    "realesrgan-x4-coreai": "RealESRGAN_x4plus-256-fp16.aimodel",
+    "realesrgan-x4": "RealESRGAN_x4plus_256.mlpackage",
+    "realesrgan-x4-coreml": "RealESRGAN_x4plus_256.mlpackage",
+    "realesr-general-x4v3-coreai": "realesr-general-x4v3-256-fp16.aimodel",
+    "realesr-general-x4v3-coreml": "realesr-general-x4v3_256.mlpackage",
+    "mewzoom-x4-coreml": "MewZoom-V1-4X-Unet_256.mlpackage",
+    "mewzoom-x4-coreml-512": "MewZoom-V1-4X-Unet_512.mlpackage",
+    "swinir-x4-coreml": "swinir-real-x4_256.mlpackage",
+    "swinir-real-x4-coreml": "swinir-real-x4_256.mlpackage",
+    "nomos-webphoto-realplksr-x4-coreai": "4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel",
+    "nomos-webphoto-realplksr-x4": "4xNomosWebPhoto_RealPLKSR_256.mlpackage",
+    "nomos-webphoto-realplksr-x4-coreml": "4xNomosWebPhoto_RealPLKSR_256.mlpackage",
+    "jasna-v6-coreai": "rfdetr-v6-576-fp32.aimodel",
+    "jasna-v6-large-coreai": "rfdetr-v6-large-768-fp32.aimodel",
+}
+for model_id, source in optional_assets.items():
+    add(model_id, source, required=False)
+
+payload = {
+    "format_version": 1,
+    "digest_algorithm": "sha256-tree-v1",
+    "models": dict(sorted(models.items())),
+}
+destination.write_text(
+    json.dumps(payload, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+PY
+
 cp "$ROOT/LICENSE.md" "$RESOURCES/LICENSE.md"
 ditto "$ROOT/LICENSES" "$RESOURCES/LICENSES"
 if [[ "$MIOH_BUNDLE_PYTHON_RUNTIME" == 1 ]]; then

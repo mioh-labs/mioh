@@ -221,6 +221,7 @@ struct PreviewWorkerEvent: Decodable {
   let positionNs: Int64?
   let seconds: Double?
   let segmentSeconds: Double?
+  let codec: String?
 }
 
 private struct PreviewSegment {
@@ -229,6 +230,35 @@ private struct PreviewSegment {
   let endSeconds: Double
   let url: URL
 }
+
+/// Stable, file-oriented events exposed to optional consumers such as the LAN
+/// streaming adapter. The restoration worker remains the sole producer; a
+/// consumer must retain a segment immediately because normal local playback
+/// deletes consumed files from the rolling queue.
+struct RealtimeStreamingSource: Sendable {
+  let generation: Int
+  let inputURL: URL
+  let ffmpegURL: URL
+  let segmentSeconds: Double
+}
+
+struct RealtimeStreamingSegment: Sendable {
+  let generation: Int
+  let sequence: Int
+  let startSeconds: Double
+  let endSeconds: Double
+  let url: URL
+  let codec: String
+}
+
+enum RealtimeStreamingEvent: Sendable {
+  case reset(RealtimeStreamingSource)
+  case segment(RealtimeStreamingSegment)
+  case ended(generation: Int)
+  case stopped(generation: Int)
+}
+
+typealias RealtimeStreamingEventConsumer = @MainActor (RealtimeStreamingEvent) -> Void
 
 private struct PreparedSourcePlayerItem {
   let item: AVPlayerItem
@@ -960,6 +990,9 @@ final class RealtimePlayerController: ObservableObject {
   private var sourceSeekNeedsBuffer = false
   private var previewSegmentSeconds = 2.0
   private weak var runner: RestorationRunner?
+  private var streamingSource: RealtimeStreamingSource?
+  private var streamingSegmentCodecs: [Int: String] = [:]
+  private var streamingEventConsumer: RealtimeStreamingEventConsumer?
 
   var showsSourceFrameWhilePreparingRestoration: Bool {
     guard !sourceOnlyPlayback, !generationHasStarted else { return false }
@@ -1054,6 +1087,18 @@ final class RealtimePlayerController: ObservableObject {
       state = .loading
       errorMessage = ""
       playbackDetail = sourceOnlyPlayback ? "VR動画のコンテナを確認中" : ""
+
+      if !sourceOnlyPlayback {
+        let source = RealtimeStreamingSource(
+          generation: startingGeneration,
+          inputURL: input,
+          ffmpegURL: resources.appendingPathComponent("bin/ffmpeg"),
+          segmentSeconds: previewSegmentSeconds
+        )
+        streamingSource = source
+        streamingSegmentCodecs.removeAll(keepingCapacity: true)
+        streamingEventConsumer?(.reset(source))
+      }
 
       if canReuseCurrentSource && !sourceOnlyPlayback {
         // Keep the already-decoded source item visible while the restoration
@@ -1329,6 +1374,63 @@ final class RealtimePlayerController: ObservableObject {
     }
   }
 
+  /// Idempotent playback controls used by the LAN remote. Keeping these
+  /// decisions in the controller avoids exposing AVPlayer or worker details
+  /// to the HTTP layer and prevents a repeated play request from pausing an
+  /// already-playing video.
+  @discardableResult
+  func remotePlay(runner: RestorationRunner) -> Bool {
+    switch state {
+    case .playing:
+      return true
+    case .paused, .buffering:
+      togglePlayback()
+      return true
+    case .idle, .ended, .failed:
+      guard previewInputURL != nil else { return false }
+      start(runner: runner, at: position)
+      return true
+    case .loading, .seeking:
+      shouldPlay = true
+      return true
+    }
+  }
+
+  @discardableResult
+  func remotePause() -> Bool {
+    switch state {
+    case .paused:
+      return true
+    case .playing:
+      togglePlayback()
+      return true
+    case .buffering:
+      shouldPlay = false
+      sourcePlayer.pause()
+      restoredPlayer.pause()
+      state = .paused
+      return true
+    case .loading, .seeking:
+      shouldPlay = false
+      return true
+    case .idle, .ended, .failed:
+      return false
+    }
+  }
+
+  @discardableResult
+  func remoteToggle(runner: RestorationRunner) -> Bool {
+    switch state {
+    case .playing:
+      return remotePause()
+    case .paused, .buffering, .idle, .ended, .failed:
+      return remotePlay(runner: runner)
+    case .loading, .seeking:
+      shouldPlay.toggle()
+      return true
+    }
+  }
+
   func choosePreviewInput(runner: RestorationRunner) {
     let panel = NSOpenPanel()
     panel.title = "再生動画を選択"
@@ -1336,6 +1438,13 @@ final class RealtimePlayerController: ObservableObject {
     panel.canChooseDirectories = false
     panel.allowsMultipleSelection = false
     guard panel.runModal() == .OK, let url = panel.url else { return }
+    selectPreviewInput(url, runner: runner)
+  }
+
+  /// Selects a source through the same reset/VR-detection transaction used by
+  /// the native file picker. The Web remote calls this rather than assigning
+  /// `previewInputURL` directly, which would leave stale player/model state.
+  func selectPreviewInput(_ url: URL, runner: RestorationRunner) {
     stop()
     previewInputURL = url
     position = 0
@@ -1437,6 +1546,12 @@ final class RealtimePlayerController: ObservableObject {
   }
 
   func stop(preserveSourceItem: Bool = false) {
+    let stoppedGeneration = generation
+    if streamingSource?.generation == stoppedGeneration {
+      streamingEventConsumer?(.stopped(generation: stoppedGeneration))
+    }
+    streamingSource = nil
+    streamingSegmentCodecs.removeAll(keepingCapacity: false)
     generation += 1
     sourceCompatibilityJob?.cancel()
     sourceCompatibilityJob = nil
@@ -1700,6 +1815,18 @@ final class RealtimePlayerController: ObservableObject {
     case "ready":
       duration = event.duration ?? 0
       previewSegmentSeconds = max(0.1, event.segmentSeconds ?? 2.0)
+      if let existing = streamingSource, existing.generation == generation,
+        abs(existing.segmentSeconds - previewSegmentSeconds) > 0.000_001
+      {
+        let updated = RealtimeStreamingSource(
+          generation: existing.generation,
+          inputURL: existing.inputURL,
+          ffmpegURL: existing.ffmpegURL,
+          segmentSeconds: previewSegmentSeconds
+        )
+        streamingSource = updated
+        streamingEventConsumer?(.reset(updated))
+      }
       state = shouldPlay ? .buffering : .paused
     case "segment":
       guard let sequence = event.sequence,
@@ -1714,9 +1841,24 @@ final class RealtimePlayerController: ObservableObject {
         url: URL(fileURLWithPath: path)
       )
       enqueue(segment)
+      let codec = event.codec ?? "h264_videotoolbox"
+      streamingSegmentCodecs[sequence] = codec
+      streamingEventConsumer?(
+        .segment(
+          RealtimeStreamingSegment(
+            generation: generation,
+            sequence: sequence,
+            startSeconds: segment.startSeconds,
+            endSeconds: segment.endSeconds,
+            url: segment.url,
+            codec: codec
+          )
+        )
+      )
       resumeIfBuffered()
     case "ended":
       generationReachedEOF = true
+      streamingEventConsumer?(.ended(generation: generation))
       if queuedSegments.isEmpty {
         shouldPlay = false
         sourcePlayer.pause()
@@ -2058,6 +2200,9 @@ final class RealtimePlayerController: ObservableObject {
       itemSegments.removeValue(forKey: identifier)
     }
     queuedSegments.removeAll { $0.sequence <= sequence }
+    for released in releasedSegments {
+      streamingSegmentCodecs.removeValue(forKey: released.sequence)
+    }
     releasedThroughSequence = sequence
 
     // The worker owns finalized segment files and acknowledges consumption by
@@ -2110,6 +2255,32 @@ final class RealtimePlayerController: ObservableObject {
     itemSegments.removeAll()
     releasedThroughSequence = -1
     bufferedSeconds = 0
+  }
+
+  /// Installs or removes a non-owning stream consumer. Attaching in the
+  /// middle of playback publishes a consistent snapshot of the active
+  /// generation and every segment retained by the local queue.
+  func setStreamingEventConsumer(_ consumer: RealtimeStreamingEventConsumer?) {
+    streamingEventConsumer = consumer
+    guard let consumer, let source = streamingSource else { return }
+    consumer(.reset(source))
+    for segment in queuedSegments {
+      consumer(
+        .segment(
+          RealtimeStreamingSegment(
+            generation: source.generation,
+            sequence: segment.sequence,
+            startSeconds: segment.startSeconds,
+            endSeconds: segment.endSeconds,
+            url: segment.url,
+            codec: streamingSegmentCodecs[segment.sequence] ?? "h264_videotoolbox"
+          )
+        )
+      )
+    }
+    if generationReachedEOF {
+      consumer(.ended(generation: source.generation))
+    }
   }
 
   private func cleanupSession() {

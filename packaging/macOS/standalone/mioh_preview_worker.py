@@ -716,10 +716,10 @@ def run_native_swift_preview(config, output_dir: Path) -> int | None:
     # user-selected detector architecture, but run its equivalent Core ML
     # asset on the ANE. This independent lane makes T36 faster than T18 in the
     # measured end-to-end preview. If the compiled Core ML asset is absent,
-    # retain the proven Core AI/T18 path rather than silently using a
+    # retain the Core AI/T30 quality path rather than silently using a
     # contention-prone T36 configuration.
     detection_compute_units: str | None = None
-    temporal_frame_limit = 18
+    temporal_frame_limit = 30
     coreml_detection_name = _native_swift_coreml_detector_name(
         config.detection_model
     )
@@ -758,6 +758,10 @@ def run_native_swift_preview(config, output_dir: Path) -> int | None:
         config,
         temporal_frame_limit,
     )
+    temporal_overlap = min(
+        max(0, int(config.restore_temporal_overlap)),
+        max(0, temporal_frames - 1),
+    )
     payload = {
         "input": str(Path(config.input).resolve()),
         "outputDirectory": str(Path(output_dir).resolve()),
@@ -771,11 +775,13 @@ def run_native_swift_preview(config, output_dir: Path) -> int | None:
         "segmentSeconds": float(config.segment_seconds),
         "bufferLimitSeconds": float(config.buffer_limit),
         "temporalBatchFrames": temporal_frames,
+        "temporalOverlap": temporal_overlap,
         "ringCapacity": max(temporal_frames * 2, 24),
         "confidenceThreshold": 0.25,
         "iouThreshold": 0.7,
         "contextFraction": 0.30,
         "blendFeather": float(config.blend_feather),
+        "crossfade": bool(config.restore_crossfade),
     }
     config_path: Path | None = None
     try:

@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import CryptoKit
 import Foundation
 import SwiftUI
 
@@ -18,9 +19,38 @@ struct AppProgressEvent: Decodable {
   let percent: Double?
 }
 
-private struct NativeExportConfiguration: Encodable {
+/// Portable model identity shared by dedicated Mac, Universal Mac and iPad.
+/// Runtime compiler output is deliberately absent because `.aimodelc` and
+/// `.mlmodelc` are device-specific representations of the same source model.
+private struct RemoteClusterCanonicalModelManifest: Decodable {
+  let formatVersion: Int
+  let digestAlgorithm: String
+  let models: [String: RemoteClusterCanonicalModelIdentity]
+
+  enum CodingKeys: String, CodingKey {
+    case formatVersion = "format_version"
+    case digestAlgorithm = "digest_algorithm"
+    case models
+  }
+}
+
+private struct RemoteClusterCanonicalModelIdentity: Decodable {
+  let sha256: String
+  let assetType: String
+  let sourceAssets: [String]
+
+  enum CodingKeys: String, CodingKey {
+    case sha256
+    case assetType = "asset_type"
+    case sourceAssets = "source_assets"
+  }
+}
+
+struct NativeExportConfiguration: Codable, Sendable {
   let mode = "export"
   let input: String
+  let inputByteCount: Int64?
+  let inputSHA256: String?
   let outputDirectory: String
   let ffmpegTemporaryDirectory: String
   let miohTemporaryDirectory: String
@@ -37,8 +67,14 @@ private struct NativeExportConfiguration: Encodable {
   let restorationModels: String
   let restorationRunner: String
   let restorationFrameCount: Int?
-  let startNanoseconds: Int64 = 0
-  let generation: Int = 0
+  let startNanoseconds: Int64
+  let decodeEndNanoseconds: Int64?
+  let outputCoreStartNanoseconds: Int64?
+  let outputCoreEndNanoseconds: Int64?
+  let workerMode: Bool
+  let jobID: String?
+  let attemptID: String?
+  let generation: Int
   let splitMode: String
   let segmentCount: Int
   let segmentSeconds: Double
@@ -92,6 +128,7 @@ private struct NativePreviewLaunchConfiguration: Encodable {
   let segmentSeconds: Double = 2
   let bufferLimitSeconds: Double
   let temporalBatchFrames: Int
+  let temporalOverlap: Int
   let ringCapacity: Int
   let confidenceThreshold: Float
   let iouThreshold: Float = 0.7
@@ -107,6 +144,7 @@ private struct NativePreviewLaunchConfiguration: Encodable {
   let roiEnhancerScale: Int
   let detectionEmptyLookahead: Int
   let detectFaceMosaics: Bool
+  let crossfade: Bool
   let videoCodec: String = "h264"
 }
 
@@ -114,6 +152,98 @@ struct NativePreviewInvocation {
   let executable: URL
   let configuration: Data
   let environment: [String: String]
+}
+
+private final class RemoteClusterOutputCapture: @unchecked Sendable {
+  private let lock = NSLock()
+  private var data = Data()
+  private let maximumBytes = 4 * 1_024 * 1_024
+
+  func append(_ chunk: Data) {
+    guard !chunk.isEmpty else { return }
+    lock.withLock {
+      data.append(chunk)
+      if data.count > maximumBytes {
+        data.removeFirst(data.count - maximumBytes)
+      }
+    }
+  }
+
+  func snapshot() -> Data { lock.withLock { data } }
+}
+
+private final class RemoteClusterProcessResult: @unchecked Sendable {
+  private let lock = NSLock()
+  private var status: Int32?
+  private var continuation: CheckedContinuation<Int32, Never>?
+
+  func finish(_ status: Int32) {
+    let pending: CheckedContinuation<Int32, Never>? = lock.withLock {
+      guard self.status == nil else { return nil }
+      self.status = status
+      let pending = continuation
+      continuation = nil
+      return pending
+    }
+    pending?.resume(returning: status)
+  }
+
+  func value() async -> Int32 {
+    await withCheckedContinuation { continuation in
+      let completed: Int32? = lock.withLock {
+        if let status { return status }
+        self.continuation = continuation
+        return nil
+      }
+      if let completed {
+        continuation.resume(returning: completed)
+      }
+    }
+  }
+}
+
+private final class RemoteClusterProcessControl: @unchecked Sendable {
+  private let lock = NSLock()
+  private let process: Process
+  private let input: Pipe
+  private var launched = false
+  private var cancellationRequested = false
+
+  init(process: Process, input: Pipe) {
+    self.process = process
+    self.input = input
+  }
+
+  func didLaunch() {
+    let cancelNow = lock.withLock {
+      launched = true
+      return cancellationRequested
+    }
+    if cancelNow { stopProcess() }
+  }
+
+  func cancel() {
+    let stopNow = lock.withLock {
+      cancellationRequested = true
+      return launched
+    }
+    if stopNow { stopProcess() }
+  }
+
+  private func stopProcess() {
+    if process.isRunning {
+      try? input.fileHandleForWriting.write(
+        contentsOf: Data("{\"command\":\"stop\"}\n".utf8)
+      )
+      try? input.fileHandleForWriting.close()
+      process.interrupt()
+      DispatchQueue.global(qos: .utility).asyncAfter(
+        deadline: .now() + 2
+      ) { [process] in
+        if process.isRunning { process.terminate() }
+      }
+    }
+  }
 }
 
 struct PlatformCapabilities {
@@ -184,6 +314,24 @@ struct PlatformCapabilities {
     return false
 #endif
   }
+}
+
+/// Installation/runtime status exposed to the authenticated Web remote.
+/// Keep the reason deliberately generic: it is user-facing and must not leak
+/// bundle paths or other host filesystem details.
+struct MiohModelAvailability {
+  let available: Bool
+  let reason: String?
+
+  static let available = MiohModelAvailability(available: true, reason: nil)
+  static let notInstalled = MiohModelAvailability(
+    available: false,
+    reason: "モデル未導入"
+  )
+  static let nativeUnsupported = MiohModelAvailability(
+    available: false,
+    reason: "Swiftネイティブ非対応"
+  )
 }
 
 /// What the input file actually is, read once when it is selected. This is
@@ -661,6 +809,7 @@ final class RestorationRunner: ObservableObject {
   private var logHistory = ""
   private var activeProgress: [String: AppProgressEvent] = [:]
   private var activeProgressOrder: [String] = []
+  private var remoteClusterAssetDigests: [String: String] = [:]
   private let capabilities: PlatformCapabilities
   private let defaultsKey = "mioh.userProcessingDefaults.v1"
 
@@ -682,6 +831,85 @@ final class RestorationRunner: ObservableObject {
   var previewDetectionModels: [String] { capabilities.previewDetectionModels }
   var supportsPythonEngine: Bool { capabilities.bundlesPythonRuntime }
   var usesPythonEngine: Bool { supportsPythonEngine && restorationEngine == "python" }
+
+  /// Resolve availability through the same asset lookup used at execution
+  /// time.  The Web remote can therefore show every supported identifier but
+  /// prevents selecting a model that is absent from this installation.
+  func restorationModelAvailability(
+    _ model: String,
+    engine: String? = nil
+  ) -> MiohModelAvailability {
+    let pythonEngine = supportsPythonEngine
+      && (engine ?? restorationEngine) == "python"
+    if model == "カスタム" {
+      return pythonEngine ? .available : .nativeUnsupported
+    }
+    if !pythonEngine, !capabilities.supportsCoreAI {
+      return .nativeUnsupported
+    }
+    guard let resources = try? resourceDirectory() else { return .notInstalled }
+    if pythonEngine, model == "basicvsrpp-v1.2" {
+      let python = resources.appendingPathComponent("runtime/bin/python3.12")
+      let weights = resources.appendingPathComponent(
+        "models/lada_mosaic_restoration_model_generic_v1.2.pth"
+      )
+      return FileManager.default.isExecutableFile(atPath: python.path)
+          && FileManager.default.fileExists(atPath: weights.path)
+        ? .available : .notInstalled
+    }
+    guard model.contains("coreai") else { return .nativeUnsupported }
+    guard let asset = nativeRestorationAsset(resources: resources, model: model)
+    else { return .notInstalled }
+    let executable = resources.appendingPathComponent("bin/\(asset.runnerName)")
+    return FileManager.default.isExecutableFile(atPath: executable.path)
+      ? .available : .notInstalled
+  }
+
+  func detectionModelAvailability(
+    _ model: String,
+    engine: String? = nil
+  ) -> MiohModelAvailability {
+    let pythonEngine = supportsPythonEngine
+      && (engine ?? restorationEngine) == "python"
+    if model == "カスタム" {
+      return pythonEngine ? .available : .nativeUnsupported
+    }
+    if !pythonEngine, !capabilities.supportsCoreAI {
+      return .nativeUnsupported
+    }
+    guard let resources = try? resourceDirectory() else { return .notInstalled }
+    return nativeDetectionAsset(resources: resources, model: model) == nil
+      ? .notInstalled : .available
+  }
+
+  func roiEnhancerModelAvailability(
+    _ model: String,
+    engine: String? = nil
+  ) -> MiohModelAvailability {
+    let pythonEngine = supportsPythonEngine
+      && (engine ?? restorationEngine) == "python"
+    if model.isEmpty { return .available }
+    guard let resources = try? resourceDirectory() else { return .notInstalled }
+    if nativeROIEnhancerAsset(
+      resources: resources,
+      model: model,
+      requestedScale: roiEnhancerScale
+    ) != nil {
+      return .available
+    }
+    guard pythonEngine else { return .nativeUnsupported }
+    let filenames: [String: String] = [
+      "realesrgan-x2": "RealESRGAN_x2plus.pth",
+      "realesrgan-x4": "RealESRGAN_x4plus.pth",
+      "nomos-webphoto-realplksr-x4": "4xNomosWebPhoto_RealPLKSR.safetensors",
+      "nomos-uni-span-x4": "4xNomosUni_span_multijpg.safetensors",
+      "nomos-uni-compact-x2": "2xNomosUni_compact_multijpg.safetensors",
+    ]
+    guard let filename = filenames[model] else { return .notInstalled }
+    return FileManager.default.fileExists(
+      atPath: resources.appendingPathComponent("models/\(filename)").path
+    ) ? .available : .notInstalled
+  }
 
   /// The rates a user can actually pick, each as its exact rational. NTSC
   /// entries are the whole rate over 1.001 — 29.970 is 30000/1001, never 30.
@@ -768,8 +996,18 @@ final class RestorationRunner: ObservableObject {
   ]
 
   var roiEnhancerModelOptions: [ROIEnhancerModelOption] {
+    roiEnhancerModelOptions(for: roiEnhancer, includingSelectedModel: true)
+  }
+
+  /// The same model catalogue is used by SwiftUI and the authenticated Web
+  /// remote. Keeping it here prevents the browser UI from drifting from the
+  /// actual build/OS capabilities.
+  func roiEnhancerModelOptions(
+    for enhancer: String,
+    includingSelectedModel: Bool = false
+  ) -> [ROIEnhancerModelOption] {
     var options: [ROIEnhancerModelOption]
-    switch roiEnhancer {
+    switch enhancer {
     case "realesrgan":
       options = [
         ROIEnhancerModelOption(
@@ -863,7 +1101,9 @@ final class RestorationRunner: ObservableObject {
     if !capabilities.supportsCoreAI {
       options.removeAll { $0.name.contains("coreai") }
     }
-    let selected = roiEnhancerModel.trimmingCharacters(in: .whitespacesAndNewlines)
+    let selected = includingSelectedModel
+      ? roiEnhancerModel.trimmingCharacters(in: .whitespacesAndNewlines)
+      : ""
     if !selected.isEmpty && !options.contains(where: { $0.name == selected })
       && !knownROIEnhancerModelNames.contains(selected)
     {
@@ -1229,6 +1469,8 @@ final class RestorationRunner: ObservableObject {
     let splitMode = noSplit ? "none" : (useSegmentCount ? "count" : "duration")
     let configuration = NativeExportConfiguration(
       input: input.path,
+      inputByteCount: nil,
+      inputSHA256: nil,
       outputDirectory: exportDirectory.path,
       ffmpegTemporaryDirectory: ffmpegWorkDirectory.path,
       miohTemporaryDirectory: miohWorkDirectory.path,
@@ -1245,6 +1487,14 @@ final class RestorationRunner: ObservableObject {
       restorationModels: restoration.url.path,
       restorationRunner: restorationRunner.path,
       restorationFrameCount: restoration.fixedFrameCount,
+      startNanoseconds: 0,
+      decodeEndNanoseconds: nil,
+      outputCoreStartNanoseconds: nil,
+      outputCoreEndNanoseconds: nil,
+      workerMode: false,
+      jobID: nil,
+      attemptID: nil,
+      generation: 0,
       splitMode: splitMode,
       segmentCount: max(1, segmentCount),
       segmentSeconds: Double(max(10, segmentDuration)),
@@ -1297,6 +1547,734 @@ final class RestorationRunner: ObservableObject {
     nativeExportPreservesTemporaryFiles = keepTemp && !deleteSegments
     runningNativeExport = true
     return (task, outputPipe, configuration)
+  }
+
+  /// Snapshot the current native settings into the immutable contract sent
+  /// to cluster workers. The same resolved assets and tree-digest helper are
+  /// used by the worker launcher, so an identifier cannot silently select a
+  /// different set of weights on another Mac.
+  func clusterRestorationOptions() async throws
+    -> RemoteClusterRestorationOptions
+  {
+    normalizeModelSelections()
+    guard capabilities.supportsCoreAI else {
+      throw RunnerError.unsupportedFeature(
+        "クラスタ復元にはmacOS 27以降が必要です"
+      )
+    }
+    guard !useFPS else {
+      throw RunnerError.unsupportedFeature(
+        "クラスタ worker v1 はFPS変換に対応していません"
+      )
+    }
+    guard restorationModel != "カスタム", detectionModel != "カスタム"
+    else {
+      throw RunnerError.unsupportedFeature(
+        "クラスタ復元では同梱モデルだけを使用できます"
+      )
+    }
+    let resources = try resourceDirectory()
+    guard let restoration = nativeRestorationAsset(
+      resources: resources,
+      model: restorationModel
+    ) else {
+      throw RunnerError.missingResource(
+        "Swift native restoration model: \(restorationModel)"
+      )
+    }
+    guard let detection = nativeDetectionAsset(
+      resources: resources,
+      model: detectionModel
+    ) else {
+      throw RunnerError.missingResource(
+        "Swift native detection model: \(detectionModel)"
+      )
+    }
+    let restorationDigest = try await remoteClusterCanonicalAssetDigest(
+      resources: resources,
+      modelIdentifier: restorationModel,
+      runtimeAsset: restoration.url
+    )
+    let detectionDigest = try await remoteClusterCanonicalAssetDigest(
+      resources: resources,
+      modelIdentifier: detectionModel,
+      runtimeAsset: detection.url
+    )
+    var requestedFrames = min(
+      miohMaximumClipFrames,
+      useMaxClipLength
+        ? max(1, maxClipLength)
+        : (restoration.fixedFrameCount ?? miohMaximumClipFrames)
+    )
+    if useRestoreMaxFrames, restoreMaxFrames > 0 {
+      requestedFrames = min(
+        requestedFrames,
+        min(miohMaximumClipFrames, restoreMaxFrames)
+      )
+    }
+    let clipFrames = min(
+      restoration.fixedFrameCount ?? requestedFrames,
+      requestedFrames
+    )
+    let overlap = min(max(0, restoreTemporalOverlap), clipFrames - 1)
+    let enhancerIdentifier: String? =
+      roiEnhancer != "none" && roiEnhancerStrength > 0
+      ? roiEnhancerModel : nil
+    let enhancerAsset: (url: URL, scale: Int)?
+    if let enhancerIdentifier {
+      guard !enhancerIdentifier.hasPrefix("/"),
+        let resolved = nativeROIEnhancerAsset(
+          resources: resources,
+          model: enhancerIdentifier,
+          requestedScale: roiEnhancerScale
+        ) else {
+        throw RunnerError.unsupportedFeature(
+          "クラスタ復元では同梱ROIエンハンサーだけを使用できます"
+        )
+      }
+      enhancerAsset = resolved
+    } else {
+      enhancerAsset = nil
+    }
+    let enhancerDigest: String?
+    if let enhancerAsset, let enhancerIdentifier {
+      enhancerDigest = try await remoteClusterCanonicalAssetDigest(
+        resources: resources,
+        modelIdentifier: enhancerIdentifier,
+        runtimeAsset: enhancerAsset.url
+      )
+    } else {
+      enhancerDigest = nil
+    }
+    return RemoteClusterRestorationOptions(
+      restorationModelIdentifier: restorationModel,
+      restorationAssetSHA256: restorationDigest,
+      detectorModelIdentifier: detectionModel,
+      detectorAssetSHA256: detectionDigest,
+      restorationClipLength: clipFrames,
+      temporalOverlap: overlap,
+      crossfade: restoreCrossfade,
+      // Worker v1 deliberately uses endpoint lookahead only. It prevents
+      // coordinator UI defaults from changing shard semantics.
+      detectionEmptyLookahead: 1,
+      detectFaceMosaics: detectFaceMosaics,
+      blendFeather: Float(blendFeather),
+      sharpenStrength: Float(sharpenStrength),
+      detailBoost: Float(detailBoost),
+      textureMix: Float(textureMix),
+      smoothStrength: Float(smoothStrength),
+      effectUpscale: max(1, min(4, effectUpscale)),
+      roiEnhancerModelIdentifier: enhancerIdentifier,
+      roiEnhancerAssetSHA256: enhancerDigest,
+      roiEnhancerStrength: enhancerIdentifier == nil
+        ? 0 : Float(roiEnhancerStrength),
+      roiEnhancerScale: max(1, min(8, roiEnhancerScale)),
+      videoCodec: encodingPreset.hasPrefix("h264") ? "h264" : "hevc",
+      bitrateMultiplier: bitrateMultiplier,
+      mp4FastStart: mp4FastStart,
+      targetFPSNumerator: nil,
+      targetFPSDenominator: nil
+    )
+  }
+
+  /// Advertises the same portable identities used by job contracts. Optional
+  /// maps keep old Workers wire-compatible while allowing new coordinators to
+  /// reject same-name/different-weight nodes before dispatch.
+  func clusterCanonicalAssetIdentityMaps() throws -> (
+    restoration: [String: String]?, detector: [String: String]?
+  ) {
+    let resources = try resourceDirectory()
+    guard let manifest = try remoteClusterCanonicalManifest(resources: resources) else {
+      return (nil, nil)
+    }
+    let restorationIDs = Set(restorationModels.filter { $0 != "カスタム" })
+    let detectorIDs = Set(detectionModels.filter { $0 != "カスタム" })
+    var restoration: [String: String] = [:]
+    var detector: [String: String] = [:]
+    for modelID in restorationIDs {
+      if let identity = manifest.models[modelID] {
+        restoration[modelID] = try Self.validatedCanonicalSHA256(
+          identity,
+          modelIdentifier: modelID
+        )
+      }
+    }
+    for modelID in detectorIDs {
+      if let identity = manifest.models[modelID] {
+        detector[modelID] = try Self.validatedCanonicalSHA256(
+          identity,
+          modelIdentifier: modelID
+        )
+      }
+    }
+    return (restoration, detector)
+  }
+
+  func clusterResolvedOutputFile() -> URL? {
+    guard let inputURL, let outputURL else { return nil }
+    return resolvedOutputFile(input: inputURL, selectedOutput: outputURL)
+  }
+
+  func remoteClusterJobLauncher() -> RemoteClusterJobLauncher {
+    { [weak self] request, inputURL, outputURL in
+      guard let self else {
+        throw RunnerError.unsupportedFeature(
+          "クラスタワーカーが終了しました"
+        )
+      }
+      return try await self.runRemoteClusterWorkerJob(
+        request,
+        inputURL: inputURL,
+        outputURL: outputURL
+      )
+    }
+  }
+
+  func runRemoteClusterWorkerJob(
+    _ request: RemoteClusterJobRequest,
+    inputURL: URL,
+    outputURL: URL
+  ) async throws -> RemoteClusterJobMetrics {
+    guard capabilities.supportsCoreAI else {
+      throw RunnerError.unsupportedFeature(
+        "クラスタ復元にはmacOS 27以降が必要です"
+      )
+    }
+    guard request.protocolVersion == RemoteClusterJobRequest.protocolVersion,
+      request.mediaRange.isValid,
+      request.options.isValid,
+      request.options.detectionEmptyLookahead == 1,
+      request.options.targetFPSNumerator == nil,
+      request.options.targetFPSDenominator == nil
+    else {
+      throw RunnerError.unsupportedFeature(
+        "クラスタジョブの設定がworker v1契約と一致しません"
+      )
+    }
+    if request.httpTransfer == nil {
+      let inputValues = try inputURL.resourceValues(forKeys: [
+        .isRegularFileKey, .fileSizeKey,
+      ])
+      guard inputValues.isRegularFile == true,
+        Int64(inputValues.fileSize ?? -1) == request.inputByteCount
+      else {
+        throw RunnerError.unsupportedFeature(
+          "クラスタ入力ファイルのサイズがジョブ契約と一致しません"
+        )
+      }
+    }
+    guard !inputURL.isFileURL
+      || inputURL.standardizedFileURL != outputURL.standardizedFileURL
+    else {
+      throw RunnerError.unsupportedFeature(
+        "クラスタ入力と出力に同じファイルは指定できません"
+      )
+    }
+    guard !FileManager.default.fileExists(atPath: outputURL.path) else {
+      throw RunnerError.unsupportedFeature(
+        "クラスタ出力ファイルが既に存在します: \(outputURL.path)"
+      )
+    }
+
+    let resources = try resourceDirectory()
+    guard let restoration = nativeRestorationAsset(
+      resources: resources,
+      model: request.options.restorationModelIdentifier
+    ) else {
+      throw RunnerError.missingResource(
+        "Swift native restoration model: "
+          + request.options.restorationModelIdentifier
+      )
+    }
+    guard let detection = nativeDetectionAsset(
+      resources: resources,
+      model: request.options.detectorModelIdentifier
+    ) else {
+      throw RunnerError.missingResource(
+        "Swift native detection model: "
+          + request.options.detectorModelIdentifier
+      )
+    }
+    let restorationDigest = try await remoteClusterCanonicalAssetDigest(
+      resources: resources,
+      modelIdentifier: request.options.restorationModelIdentifier,
+      runtimeAsset: restoration.url
+    )
+    let detectionDigest = try await remoteClusterCanonicalAssetDigest(
+      resources: resources,
+      modelIdentifier: request.options.detectorModelIdentifier,
+      runtimeAsset: detection.url
+    )
+    guard restorationDigest
+      == request.options.restorationAssetSHA256.lowercased()
+    else {
+      throw RunnerError.unsupportedFeature(
+        "クラスタ復元モデルのSHA-256が一致しません"
+      )
+    }
+    guard detectionDigest == request.options.detectorAssetSHA256.lowercased()
+    else {
+      throw RunnerError.unsupportedFeature(
+        "クラスタ検出モデルのSHA-256が一致しません"
+      )
+    }
+
+    let runner = resources.appendingPathComponent(
+      "bin/mioh-native-coreai-preview"
+    )
+    let ffmpeg = resources.appendingPathComponent("bin/ffmpeg")
+    let restorationRunner = resources.appendingPathComponent(
+      "bin/\(restoration.runnerName)"
+    )
+    for executable in [runner, ffmpeg, restorationRunner]
+    where !FileManager.default.isExecutableFile(atPath: executable.path) {
+      throw RunnerError.missingResource(executable.lastPathComponent)
+    }
+
+    let enhancer: (url: URL, scale: Int)?
+    if let identifier = request.options.roiEnhancerModelIdentifier,
+      request.options.roiEnhancerStrength > 0
+    {
+      // Cluster identifiers are names, never arbitrary absolute paths.
+      guard !identifier.hasPrefix("/"),
+        let resolved = nativeROIEnhancerAsset(
+          resources: resources,
+          model: identifier,
+          requestedScale: request.options.roiEnhancerScale
+        )
+      else {
+        throw RunnerError.missingResource(
+          "Swift native ROI enhancer: \(identifier)"
+        )
+      }
+      enhancer = resolved
+    } else {
+      enhancer = nil
+    }
+    if let enhancer {
+      guard let identifier = request.options.roiEnhancerModelIdentifier,
+        let expected = request.options.roiEnhancerAssetSHA256
+      else {
+        throw RunnerError.unsupportedFeature(
+          "クラスタROIエンハンサーのSHA-256がありません"
+        )
+      }
+      let digest = try await remoteClusterCanonicalAssetDigest(
+        resources: resources,
+        modelIdentifier: identifier,
+        runtimeAsset: enhancer.url
+      )
+      guard digest == expected.lowercased() else {
+        throw RunnerError.unsupportedFeature(
+          "クラスタROIエンハンサーのSHA-256が一致しません"
+        )
+      }
+    }
+
+    let base = tempDirectory.isEmpty
+      ? FileManager.default.temporaryDirectory
+      : URL(fileURLWithPath: tempDirectory, isDirectory: true)
+    let workerRoot = base.appendingPathComponent(
+      "mioh-cluster-\(request.attemptID.uuidString.lowercased())",
+      isDirectory: true
+    )
+    let segmentDirectory = workerRoot.appendingPathComponent(
+      "segments",
+      isDirectory: true
+    )
+    let ffmpegDirectory = workerRoot.appendingPathComponent(
+      "ffmpeg",
+      isDirectory: true
+    )
+    let runtimeDirectory = workerRoot.appendingPathComponent(
+      "runtime",
+      isDirectory: true
+    )
+    // The ledger reserves an extensionless `.part` staging path. ffmpeg needs
+    // a real media extension while muxing, so finalize inside the private
+    // worker directory and atomically move that artifact to the reservation.
+    let artifactURL = workerRoot.appendingPathComponent("artifact.mp4")
+    try FileManager.default.createDirectory(
+      at: workerRoot,
+      withIntermediateDirectories: true,
+      attributes: [.posixPermissions: 0o700]
+    )
+    try FileManager.default.setAttributes(
+      [.posixPermissions: 0o700],
+      ofItemAtPath: workerRoot.path
+    )
+    try FileManager.default.createDirectory(
+      at: segmentDirectory,
+      withIntermediateDirectories: true,
+      attributes: [.posixPermissions: 0o700]
+    )
+    try FileManager.default.createDirectory(
+      at: ffmpegDirectory,
+      withIntermediateDirectories: true,
+      attributes: [.posixPermissions: 0o700]
+    )
+    try FileManager.default.createDirectory(
+      at: runtimeDirectory,
+      withIntermediateDirectories: true,
+      attributes: [.posixPermissions: 0o700]
+    )
+    try FileManager.default.createDirectory(
+      at: outputURL.deletingLastPathComponent(),
+      withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: workerRoot) }
+
+    let requestedFrames = min(
+      miohMaximumClipFrames,
+      max(1, request.options.restorationClipLength)
+    )
+    let clipFrames = min(
+      restoration.fixedFrameCount ?? requestedFrames,
+      requestedFrames
+    )
+    let overlap = min(
+      max(0, request.options.temporalOverlap),
+      clipFrames - 1
+    )
+    let configuration = NativeExportConfiguration(
+      input: inputURL.isFileURL ? inputURL.path : inputURL.absoluteString,
+      inputByteCount: request.httpTransfer == nil ? nil : request.inputByteCount,
+      inputSHA256: request.httpTransfer == nil ? nil : request.inputSHA256,
+      outputDirectory: segmentDirectory.path,
+      ffmpegTemporaryDirectory: ffmpegDirectory.path,
+      miohTemporaryDirectory: runtimeDirectory.path,
+      outputFile: artifactURL.path,
+      ffmpeg: ffmpeg.path,
+      detectionModel: detection.url.path,
+      detectionBackend: detection.backend,
+      detectionInputSize: detection.inputSize,
+      detectionCandidateChannels: detection.candidateChannels,
+      detectionQueries: detection.queries,
+      detectionLogitClasses: detection.logitClasses,
+      detectionMaxDet: detection.maxDetections,
+      detectionComputeUnits: detection.computeUnits,
+      restorationModels: restoration.url.path,
+      restorationRunner: restorationRunner.path,
+      restorationFrameCount: restoration.fixedFrameCount,
+      startNanoseconds: request.mediaRange.decodeStartNanoseconds,
+      decodeEndNanoseconds: request.mediaRange.decodeEndNanoseconds,
+      outputCoreStartNanoseconds: request.mediaRange.coreStartNanoseconds,
+      outputCoreEndNanoseconds: request.mediaRange.coreEndNanoseconds,
+      workerMode: true,
+      jobID: request.jobID.uuidString.lowercased(),
+      attemptID: request.attemptID.uuidString.lowercased(),
+      generation: 0,
+      splitMode: "none",
+      segmentCount: 1,
+      segmentSeconds: 60,
+      temporalBatchFrames: clipFrames,
+      temporalOverlap: overlap,
+      ringCapacity: max(clipFrames + overlap + 8, 32),
+      confidenceThreshold: detection.confidenceThreshold,
+      blendFeather: request.options.blendFeather,
+      sharpenStrength: request.options.sharpenStrength,
+      detailBoost: request.options.detailBoost,
+      textureMix: request.options.textureMix,
+      smoothStrength: request.options.smoothStrength,
+      effectUpscale: max(1, min(4, request.options.effectUpscale)),
+      roiEnhancerModel: enhancer?.url.path,
+      roiEnhancerStrength: enhancer == nil
+        ? 0 : request.options.roiEnhancerStrength,
+      roiEnhancerScale: enhancer?.scale
+        ?? max(1, request.options.roiEnhancerScale),
+      detectionEmptyLookahead: 1,
+      detectFaceMosaics: request.options.detectFaceMosaics,
+      crossfade: request.options.crossfade,
+      targetFPS: nil,
+      targetFPSDenominator: nil,
+      preFPSConversion: false,
+      videoCodec: request.options.videoCodec,
+      averageBitRate: nil,
+      bitrateMultiplier: request.options.bitrateMultiplier,
+      mp4FastStart: request.options.mp4FastStart
+    )
+    let configurationURL = workerRoot.appendingPathComponent(
+      "configuration.json"
+    )
+    try JSONEncoder().encode(configuration).write(
+      to: configurationURL,
+      options: .atomic
+    )
+    try FileManager.default.setAttributes(
+      [.posixPermissions: 0o600],
+      ofItemAtPath: configurationURL.path
+    )
+
+    let task = Process()
+    let inputPipe = Pipe()
+    let outputPipe = Pipe()
+    task.executableURL = runner
+    task.arguments = [configurationURL.path]
+    task.standardInput = inputPipe
+    task.standardOutput = outputPipe
+    task.standardError = outputPipe
+    var environment = ProcessInfo.processInfo.environment
+    environment["TMPDIR"] = runtimeDirectory.path
+    environment["TEMP"] = runtimeDirectory.path
+    environment["TMP"] = runtimeDirectory.path
+    task.environment = environment
+
+    let capture = RemoteClusterOutputCapture()
+    let result = RemoteClusterProcessResult()
+    let control = RemoteClusterProcessControl(
+      process: task,
+      input: inputPipe
+    )
+    task.terminationHandler = { completed in
+      result.finish(completed.terminationStatus)
+    }
+    let startedAt = Date()
+    try Task.checkCancellation()
+    try task.run()
+    control.didLaunch()
+    let drainTask = Task.detached(priority: .utility) {
+      let handle = outputPipe.fileHandleForReading
+      while let chunk = try? handle.read(upToCount: 64 * 1_024),
+        !chunk.isEmpty
+      {
+        capture.append(chunk)
+      }
+    }
+    let status = await withTaskCancellationHandler {
+      await result.value()
+    } onCancel: {
+      control.cancel()
+    }
+    await drainTask.value
+    try Task.checkCancellation()
+    let processOutput = capture.snapshot()
+    guard status == 0 else {
+      let detail = String(data: processOutput, encoding: .utf8) ?? ""
+      throw RunnerError.unsupportedFeature(
+        "クラスタワーカーが終了コード\(status)で失敗しました: "
+          + String(detail.suffix(2_000))
+      )
+    }
+
+    var artifact: [String: Any]?
+    for line in processOutput.split(separator: 0x0A) {
+      guard let object = try? JSONSerialization.jsonObject(with: Data(line))
+        as? [String: Any],
+        object["kind"] as? String == "cluster_artifact"
+      else { continue }
+      artifact = object
+    }
+    guard let artifact,
+      artifact["job_id"] as? String
+        == request.jobID.uuidString.lowercased(),
+      artifact["attempt_id"] as? String
+        == request.attemptID.uuidString.lowercased(),
+      (artifact["path"] as? String).map({
+        URL(fileURLWithPath: $0).standardizedFileURL
+          == artifactURL.standardizedFileURL
+      }) == true,
+      let processedFrames = (artifact["frame_count"] as? NSNumber)?.intValue,
+      processedFrames > 0,
+      (artifact["core_start_ns"] as? NSNumber)?.int64Value
+        == request.mediaRange.coreStartNanoseconds,
+      (artifact["core_end_ns"] as? NSNumber)?.int64Value
+        == request.mediaRange.coreEndNanoseconds,
+      artifact["has_audio"] as? Bool == false,
+      FileManager.default.fileExists(atPath: artifactURL.path)
+    else {
+      throw RunnerError.unsupportedFeature(
+        "クラスタワーカーの成果物イベントが不正です"
+      )
+    }
+    try FileManager.default.moveItem(at: artifactURL, to: outputURL)
+    let outputValues = try outputURL.resourceValues(forKeys: [
+      .isRegularFileKey, .fileSizeKey,
+    ])
+    guard outputValues.isRegularFile == true,
+      let outputSize = outputValues.fileSize, outputSize > 0
+    else {
+      throw RunnerError.unsupportedFeature(
+        "クラスタワーカーの出力ファイルが空です"
+      )
+    }
+    return RemoteClusterJobMetrics(
+      processedFrames: processedFrames,
+      wallSeconds: max(0.001, Date().timeIntervalSince(startedAt)),
+      outputByteCount: Int64(outputSize)
+    )
+  }
+
+  private func remoteClusterAssetDigest(_ url: URL) async throws -> String {
+    let key = url.standardizedFileURL.path
+    if let cached = remoteClusterAssetDigests[key] { return cached }
+    let digest = try await Task.detached(priority: .utility) {
+      try Self.computeRemoteClusterAssetSHA256(url)
+    }.value
+    remoteClusterAssetDigests[key] = digest
+    return digest
+  }
+
+  /// Returns the digest of the portable source model represented by a model
+  /// ID. Both coordinator and Worker use this path, so a Mac `.aimodelc` and
+  /// an iPad `.aimodel` compare equal when they came from the same source.
+  /// Models absent from the v1 manifest (for example dedicated-only HQ assets)
+  /// retain the previous runtime-tree digest as a compatibility fallback.
+  private func remoteClusterCanonicalAssetDigest(
+    resources: URL,
+    modelIdentifier: String,
+    runtimeAsset: URL
+  ) async throws -> String {
+    let cacheKey = "canonical-v1:\(modelIdentifier)"
+    if let cached = remoteClusterAssetDigests[cacheKey] { return cached }
+
+    let manifestURL = resources.appendingPathComponent(
+      "models/mioh-cluster-model-identities-v1.json"
+    )
+    let digest: String
+    if FileManager.default.fileExists(atPath: manifestURL.path),
+      let manifest = try remoteClusterCanonicalManifest(resources: resources)
+    {
+      if let identity = manifest.models[modelIdentifier] {
+        digest = try Self.validatedCanonicalSHA256(
+          identity,
+          modelIdentifier: modelIdentifier
+        )
+      } else {
+        digest = try await remoteClusterAssetDigest(runtimeAsset)
+      }
+    } else {
+      digest = try await remoteClusterAssetDigest(runtimeAsset)
+    }
+    remoteClusterAssetDigests[cacheKey] = digest
+    return digest
+  }
+
+  private func remoteClusterCanonicalManifest(
+    resources: URL
+  ) throws -> RemoteClusterCanonicalModelManifest? {
+    let manifestURL = resources.appendingPathComponent(
+      "models/mioh-cluster-model-identities-v1.json"
+    )
+    guard FileManager.default.fileExists(atPath: manifestURL.path) else { return nil }
+    let manifest = try JSONDecoder().decode(
+      RemoteClusterCanonicalModelManifest.self,
+      from: Data(contentsOf: manifestURL)
+    )
+    guard manifest.formatVersion == 1,
+      manifest.digestAlgorithm == "sha256-tree-v1"
+    else {
+      throw RunnerError.unsupportedFeature(
+        "クラスタモデルidentity manifestの形式に対応していません"
+      )
+    }
+    return manifest
+  }
+
+  private nonisolated static func validatedCanonicalSHA256(
+    _ identity: RemoteClusterCanonicalModelIdentity,
+    modelIdentifier: String
+  ) throws -> String {
+    let normalized = identity.sha256.lowercased()
+    guard normalized.utf8.count == 64,
+      normalized.utf8.allSatisfy({ byte in
+        (48...57).contains(byte) || (97...102).contains(byte)
+      }),
+      !identity.assetType.isEmpty,
+      !identity.sourceAssets.isEmpty
+    else {
+      throw RunnerError.unsupportedFeature(
+        "クラスタモデルidentity manifestのエントリが不正です: \(modelIdentifier)"
+      )
+    }
+    return normalized
+  }
+
+  /// Asset digest convention shared by coordinator and worker:
+  /// * a regular file hashes its raw bytes;
+  /// * a directory rejects symlinks, recursively includes regular files only,
+  ///   sorts NFC-normalized POSIX relative paths by UTF-8 bytes, then hashes
+  ///   `relativePath + NUL + fileBytes + NUL` for every entry.
+  /// The result is lowercase hexadecimal SHA-256.
+  private nonisolated static func computeRemoteClusterAssetSHA256(
+    _ url: URL
+  ) throws -> String {
+    let keys: Set<URLResourceKey> = [
+      .isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey,
+    ]
+    let rootValues = try url.resourceValues(forKeys: keys)
+    guard rootValues.isSymbolicLink != true else {
+      throw RunnerError.unsupportedFeature(
+        "クラスタモデル資産にシンボリックリンクは使用できません"
+      )
+    }
+
+    func updateFile(_ file: URL, hasher: inout SHA256) throws {
+      let handle = try FileHandle(forReadingFrom: file)
+      defer { try? handle.close() }
+      while let chunk = try handle.read(upToCount: 1_024 * 1_024),
+        !chunk.isEmpty
+      {
+        hasher.update(data: chunk)
+      }
+    }
+
+    var hasher = SHA256()
+    if rootValues.isRegularFile == true {
+      try updateFile(url, hasher: &hasher)
+    } else if rootValues.isDirectory == true {
+      var enumerationError: Error?
+      guard let enumerator = FileManager.default.enumerator(
+        at: url,
+        includingPropertiesForKeys: Array(keys),
+        options: [],
+        errorHandler: { _, error in
+          enumerationError = error
+          return false
+        }
+      ) else {
+        throw RunnerError.missingResource(url.lastPathComponent)
+      }
+      let rootPath = url.standardizedFileURL.path
+      var entries: [(relative: String, url: URL)] = []
+      for case let candidate as URL in enumerator {
+        let values = try candidate.resourceValues(forKeys: keys)
+        guard values.isSymbolicLink != true else {
+          throw RunnerError.unsupportedFeature(
+            "クラスタモデル資産にシンボリックリンクは使用できません"
+          )
+        }
+        guard values.isRegularFile == true else { continue }
+        let candidatePath = candidate.standardizedFileURL.path
+        guard candidatePath.hasPrefix(rootPath + "/") else {
+          throw RunnerError.unsupportedFeature(
+            "クラスタモデル資産のパスが不正です"
+          )
+        }
+        let relative = String(candidatePath.dropFirst(rootPath.count + 1))
+          .precomposedStringWithCanonicalMapping
+        entries.append((relative, candidate))
+      }
+      if let enumerationError { throw enumerationError }
+      entries.sort {
+        Array($0.relative.utf8).lexicographicallyPrecedes(
+          Array($1.relative.utf8)
+        )
+      }
+      guard Set(entries.map(\.relative)).count == entries.count else {
+        throw RunnerError.unsupportedFeature(
+          "クラスタモデル資産に正規化後の重複パスがあります"
+        )
+      }
+      for entry in entries {
+        hasher.update(data: Data(entry.relative.utf8))
+        hasher.update(data: Data([0]))
+        try updateFile(entry.url, hasher: &hasher)
+        hasher.update(data: Data([0]))
+      }
+    } else {
+      throw RunnerError.missingResource(url.lastPathComponent)
+    }
+    return hasher.finalize().map { String(format: "%02x", $0) }.joined()
   }
 
   // MARK: - Bundled Python engine
@@ -1721,10 +2699,13 @@ final class RestorationRunner: ObservableObject {
     computeUnits: String?
   )? {
     let models = resources.appendingPathComponent("models", isDirectory: true)
+    let requestsCoreAI = model.hasSuffix("-coreai")
+    let requestsCoreML = model.hasSuffix("-coreml")
     let base = model
       .replacingOccurrences(of: "-coreai", with: "")
       .replacingOccurrences(of: "-coreml", with: "")
     if base == "jasna-v6" || base == "jasna-v6-large" {
+      guard !requestsCoreML else { return nil }
       let large = base == "jasna-v6-large"
       let stem = large
         ? "rfdetr-v6-large-768-fp32"
@@ -1763,31 +2744,39 @@ final class RestorationRunner: ObservableObject {
       return nil
     }
     let candidateChannels = base == "v2" ? 37 : 38
-    // Detection on Core ML/ANE and restoration on Core AI avoids resource
-    // contention and was faster in the measured native preview pipeline.
-    for suffix in [".mlmodelc", ".mlpackage"] {
-      if let coreML = firstModelAsset(
-        in: models,
-        prefixes: [stem],
-        suffix: suffix
-      ) {
-        return (
-          coreML, "yolo", 640, candidateChannels,
-          0, 0, 0, 0.25, "cpuAndNeuralEngine"
-        )
+    func coreMLAsset() -> URL? {
+      for suffix in [".mlmodelc", ".mlpackage"] {
+        if let url = firstModelAsset(in: models, prefixes: [stem], suffix: suffix) {
+          return url
+        }
       }
+      return nil
     }
-    for suffix in [".aimodelc", ".aimodel"] {
-      if let coreAI = firstModelAsset(
-        in: models,
-        prefixes: ["\(stem)-fp16", stem],
-        suffix: suffix
-      ) {
-        return (
-          coreAI, "yolo", 640, candidateChannels,
-          0, 0, 0, 0.25, nil
-        )
+    func coreAIAsset() -> URL? {
+      for suffix in [".aimodelc", ".aimodel"] {
+        if let url = firstModelAsset(
+          in: models,
+          prefixes: ["\(stem)-fp16", stem],
+          suffix: suffix
+        ) {
+          return url
+        }
       }
+      return nil
+    }
+    // Explicit backend suffixes are contracts, not preferences. Unsuffixed
+    // legacy identifiers keep the measured Core ML-first fallback behavior.
+    if !requestsCoreAI, let coreML = coreMLAsset() {
+      return (
+        coreML, "yolo", 640, candidateChannels,
+        0, 0, 0, 0.25, "cpuAndNeuralEngine"
+      )
+    }
+    if !requestsCoreML, let coreAI = coreAIAsset() {
+      return (
+        coreAI, "yolo", 640, candidateChannels,
+        0, 0, 0, 0.25, nil
+      )
     }
     return nil
   }
@@ -1979,7 +2968,9 @@ final class RestorationRunner: ObservableObject {
     defaultsStatus = "保存済みデフォルトを適用済み"
   }
 
-  private func currentDefaultsSnapshot() -> MiohUserDefaultsSnapshot {
+  /// Single source of truth for both local defaults and remote configuration.
+  /// Callers must still validate untrusted input before applying it.
+  func currentDefaultsSnapshot() -> MiohUserDefaultsSnapshot {
     MiohUserDefaultsSnapshot(
       inputPath: inputURL?.path,
       outputPath: outputURL?.path,
@@ -2058,7 +3049,9 @@ final class RestorationRunner: ObservableObject {
     )
   }
 
-  private func apply(defaults snapshot: MiohUserDefaultsSnapshot) {
+  /// Applies a previously validated snapshot using exactly the same
+  /// normalization rules as the local settings UI/defaults loader.
+  func apply(defaults snapshot: MiohUserDefaultsSnapshot) {
     inputURL = snapshot.inputPath.flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
     outputURL = snapshot.outputPath.flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
     tempDirectory = snapshot.tempDirectory
@@ -2186,10 +3179,20 @@ final class RestorationRunner: ObservableObject {
         "Swiftネイティブ再生にはmacOS 27以降が必要です"
       )
     }
-    let previewModel = capabilities.previewRestorationModel
+    guard previewRestorationModel != "カスタム" else {
+      throw RunnerError.unsupportedFeature(
+        "Swiftネイティブ再生はカスタム復元モデルに未対応です"
+      )
+    }
+    let previewModel = previewRestorationModel
     try rejectUnsupportedCoreAIModel(previewModel)
-    let previewDetectionModel = capabilities.previewDetectionModel
-    try rejectUnsupportedCoreAIModel(previewDetectionModel)
+    guard previewDetectionModel != "カスタム" else {
+      throw RunnerError.unsupportedFeature(
+        "Swiftネイティブ再生はカスタム検出モデルに未対応です"
+      )
+    }
+    let selectedPreviewDetectionModel = previewDetectionModel
+    try rejectUnsupportedCoreAIModel(selectedPreviewDetectionModel)
     let effectiveEnhancerStrength = previewRealtimeOptimization
       ? 0
       : roiEnhancerStrength
@@ -2219,10 +3222,10 @@ final class RestorationRunner: ObservableObject {
     }
     guard let detection = nativeDetectionAsset(
       resources: resources,
-      model: previewDetectionModel
+      model: selectedPreviewDetectionModel
     ) else {
       throw RunnerError.missingResource(
-        "Swift native detection model: \(previewDetectionModel)"
+        "Swift native detection model: \(selectedPreviewDetectionModel)"
       )
     }
     let nativeEnhancer: (url: URL, scale: Int)?
@@ -2240,7 +3243,7 @@ final class RestorationRunner: ObservableObject {
     } else {
       nativeEnhancer = nil
     }
-    let temporalLimit = detection.computeUnits == nil ? 18 : 36
+    let temporalLimit = detection.computeUnits == nil ? 30 : 36
     var requestedFrames = min(
       miohMaximumClipFrames,
       useMaxClipLength ? maxClipLength : temporalLimit
@@ -2248,7 +3251,14 @@ final class RestorationRunner: ObservableObject {
     if useRestoreMaxFrames, restoreMaxFrames > 0 {
       requestedFrames = min(miohMaximumClipFrames, restoreMaxFrames)
     }
-    let temporalFrames = min(temporalLimit, max(2, requestedFrames))
+    let temporalFrames = min(
+      restoration.fixedFrameCount ?? temporalLimit,
+      min(temporalLimit, max(2, requestedFrames))
+    )
+    let previewOverlap = min(
+      max(0, restoreTemporalOverlap),
+      max(0, temporalFrames - 1)
+    )
     let ffmpeg = resources.appendingPathComponent("bin/ffmpeg")
     guard FileManager.default.isExecutableFile(atPath: ffmpeg.path) else {
       throw RunnerError.missingResource("FFmpeg")
@@ -2280,6 +3290,7 @@ final class RestorationRunner: ObservableObject {
       generation: generation,
       bufferLimitSeconds: previewBufferLimit,
       temporalBatchFrames: temporalFrames,
+      temporalOverlap: previewOverlap,
       ringCapacity: max(temporalFrames * 2, 24),
       confidenceThreshold: detection.confidenceThreshold,
       blendFeather: Float(blendFeather),
@@ -2292,7 +3303,8 @@ final class RestorationRunner: ObservableObject {
       roiEnhancerStrength: nativeEnhancer == nil ? 0 : Float(effectiveEnhancerStrength),
       roiEnhancerScale: nativeEnhancer?.scale ?? max(1, roiEnhancerScale),
       detectionEmptyLookahead: max(0, detectionEmptyLookahead),
-      detectFaceMosaics: detectFaceMosaics
+      detectFaceMosaics: detectFaceMosaics,
+      crossfade: restoreCrossfade
     )
     var environment = ProcessInfo.processInfo.environment
     environment["PATH"] = [
@@ -2707,6 +3719,9 @@ struct PathSettingRow: View {
 struct ContentView: View {
   @StateObject private var runner = RestorationRunner()
   @StateObject private var player = RealtimePlayerController()
+  @StateObject private var remoteControl = RemoteControlServer()
+  @StateObject private var remoteStreaming = RemoteStreamingCoordinator()
+  @StateObject private var cluster = MiohClusterController()
 
   var body: some View {
     VStack(spacing: 0) {
@@ -2725,11 +3740,32 @@ struct ContentView: View {
         logTab.tabItem { Label("ログ", systemImage: "terminal") }
       }
       .padding(.horizontal, 14)
-      ProgressView(value: runner.progress).progressViewStyle(.linear).padding(.horizontal, 20)
+      ProgressView(value: cluster.isRunning ? cluster.progress : runner.progress)
+        .progressViewStyle(.linear).padding(.horizontal, 20)
       Divider()
       footer
     }
     .frame(minWidth: 820, minHeight: 680)
+    .onAppear {
+      cluster.attach(runner: runner)
+      remoteControl.attach(runner: runner, player: player)
+      remoteControl.attachCluster(cluster)
+      remoteControl.attachStreaming(remoteStreaming)
+      if remoteControl.enabled {
+        player.setStreamingEventConsumer(remoteStreaming.eventConsumer())
+      }
+    }
+    .onChange(of: cluster.role) { _, _ in
+      cluster.deactivate(preserveRole: true)
+    }
+    .onChange(of: remoteControl.enabled) { _, enabled in
+      if enabled {
+        player.setStreamingEventConsumer(remoteStreaming.eventConsumer())
+      } else {
+        player.setStreamingEventConsumer(nil)
+        remoteStreaming.stop()
+      }
+    }
   }
 
   private var header: some View {
@@ -2746,8 +3782,10 @@ struct ContentView: View {
         Text(runner.restorationModel).font(.caption).foregroundStyle(.secondary)
       }
       Spacer()
-      Text(L(runner.status)).font(.callout.monospacedDigit())
-        .foregroundStyle(runner.status == "エラー" ? .red : .secondary)
+      let visibleStatus = cluster.isRunning || cluster.serviceActive
+        ? cluster.status : runner.status
+      Text(L(visibleStatus)).font(.callout.monospacedDigit())
+        .foregroundStyle(visibleStatus.contains("失敗") || visibleStatus == "エラー" ? .red : .secondary)
     }
     .padding(.horizontal, 20).frame(height: 66)
   }
@@ -3002,6 +4040,164 @@ struct ContentView: View {
 
   private var settingsTab: some View {
     Form {
+      Section("ローカルネットワーク操作") {
+        Toggle(
+          "Webリモコンを有効にする",
+          isOn: Binding(
+            get: { remoteControl.enabled },
+            set: { remoteControl.setEnabled($0) }
+          )
+        )
+        LabeledContent("ポート") {
+          TextField("", value: $remoteControl.port, format: .number)
+            .multilineTextAlignment(.trailing)
+            .frame(width: 90)
+            .disabled(remoteControl.enabled)
+        }
+        LabeledContent("状態") {
+          Text(remoteControl.status)
+            .foregroundStyle(
+              remoteControl.enabled && !remoteControl.urls.isEmpty
+                ? .green : .secondary
+            )
+        }
+        if remoteControl.enabled {
+          if remoteControl.urls.isEmpty {
+            Text("同じLANから接続できるアドレスを確認中です。")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+          } else {
+            ForEach(remoteControl.urls, id: \.absoluteString) { url in
+              LabeledContent("接続URL") {
+                HStack(spacing: 8) {
+                  Text(url.absoluteString)
+                    .font(.system(.body, design: .monospaced))
+                    .textSelection(.enabled)
+                  Button("コピー") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(url.absoluteString, forType: .string)
+                  }
+                  Button("開く") { NSWorkspace.shared.open(url) }
+                }
+              }
+            }
+          }
+          LabeledContent("アクセスコード") {
+            HStack(spacing: 8) {
+              Text(remoteControl.token)
+                .font(.system(.caption, design: .monospaced))
+                .lineLimit(1)
+                .textSelection(.enabled)
+              Button("コピー") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(remoteControl.token, forType: .string)
+              }
+              Button("再生成", role: .destructive) {
+                remoteControl.regenerateToken()
+              }
+            }
+          }
+          Text("接続先のブラウザで12文字のアクセスコードを入力してください。大文字小文字・ハイフンの有無は問いません。信頼できる家庭・社内LAN専用です。")
+            .font(.caption)
+            .foregroundStyle(.orange)
+        }
+      }
+      Section("ローカル復元クラスタ") {
+        Picker("役割", selection: $cluster.role) {
+          ForEach(MiohClusterRoleSelection.allCases) { role in
+            Text(role.label).tag(role)
+          }
+        }
+        LabeledContent("共有ルート") {
+          HStack(spacing: 8) {
+            TextField("", text: $cluster.sharedRootPath)
+              .textFieldStyle(.roundedBorder)
+              .frame(width: 360)
+            Button { cluster.chooseSharedRoot() } label: {
+              Image(systemName: "folder")
+            }
+          }
+        }
+        LabeledContent("共有ルートID") {
+          TextField("", text: $cluster.sharedRootIdentifier)
+            .textFieldStyle(.roundedBorder)
+            .frame(width: 220)
+        }
+        if cluster.role == .coordinator {
+          LabeledContent("ジョブ長") {
+            Stepper(value: $cluster.shardMinutes, in: 1...30) {
+              Text("\(cluster.shardMinutes)分")
+            }
+          }
+          Toggle("このMacもWorkerとして使用", isOn: $cluster.useCoordinatorAsWorker)
+            .disabled(cluster.isRunning)
+          Text("有効時はCoordinatorでも同じジョブ契約を1並列で処理します。")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+          Toggle("クラスタで書き出す", isOn: $cluster.useForExport)
+        }
+        HStack(spacing: 10) {
+          if cluster.serviceActive {
+            Button("クラスタサービスを停止", role: .destructive) {
+              cluster.deactivate(preserveRole: true)
+            }
+          } else if cluster.role != .off {
+            Button("クラスタサービスを開始") {
+              cluster.activate(using: runner)
+            }
+            .buttonStyle(.borderedProminent)
+          }
+          Text(cluster.status)
+            .font(.callout.monospacedDigit())
+            .foregroundStyle(cluster.status.contains("失敗") ? .red : .secondary)
+        }
+
+        if cluster.role == .worker {
+          Text("同じローカルLAN上のCoordinatorから、認証コードなしで利用できます。")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+          if !cluster.workerAttempts.isEmpty {
+            ForEach(cluster.workerAttempts.suffix(4)) { attempt in
+              LabeledContent(String(attempt.jobID.uuidString.prefix(8))) {
+                Text(attempt.state.rawValue)
+                  .font(.system(.caption, design: .monospaced))
+              }
+            }
+          }
+        }
+
+        if cluster.role == .coordinator {
+          if cluster.discoveredNodes.isEmpty {
+            Text(cluster.serviceActive
+              ? "同じLAN上のWorkerを探索しています。"
+              : "サービスを開始するとWorkerを自動検出します。")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+          }
+          ForEach(cluster.discoveredNodes) { node in
+            VStack(alignment: .leading, spacing: 7) {
+              HStack {
+                Toggle(
+                  isOn: Binding(
+                    get: { cluster.selectedNodeIDs.contains(node.id) },
+                    set: { cluster.toggleSelection(node.id, selected: $0) }
+                  )
+                ) {
+                  Text(node.metadata.displayName)
+                }
+                .disabled(!cluster.verifiedNodeIDs.contains(node.id))
+                Spacer()
+                Text(cluster.verifiedNodeIDs.contains(node.id) ? "接続済み" : "確認中")
+                  .font(.caption)
+                  .foregroundStyle(cluster.verifiedNodeIDs.contains(node.id) ? .green : .secondary)
+              }
+            }
+          }
+        }
+        Text("標準HTTP転送では共有ルートは不要です。旧Workerとの共有フォルダ方式も併用できます。TLSはないため信頼できる家庭・社内LANだけで使い、インターネットへ公開しないでください。FPS変換との同時使用はできません。")
+          .font(.caption)
+          .foregroundStyle(.orange)
+      }
       Section("ユーザーデフォルト") {
         Text("現在の各タブの値を、このMacユーザーのmiohデフォルトとして保存します。次回起動時に自動で適用されます。")
           .font(.callout)
@@ -3043,11 +4239,28 @@ struct ContentView: View {
       Button(action: runner.revealOutput) { Image(systemName: "folder.badge.gearshape") }
         .help(L("出力をFinderで表示")).disabled(runner.outputURL == nil)
       Spacer()
-      if runner.isRunning {
+      if cluster.isRunning {
+        Button(role: .destructive, action: cluster.stopExport) {
+          Label("停止", systemImage: "stop.fill")
+        }
+      } else if runner.isRunning {
         Button(role: .destructive, action: runner.stop) { Label("停止", systemImage: "stop.fill") }
       } else {
-        Button(action: runner.start) { Label("開始", systemImage: "play.fill") }
-          .buttonStyle(.borderedProminent).disabled(!runner.canStart)
+        Button(
+          action: {
+            if cluster.useForExport && cluster.role == .coordinator {
+              cluster.startExport(using: runner)
+            } else {
+              runner.start()
+            }
+          }
+        ) { Label("開始", systemImage: "play.fill") }
+          .buttonStyle(.borderedProminent)
+          .disabled(
+            cluster.useForExport && cluster.role == .coordinator
+              ? !cluster.canStartExport(runner: runner)
+              : (!runner.canStart || (cluster.role == .worker && cluster.serviceActive))
+          )
       }
     }.padding(.horizontal, 20).frame(height: 58)
   }
@@ -3124,7 +4337,9 @@ struct ContentView: View {
   }
 }
 
+#if !MIOH_REMOTE_SETTINGS_HARNESS
 @main
+#endif
 struct MiohStandaloneApp: App {
   var body: some Scene {
     WindowGroup { ContentView() }

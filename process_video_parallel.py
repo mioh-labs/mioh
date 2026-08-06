@@ -36,6 +36,7 @@ import queue
 import re
 import shlex
 import signal
+import stat
 import sys
 import atexit
 import multiprocessing as mp
@@ -2175,18 +2176,28 @@ class ParallelVideoProcessor:
         cleanup_resources()
 
 # ===== バッチ処理 =====
+def collect_batch_video_files(input_dir):
+    """バッチ処理対象の直下にある通常の動画ファイルを収集"""
+    input_dir = Path(input_dir)
+    video_extensions = ['.mp4', '.mkv', '.mov', '.avi', '.m4v']
+    video_files = []
+    for ext in video_extensions:
+        for candidate in input_dir.glob(f'*{ext}'):
+            try:
+                if stat.S_ISREG(candidate.lstat().st_mode):
+                    video_files.append(candidate)
+            except OSError:
+                continue
+    return sorted(set(video_files))
+
+
 def process_batch(input_dir, output_dir, temp_dir_base, args):
     """バッチ処理"""
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    video_extensions = ['.mp4', '.mkv', '.mov', '.avi', '.m4v']
-    video_files = []
-    for ext in video_extensions:
-        video_files.extend(input_dir.glob(f'*{ext}'))
-    
-    video_files = sorted(set(video_files))
+
+    video_files = collect_batch_video_files(input_dir)
     
     if not video_files:
         print(f"エラー: {input_dir} に動画ファイルが見つかりません")

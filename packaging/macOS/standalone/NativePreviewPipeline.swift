@@ -20,6 +20,8 @@ private let maximumInternalExportSegmentSeconds = 60.0
 private struct NativePreviewConfiguration: Decodable {
   let mode: String?
   let input: String
+  let inputByteCount: Int64?
+  let inputSHA256: String?
   let outputDirectory: String
   let ffmpegTemporaryDirectory: String?
   let miohTemporaryDirectory: String?
@@ -37,6 +39,15 @@ private struct NativePreviewConfiguration: Decodable {
   let restorationRunner: String
   let restorationFrameCount: Int?
   let startNanoseconds: Int64
+  // Cluster workers may decode a padded range while emitting only the core
+  // range. This preserves temporal warm-up/crossfade context without making
+  // adjacent workers write duplicate frames.
+  let decodeEndNanoseconds: Int64?
+  let outputCoreStartNanoseconds: Int64?
+  let outputCoreEndNanoseconds: Int64?
+  let workerMode: Bool?
+  let jobID: String?
+  let attemptID: String?
   let generation: Int
   let splitMode: String?
   let segmentCount: Int?
@@ -72,6 +83,7 @@ private struct NativePreviewConfiguration: Decodable {
   let mp4FastStart: Bool?
 
   var isExport: Bool { mode == "export" }
+  var isWorker: Bool { workerMode ?? false }
 }
 
 private enum NativePreviewError: LocalizedError {
@@ -711,9 +723,13 @@ private struct MalformedH264FrameReorderBuffer {
 
 private final class ContinuousVideoDecoder: @unchecked Sendable {
   private let asset: AVURLAsset
+  // AVAssetResourceLoader.delegate is weak. This owner must stay alive until
+  // both decoded and compressed AVAssetReaders have stopped.
+  private let remoteResourceLoader: MiohHTTPRangeAsset?
   private let track: AVAssetTrack
   private let ring: PixelBufferRing
   private let startTime: CMTime
+  private let endTime: CMTime?
   // Some malformed H.264 files contain B-slices while declaring PTS == DTS.
   // AVFoundation then reports requiresFrameReordering=false and returns the
   // decoded pixels in coding order. A second compressed reader supplies only
@@ -730,10 +746,29 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
 
   init(
     input: URL,
+    expectedRemoteByteCount: Int64? = nil,
+    expectedRemoteSHA256: String? = nil,
     startNanoseconds: Int64,
+    endNanoseconds: Int64? = nil,
     ring: PixelBufferRing
   ) async throws {
-    asset = AVURLAsset(url: input)
+    if input.isFileURL {
+      remoteResourceLoader = nil
+      asset = AVURLAsset(url: input)
+    } else {
+      guard let expectedRemoteByteCount, let expectedRemoteSHA256 else {
+        throw NativePreviewError.invalidConfiguration(
+          "HTTP cluster input is missing its byte-count/SHA-256 contract"
+        )
+      }
+      let loader = try MiohHTTPRangeAsset(
+        remoteURL: input,
+        expectedByteCount: expectedRemoteByteCount,
+        expectedSHA256: expectedRemoteSHA256
+      )
+      remoteResourceLoader = loader
+      asset = loader.asset
+    }
     let tracks = try await asset.loadTracks(withMediaType: .video)
     guard let track = tracks.first else {
       throw NativePreviewError.missingVideoTrack
@@ -786,6 +821,19 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
       value: max(0, startNanoseconds),
       timescale: 1_000_000_000
     )
+    if let endNanoseconds {
+      guard endNanoseconds > max(0, startNanoseconds) else {
+        throw NativePreviewError.invalidConfiguration(
+          "decodeEndNanoseconds must be greater than startNanoseconds"
+        )
+      }
+      endTime = CMTime(
+        value: endNanoseconds,
+        timescale: 1_000_000_000
+      )
+    } else {
+      endTime = nil
+    }
   }
 
   func description() async throws -> VideoDescription {
@@ -813,11 +861,15 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
   func start() throws {
     let reader = try AVAssetReader(asset: asset)
     var decodeRange: CMTimeRange?
-    if startTime > .zero {
-      let duration = asset.duration - startTime
+    if startTime > .zero || endTime != nil {
+      let rangeEnd = endTime ?? asset.duration
+      let duration = rangeEnd - startTime
+      guard duration > .zero else {
+        throw NativePreviewError.reader("requested decode range is empty")
+      }
       let range = CMTimeRange(
         start: startTime,
-        duration: max(duration, .zero)
+        duration: duration
       )
       reader.timeRange = range
       decodeRange = range
@@ -1063,6 +1115,7 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
     task?.cancel()
     reader?.cancelReading()
     orderingReader?.cancelReading()
+    remoteResourceLoader?.cancel()
     ring.stop()
     await task?.value
     task = nil
@@ -2215,10 +2268,23 @@ private struct NativeClipGeometry {
   let padLeft: Int
 }
 
+private struct NativeEnhancerOutput {
+  let pixels: [Float16]
+  let width: Int
+  let height: Int
+  let legacyLowResolution: [Float16]?
+}
+
+private struct NativeEnhancerFrame {
+  let output: NativeEnhancerOutput
+  let lowResolution: [Float16]
+  let strength: Float
+}
+
 /// Fixed-shape ROI enhancer used by the all-Swift pipeline. Core AI models
-/// consume/produce planar FP16 directly. Core ML image models use a pair of
-/// small, bounded CVPixelBuffer pools and are immediately reduced back to the
-/// 256px restoration grid, so no upscaled frame is retained by the pipeline.
+/// consume/produce planar FP16 directly. The enhancer output remains at its
+/// native 2x/4x resolution until composition; only one high-resolution frame
+/// is retained at a time.
 private final class NativeROIEnhancer {
   private let function: InferenceFunction?
   private var coreMLModel: MLModel?
@@ -2236,7 +2302,8 @@ private final class NativeROIEnhancer {
   ])
   private var sourcePool: CVPixelBufferPool?
   private var modelInputPool: CVPixelBufferPool?
-  private var reducedPool: CVPixelBufferPool?
+  private var modelOutputPool: CVPixelBufferPool?
+  private var legacyOutputPool: CVPixelBufferPool?
 
   init(modelURL: URL, scale: Int, strength: Float) async throws {
     self.scale = max(1, min(8, scale))
@@ -2247,7 +2314,8 @@ private final class NativeROIEnhancer {
     outputName = nil
     sourcePool = nil
     modelInputPool = nil
-    reducedPool = nil
+    modelOutputPool = nil
+    legacyOutputPool = nil
     coreMLModel = nil
     compiledModelURL = nil
 
@@ -2285,7 +2353,8 @@ private final class NativeROIEnhancer {
     }
     guard let input = imageInputs.first,
       let output = imageOutputs.first,
-      let constraint = input.value.imageConstraint
+      let constraint = input.value.imageConstraint,
+      let outputConstraint = output.value.imageConstraint
     else {
       throw NativePreviewError.invalidConfiguration(
         "ROI enhancer must expose one image input and one image output"
@@ -2296,9 +2365,12 @@ private final class NativeROIEnhancer {
     outputName = output.key
     inputWidth = constraint.pixelsWide
     inputHeight = constraint.pixelsHigh
-    guard inputWidth > 0, inputHeight > 0 else {
+    guard inputWidth > 0, inputHeight > 0,
+      outputConstraint.pixelsWide > 0,
+      outputConstraint.pixelsHigh > 0
+    else {
       throw NativePreviewError.invalidConfiguration(
-        "ROI enhancer input dimensions are invalid"
+        "ROI enhancer image dimensions are invalid"
       )
     }
     sourcePool = try Self.makePool(
@@ -2309,7 +2381,11 @@ private final class NativeROIEnhancer {
       && inputHeight == restorationSize)
       ? nil
       : try Self.makePool(width: inputWidth, height: inputHeight)
-    reducedPool = try Self.makePool(
+    modelOutputPool = try Self.makePool(
+      width: outputConstraint.pixelsWide,
+      height: outputConstraint.pixelsHigh
+    )
+    legacyOutputPool = try Self.makePool(
       width: restorationSize,
       height: restorationSize
     )
@@ -2320,61 +2396,59 @@ private final class NativeROIEnhancer {
     if let modelInputPool {
       CVPixelBufferPoolFlush(modelInputPool, .excessBuffers)
     }
-    if let reducedPool { CVPixelBufferPoolFlush(reducedPool, .excessBuffers) }
+    if let modelOutputPool {
+      CVPixelBufferPoolFlush(modelOutputPool, .excessBuffers)
+    }
+    if let legacyOutputPool {
+      CVPixelBufferPoolFlush(legacyOutputPool, .excessBuffers)
+    }
     coreMLModel = nil
     if let compiledModelURL {
       try? FileManager.default.removeItem(at: compiledModelURL)
     }
   }
 
-  func enhance(_ restored: [Float16], masks: [[Float]]) async throws
-    -> [Float16]
-  {
+  func enhanceFrame(
+    restored: [Float16],
+    offset: Int,
+    mask: [Float]
+  ) async throws -> NativeEnhancerFrame? {
     let plane = restorationSize * restorationSize
     let frameElements = plane * 3
     guard strength > 0,
-      restored.count == masks.count * frameElements
-    else { return restored }
-    var result = restored
-    for frameIndex in masks.indices {
-      guard masks[frameIndex].contains(where: { $0 > 0.5 }) else { continue }
-      let offset = frameIndex * frameElements
-      let enhanced: [Float16]
-      if let function {
-        enhanced = try await enhanceCoreAI(
-          function: function,
-          restored: restored,
-          offset: offset
-        )
-      } else {
-        enhanced = try enhanceCoreML(restored: restored, offset: offset)
-      }
-      guard enhanced.count == frameElements else {
-        throw NativePreviewError.restorer(
-          "ROI enhancer returned \(enhanced.count) elements; expected \(frameElements)"
-        )
-      }
-      let mask = masks[frameIndex]
-      for channel in 0..<3 {
-        let channelOffset = channel * plane
-        for pixel in 0..<plane where mask[pixel] > 0.5 {
-          let destination = offset + channelOffset + pixel
-          let base = Float(restored[destination])
-          let detail = Float(enhanced[channelOffset + pixel])
-          result[destination] = Float16(
-            max(0, min(1, base + (detail - base) * strength))
-          )
-        }
-      }
+      restored.count >= offset + frameElements,
+      mask.count == plane,
+      mask.contains(where: { $0 > 0.5 })
+    else { return nil }
+
+    let output: NativeEnhancerOutput
+    if let function {
+      output = try await enhanceCoreAI(
+        function: function,
+        restored: restored,
+        offset: offset
+      )
+    } else {
+      output = try enhanceCoreML(restored: restored, offset: offset)
     }
-    return result
+    return NativeEnhancerFrame(
+      output: output,
+      lowResolution: try Self.makeLowResolution(
+        output: output,
+        restored: restored,
+        offset: offset,
+        mask: mask,
+        strength: strength
+      ),
+      strength: strength
+    )
   }
 
   private func enhanceCoreAI(
     function: InferenceFunction,
     restored: [Float16],
     offset: Int
-  ) async throws -> [Float16] {
+  ) async throws -> NativeEnhancerOutput {
     let plane = restorationSize * restorationSize
     let frameElements = plane * 3
     var input = NDArray(
@@ -2414,43 +2488,42 @@ private final class NativeROIEnhancer {
           "Core AI ROI enhancer output shape \(actualShape), expected \(expectedShape)"
         )
       }
-      var reduced = [Float16](repeating: 0, count: frameElements)
       let highPlane = outputSize * outputSize
-      let divisor = Float(scale * scale)
-      for channel in 0..<3 {
-        for y in 0..<restorationSize {
-          for x in 0..<restorationSize {
-            var sum: Float = 0
-            for subY in 0..<scale {
-              let sourceY = y * scale + subY
-              let row = channel * highPlane + sourceY * outputSize
-              for subX in 0..<scale {
-                let value = max(
-                  0,
-                  min(1, Float(pointer[row + x * scale + subX]))
-                )
-                // The Python backend converts the upscaled result to uint8
-                // before INTER_AREA reduction. Preserve that contract.
-                sum += Float(Int((value * 255).rounded())) / 255
-              }
-            }
-            reduced[channel * plane + y * restorationSize + x] =
-              Float16(sum / divisor)
-          }
+      var pixels = [Float16](repeating: 0, count: highPlane * 3)
+      _ = pixels.withUnsafeMutableBytes { destination in
+        memcpy(
+          destination.baseAddress!,
+          pointer,
+          highPlane * 3 * MemoryLayout<Float16>.stride
+        )
+      }
+      for index in pixels.indices {
+        let value = Float(pixels[index])
+        if !value.isFinite {
+          pixels[index] = 0
+        } else if value < 0 {
+          pixels[index] = 0
+        } else if value > 1 {
+          pixels[index] = 1
         }
       }
-      return reduced
+      return NativeEnhancerOutput(
+        pixels: pixels,
+        width: outputSize,
+        height: outputSize,
+        legacyLowResolution: nil
+      )
     }
   }
 
   private func enhanceCoreML(restored: [Float16], offset: Int) throws
-    -> [Float16]
+    -> NativeEnhancerOutput
   {
-    guard let model = coreMLModel,
+      guard let model = coreMLModel,
       let inputName,
       let outputName,
       let sourcePool,
-      let reducedPool
+      let legacyOutputPool
     else {
       throw NativePreviewError.restorer(
         "Core ML ROI enhancer backend is unavailable"
@@ -2495,21 +2568,26 @@ private final class NativeROIEnhancer {
           "Core ML ROI enhancer image output is missing"
         )
       }
-      let reduced = try Self.allocate(
-        from: reducedPool,
-        label: "enhancer reduced output"
-      )
       let outputWidth = CVPixelBufferGetWidth(enhanced)
       let outputHeight = CVPixelBufferGetHeight(enhanced)
-      let image = CIImage(cvPixelBuffer: enhanced).transformed(
+      guard outputWidth > 0, outputHeight > 0 else {
+        throw NativePreviewError.restorer(
+          "Core ML ROI enhancer output dimensions are invalid"
+        )
+      }
+      let legacyOutput = try Self.allocate(
+        from: legacyOutputPool,
+        label: "enhancer legacy 256px output"
+      )
+      let legacyImage = CIImage(cvPixelBuffer: enhanced).transformed(
         by: CGAffineTransform(
           scaleX: CGFloat(restorationSize) / CGFloat(outputWidth),
           y: CGFloat(restorationSize) / CGFloat(outputHeight)
         )
       )
       imageContext.render(
-        image,
-        to: reduced,
+        legacyImage,
+        to: legacyOutput,
         bounds: CGRect(
           x: 0,
           y: 0,
@@ -2518,8 +2596,120 @@ private final class NativeROIEnhancer {
         ),
         colorSpace: nil
       )
-      return try Self.readPlanarRGB(from: reduced)
+      let readable: CVPixelBuffer
+      if CVPixelBufferGetPixelFormatType(enhanced)
+        == kCVPixelFormatType_32BGRA
+      {
+        readable = enhanced
+      } else {
+        guard let modelOutputPool else {
+          throw NativePreviewError.restorer(
+            "Core ML ROI enhancer output pool is unavailable"
+          )
+        }
+        let converted = try Self.allocate(
+          from: modelOutputPool,
+          label: "enhancer native-size output"
+        )
+        imageContext.render(
+          CIImage(cvPixelBuffer: enhanced),
+          to: converted,
+          bounds: CGRect(x: 0, y: 0, width: outputWidth, height: outputHeight),
+          colorSpace: nil
+        )
+        readable = converted
+      }
+      return NativeEnhancerOutput(
+        pixels: try Self.readPlanarRGB(from: readable),
+        width: outputWidth,
+        height: outputHeight,
+        legacyLowResolution: try Self.readPlanarRGB(from: legacyOutput)
+      )
     }
+  }
+
+  /// Reconstruct the legacy 256px enhancer result for the existing effect
+  /// chain. The high-resolution output is retained separately, and only the
+  /// detail that this reduction cannot represent is added at composition.
+  private static func makeLowResolution(
+    output: NativeEnhancerOutput,
+    restored: [Float16],
+    offset: Int,
+    mask: [Float],
+    strength: Float
+  ) throws -> [Float16] {
+    let plane = restorationSize * restorationSize
+    let frameElements = plane * 3
+    guard output.width >= restorationSize,
+      output.height >= restorationSize,
+      output.width.isMultiple(of: restorationSize),
+      output.height.isMultiple(of: restorationSize),
+      output.pixels.count == output.width * output.height * 3,
+      restored.count >= offset + frameElements,
+      mask.count == plane
+    else {
+      throw NativePreviewError.restorer(
+        "ROI enhancer output cannot be reduced to the restoration grid"
+      )
+    }
+    let scaleX = output.width / restorationSize
+    let scaleY = output.height / restorationSize
+    let divisor = Float(scaleX * scaleY)
+    let outputPlane = output.width * output.height
+    let reduced: [Float]
+    if let legacy = output.legacyLowResolution,
+      legacy.count == frameElements
+    {
+      // Core ML historically used this exact Core Image reduction before
+      // applying manual effects. Keep it while the native-size output is used
+      // only for the added high-frequency residual.
+      reduced = legacy.map(Float.init)
+    } else {
+      var areaReduced = [Float](repeating: 0, count: frameElements)
+      for channel in 0..<3 {
+        let sourceOffset = channel * outputPlane
+        let destinationOffset = channel * plane
+        for y in 0..<restorationSize {
+          for x in 0..<restorationSize {
+            var sum: Float = 0
+            for subY in 0..<scaleY {
+              let sourceY = y * scaleY + subY
+              let row = sourceOffset + sourceY * output.width + x * scaleX
+              for subX in 0..<scaleX {
+                let value = max(
+                  0,
+                  min(1, Float(output.pixels[row + subX]))
+                )
+                // Keep the established uint8 image-model contract for the
+                // low-resolution path used by existing effect settings.
+                sum += Float(Int((value * 255).rounded())) / 255
+              }
+            }
+            areaReduced[destinationOffset + y * restorationSize + x] =
+              sum / divisor
+          }
+        }
+      }
+      reduced = areaReduced
+    }
+    var result = Array(restored[offset..<(offset + frameElements)])
+    for channel in 0..<3 {
+      let channelOffset = channel * plane
+      for pixel in 0..<plane where mask[pixel] > 0.5 {
+        let destination = channelOffset + pixel
+        let base = Float(result[destination])
+        result[destination] = Float16(
+          max(
+            0,
+            min(
+              1,
+              base + (reduced[destination] - base) * strength
+            )
+          )
+        )
+      }
+    }
+    return result
   }
 
   private static func makePool(width: Int, height: Int) throws
@@ -2622,12 +2812,14 @@ private final class NativeROIEnhancer {
     }
     let rowBytes = CVPixelBufferGetBytesPerRow(pixelBuffer)
     let pixels = base.assumingMemoryBound(to: UInt8.self)
-    let plane = restorationSize * restorationSize
+    let width = CVPixelBufferGetWidth(pixelBuffer)
+    let height = CVPixelBufferGetHeight(pixelBuffer)
+    let plane = width * height
     var result = [Float16](repeating: 0, count: plane * 3)
-    for y in 0..<restorationSize {
+    for y in 0..<height {
       let row = pixels.advanced(by: y * rowBytes)
-      for x in 0..<restorationSize {
-        let pixel = y * restorationSize + x
+      for x in 0..<width {
+        let pixel = y * width + x
         result[pixel] = Float16(Float(row[x * 4 + 2]) / 255)
         result[plane + pixel] = Float16(Float(row[x * 4 + 1]) / 255)
         result[2 * plane + pixel] = Float16(Float(row[x * 4]) / 255)
@@ -2770,10 +2962,67 @@ private final class NativeFrameProcessor {
     for scene in scenes.sorted(by: {
       ($0.frames.first?.batchIndex ?? 0) < ($1.frames.first?.batchIndex ?? 0)
     }) {
-      let (restored, geometries, masks) = try await restore(scene)
-      let compositionStart = Date()
+      let (restored, originalInput, geometries, masks) = try await restore(scene)
       let restoredFrameElements =
         3 * restorationSize * restorationSize
+      if let roiEnhancer {
+        guard let originalInput else {
+          throw NativePreviewError.restorer(
+            "ROI enhancer original frame is unavailable"
+          )
+        }
+        // Keep only one 512/1024 enhancer frame alive at a time. The final
+        // compositor samples only native ROI pixels, so there is no full-size
+        // high-resolution residual pass and memory does not scale with scene
+        // length.
+        for index in scene.frames.indices {
+          let offset = index * restoredFrameElements
+          let restorationBase = Array(
+            restored[offset..<(offset + restoredFrameElements)]
+          )
+          let originalFrame = Array(
+            originalInput[offset..<(offset + restoredFrameElements)]
+          )
+          let enhancementStart = Date()
+          let modelMask = Self.modelMask(
+            cropMask: masks[index],
+            geometry: geometries[index]
+          )
+          let enhancedFrame = try await roiEnhancer.enhanceFrame(
+            restored: restored,
+            offset: offset,
+            mask: modelMask
+          )
+          restorationSeconds += Date().timeIntervalSince(enhancementStart)
+          let lowEnhanced = enhancedFrame?.lowResolution ?? restorationBase
+          let lowOutput = effects.isEnabled
+            ? Self.applyRestoreEffects(
+              restored: lowEnhanced,
+              original: originalFrame,
+              geometries: [geometries[index]],
+              cropMasks: [masks[index]],
+              effects: effects
+            )
+            : lowEnhanced
+
+          let compositionStart = Date()
+          let frameIndex = scene.frames[index].batchIndex
+          outputs[frameIndex] = try composite(
+            source: outputs[frameIndex],
+            restored: lowOutput,
+            enhancerBase: enhancedFrame?.lowResolution,
+            restorationBase: enhancedFrame == nil ? nil : restorationBase,
+            restoredOffset: 0,
+            geometry: geometries[index],
+            hardMask: masks[index],
+            enhancedFrame: enhancedFrame
+          )
+          compositionSeconds += Date().timeIntervalSince(compositionStart)
+        }
+        continue
+      }
+
+      let compositionStart = Date()
       let composed = UnsafeMutablePointer<CVPixelBuffer?>.allocate(
         capacity: scene.frames.count
       )
@@ -2790,9 +3039,12 @@ private final class NativeFrameProcessor {
           composed[index] = try composite(
             source: outputs[scene.frames[index].batchIndex],
             restored: restored,
+            enhancerBase: nil,
+            restorationBase: nil,
             restoredOffset: index * restoredFrameElements,
             geometry: geometries[index],
-            hardMask: masks[index]
+            hardMask: masks[index],
+            enhancedFrame: nil
           )
         } catch {
           errorLock.lock()
@@ -2913,7 +3165,9 @@ private final class NativeFrameProcessor {
 
   private func restore(
     _ scene: NativeScene
-  ) async throws -> ([Float16], [NativeClipGeometry], [[Float]]) {
+  ) async throws -> (
+    [Float16], [Float16]?, [NativeClipGeometry], [[Float]]
+  ) {
     let preparationStart = Date()
     let width = CVPixelBufferGetWidth(scene.frames[0].source)
     let height = CVPixelBufferGetHeight(scene.frames[0].source)
@@ -3004,21 +3258,13 @@ private final class NativeFrameProcessor {
     }
     preparationSeconds += Date().timeIntervalSince(preparationStart)
     let restorationStart = Date()
-    var restored = try restorer.restore(
+    let restorationBase = try restorer.restore(
       modelInput,
       frameCount: scene.frames.count
     )
-    if let roiEnhancer {
-      let modelMasks = geometries.indices.map {
-        Self.modelMask(
-          cropMask: hardMasks[$0],
-          geometry: geometries[$0]
-        )
-      }
-      restored = try await roiEnhancer.enhance(restored, masks: modelMasks)
-    }
     restorationSeconds += Date().timeIntervalSince(restorationStart)
-    if effects.isEnabled {
+    var restored = restorationBase
+    if roiEnhancer == nil, effects.isEnabled {
       restored = Self.applyRestoreEffects(
         restored: restored,
         original: modelInput,
@@ -3027,7 +3273,12 @@ private final class NativeFrameProcessor {
         effects: effects
       )
     }
-    return (restored, geometries, hardMasks)
+    return (
+      restored,
+      roiEnhancer == nil ? nil : modelInput,
+      geometries,
+      hardMasks
+    )
   }
 
   private static func cropToBox(
@@ -3822,9 +4073,12 @@ private final class NativeFrameProcessor {
   private func composite(
     source: CVPixelBuffer,
     restored: [Float16],
+    enhancerBase: [Float16]?,
+    restorationBase: [Float16]?,
     restoredOffset: Int,
     geometry: NativeClipGeometry,
-    hardMask: [Float]
+    hardMask: [Float],
+    enhancedFrame: NativeEnhancerFrame?
   ) throws -> CVPixelBuffer {
     let output = try allocateOutputBuffer(context: "composite")
     CVPixelBufferLockBaseAddress(source, .readOnly)
@@ -3887,6 +4141,82 @@ private final class NativeFrameProcessor {
       y1[cropY] = min(restorationSize - 1, lowerY + 1)
       yFraction[cropY] = clampedY - Float(lowerY)
     }
+    let validEnhancer: NativeEnhancerFrame?
+    if let enhancedFrame,
+      let enhancerBase,
+      let restorationBase,
+      enhancedFrame.output.width > 0,
+      enhancedFrame.output.height > 0,
+      enhancedFrame.output.pixels.count
+        == enhancedFrame.output.width * enhancedFrame.output.height * 3,
+      enhancerBase.count >= restoredOffset + plane * 3,
+      restorationBase.count >= restoredOffset + plane * 3
+    {
+      validEnhancer = enhancedFrame
+    } else {
+      validEnhancer = nil
+    }
+    var enhancerX0 = [Int](
+      repeating: 0,
+      count: validEnhancer == nil ? 0 : cropWidth
+    )
+    var enhancerX1 = enhancerX0
+    var enhancerXFraction = [Float](
+      repeating: 0,
+      count: validEnhancer == nil ? 0 : cropWidth
+    )
+    var enhancerY0 = [Int](
+      repeating: 0,
+      count: validEnhancer == nil ? 0 : cropHeight
+    )
+    var enhancerY1 = enhancerY0
+    var enhancerYFraction = [Float](
+      repeating: 0,
+      count: validEnhancer == nil ? 0 : cropHeight
+    )
+    if let validEnhancer {
+      for cropX in 0..<cropWidth {
+        let restoredX = Float(x0[cropX]) + xFraction[cropX]
+        let enhancerX = (restoredX + 0.5)
+          * Float(validEnhancer.output.width)
+          / Float(restorationSize) - 0.5
+        let clampedX = max(
+          0,
+          min(Float(validEnhancer.output.width - 1), enhancerX)
+        )
+        let lowerX = Int(floor(clampedX))
+        enhancerX0[cropX] = lowerX
+        enhancerX1[cropX] = min(
+          validEnhancer.output.width - 1,
+          lowerX + 1
+        )
+        enhancerXFraction[cropX] = clampedX - Float(lowerX)
+      }
+      for cropY in 0..<cropHeight {
+        let restoredY = Float(y0[cropY]) + yFraction[cropY]
+        let enhancerY = (restoredY + 0.5)
+          * Float(validEnhancer.output.height)
+          / Float(restorationSize) - 0.5
+        let clampedY = max(
+          0,
+          min(Float(validEnhancer.output.height - 1), enhancerY)
+        )
+        let lowerY = Int(floor(clampedY))
+        enhancerY0[cropY] = lowerY
+        enhancerY1[cropY] = min(
+          validEnhancer.output.height - 1,
+          lowerY + 1
+        )
+        enhancerYFraction[cropY] = clampedY - Float(lowerY)
+      }
+    }
+    let enhancerBlendMask = validEnhancer == nil
+      ? []
+      : Self.createEnhancerBlendMask(
+        hardMask,
+        width: cropWidth,
+        height: cropHeight
+      )
     for cropY in 0..<geometry.cropBox.height {
       let sourceY = geometry.cropBox.top + cropY
       let upperRow = y0[cropY] * restorationSize
@@ -3907,24 +4237,68 @@ private final class NativeFrameProcessor {
         let rightX = x1[cropX]
         let fx = xFraction[cropX]
         @inline(__always)
-        func sample(_ offset: Int) -> Float {
+        func sample(_ values: [Float16], _ offset: Int) -> Float {
           let upper =
-            Float(restored[restoredOffset + offset + upperRow + leftX])
+            Float(values[restoredOffset + offset + upperRow + leftX])
               * (1 - fx)
-            + Float(restored[
+            + Float(values[
               restoredOffset + offset + upperRow + rightX
             ]) * fx
           let lower =
-            Float(restored[restoredOffset + offset + lowerRow + leftX])
+            Float(values[restoredOffset + offset + lowerRow + leftX])
               * (1 - fx)
-            + Float(restored[
+            + Float(values[
               restoredOffset + offset + lowerRow + rightX
             ]) * fx
-          return (upper * (1 - fy) + lower * fy) * 255
+          return upper * (1 - fy) + lower * fy
         }
-        let restoredBlue = sample(2 * plane)
-        let restoredGreen = sample(plane)
-        let restoredRed = sample(0)
+        @inline(__always)
+        func sampleEnhanced(_ channel: Int) -> Float {
+          guard let validEnhancer else { return 0 }
+          let output = validEnhancer.output
+          let enhancerPlane = output.width * output.height
+          let upperRow = enhancerY0[cropY] * output.width
+          let lowerRow = enhancerY1[cropY] * output.width
+          let leftX = enhancerX0[cropX]
+          let rightX = enhancerX1[cropX]
+          let fx = enhancerXFraction[cropX]
+          let fy = enhancerYFraction[cropY]
+          let offset = channel * enhancerPlane
+          let upper =
+            Float(output.pixels[offset + upperRow + leftX]) * (1 - fx)
+            + Float(output.pixels[offset + upperRow + rightX]) * fx
+          let lower =
+            Float(output.pixels[offset + lowerRow + leftX]) * (1 - fx)
+            + Float(output.pixels[offset + lowerRow + rightX]) * fx
+          return upper * (1 - fy) + lower * fy
+        }
+        let enhancerAmount = validEnhancer == nil
+          ? 0
+          : enhancerBlendMask[cropY * cropWidth + cropX]
+        @inline(__always)
+        func outputValue(_ channel: Int) -> Float {
+          let channelOffset = channel * plane
+          let base = sample(restored, channelOffset)
+          guard enhancerAmount > 0,
+            let validEnhancer,
+            let enhancerBase,
+            let restorationBase
+          else { return base }
+          let lowEnhanced = sample(enhancerBase, channelOffset)
+          let unenhanced = sample(restorationBase, channelOffset)
+          let highEnhanced = unenhanced
+            + (sampleEnhanced(channel) - unenhanced) * validEnhancer.strength
+          return max(
+            0,
+            min(
+              1,
+              base + (highEnhanced - lowEnhanced) * enhancerAmount
+            )
+          )
+        }
+        let restoredBlue = outputValue(2) * 255
+        let restoredGreen = outputValue(1) * 255
+        let restoredRed = outputValue(0) * 255
         pixel[0] = UInt8(max(0, min(255, Int(Float(pixel[0]) * (1 - alpha) + restoredBlue * alpha))))
         pixel[1] = UInt8(max(0, min(255, Int(Float(pixel[1]) * (1 - alpha) + restoredGreen * alpha))))
         pixel[2] = UInt8(max(0, min(255, Int(Float(pixel[2]) * (1 - alpha) + restoredRed * alpha))))
@@ -3936,6 +4310,64 @@ private final class NativeFrameProcessor {
     // untouched frames around them and shift their levels.
     CVBufferPropagateAttachments(source, output)
     return output
+  }
+
+  /// Inward-only feather for the high-resolution residual. Values outside the
+  /// detector mask stay exactly zero; only the inner few pixels are tapered,
+  /// preventing a one-pixel enhancer seam from flickering with mask motion.
+  private static func createEnhancerBlendMask(
+    _ mask: [Float],
+    width: Int,
+    height: Int
+  ) -> [Float] {
+    guard width > 0, height > 0, mask.count == width * height else {
+      return [Float](repeating: 0, count: max(0, width * height))
+    }
+    let radius = max(1, min(4, min(width, height) / 64))
+    let maximumDistance = radius + 1
+    var distance = mask.map { $0 > 0.5 ? maximumDistance : 0 }
+    // Treat the crop exterior as mask=0 so an ROI touching the crop edge also
+    // reaches zero before high-resolution detail is composited.
+    for y in 0..<height {
+      for x in 0..<width {
+        let index = y * width + x
+        guard distance[index] > 0 else { continue }
+        if x == 0 || y == 0 || x == width - 1 || y == height - 1 {
+          distance[index] = 1
+          continue
+        }
+        var nearest = distance[index]
+        nearest = min(nearest, distance[index - 1] + 1)
+        nearest = min(nearest, distance[index - width] + 1)
+        nearest = min(nearest, distance[index - width - 1] + 1)
+        nearest = min(nearest, distance[index - width + 1] + 1)
+        distance[index] = min(maximumDistance, nearest)
+      }
+    }
+    for y in stride(from: height - 1, through: 0, by: -1) {
+      for x in stride(from: width - 1, through: 0, by: -1) {
+        let index = y * width + x
+        guard distance[index] > 0 else { continue }
+        var nearest = distance[index]
+        if x + 1 < width {
+          nearest = min(nearest, distance[index + 1] + 1)
+        }
+        if y + 1 < height {
+          nearest = min(nearest, distance[index + width] + 1)
+          if x > 0 {
+            nearest = min(nearest, distance[index + width - 1] + 1)
+          }
+          if x + 1 < width {
+            nearest = min(nearest, distance[index + width + 1] + 1)
+          }
+        }
+        distance[index] = min(maximumDistance, nearest)
+      }
+    }
+    return distance.map {
+      guard $0 > 1 else { return 0 }
+      return min(1, Float($0 - 1) / Float(radius))
+    }
   }
 
   private static func createBlendMask(
@@ -4179,12 +4611,28 @@ private enum NativeExportSupport {
     directory: URL
   ) async throws -> (url: URL, temporary: URL?) {
     let directlySupportedExtensions = Set(["mp4", "mov", "m4v"])
+    if !source.isFileURL {
+      guard directlySupportedExtensions.contains(source.pathExtension.lowercased()) else {
+        throw NativePreviewError.export(
+          "HTTPクラスタ入力はAVFoundation互換のmp4/mov/m4vのみ対応しています"
+        )
+      }
+      // AVAssetReader rejects an ordinary remote AVURLAsset. The decoder
+      // installs MiohHTTPRangeAsset on a custom-scheme asset instead.
+      return (source, nil)
+    }
     let asset = AVURLAsset(url: source)
     let playable = (try? await asset.load(.isPlayable)) ?? false
-    if directlySupportedExtensions.contains(source.pathExtension.lowercased()),
-      playable
-    {
+    if directlySupportedExtensions.contains(source.pathExtension.lowercased()), playable {
       return (source, nil)
+    }
+    // Remote cluster input is intentionally byte-range streamed. Silently
+    // downloading/remuxing the whole capability URL would defeat bounded
+    // transfer and can expose the short-lived ticket to a subprocess.
+    guard source.isFileURL else {
+      throw NativePreviewError.export(
+        "HTTPクラスタ入力はAVFoundation互換のmp4/mov/m4vのみ対応しています"
+      )
     }
     guard let ffmpeg else {
       throw NativePreviewError.export(
@@ -4321,6 +4769,63 @@ private enum NativeExportSupport {
     try? FileManager.default.removeItem(at: output)
     try FileManager.default.moveItem(at: part, to: output)
   }
+
+  /// Concatenate a cluster worker's completed video segments without reading
+  /// or muxing the source audio. Audio is owned by the coordinator and is
+  /// added once, after all core ranges have been assembled in timeline order.
+  static func finishWorkerExport(
+    segments: [SegmentEvent],
+    output: URL,
+    ffmpeg: URL,
+    workingDirectory: URL,
+    fastStart: Bool
+  ) throws {
+    guard !segments.isEmpty else {
+      throw NativePreviewError.export(
+        "クラスタワーカーが映像フレームを生成しませんでした"
+      )
+    }
+    try FileManager.default.createDirectory(
+      at: workingDirectory,
+      withIntermediateDirectories: true
+    )
+    let manifest = workingDirectory.appendingPathComponent(
+      "cluster-concat-\(UUID().uuidString).txt"
+    )
+    defer { try? FileManager.default.removeItem(at: manifest) }
+    let contents = segments.sorted { $0.sequence < $1.sequence }.map {
+      let escaped = $0.path.replacingOccurrences(of: "'", with: "'\\''")
+      return "file '\(escaped)'"
+    }.joined(separator: "\n") + "\n"
+    try Data(contents.utf8).write(to: manifest, options: .atomic)
+
+    try FileManager.default.createDirectory(
+      at: output.deletingLastPathComponent(),
+      withIntermediateDirectories: true
+    )
+    let ext = output.pathExtension.isEmpty ? "mp4" : output.pathExtension
+    let part = output.deletingPathExtension()
+      .appendingPathExtension("part")
+      .appendingPathExtension(ext)
+    try? FileManager.default.removeItem(at: part)
+    var arguments = [
+      "-hide_banner", "-loglevel", "error", "-y",
+      "-f", "concat", "-safe", "0", "-i", manifest.path,
+      "-map", "0:v:0", "-an", "-c:v", "copy",
+    ]
+    if fastStart && ext.lowercased() == "mp4" {
+      arguments.append(contentsOf: ["-movflags", "+faststart"])
+    }
+    arguments.append(part.path)
+    _ = try runProcess(
+      executable: ffmpeg,
+      arguments: arguments,
+      temporaryDirectory: workingDirectory,
+      failureMessage: "クラスタワーカー映像の結合に失敗しました"
+    )
+    try? FileManager.default.removeItem(at: output)
+    try FileManager.default.moveItem(at: part, to: output)
+  }
 }
 
 @main
@@ -4360,9 +4865,49 @@ private struct NativePreviewPipeline {
         "temporal batch must be 1...\(maximumTemporalBatchFrames) frames and fit in the ring"
       )
     }
-    let overlap = config.isExport
-      ? min(max(0, config.temporalOverlap ?? 0), config.temporalBatchFrames - 1)
-      : 0
+    if config.isWorker {
+      guard config.isExport else {
+        throw NativePreviewError.invalidConfiguration(
+          "workerMode requires export mode"
+        )
+      }
+      guard config.targetFPS == nil else {
+        throw NativePreviewError.invalidConfiguration(
+          "cluster worker v1 does not support targetFPS conversion"
+        )
+      }
+      guard let decodeEnd = config.decodeEndNanoseconds,
+        let coreStart = config.outputCoreStartNanoseconds,
+        let coreEnd = config.outputCoreEndNanoseconds,
+        decodeEnd > config.startNanoseconds,
+        coreStart >= config.startNanoseconds,
+        coreEnd > coreStart,
+        coreEnd <= decodeEnd
+      else {
+        throw NativePreviewError.invalidConfiguration(
+          "workerMode requires a valid padded decode range and core output range"
+        )
+      }
+      guard let jobID = config.jobID, !jobID.isEmpty,
+        let attemptID = config.attemptID, !attemptID.isEmpty
+      else {
+        throw NativePreviewError.invalidConfiguration(
+          "workerMode requires jobID and attemptID"
+        )
+      }
+    }
+    if let coreStart = config.outputCoreStartNanoseconds,
+      let coreEnd = config.outputCoreEndNanoseconds,
+      coreEnd <= coreStart
+    {
+      throw NativePreviewError.invalidConfiguration(
+        "outputCoreEndNanoseconds must be greater than outputCoreStartNanoseconds"
+      )
+    }
+    let overlap = min(
+      max(0, config.temporalOverlap ?? 0),
+      config.temporalBatchFrames - 1
+    )
     let outputDirectory = URL(
       fileURLWithPath: config.outputDirectory,
       isDirectory: true
@@ -4371,8 +4916,16 @@ private struct NativePreviewPipeline {
       URL(fileURLWithPath: $0, isDirectory: true)
     } ?? outputDirectory
     let ffmpegURL = config.ffmpeg.map { URL(fileURLWithPath: $0) }
+    let sourceURL: URL
+    if let parsed = URL(string: config.input),
+      parsed.scheme?.lowercased() == "http" || parsed.scheme?.lowercased() == "https"
+    {
+      sourceURL = parsed
+    } else {
+      sourceURL = URL(fileURLWithPath: config.input)
+    }
     let preparedInput = try await NativeExportSupport.prepareInput(
-      source: URL(fileURLWithPath: config.input),
+      source: sourceURL,
       ffmpeg: ffmpegURL,
       directory: ffmpegTemporaryDirectory
     )
@@ -4385,7 +4938,10 @@ private struct NativePreviewPipeline {
     let ring = PixelBufferRing(capacity: config.ringCapacity)
     let decoder = try await ContinuousVideoDecoder(
       input: preparedInput.url,
+      expectedRemoteByteCount: config.inputByteCount,
+      expectedRemoteSHA256: config.inputSHA256,
       startNanoseconds: config.startNanoseconds,
+      endNanoseconds: config.decodeEndNanoseconds,
       ring: ring
     )
     let video = try await decoder.description()
@@ -4575,7 +5131,9 @@ private struct NativePreviewPipeline {
       "h264_display_order_recovery":
         decoder.repairsMalformedH264DisplayOrder,
       "pipeline": config.isExport
-        ? "swift-native-export"
+        ? (config.isWorker
+          ? "swift-native-cluster-worker"
+          : "swift-native-export")
         : "swift-cvpixelbuffer-ring-coreai",
     ])
     try decoder.start()
@@ -4595,6 +5153,21 @@ private struct NativePreviewPipeline {
         : targetRate.map {
           PTSFrameRateGate(numerator: $0.numerator, denominator: $0.denominator)
         }
+
+      @inline(__always)
+      func belongsToCoreOutput(_ ptsNanoseconds: Int64) -> Bool {
+        if let start = config.outputCoreStartNanoseconds,
+          ptsNanoseconds < start
+        {
+          return false
+        }
+        if let end = config.outputCoreEndNanoseconds,
+          ptsNanoseconds >= end
+        {
+          return false
+        }
+        return true
+      }
 
       // Keep at most two detected batches resident: one being restored and
       // one being prepared. This overlaps detection CPU/Core AI work with the
@@ -4881,6 +5454,9 @@ private struct NativePreviewPipeline {
               }
             }
             let acceptedFrames = framesToEncode.filter { frame in
+              guard belongsToCoreOutput(frame.ptsNanoseconds) else {
+                return false
+              }
               guard var gate = postRestorationFrameRateGate else { return true }
               let accepted = gate.accepts(frame.ptsNanoseconds)
               postRestorationFrameRateGate = gate
@@ -4973,6 +5549,7 @@ private struct NativePreviewPipeline {
         pendingEncoding = nil
         if !deferredCrossfadeTail.isEmpty {
           for frame in deferredCrossfadeTail {
+            guard belongsToCoreOutput(frame.ptsNanoseconds) else { continue }
             if var gate = postRestorationFrameRateGate {
               let accepted = gate.accepts(frame.ptsNanoseconds)
               postRestorationFrameRateGate = gate
@@ -5003,19 +5580,51 @@ private struct NativePreviewPipeline {
               "export mode requires outputFile and ffmpeg"
             )
           }
-          emit([
-            "kind": "export_finalizing",
-            "generation": config.generation,
-            "message": "音声を結合しています",
-          ])
-          try NativeExportSupport.finishExport(
-            segments: completedSegments,
-            source: URL(fileURLWithPath: config.input),
-            output: URL(fileURLWithPath: outputFile),
-            ffmpeg: ffmpegURL,
-            workingDirectory: ffmpegTemporaryDirectory,
-            fastStart: config.mp4FastStart ?? false
-          )
+          let finalOutput = URL(fileURLWithPath: outputFile)
+          if config.isWorker {
+            emit([
+              "kind": "export_finalizing",
+              "generation": config.generation,
+              "message": "クラスタワーカー映像を確定しています",
+            ])
+            try NativeExportSupport.finishWorkerExport(
+              segments: completedSegments,
+              output: finalOutput,
+              ffmpeg: ffmpegURL,
+              workingDirectory: ffmpegTemporaryDirectory,
+              fastStart: config.mp4FastStart ?? false
+            )
+            emit([
+              "kind": "cluster_artifact",
+              "generation": config.generation,
+              "job_id": config.jobID ?? "",
+              "attempt_id": config.attemptID ?? "",
+              "path": finalOutput.path,
+              "segment_paths": completedSegments.sorted {
+                $0.sequence < $1.sequence
+              }.map(\.path),
+              "decode_start_ns": config.startNanoseconds,
+              "decode_end_ns": config.decodeEndNanoseconds ?? 0,
+              "core_start_ns": config.outputCoreStartNanoseconds ?? 0,
+              "core_end_ns": config.outputCoreEndNanoseconds ?? 0,
+              "frame_count": encodedFrames,
+              "has_audio": false,
+            ])
+          } else {
+            emit([
+              "kind": "export_finalizing",
+              "generation": config.generation,
+              "message": "音声を結合しています",
+            ])
+            try NativeExportSupport.finishExport(
+              segments: completedSegments,
+              source: URL(fileURLWithPath: config.input),
+              output: finalOutput,
+              ffmpeg: ffmpegURL,
+              workingDirectory: ffmpegTemporaryDirectory,
+              fastStart: config.mp4FastStart ?? false
+            )
+          }
         }
         let elapsed = max(0.001, Date().timeIntervalSince(wallStart))
         emit([

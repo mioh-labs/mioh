@@ -165,6 +165,16 @@ class PreviewProtocolTests(unittest.TestCase):
             12,
         )
 
+    def test_native_swift_realtime_payload_uses_t30_overlap_and_crossfade(self):
+        source = WORKER_PATH.read_text()
+
+        for contract in [
+            "temporal_frame_limit = 30",
+            '"temporalOverlap": temporal_overlap',
+            '"crossfade": bool(config.restore_crossfade)',
+        ]:
+            self.assertIn(contract, source)
+
 
 class SegmentEncoderTests(unittest.TestCase):
     @classmethod

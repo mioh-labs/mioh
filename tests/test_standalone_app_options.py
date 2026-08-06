@@ -301,15 +301,17 @@ class StandaloneAppOptionTests(unittest.TestCase):
 
         self.assertIn("func nativePreviewInvocation(", app)
         for contract in [
-            "let previewModel = capabilities.previewRestorationModel",
-            "let previewDetectionModel = capabilities.previewDetectionModel",
+            "let previewModel = previewRestorationModel",
+            "let selectedPreviewDetectionModel = previewDetectionModel",
             "restorationModels: restoration.url.path",
             "detectionModel: detection.url.path",
             "bufferLimitSeconds: previewBufferLimit",
             "temporalBatchFrames: temporalFrames",
+            "temporalOverlap: previewOverlap",
             "blendFeather: Float(blendFeather)",
             "detectionEmptyLookahead: max(0, detectionEmptyLookahead)",
             "detectFaceMosaics: detectFaceMosaics",
+            "crossfade: restoreCrossfade",
             'environment["TMPDIR"] = miohTemporary',
         ]:
             self.assertIn(contract, app)
@@ -332,8 +334,8 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "func loadSavedDefaults()",
             "func resetDefaultsToFactory()",
             "private func loadSavedDefaultsOnLaunch()",
-            "private func currentDefaultsSnapshot() -> MiohUserDefaultsSnapshot",
-            "private func apply(defaults snapshot: MiohUserDefaultsSnapshot)",
+            "func currentDefaultsSnapshot() -> MiohUserDefaultsSnapshot",
+            "func apply(defaults snapshot: MiohUserDefaultsSnapshot)",
             "UserDefaults.standard.set(data, forKey: defaultsKey)",
             "UserDefaults.standard.data(forKey: defaultsKey)",
             "UserDefaults.standard.removeObject(forKey: defaultsKey)",
@@ -512,7 +514,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn('let splitMode = noSplit ? "none"', source)
         self.assertIn(".disabled(runner.noSplit)", source)
 
-    def test_preview_uses_fixed_models_without_model_pickers(self):
+    def test_native_preview_honors_selected_models(self):
         source = APP_SOURCE.read_text()
         player = PLAYER_SOURCE.read_text()
 
@@ -523,17 +525,17 @@ class StandaloneAppOptionTests(unittest.TestCase):
             source,
         )
         self.assertIn(
-            "let previewModel = capabilities.previewRestorationModel",
+            "let previewModel = previewRestorationModel",
             source,
         )
         self.assertIn(
-            "let previewDetectionModel = capabilities.previewDetectionModel",
+            "let selectedPreviewDetectionModel = previewDetectionModel",
             source,
         )
         self.assertIn("model: previewModel", source)
-        self.assertIn("model: previewDetectionModel", source)
-        # The pickers exist again for the bundled Python worker, but the
-        # native preview still resolves its assets from capabilities alone.
+        self.assertIn("model: selectedPreviewDetectionModel", source)
+        self.assertIn('previewRestorationModel != "カスタム"', source)
+        self.assertIn('previewDetectionModel != "カスタム"', source)
         self.assertIn("@Published var previewRestorationModel: String", source)
         self.assertIn("@Published var previewDetectionModel: String", source)
         self.assertIn(
@@ -548,7 +550,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
         )
         self.assertIn('if !controller.isVRVideo', player)
         self.assertIn(
-            "let temporalLimit = detection.computeUnits == nil ? 18 : 36",
+            "let temporalLimit = detection.computeUnits == nil ? 30 : 36",
             source,
         )
         self.assertIn(
@@ -740,6 +742,24 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn('ditto "$source_model" "$RESOURCES/models/$asset"', script)
         self.assertIn('--distribution "$COREAI_DISTRIBUTION"', script)
         self.assertIn('--smoke-model basicvsrpp-v1.2-coreai', script)
+
+    def test_build_keeps_dedicated_and_portable_checkpoints_separate(self):
+        script = BUILD_SCRIPT.read_text()
+
+        self.assertIn(
+            '$ROOT/model_weights/hf2500-plus-fc2-500-ema.pth', script
+        )
+        self.assertIn(
+            '$ROOT/model_weights/lada_mosaic_restoration_model_generic_v1.2.pth',
+            script,
+        )
+        self.assertIn(
+            'VARIABLE_COREAI_CHECKPOINT="${VARIABLE_COREAI_CHECKPOINT:-$default_variable_checkpoint}"',
+            script,
+        )
+        self.assertIn(
+            'Missing variable restoration checkpoint:', script
+        )
 
     def test_build_records_variable_restoration_checkpoint_provenance(self):
         script = BUILD_SCRIPT.read_text()
@@ -1080,6 +1100,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
 
     def test_gui_exposes_temporal_overlap_controls(self):
         source = APP_SOURCE.read_text()
+        pipeline = NATIVE_PIPELINE_SOURCE.read_text()
 
         for contract in [
             "@Published var restoreTemporalOverlap = 8",
@@ -1089,8 +1110,18 @@ class StandaloneAppOptionTests(unittest.TestCase):
             'Toggle("クロスフェードを有効化", isOn: $runner.restoreCrossfade)',
             "temporalOverlap: overlap",
             "crossfade: restoreCrossfade",
+            "let temporalOverlap: Int",
+            "let crossfade: Bool",
+            "let previewOverlap = min(",
+            "temporalOverlap: previewOverlap",
         ]:
             self.assertIn(contract, source)
+
+        self.assertIn("let temporalOverlap: Int?", pipeline)
+        self.assertIn("let crossfade: Bool?", pipeline)
+        self.assertIn("max(0, config.temporalOverlap ?? 0)", pipeline)
+        self.assertIn("(config.crossfade ?? false), overlap > 0", pipeline)
+        self.assertNotIn("let overlap = config.isExport", pipeline)
 
     def test_app_defaults_to_native_swift_export(self):
         script = BUILD_SCRIPT.read_text()
@@ -1260,7 +1291,17 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn("nativeROIEnhancerAsset(", source)
         self.assertIn("roiEnhancerModel: nativeEnhancer?.url.path", source)
         self.assertIn("private final class NativeROIEnhancer", pipeline)
-        self.assertIn("restored = try await roiEnhancer.enhance", pipeline)
+        self.assertIn("try await roiEnhancer.enhanceFrame", pipeline)
+        self.assertIn("enhancedFrame: enhancedFrame", pipeline)
+        self.assertIn("lowResolution: try Self.makeLowResolution", pipeline)
+        self.assertIn("enhancer legacy 256px output", pipeline)
+        self.assertIn("base + (highEnhanced - lowEnhanced) * enhancerAmount", pipeline)
+        self.assertIn("createEnhancerBlendMask", pipeline)
+        self.assertIn("if roiEnhancer == nil, effects.isEnabled", pipeline)
+        self.assertIn("only one high-resolution frame", pipeline)
+        self.assertNotIn("makeDetailResidual", pipeline)
+        self.assertNotIn("private var reducedPool", pipeline)
+        self.assertNotIn('label: "enhancer reduced output"', pipeline)
         self.assertIn("CVPixelBufferPoolFlush(sourcePool", pipeline)
         self.assertNotIn('guard roiEnhancer == "none"', source)
 
