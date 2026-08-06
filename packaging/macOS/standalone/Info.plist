@@ -32,6 +32,13 @@
     <string>public.app-category.video</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>同じローカルネットワーク上の端末からmiohを操作・視聴し、Mac間で復元ジョブを分散するために使用します。</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_mioh._tcp</string>
+		<string>_mioh-worker._tcp</string>
+	</array>
     <key>NSAppTransportSecurity</key>
     <dict>
         <key>NSAllowsLocalNetworking</key>
