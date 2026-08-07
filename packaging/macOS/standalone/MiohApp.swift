@@ -124,6 +124,9 @@ private struct NativePreviewLaunchConfiguration: Encodable {
   let restorationRunner: String
   let restorationFrameCount: Int?
   let startNanoseconds: Int64
+  let decodeEndNanoseconds: Int64?
+  let outputCoreStartNanoseconds: Int64?
+  let outputCoreEndNanoseconds: Int64?
   let generation: Int
   let segmentSeconds: Double = 2
   let bufferLimitSeconds: Double
@@ -2339,7 +2342,12 @@ final class RestorationRunner: ObservableObject {
     if !previewRealtimeOptimization && roiEnhancer != "none" {
       try rejectUnsupportedCoreAIModel(roiEnhancerModel)
     }
-    var args = ["--input", input.path, "--output-dir", outputDirectory.path]
+    var args = [
+      "--input",
+      input.isFileURL ? input.path : input.absoluteString,
+      "--output-dir",
+      outputDirectory.path,
+    ]
     add(&args, "--device", device)
     args.append(fp16 ? "--fp16" : "--no-fp16")
     add(&args, "--restoration-model", previewModel)
@@ -3171,7 +3179,10 @@ final class RestorationRunner: ObservableObject {
     outputDirectory: URL,
     input: URL,
     startNanoseconds: Int64,
-    generation: Int
+    generation: Int,
+    decodeEndNanoseconds: Int64? = nil,
+    outputCoreStartNanoseconds: Int64? = nil,
+    outputCoreEndNanoseconds: Int64? = nil
   ) throws -> NativePreviewInvocation {
     normalizeModelSelections()
     guard capabilities.supportsCoreAI else {
@@ -3270,7 +3281,7 @@ final class RestorationRunner: ObservableObject {
       ? outputDirectory.path
       : ladaTempDirectory
     let configuration = NativePreviewLaunchConfiguration(
-      input: input.path,
+      input: input.isFileURL ? input.path : input.absoluteString,
       outputDirectory: outputDirectory.path,
       ffmpegTemporaryDirectory: ffmpegTemporary,
       miohTemporaryDirectory: miohTemporary,
@@ -3287,6 +3298,9 @@ final class RestorationRunner: ObservableObject {
       restorationRunner: restorationRunner.path,
       restorationFrameCount: restoration.fixedFrameCount,
       startNanoseconds: startNanoseconds,
+      decodeEndNanoseconds: decodeEndNanoseconds,
+      outputCoreStartNanoseconds: outputCoreStartNanoseconds,
+      outputCoreEndNanoseconds: outputCoreEndNanoseconds,
       generation: generation,
       bufferLimitSeconds: previewBufferLimit,
       temporalBatchFrames: temporalFrames,
@@ -3639,7 +3653,7 @@ struct PathRow: View {
       Image(systemName: icon).frame(width: 20).foregroundStyle(.secondary)
       VStack(alignment: .leading, spacing: 3) {
         Text(L(title)).font(.caption).foregroundStyle(.secondary)
-        Text(url?.path ?? L("未選択"))
+        Text(url.map { $0.isFileURL ? $0.path : $0.absoluteString } ?? L("未選択"))
           .lineLimit(1).truncationMode(.middle)
           .frame(maxWidth: .infinity, alignment: .leading)
       }
@@ -3716,28 +3730,67 @@ struct PathSettingRow: View {
   }
 }
 
+private enum WorkspaceTab: Hashable {
+  case basic
+  case browser
+  case processing
+  case restoration
+  case detection
+  case encoding
+  case memory
+  case settings
+  case playback
+  case log
+}
+
 struct ContentView: View {
   @StateObject private var runner = RestorationRunner()
   @StateObject private var player = RealtimePlayerController()
+  @StateObject private var mediaBrowser = MacMediaBrowserController()
   @StateObject private var remoteControl = RemoteControlServer()
   @StateObject private var remoteStreaming = RemoteStreamingCoordinator()
   @StateObject private var cluster = MiohClusterController()
+  @State private var selectedTab: WorkspaceTab = .basic
 
   var body: some View {
     VStack(spacing: 0) {
       header
       Divider()
-      TabView {
-        basicTab.tabItem { Label("基本", systemImage: "slider.horizontal.3") }
-        processingTab.tabItem { Label("分割", systemImage: "square.split.2x1") }
-        restorationTab.tabItem { Label("復元", systemImage: "wand.and.stars") }
-        detectionTab.tabItem { Label("検出", systemImage: "viewfinder") }
-        encodingTab.tabItem { Label("出力", systemImage: "video") }
-        memoryTab.tabItem { Label("メモリ", systemImage: "memorychip") }
+      TabView(selection: $selectedTab) {
+        basicTab
+          .tabItem { Label("基本", systemImage: "slider.horizontal.3") }
+          .tag(WorkspaceTab.basic)
+        MacMediaBrowserView(
+          controller: mediaBrowser,
+          player: player,
+          runner: runner,
+          selectPlayback: { selectedTab = .playback }
+        )
+          .tabItem { Label("ブラウザ", systemImage: "globe") }
+          .tag(WorkspaceTab.browser)
+        processingTab
+          .tabItem { Label("分割", systemImage: "square.split.2x1") }
+          .tag(WorkspaceTab.processing)
+        restorationTab
+          .tabItem { Label("復元", systemImage: "wand.and.stars") }
+          .tag(WorkspaceTab.restoration)
+        detectionTab
+          .tabItem { Label("検出", systemImage: "viewfinder") }
+          .tag(WorkspaceTab.detection)
+        encodingTab
+          .tabItem { Label("出力", systemImage: "video") }
+          .tag(WorkspaceTab.encoding)
+        memoryTab
+          .tabItem { Label("メモリ", systemImage: "memorychip") }
+          .tag(WorkspaceTab.memory)
         settingsTab.tabItem { Label("設定", systemImage: "gearshape") }
+          .tag(WorkspaceTab.settings)
         RealtimePlayerView(controller: player, runner: runner)
           .tabItem { Label("再生", systemImage: "play.rectangle") }
-        logTab.tabItem { Label("ログ", systemImage: "terminal") }
+          .tag(WorkspaceTab.playback)
+        logTab
+          .tabItem { Label("ログ", systemImage: "terminal") }
+          .tag(WorkspaceTab.log)
       }
       .padding(.horizontal, 14)
       ProgressView(value: cluster.isRunning ? cluster.progress : runner.progress)
