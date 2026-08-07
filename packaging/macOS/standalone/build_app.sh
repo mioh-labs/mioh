@@ -2,7 +2,8 @@
 set -euo pipefail
 
 ROOT="${0:A:h:h:h:h}"
-PACKAGE_DIR="$ROOT/packaging/macos/standalone"
+PACKAGE_DIR="$ROOT/packaging/macOS/standalone"
+REMOTE_APP_SOURCE_DIR="$ROOT/apps/MiohRemote/MiohRemote"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build/macos-standalone}"
 COREAI_DISTRIBUTION="${COREAI_DISTRIBUTION:-dedicated}"
 APP_BASENAME="${APP_BASENAME:-mioh}"
@@ -88,12 +89,22 @@ xcrun swiftc \
   -framework SwiftUI \
   -framework AVFoundation \
   -framework AVKit \
+  -framework CoreMedia \
   -framework Metal \
   -framework Network \
   -framework Security \
   -framework SceneKit \
+  -framework WebKit \
   "${APP_SWIFT_FLAGS[@]}" \
+  "$REMOTE_APP_SOURCE_DIR/IPadBrowserLibraryStore.swift" \
+  "$REMOTE_APP_SOURCE_DIR/IPadWebMediaDiscovery.swift" \
+  "$REMOTE_APP_SOURCE_DIR/IPadMediaURLResolver.swift" \
+  "$REMOTE_APP_SOURCE_DIR/IPadAuthenticatedMediaProxy.swift" \
+  "$REMOTE_APP_SOURCE_DIR/IPadMPEGTSRemuxer.swift" \
+  "$REMOTE_APP_SOURCE_DIR/IPadInteractiveMediaBrowser.swift" \
   "$PACKAGE_DIR/MiohApp.swift" \
+  "$PACKAGE_DIR/MacMediaBrowser.swift" \
+  "$PACKAGE_DIR/MacHLSRealtimePipeline.swift" \
   "$PACKAGE_DIR/RealtimePlayer.swift" \
   "$PACKAGE_DIR/RemoteControlServer.swift" \
   "$PACKAGE_DIR/RemoteStreamingCoordinator.swift" \
