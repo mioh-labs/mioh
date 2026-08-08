@@ -12,6 +12,21 @@ __pycache__/
 build/
 tmp/
 
+# Large binary artifacts are local/downloaded/generated; keep them out of git.
+*.dmg
+*.mp4
+*.mov
+*.mkv
+*.pth
+*.pt
+*.onnx
+*.safetensors
+model_weights/**/*.bin
+model_weights/**/*.mlirb
+model_weights/**/*.mlpackage/
+model_weights/**/*.aimodel/
+model_weights/**/*.aimodelc/
+
 # Xcode per-user UI and scheme state
 **/xcuserdata/
 *.xcuserstate
