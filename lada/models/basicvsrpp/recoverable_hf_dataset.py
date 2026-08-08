@@ -383,6 +383,12 @@ class RecoverableHFMosaicVideoDataset(Dataset):
         data_sample.mosaic_block_size = torch.tensor(
             block_size, dtype=torch.int64
         )
+        # Explicit opt-in prevents exact observation consistency from being
+        # applied accidentally if a future curriculum mixes approximate,
+        # resized, compressed, or otherwise non-invertible degradations.
+        data_sample.mosaic_observation_weight = torch.tensor(
+            1.0, dtype=torch.float32
+        )
         data_sample.mask_reliability = torch.tensor(
             reliability, dtype=torch.float32
         )

@@ -3,6 +3,19 @@ import XCTest
 @testable import MiohRemoteKit
 
 final class MiohRemoteKitTests: XCTestCase {
+  func testRestorationOptionsAcceptExactRationalFPS() throws {
+    let request = try workerRequest(
+      rootID: "test-root",
+      inputByteCount: 1,
+      inputSHA256: String(repeating: "a", count: 64),
+      targetFPSNumerator: 30_000,
+      targetFPSDenominator: 1_001
+    )
+    XCTAssertTrue(request.options.isValid)
+    XCTAssertEqual(request.options.targetFPSNumerator, 30_000)
+    XCTAssertEqual(request.options.targetFPSDenominator, 1_001)
+  }
+
   func testClusterRelativePathRejectsEscapes() throws {
     XCTAssertThrowsError(try MiohClusterRelativePath(validating: "../movie.mp4"))
     XCTAssertThrowsError(try MiohClusterRelativePath(validating: "/movie.mp4"))
@@ -581,7 +594,7 @@ final class MiohRemoteKitTests: XCTestCase {
 
   func testHTTPUploaderUsesBoundedLongTransferTimeouts() {
     let configuration = WorkerHTTPUploader.sessionConfiguration()
-    XCTAssertEqual(configuration.timeoutIntervalForRequest, 5 * 60)
+    XCTAssertEqual(configuration.timeoutIntervalForRequest, 30 * 60)
     XCTAssertEqual(configuration.timeoutIntervalForResource, 24 * 60 * 60)
     XCTAssertEqual(configuration.httpMaximumConnectionsPerHost, 1)
   }
@@ -656,7 +669,9 @@ final class MiohRemoteKitTests: XCTestCase {
     inputByteCount: Int64,
     inputSHA256: String,
     httpTransfer: MiohClusterHTTPTransferDescriptor? = nil,
-    leaseExpiresAt: Date = Date().addingTimeInterval(120)
+    leaseExpiresAt: Date = Date().addingTimeInterval(120),
+    targetFPSNumerator: Int? = nil,
+    targetFPSDenominator: Int? = nil
   ) throws -> MiohClusterJobRequest {
     MiohClusterJobRequest(
       jobID: UUID(),
@@ -694,7 +709,9 @@ final class MiohRemoteKitTests: XCTestCase {
         effectUpscale: 1,
         videoCodec: "h264",
         bitrateMultiplier: 1,
-        mp4FastStart: true
+        mp4FastStart: true,
+        targetFPSNumerator: targetFPSNumerator,
+        targetFPSDenominator: targetFPSDenominator
       ),
       createdAt: Date(),
       leaseExpiresAt: leaseExpiresAt,

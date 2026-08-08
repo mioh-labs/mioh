@@ -76,6 +76,23 @@ public enum MiohClusterWorkerError: LocalizedError, Equatable, Sendable {
   }
 }
 
+private func miohClusterFailureCode(for error: Error) -> String {
+  if let workerError = error as? MiohClusterWorkerError {
+    return workerError.failureCode
+  }
+  let message = error.localizedDescription
+    .replacingOccurrences(of: "\r", with: " ")
+    .replacingOccurrences(of: "\n", with: " ")
+    .trimmingCharacters(in: .whitespacesAndNewlines)
+  guard !message.isEmpty else { return "launcher_failed" }
+  if message == "The operation couldn’t be completed. (Swift.CancellationError error 1.)" {
+    return "cancelled"
+  }
+  let nsError = error as NSError
+  let suffix = nsError.domain.isEmpty ? "" : " [\(nsError.domain):\(nsError.code)]"
+  return String(("launcher_failed: " + message + suffix).prefix(700))
+}
+
 public typealias MiohClusterHTTPUploader = @Sendable (
   _ transfer: MiohClusterHTTPTransferDescriptor,
   _ localFile: URL,
@@ -84,6 +101,7 @@ public typealias MiohClusterHTTPUploader = @Sendable (
 
 enum WorkerHTTPUploader {
   typealias RetrySleeper = (UInt64) async throws -> Void
+  private static let transferTimeout: TimeInterval = 30 * 60
 
   static func sessionConfiguration() -> URLSessionConfiguration {
     let configuration = URLSessionConfiguration.ephemeral
@@ -93,7 +111,7 @@ enum WorkerHTTPUploader {
     configuration.httpMaximumConnectionsPerHost = 1
     // Request timeout is the idle timeout. Large shards may legitimately take
     // much longer end-to-end on Wi-Fi, so retain a separate 24-hour resource cap.
-    configuration.timeoutIntervalForRequest = 5 * 60
+    configuration.timeoutIntervalForRequest = transferTimeout
     configuration.timeoutIntervalForResource = 24 * 60 * 60
     return configuration
   }
@@ -119,7 +137,7 @@ enum WorkerHTTPUploader {
     // lease was renewed by the coordinator, so publication must not reject it
     // using stale descriptor time. The capability endpoint remains the final
     // authority and can reject an invalid or revoked ticket.
-    request.timeoutInterval = 5 * 60
+    request.timeoutInterval = transferTimeout
     request.setValue("video/mp4", forHTTPHeaderField: "Content-Type")
     request.setValue(String(byteCount), forHTTPHeaderField: "Content-Length")
     let ownsSession = injectedSession == nil
@@ -579,8 +597,7 @@ public final class MiohClusterWorkerLedger: ObservableObject {
         !attempts[failedIndex].state.isTerminal
       {
         attempts[failedIndex].state = .failed
-        attempts[failedIndex].failureCode =
-          (error as? MiohClusterWorkerError)?.failureCode ?? "launcher_failed"
+        attempts[failedIndex].failureCode = miohClusterFailureCode(for: error)
         attempts[failedIndex].updatedAt = Date()
       }
     }

@@ -117,6 +117,7 @@ def test_recoverable_hf_dataset_is_native_deterministic_and_preprocessor_compati
         sample.mosaic_phase, second["data_samples"].mosaic_phase
     )
     assert sample.mosaic_block_size.item() in range(6, 13)
+    assert sample.mosaic_observation_weight.item() == 1.0
 
     block_size = int(sample.mosaic_block_size)
     final_phase = tuple(int(value) for value in sample.mosaic_phase[0])
@@ -156,6 +157,9 @@ def test_recoverable_hf_dataset_is_native_deterministic_and_preprocessor_compati
     torch.testing.assert_close(
         processed["data_samples"].gt_img[0], raw_gt.float() / 255.0
     )
+    assert processed["data_samples"].mosaic_phase.shape == (1, 9, 2)
+    assert processed["data_samples"].mosaic_block_size.shape == (1,)
+    assert processed["data_samples"].mosaic_observation_weight.shape == (1,)
     assert DATASETS.get("RecoverableHFMosaicVideoDataset") is (
         RecoverableHFMosaicVideoDataset
     )

@@ -190,49 +190,30 @@ enum NTSCFrameRate {
   }
 }
 
-/// Selects frames from a VFR or CFR stream using presentation timestamps.
-/// Keeping the original PTS for accepted frames preserves audio sync, while
-/// SegmentWriter emits them at the requested constant output frame rate.
-/// The step is carried as an exact rational (whole nanoseconds plus a
-/// remainder over the numerator) so an NTSC rate such as 30000/1001 does not
-/// accumulate the ~0.33ns per frame that rounding 33.3667ms would.
+/// Selects the first source frame in each absolute target-rate time slot.
+/// Slot zero is anchored at source PTS zero, so separate cluster shards make
+/// the same decision in their overlap and never restart conversion phase at a
+/// shard boundary. SegmentWriter emits the accepted frames at the requested
+/// exact rational output rate.
 private struct PTSFrameRateGate: Sendable {
-  private let numerator: Int64
-  private let intervalWhole: Int64
-  private let intervalRemainder: Int64
-  private var nextPTS: Int64?
-  private var carry: Int64 = 0
+  private let numerator: Double
+  private let denominatorNanoseconds: Double
+  private var lastSlot: Int64?
 
   init(numerator: Int, denominator: Int) {
-    let frames = Int64(max(1, numerator))
-    let seconds = Int64(max(1, denominator))
-    let step = seconds * 1_000_000_000
-    self.numerator = frames
-    intervalWhole = max(1, step / frames)
-    intervalRemainder = step % frames
-  }
-
-  private mutating func advance(_ pts: Int64) -> Int64 {
-    var next = pts + intervalWhole
-    carry += intervalRemainder
-    if carry >= numerator {
-      carry -= numerator
-      next += 1
-    }
-    return next
+    self.numerator = Double(max(1, numerator))
+    denominatorNanoseconds = Double(max(1, denominator)) * 1_000_000_000
   }
 
   mutating func accepts(_ ptsNanoseconds: Int64) -> Bool {
-    guard let nextPTS else {
-      self.nextPTS = advance(ptsNanoseconds)
-      return true
-    }
-    guard ptsNanoseconds >= nextPTS else { return false }
-    var following = nextPTS
-    repeat {
-      following = advance(following)
-    } while following <= ptsNanoseconds
-    self.nextPTS = following
+    let slot = Int64(
+      floor(
+        Double(max(0, ptsNanoseconds)) * numerator / denominatorNanoseconds
+          + 1e-8
+      )
+    )
+    guard slot != lastSlot else { return false }
+    lastSlot = slot
     return true
   }
 }
@@ -3023,45 +3004,32 @@ private final class NativeFrameProcessor {
       }
 
       let compositionStart = Date()
-      let composed = UnsafeMutablePointer<CVPixelBuffer?>.allocate(
-        capacity: scene.frames.count
+      var composed = Array<CVPixelBuffer?>(
+        repeating: nil,
+        count: scene.frames.count
       )
-      composed.initialize(repeating: nil, count: scene.frames.count)
-      defer {
-        composed.deinitialize(count: scene.frames.count)
-        composed.deallocate()
-      }
-      let errorLock = NSLock()
-      var compositionError: Error?
-      DispatchQueue.concurrentPerform(iterations: scene.frames.count) {
-        index in
-        do {
-          composed[index] = try composite(
-            source: outputs[scene.frames[index].batchIndex],
-            restored: restored,
-            enhancerBase: nil,
-            restorationBase: nil,
-            restoredOffset: index * restoredFrameElements,
-            geometry: geometries[index],
-            hardMask: masks[index],
-            enhancedFrame: nil
-          )
-        } catch {
-          errorLock.lock()
-          if compositionError == nil {
-            compositionError = error
-          }
-          errorLock.unlock()
-        }
-      }
-      if let compositionError {
-        throw compositionError
+      // CVPixelBufferPoolCreatePixelBufferWithAuxAttributes initializes
+      // IOSurface tracking internally. Running that path from many
+      // dispatch_apply workers can trip libdispatch's inactive-object guard
+      // under long 1080p cluster jobs, so keep final pixel-buffer allocation
+      // and composition serialized.
+      for index in scene.frames.indices {
+        composed[index] = try composite(
+          source: outputs[scene.frames[index].batchIndex],
+          restored: restored,
+          enhancerBase: nil,
+          restorationBase: nil,
+          restoredOffset: index * restoredFrameElements,
+          geometry: geometries[index],
+          hardMask: masks[index],
+          enhancedFrame: nil
+        )
       }
       for index in scene.frames.indices {
         let frameIndex = scene.frames[index].batchIndex
         guard let frame = composed[index] else {
           throw NativePreviewError.pixelBuffer(
-            "parallel composition produced no frame at index \(index)"
+            "composition produced no frame at index \(index)"
           )
         }
         outputs[frameIndex] = frame
@@ -4871,11 +4839,6 @@ private struct NativePreviewPipeline {
           "workerMode requires export mode"
         )
       }
-      guard config.targetFPS == nil else {
-        throw NativePreviewError.invalidConfiguration(
-          "cluster worker v1 does not support targetFPS conversion"
-        )
-      }
       guard let decodeEnd = config.decodeEndNanoseconds,
         let coreStart = config.outputCoreStartNanoseconds,
         let coreEnd = config.outputCoreEndNanoseconds,
@@ -5454,13 +5417,14 @@ private struct NativePreviewPipeline {
               }
             }
             let acceptedFrames = framesToEncode.filter { frame in
-              guard belongsToCoreOutput(frame.ptsNanoseconds) else {
-                return false
+              let accepted: Bool
+              if var gate = postRestorationFrameRateGate {
+                accepted = gate.accepts(frame.ptsNanoseconds)
+                postRestorationFrameRateGate = gate
+              } else {
+                accepted = true
               }
-              guard var gate = postRestorationFrameRateGate else { return true }
-              let accepted = gate.accepts(frame.ptsNanoseconds)
-              postRestorationFrameRateGate = gate
-              return accepted
+              return accepted && belongsToCoreOutput(frame.ptsNanoseconds)
             }
             pendingEncoding = Task.detached(priority: .userInitiated) {
               var completedSegments: [SegmentEvent] = []
@@ -5549,12 +5513,12 @@ private struct NativePreviewPipeline {
         pendingEncoding = nil
         if !deferredCrossfadeTail.isEmpty {
           for frame in deferredCrossfadeTail {
-            guard belongsToCoreOutput(frame.ptsNanoseconds) else { continue }
             if var gate = postRestorationFrameRateGate {
               let accepted = gate.accepts(frame.ptsNanoseconds)
               postRestorationFrameRateGate = gate
               if !accepted { continue }
             }
+            guard belongsToCoreOutput(frame.ptsNanoseconds) else { continue }
             if let segment = try await writer.append(
               pixelBuffer: frame.pixelBuffer,
               ptsNanoseconds: frame.ptsNanoseconds

@@ -27,6 +27,9 @@ from mmengine.config import Config
 
 from lada.models.basicvsrpp import register_all_modules
 from lada.models.basicvsrpp.mmagic.registry import DATASETS, MODELS
+from lada.models.basicvsrpp.mmagic.mosaic_consistency_error import (
+    known_grid_mosaic_consistency_error,
+)
 from lada.models.basicvsrpp.mmagic.roi_laplacian_error import (
     roi_laplacian_error,
 )
@@ -90,6 +93,10 @@ def sequence_metrics(
     prediction: torch.Tensor,
     target: torch.Tensor,
     mask: torch.Tensor,
+    observation: torch.Tensor | None = None,
+    mosaic_phase: torch.Tensor | None = None,
+    mosaic_block_size: torch.Tensor | None = None,
+    mosaic_observation_weight: torch.Tensor | None = None,
 ) -> dict[str, float]:
     roi_psnr_values = []
     laplacian_values = []
@@ -113,13 +120,33 @@ def sequence_metrics(
             float(torch.abs(prediction_delta - target_delta)[roi].mean())
         )
 
-    return {
+    metrics = {
         "roi_psnr": float(np.mean(roi_psnr_values)),
         "roi_laplacian_error": float(np.mean(laplacian_values)),
         "roi_temporal_error": (
             float(np.mean(temporal_values)) if temporal_values else 0.0
         ),
     }
+    if (
+        observation is not None
+        and mosaic_phase is not None
+        and mosaic_block_size is not None
+    ):
+        metrics["roi_mosaic_consistency_error"] = (
+            known_grid_mosaic_consistency_error(
+                prediction,
+                observation,
+                mask,
+                mosaic_phase,
+                mosaic_block_size,
+                (
+                    mosaic_observation_weight
+                    if mosaic_observation_weight is not None
+                    else 1.0
+                ),
+            )
+        )
+    return metrics
 
 
 def to_uint8_rgb(value: torch.Tensor) -> np.ndarray:
@@ -365,6 +392,13 @@ def main() -> int:
                     .permute(0, 2, 3, 1)
                     .numpy()
                 ),
+                "mosaic_phase": data_sample.mosaic_phase.detach().cpu(),
+                "mosaic_block_size": data_sample.mosaic_block_size.detach().cpu(),
+                "mosaic_observation_weight": (
+                    data_sample.mosaic_observation_weight.detach().cpu()
+                    if hasattr(data_sample, "mosaic_observation_weight")
+                    else torch.tensor(1.0)
+                ),
             }
         )
 
@@ -389,6 +423,10 @@ def main() -> int:
                 prediction,
                 sample["target"],
                 sample["mask"],
+                sample["inputs"],
+                sample["mosaic_phase"],
+                sample["mosaic_block_size"],
+                sample["mosaic_observation_weight"],
             )
             per_sample.append(
                 {
@@ -406,6 +444,7 @@ def main() -> int:
                 "roi_psnr",
                 "roi_laplacian_error",
                 "roi_temporal_error",
+                "roi_mosaic_consistency_error",
             )
         }
         report["checkpoints"][label] = {
@@ -435,6 +474,10 @@ def main() -> int:
                     candidate["roi_temporal_error"]
                     - baseline["roi_temporal_error"]
                 ),
+                "roi_mosaic_consistency_error": (
+                    candidate["roi_mosaic_consistency_error"]
+                    - baseline["roi_mosaic_consistency_error"]
+                ),
             }
 
     videos = render_panels(samples, predictions, output_dir, fps=args.fps)
@@ -457,6 +500,7 @@ def main() -> int:
                 "roi_psnr",
                 "roi_laplacian_error",
                 "roi_temporal_error",
+                "roi_mosaic_consistency_error",
             )
         )
         for label, checkpoint_report in report["checkpoints"].items():
@@ -470,6 +514,7 @@ def main() -> int:
                         sample["roi_psnr"],
                         sample["roi_laplacian_error"],
                         sample["roi_temporal_error"],
+                        sample["roi_mosaic_consistency_error"],
                     )
                 )
 

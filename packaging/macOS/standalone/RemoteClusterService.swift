@@ -82,6 +82,8 @@ struct RemoteClusterCapabilities: Codable, Hashable, Sendable {
   let maximumRestorationClipLength: Int?
   let supportsROIEnhancer: Bool?
   let supportsRestorationEffects: Bool?
+  /// True only for Workers that honor the exact rational target FPS fields.
+  let supportsFPSConversion: Bool?
   let supportedInputExtensions: [String]?
   let restorationAssetSHA256ByIdentifier: [String: String]?
   let detectorAssetSHA256ByIdentifier: [String: String]?
@@ -102,6 +104,7 @@ struct RemoteClusterCapabilities: Codable, Hashable, Sendable {
     maximumRestorationClipLength: Int? = nil,
     supportsROIEnhancer: Bool? = nil,
     supportsRestorationEffects: Bool? = nil,
+    supportsFPSConversion: Bool? = nil,
     supportedInputExtensions: [String]? = nil,
     restorationAssetSHA256ByIdentifier: [String: String]? = nil,
     detectorAssetSHA256ByIdentifier: [String: String]? = nil,
@@ -122,6 +125,7 @@ struct RemoteClusterCapabilities: Codable, Hashable, Sendable {
     self.maximumRestorationClipLength = maximumRestorationClipLength.map { max(1, $0) }
     self.supportsROIEnhancer = supportsROIEnhancer
     self.supportsRestorationEffects = supportsRestorationEffects
+    self.supportsFPSConversion = supportsFPSConversion
     self.supportedInputExtensions = supportedInputExtensions.map {
       Array(Set($0.map { $0.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ".")) }))
         .filter { !$0.isEmpty }
@@ -182,8 +186,8 @@ struct RemoteClusterRestorationOptions: Codable, Hashable, Sendable {
   let videoCodec: String
   let bitrateMultiplier: Double
   let mp4FastStart: Bool
-  /// Worker v1 intentionally rejects frame-rate conversion because each
-  /// process would otherwise restart the sampling phase at its own boundary.
+  /// Exact rational target rate. Workers sample against absolute source PTS,
+  /// so independently processed shards keep one global conversion phase.
   let targetFPSNumerator: Int?
   let targetFPSDenominator: Int?
 
@@ -204,7 +208,9 @@ struct RemoteClusterRestorationOptions: Codable, Hashable, Sendable {
           && roiEnhancerAssetSHA256.map(Self.isSHA256) == true))
       && (videoCodec == "h264" || videoCodec == "hevc")
       && bitrateMultiplier.isFinite && bitrateMultiplier > 0
-      && targetFPSNumerator == nil && targetFPSDenominator == nil
+      && ((targetFPSNumerator == nil && targetFPSDenominator == nil)
+        || (targetFPSNumerator.map { (1...120_000).contains($0) } == true
+          && targetFPSDenominator.map { (1...1_001).contains($0) } == true))
   }
 
   private static func isSHA256(_ value: String) -> Bool {
@@ -457,6 +463,23 @@ private enum RemoteClusterExecutionFailure: Error {
     case .outputByteCountMismatch: "output_byte_count_mismatch"
     }
   }
+}
+
+private func remoteClusterFailureCode(for error: Error) -> String {
+  if let executionFailure = error as? RemoteClusterExecutionFailure {
+    return executionFailure.code
+  }
+  let message = error.localizedDescription
+    .replacingOccurrences(of: "\r", with: " ")
+    .replacingOccurrences(of: "\n", with: " ")
+    .trimmingCharacters(in: .whitespacesAndNewlines)
+  guard !message.isEmpty else { return "launcher_failed" }
+  if message == "The operation couldn’t be completed. (Swift.CancellationError error 1.)" {
+    return "cancelled"
+  }
+  let nsError = error as NSError
+  let suffix = nsError.domain.isEmpty ? "" : " [\(nsError.domain):\(nsError.code)]"
+  return String(("launcher_failed: " + message + suffix).prefix(700))
 }
 
 private struct RemoteClusterFileSignature: Hashable, Sendable {
@@ -1158,8 +1181,7 @@ final class RemoteClusterWorkerJobLedger: ObservableObject {
         !attemptRecords[failedIndex].state.isTerminal
       {
         attemptRecords[failedIndex].state = .failed
-        attemptRecords[failedIndex].failureCode =
-          (error as? RemoteClusterExecutionFailure)?.code ?? "launcher_failed"
+        attemptRecords[failedIndex].failureCode = remoteClusterFailureCode(for: error)
         attemptRecords[failedIndex].updatedAt = Date()
       }
     }

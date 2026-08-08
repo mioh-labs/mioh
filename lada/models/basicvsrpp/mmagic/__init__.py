@@ -17,9 +17,11 @@ def register_all_modules():
     from .iter_time_hook import IterTimerHook
     from .log_processor import LogProcessor
     from .multi_optimizer_constructor import MultiOptimWrapperConstructor
+    from .mosaic_consistency_error import ROIMosaicConsistencyError
     from .perceptual_loss import PerceptualLoss
     from .pixelwise_loss import CharbonnierLoss
     from .roi_loss import (
+        KnownGridMosaicConsistencyLoss,
         ROIHighFrequencyLoss,
         ROIPixelLoss,
         ROITemporalDifferenceLoss,

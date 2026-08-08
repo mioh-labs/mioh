@@ -31,8 +31,8 @@ class MiohClusterWorkerLauncherTests(unittest.TestCase):
             "outputCoreEndNanoseconds: request.mediaRange.coreEndNanoseconds",
             'splitMode: "none"',
             "detectionEmptyLookahead: 1",
-            "targetFPS: nil",
-            "targetFPSDenominator: nil",
+            "targetFPS: request.options.targetFPSNumerator",
+            "targetFPSDenominator: request.options.targetFPSDenominator",
         ]:
             self.assertIn(contract, self.source)
 
@@ -52,12 +52,24 @@ class MiohClusterWorkerLauncherTests(unittest.TestCase):
         ]:
             self.assertIn(contract, self.source)
 
-    def test_worker_rejects_shard_phase_changing_options(self):
+    def test_worker_preserves_fps_conversion_across_shards(self):
         self.assertIn(
             "request.options.detectionEmptyLookahead == 1", self.source
         )
-        self.assertIn("request.options.targetFPSNumerator == nil", self.source)
-        self.assertIn("request.options.targetFPSDenominator == nil", self.source)
+        self.assertIn(
+            "targetFPSNumerator: useFPS ? max(1, fps) : nil", self.source
+        )
+        self.assertIn(
+            "targetFPSDenominator: useFPS ? max(1, fpsDenominator) : nil",
+            self.source,
+        )
+        self.assertNotIn("クラスタ worker v1 はFPS変換に対応していません", self.source)
+
+    def test_cluster_preserves_selected_detector_backend_identity(self):
+        self.assertIn("model: detectionModel", self.source)
+        self.assertIn("modelIdentifier: detectionModel", self.source)
+        self.assertIn("detectorModelIdentifier: detectionModel", self.source)
+        self.assertNotIn("clusterPortableDetectorIdentifier", self.source)
 
     def test_model_asset_digest_is_deterministic_and_rejects_symlinks(self):
         for contract in [

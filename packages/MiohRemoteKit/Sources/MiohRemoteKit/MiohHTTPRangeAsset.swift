@@ -46,7 +46,7 @@ public final class MiohHTTPRangeAsset: NSObject, AVAssetResourceLoaderDelegate,
   public let asset: AVURLAsset
 
   private struct ActiveRequest {
-    let task: URLSessionDataTask
+    var task: URLSessionDataTask?
     // AVAssetResourceLoader does not retain the request after the delegate
     // returns. Keeping it strong until completion is required; weak capture
     // causes a silent metadata-load hang.
@@ -61,13 +61,14 @@ public final class MiohHTTPRangeAsset: NSObject, AVAssetResourceLoaderDelegate,
   private let queue = DispatchQueue(label: "mioh.http-range-asset")
   private let redirectDelegate: MiohNoRedirectSessionDelegate
   private let session: URLSession
+  private static let transferTimeout: TimeInterval = 30 * 60
   private static func makeSessionConfiguration() -> URLSessionConfiguration {
     let configuration = URLSessionConfiguration.ephemeral
     configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
     configuration.urlCache = nil
     configuration.httpCookieStorage = nil
     configuration.httpMaximumConnectionsPerHost = 4
-    configuration.timeoutIntervalForRequest = 5 * 60
+    configuration.timeoutIntervalForRequest = Self.transferTimeout
     configuration.timeoutIntervalForResource = 24 * 60 * 60
     return configuration
   }
@@ -135,7 +136,7 @@ public final class MiohHTTPRangeAsset: NSObject, AVAssetResourceLoaderDelegate,
       let active = Array(self.requests.values)
       self.requests.removeAll()
       active.forEach {
-        $0.task.cancel()
+        $0.task?.cancel()
         $0.loadingRequest.finishLoading(with: MiohHTTPRangeAssetError.cancelled)
       }
       self.session.invalidateAndCancel()
@@ -174,25 +175,54 @@ public final class MiohHTTPRangeAsset: NSObject, AVAssetResourceLoaderDelegate,
     } else {
       requestedBytes = Int64(max(1, dataRequest.requestedLength))
     }
-    let count = min(pageBytes, min(requestedBytes, expectedByteCount - start))
-    guard count > 0 else {
+    let totalBytes = min(requestedBytes, expectedByteCount - start)
+    guard totalBytes > 0 else {
       loadingRequest.finishLoading(with: MiohHTTPRangeAssetError.invalidRange)
       return true
     }
-    let end = start + count - 1
+    let identifier = ObjectIdentifier(loadingRequest)
+    requests[identifier] = ActiveRequest(task: nil, loadingRequest: loadingRequest)
+    fetchRangePage(
+      identifier: identifier,
+      loadingRequest: loadingRequest,
+      dataRequest: dataRequest,
+      offset: start,
+      remainingBytes: totalBytes
+    )
+    return true
+  }
+
+  private func fetchRangePage(
+    identifier: ObjectIdentifier,
+    loadingRequest: AVAssetResourceLoadingRequest,
+    dataRequest: AVAssetResourceLoadingDataRequest,
+    offset: Int64,
+    remainingBytes: Int64
+  ) {
+    guard let active = requests[identifier],
+      active.loadingRequest === loadingRequest,
+      !isCancelled
+    else { return }
+    let count = min(pageBytes, min(remainingBytes, expectedByteCount - offset))
+    guard count > 0 else {
+      requests.removeValue(forKey: identifier)
+      loadingRequest.finishLoading()
+      return
+    }
+    let start = offset
+    let end = offset + count - 1
     var request = URLRequest(url: remoteURL)
     request.httpMethod = "GET"
     request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-    request.timeoutInterval = 5 * 60
+    request.timeoutInterval = Self.transferTimeout
     request.setValue("bytes=\(start)-\(end)", forHTTPHeaderField: "Range")
     request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
 
-    let identifier = ObjectIdentifier(loadingRequest)
     let task = session.dataTask(with: request) {
       [weak self, loadingRequest] data, response, error in
       guard let self else { return }
       self.queue.async {
-        guard let active = self.requests.removeValue(forKey: identifier),
+        guard let active = self.requests[identifier],
           active.loadingRequest === loadingRequest,
           !self.isCancelled
         else { return }
@@ -216,18 +246,29 @@ public final class MiohHTTPRangeAsset: NSObject, AVAssetResourceLoaderDelegate,
           return
         }
         dataRequest.respond(with: data)
-        loadingRequest.finishLoading()
+        let nextRemaining = remainingBytes - count
+        if nextRemaining > 0 {
+          self.fetchRangePage(
+            identifier: identifier,
+            loadingRequest: loadingRequest,
+            dataRequest: dataRequest,
+            offset: offset + count,
+            remainingBytes: nextRemaining
+          )
+        } else {
+          self.requests.removeValue(forKey: identifier)
+          loadingRequest.finishLoading()
+        }
       }
     }
-    requests[identifier] = ActiveRequest(task: task, loadingRequest: loadingRequest)
+    requests[identifier]?.task = task
     task.resume()
-    return true
   }
 
   public func resourceLoader(
     _ resourceLoader: AVAssetResourceLoader,
     didCancel loadingRequest: AVAssetResourceLoadingRequest
   ) {
-    requests.removeValue(forKey: ObjectIdentifier(loadingRequest))?.task.cancel()
+    requests.removeValue(forKey: ObjectIdentifier(loadingRequest))?.task?.cancel()
   }
 }
