@@ -1565,11 +1565,6 @@ final class RestorationRunner: ObservableObject {
         "クラスタ復元にはmacOS 27以降が必要です"
       )
     }
-    guard !useFPS else {
-      throw RunnerError.unsupportedFeature(
-        "クラスタ worker v1 はFPS変換に対応していません"
-      )
-    }
     guard restorationModel != "カスタム", detectionModel != "カスタム"
     else {
       throw RunnerError.unsupportedFeature(
@@ -1675,8 +1670,8 @@ final class RestorationRunner: ObservableObject {
       videoCodec: encodingPreset.hasPrefix("h264") ? "h264" : "hevc",
       bitrateMultiplier: bitrateMultiplier,
       mp4FastStart: mp4FastStart,
-      targetFPSNumerator: nil,
-      targetFPSDenominator: nil
+      targetFPSNumerator: useFPS ? max(1, fps) : nil,
+      targetFPSDenominator: useFPS ? max(1, fpsDenominator) : nil
     )
   }
 
@@ -1746,9 +1741,7 @@ final class RestorationRunner: ObservableObject {
     guard request.protocolVersion == RemoteClusterJobRequest.protocolVersion,
       request.mediaRange.isValid,
       request.options.isValid,
-      request.options.detectionEmptyLookahead == 1,
-      request.options.targetFPSNumerator == nil,
-      request.options.targetFPSDenominator == nil
+      request.options.detectionEmptyLookahead == 1
     else {
       throw RunnerError.unsupportedFeature(
         "クラスタジョブの設定がworker v1契約と一致しません"
@@ -1988,8 +1981,8 @@ final class RestorationRunner: ObservableObject {
       detectionEmptyLookahead: 1,
       detectFaceMosaics: request.options.detectFaceMosaics,
       crossfade: request.options.crossfade,
-      targetFPS: nil,
-      targetFPSDenominator: nil,
+      targetFPS: request.options.targetFPSNumerator,
+      targetFPSDenominator: request.options.targetFPSDenominator,
       preFPSConversion: false,
       videoCodec: request.options.videoCodec,
       averageBitRate: nil,
@@ -4247,7 +4240,7 @@ struct ContentView: View {
             }
           }
         }
-        Text("標準HTTP転送では共有ルートは不要です。旧Workerとの共有フォルダ方式も併用できます。TLSはないため信頼できる家庭・社内LANだけで使い、インターネットへ公開しないでください。FPS変換との同時使用はできません。")
+        Text("標準HTTP転送では共有ルートは不要です。旧Workerとの共有フォルダ方式も併用できます。TLSはないため信頼できる家庭・社内LANだけで使い、インターネットへ公開しないでください。FPS変換は復元後に全Worker共通の時間軸で適用します。")
           .font(.caption)
           .foregroundStyle(.orange)
       }
@@ -4281,10 +4274,17 @@ struct ContentView: View {
 
   private var logTab: some View {
     ScrollView {
-      Text(runner.log.isEmpty ? " " : runner.log)
+      Text(activeLogText.isEmpty ? " " : activeLogText)
         .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
         .frame(maxWidth: .infinity, alignment: .topLeading).padding(12)
     }.background(Color(nsColor: .textBackgroundColor)).padding(.vertical, 10)
+  }
+
+  private var activeLogText: String {
+    if cluster.isRunning { return cluster.log }
+    if runner.isRunning { return runner.log }
+    if runner.log.isEmpty, !cluster.log.isEmpty { return cluster.log }
+    return runner.log
   }
 
   private var footer: some View {

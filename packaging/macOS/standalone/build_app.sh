@@ -360,7 +360,7 @@ COREAI_MODEL_ASSETS=(
 )
 VARIABLE_COREAI_SOURCE_MODELS="${VARIABLE_COREAI_SOURCE_MODELS:-$BUILD_DIR/variable-basicvsrpp-source}"
 if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
-  default_variable_checkpoint="$ROOT/model_weights/hf2500-plus-fc2-500-ema.pth"
+  default_variable_checkpoint="$ROOT/model_weights/hf2500-plus-fc2-forward-consistency-w005-500-ema.pth"
 else
   default_variable_checkpoint="$ROOT/model_weights/lada_mosaic_restoration_model_generic_v1.2.pth"
 fi
@@ -616,7 +616,7 @@ fi
 CANONICAL_MODEL_MANIFEST="$RESOURCES/models/mioh-cluster-model-identities-v1.json"
 VARIABLE_COREAI_SOURCE_MODELS="${VARIABLE_COREAI_SOURCE_MODELS:-$BUILD_DIR/variable-basicvsrpp-source}"
 if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
-  canonical_default_checkpoint="$ROOT/model_weights/hf2500-plus-fc2-500-ema.pth"
+  canonical_default_checkpoint="$ROOT/model_weights/hf2500-plus-fc2-forward-consistency-w005-500-ema.pth"
 else
   canonical_default_checkpoint="$ROOT/model_weights/lada_mosaic_restoration_model_generic_v1.2.pth"
 fi

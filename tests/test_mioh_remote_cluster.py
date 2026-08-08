@@ -70,11 +70,13 @@ class MiohRemoteClusterFoundationTests(unittest.TestCase):
             "FileManager.default.moveItem(at: part, to: binding.outputURL)",
             "session.upload(for: request, fromFile: file)",
             "URLSessionConfiguration.ephemeral",
+            "configuration.timeoutIntervalForRequest = transferTimeout",
             "configuration.timeoutIntervalForResource = 24 * 60 * 60",
             "Set([408, 425, 429])",
             'sendStatus(425, "Too Early"',
             "maximumAcceptedConnections = 128",
             "scheduleUploadIdleTimeout",
+            "uploadIdleTimeout",
             "maximumAggregateOutputBytes",
             'sendStatus(507, "Insufficient Storage"',
         ]:
@@ -112,6 +114,8 @@ class MiohRemoteClusterFoundationTests(unittest.TestCase):
             "willPerformHTTPRedirection",
             "completionHandler(nil)",
             "didCancel loadingRequest",
+            "configuration.timeoutIntervalForRequest = Self.transferTimeout",
+            "configuration.timeoutIntervalForResource = 24 * 60 * 60",
             "session.invalidateAndCancel()",
         ]:
             self.assertIn(contract, self.range_asset)
@@ -187,17 +191,34 @@ class MiohRemoteClusterFoundationTests(unittest.TestCase):
         ]:
             self.assertIn(contract, self.source)
 
+    def test_cluster_workers_receive_exact_rational_fps_conversion(self):
+        for contract in [
+            "targetFPSNumerator: useFPS ? max(1, fps) : nil",
+            "targetFPSDenominator: useFPS ? max(1, fpsDenominator) : nil",
+            "targetFPS: request.options.targetFPSNumerator",
+            "targetFPSDenominator: request.options.targetFPSDenominator",
+        ]:
+            self.assertIn(contract, self.runner)
+        for contract in [
+            "first source frame in each absolute target-rate time slot",
+            "private var lastSlot: Int64?",
+            "accepted && belongsToCoreOutput(frame.ptsNanoseconds)",
+        ]:
+            self.assertIn(contract, self.pipeline)
+
     def test_worker_capability_extensions_are_optional_and_preflighted(self):
         for contract in [
             "let maximumRestorationClipLength: Int?",
             "let supportsROIEnhancer: Bool?",
             "let supportsRestorationEffects: Bool?",
+            "let supportsFPSConversion: Bool?",
             "let supportedInputExtensions: [String]?",
             "let restorationAssetSHA256ByIdentifier: [String: String]?",
             "let detectorAssetSHA256ByIdentifier: [String: String]?",
             "maximumRestorationClipLength: Int? = nil",
             "supportsROIEnhancer: Bool? = nil",
             "supportsRestorationEffects: Bool? = nil",
+            "supportsFPSConversion: Bool? = nil",
             "supportedInputExtensions: [String]? = nil",
         ]:
             self.assertIn(contract, self.source)
@@ -206,6 +227,7 @@ class MiohRemoteClusterFoundationTests(unittest.TestCase):
             "options.restorationClipLength > maximum",
             "capabilities.supportsROIEnhancer == false",
             "capabilities.supportsRestorationEffects == false",
+            "capabilities.supportsFPSConversion != true",
             "capabilities.supportedInputExtensions",
             "capabilities.restorationAssetSHA256ByIdentifier?[",
         ]:
@@ -215,6 +237,24 @@ class MiohRemoteClusterFoundationTests(unittest.TestCase):
             self.controller,
         )
         self.assertIn("clusterCanonicalAssetIdentityMaps()", self.runner)
+
+    def test_ipad_workers_use_short_cluster_shards_and_logs_show_throughput(self):
+        for contract in [
+            "private static func effectiveShardMinutes(",
+            'localizedCaseInsensitiveContains("iPadOS")',
+            "includesIPadWorker ? min(bounded, 1) : bounded",
+            "iPad Workerを含むため、クラスタジョブ長を",
+            "shardMinutes: effectiveShardMinutes",
+            "ジョブ長 \\(effectiveShardMinutes)分",
+        ]:
+            self.assertIn(contract, self.controller)
+        completion = self.controller.split(
+            '"[\\(laneName)] job \\(job.index + 1) 完了 "',
+            1,
+        )[1].split("return MiohClusterCompletedShard", 1)[0]
+        self.assertIn("Self.formatDuration(metrics.wallSeconds)", completion)
+        self.assertIn("Self.formatFPS(frames: metrics.processedFrames", completion)
+        self.assertIn("ByteCountFormatter.string(fromByteCount:", completion)
 
     def test_manager_exposes_coordinator_and_worker_state(self):
         for contract in [
@@ -404,7 +444,10 @@ class MiohRemoteClusterFoundationTests(unittest.TestCase):
             "outputCoreEndNanoseconds",
             "belongsToCoreOutput",
             "expectedCoreFrameCount: coreEnd - coreStart",
-            "metrics.processedFrames == job.expectedCoreFrameCount",
+            "expectedProcessedFrameCount: expectedProcessedFrameCount(",
+            "metrics.processedFrames == job.expectedProcessedFrameCount",
+            "processed_frame_count_mismatch",
+            "MiohClusterPTSFrameRateGate",
         ]:
             self.assertIn(contract, self.controller + self.pipeline)
 
@@ -419,6 +462,18 @@ class MiohRemoteClusterFoundationTests(unittest.TestCase):
         self.assertIn("ptsNanoseconds < start", self.pipeline)
         self.assertIn("ptsNanoseconds >= end", self.pipeline)
         self.assertIn("belongsToCoreOutput(frame.ptsNanoseconds)", core_filter_body)
+
+    def test_native_cluster_composition_does_not_allocate_pixel_buffers_in_dispatch_apply(self):
+        composition_body = self.pipeline.split(
+            "var composed = Array<CVPixelBuffer?>",
+            1,
+        )[1].split("compositionSeconds += Date().timeIntervalSince", 1)[0]
+        self.assertIn("for index in scene.frames.indices", composition_body)
+        self.assertIn("try composite(", composition_body)
+        self.assertIn("repeating: nil", composition_body)
+        self.assertNotIn("DispatchQueue.concurrentPerform", composition_body)
+        self.assertNotIn("UnsafeMutablePointer<CVPixelBuffer?>.allocate", composition_body)
+        self.assertIn("libdispatch's inactive-object guard", composition_body)
 
     def test_cluster_outputs_video_shards_and_muxes_source_audio_once(self):
         self.assertIn("finishWorkerExport(", self.pipeline)

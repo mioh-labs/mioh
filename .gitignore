@@ -58,6 +58,7 @@ model_weights/lada_mosaic_detection_model_v4_accurate-fp16.aimodel/
 model_weights/lada_mosaic_detection_model_vr_v2_accurate-fp16.aimodel/
 model_weights/rfdetr-v6-large-768-fp32.aimodel/
 model_weights/hf2500-plus-fc2-500-ema.pth
+model_weights/hf2500-plus-fc2-forward-consistency-1500-ema.pth
 model_weights/lada_mosaic_restoration_model_generic_v1.2_full.pth
 
 # Local evaluation artifacts generated while tuning the restoration pipeline

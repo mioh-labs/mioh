@@ -67,10 +67,10 @@ enum MiohClusterControllerError: LocalizedError {
 private struct MiohClusterPlannedJob: Sendable {
   let index: Int
   /// Number of presentation-timestamp entries in the half-open core range.
-  /// The coordinator checks this against the worker metric before accepting
-  /// the shard, so an AVAssetReader boundary quirk cannot silently drop or
-  /// duplicate a VFR/NTSC frame.
+  /// This remains the source decode contract; when FPS conversion is enabled
+  /// the output/metric count is lower and is checked separately.
   let expectedCoreFrameCount: Int
+  let expectedProcessedFrameCount: Int
   let request: RemoteClusterJobRequest
   let localOutputURL: URL
 }
@@ -104,6 +104,29 @@ private struct MiohClusterMediaIndex: Sendable {
   let presentationTimestamps: [Int64]
   let endNanoseconds: Int64
   let frameRate: Double
+}
+
+private struct MiohClusterPTSFrameRateGate: Sendable {
+  private let numerator: Double
+  private let denominatorNanoseconds: Double
+  private var lastSlot: Int64?
+
+  init(numerator: Int, denominator: Int) {
+    self.numerator = Double(max(1, numerator))
+    denominatorNanoseconds = Double(max(1, denominator)) * 1_000_000_000
+  }
+
+  mutating func accepts(_ ptsNanoseconds: Int64) -> Bool {
+    let slot = Int64(
+      floor(
+        Double(max(0, ptsNanoseconds)) * numerator / denominatorNanoseconds
+          + 1e-8
+      )
+    )
+    guard slot != lastSlot else { return false }
+    lastSlot = slot
+    return true
+  }
 }
 
 private struct MiohClusterRemoteWorker: Sendable {
@@ -310,6 +333,7 @@ final class MiohClusterController: ObservableObject {
           maximumRestorationClipLength: 180,
           supportsROIEnhancer: true,
           supportsRestorationEffects: true,
+          supportsFPSConversion: true,
           supportedInputExtensions: nil,
           restorationAssetSHA256ByIdentifier: identityMaps.restoration,
           detectorAssetSHA256ByIdentifier: identityMaps.detector,
@@ -513,6 +537,17 @@ final class MiohClusterController: ObservableObject {
 
     status = "フレーム境界を索引中"
     let media = try await Self.mediaIndex(inputURL)
+    let effectiveShardMinutes = Self.effectiveShardMinutes(
+      requested: shardMinutes,
+      remoteWorkers: remoteWorkers
+    )
+    if effectiveShardMinutes != shardMinutes {
+      appendLog(
+        "iPad Workerを含むため、クラスタジョブ長を"
+          + "\(effectiveShardMinutes)分に短縮します"
+          + "（設定値 \(shardMinutes)分）。\n"
+      )
+    }
     let inputByteCount: Int64
     let inputSHA256: String
     status = "入力のSHA-256を確認中"
@@ -561,6 +596,7 @@ final class MiohClusterController: ObservableObject {
       inputSHA256: inputSHA256,
       media: media,
       options: options,
+      shardMinutes: effectiveShardMinutes,
       sessionURL: sessionURL
     )
     guard !jobs.isEmpty else { throw MiohClusterControllerError.sourceMetadataUnavailable }
@@ -571,6 +607,7 @@ final class MiohClusterController: ObservableObject {
       "クラスタ開始: \(lanes.count)レーン（ローカル "
         + "\(useCoordinatorAsWorker ? 1 : 0) / リモート \(remoteWorkers.count)） / "
         + "\(jobs.count)ジョブ / "
+        + "ジョブ長 \(effectiveShardMinutes)分 / "
         + "HTTP転送 \(remoteWorkers.filter { $0.transferMode == .coordinatorHTTPV1 }.count) / "
         + "共有ルートfallback \(remoteWorkers.filter { $0.transferMode == .sharedRootV1 }.count)\n"
     )
@@ -662,6 +699,10 @@ final class MiohClusterController: ObservableObject {
       || options.smoothStrength != 0
       || options.effectUpscale != 1
     if capabilities.supportsRestorationEffects == false, usesEffects { return false }
+
+    let usesFPSConversion = options.targetFPSNumerator != nil
+      && options.targetFPSDenominator != nil
+    if usesFPSConversion, capabilities.supportsFPSConversion != true { return false }
 
     if let supported = capabilities.supportedInputExtensions {
       let normalized = inputExtension.lowercased()
@@ -879,10 +920,10 @@ final class MiohClusterController: ObservableObject {
     metrics: RemoteClusterJobMetrics,
     laneName: String
   ) throws -> MiohClusterCompletedShard {
-    guard metrics.processedFrames == job.expectedCoreFrameCount else {
+    guard metrics.processedFrames == job.expectedProcessedFrameCount else {
       throw MiohClusterControllerError.jobFailed(
-        "core_frame_count_mismatch: expected "
-          + "\(job.expectedCoreFrameCount), got \(metrics.processedFrames)"
+        "processed_frame_count_mismatch: expected "
+          + "\(job.expectedProcessedFrameCount), got \(metrics.processedFrames)"
       )
     }
     let attributes = try FileManager.default.attributesOfItem(
@@ -900,7 +941,11 @@ final class MiohClusterController: ObservableObject {
     status = "クラスタ処理中 \(completedJobCount)/\(totalJobCount)"
     appendLog(
       "[\(laneName)] job \(job.index + 1) 完了 "
-        + "\(metrics.processedFrames)フレーム\n"
+        + "\(metrics.processedFrames)フレーム / "
+        + "\(Self.formatDuration(metrics.wallSeconds)) / "
+        + "\(Self.formatFPS(frames: metrics.processedFrames, seconds: metrics.wallSeconds)) / "
+        + ByteCountFormatter.string(fromByteCount: metrics.outputByteCount, countStyle: .file)
+        + "\n"
     )
     return MiohClusterCompletedShard(
       index: job.index,
@@ -953,6 +998,7 @@ final class MiohClusterController: ObservableObject {
     inputSHA256: String,
     media: MiohClusterMediaIndex,
     options: RemoteClusterRestorationOptions,
+    shardMinutes: Int,
     sessionURL: URL
   ) throws -> [MiohClusterPlannedJob] {
     let temporalBatchFrames = options.restorationClipLength
@@ -974,6 +1020,28 @@ final class MiohClusterController: ObservableObject {
     func timestamp(_ frame: Int) -> Int64 {
       if frame >= totalFrames { return media.endNanoseconds }
       return media.presentationTimestamps[max(0, frame)]
+    }
+
+    func expectedProcessedFrameCount(
+      decodeStart: Int,
+      coreStart: Int,
+      coreEnd: Int
+    ) -> Int {
+      guard let targetFPSNumerator = options.targetFPSNumerator,
+        let targetFPSDenominator = options.targetFPSDenominator
+      else {
+        return coreEnd - coreStart
+      }
+      var gate = MiohClusterPTSFrameRateGate(
+        numerator: targetFPSNumerator,
+        denominator: targetFPSDenominator
+      )
+      var count = 0
+      for frame in decodeStart..<coreEnd {
+        let accepted = gate.accepts(media.presentationTimestamps[frame])
+        if frame >= coreStart, accepted { count += 1 }
+      }
+      return count
     }
 
     var jobs: [MiohClusterPlannedJob] = []
@@ -1020,6 +1088,11 @@ final class MiohClusterController: ObservableObject {
         MiohClusterPlannedJob(
           index: index,
           expectedCoreFrameCount: coreEnd - coreStart,
+          expectedProcessedFrameCount: expectedProcessedFrameCount(
+            decodeStart: decodeStart,
+            coreStart: coreStart,
+            coreEnd: coreEnd
+          ),
           request: request,
           localOutputURL: localOutputURL
         )
@@ -1189,6 +1262,31 @@ final class MiohClusterController: ObservableObject {
     // source-file budget.
     let estimated = sourceShare * max(1, bitrateMultiplier) * 3 + 128 * oneMiB
     return Int64(min(maximum, max(minimum, estimated.rounded(.up))))
+  }
+
+  private static func effectiveShardMinutes(
+    requested: Int,
+    remoteWorkers: [MiohClusterRemoteWorker]
+  ) -> Int {
+    let bounded = min(30, max(1, requested))
+    let includesIPadWorker = remoteWorkers.contains {
+      $0.capabilities.operatingSystem
+        .localizedCaseInsensitiveContains("iPadOS")
+    }
+    return includesIPadWorker ? min(bounded, 1) : bounded
+  }
+
+  private static func formatDuration(_ seconds: Double) -> String {
+    guard seconds.isFinite, seconds >= 0 else { return "—" }
+    let total = Int(seconds.rounded())
+    let minutes = total / 60
+    let remainder = total % 60
+    return String(format: "%02d:%02d", minutes, remainder)
+  }
+
+  private static func formatFPS(frames: Int, seconds: Double) -> String {
+    guard seconds.isFinite, seconds > 0, frames >= 0 else { return "— fps" }
+    return String(format: "%.2f fps", Double(frames) / seconds)
   }
 
   private static func maximumAggregateUploadedBytes(

@@ -160,6 +160,7 @@ class BasicVSRPlusPlusSharpGan(BasicVSRPlusPlusGan):
         perceptual_loss=None,
         high_frequency_loss=None,
         temporal_loss=None,
+        mosaic_forward_consistency_loss=None,
         roi_dilation=4,
         **kwargs,
     ):
@@ -178,6 +179,11 @@ class BasicVSRPlusPlusSharpGan(BasicVSRPlusPlusGan):
             MODELS.build(roi_pixel_loss) if roi_pixel_loss else None
         )
         self.temporal_loss = MODELS.build(temporal_loss) if temporal_loss else None
+        self.mosaic_forward_consistency_loss = (
+            MODELS.build(mosaic_forward_consistency_loss)
+            if mosaic_forward_consistency_loss
+            else None
+        )
         self.roi_dilation = roi_dilation
 
     def _expanded_mask(self, mask):
@@ -194,13 +200,32 @@ class BasicVSRPlusPlusSharpGan(BasicVSRPlusPlusGan):
         n, t, c, h, w = gt_sequence.shape
         gt_flat = gt_sequence.reshape(n * t, c, h, w)
         mask_flat = mask_sequence.reshape(n * t, 1, h, w)
-        return (
+        result = (
             gt_flat.clone(),
             gt_flat.clone(),
             gt_flat.clone(),
             mask_flat,
             gt_sequence,
             mask_sequence,
+        )
+        if self.mosaic_forward_consistency_loss is None:
+            return result
+
+        required = (
+            "mosaic_phase",
+            "mosaic_block_size",
+            "mosaic_observation_weight",
+        )
+        missing = [name for name in required if not hasattr(data_samples, name)]
+        if missing:
+            raise ValueError(
+                "mosaic forward consistency requires exact operator metadata: "
+                + ", ".join(missing)
+            )
+        return result + (
+            data_samples.mosaic_phase,
+            data_samples.mosaic_block_size,
+            data_samples.mosaic_observation_weight,
         )
 
     def _roi_composite(self, prediction, batch_gt_data):
@@ -212,9 +237,9 @@ class BasicVSRPlusPlusSharpGan(BasicVSRPlusPlusGan):
         return self._roi_composite(fake_output, batch_gt_data)
 
     def g_step(self, batch_outputs, batch_gt_data):
-        gt_pixel, gt_percep, _, mask, gt_sequence, mask_sequence = batch_gt_data
-        fake_output, _ = batch_outputs
-        fake_output = fake_output.view(gt_pixel.shape)
+        gt_pixel, gt_percep, _, mask, gt_sequence, mask_sequence = batch_gt_data[:6]
+        fake_sequence, input_sequence = batch_outputs
+        fake_output = fake_sequence.view(gt_pixel.shape)
         fake_roi = self._roi_composite(fake_output, batch_gt_data)
 
         losses = {}
@@ -239,6 +264,18 @@ class BasicVSRPlusPlusSharpGan(BasicVSRPlusPlusGan):
                 fake_output.view_as(gt_sequence),
                 gt_sequence,
                 mask_sequence,
+            )
+        if self.mosaic_forward_consistency_loss:
+            phases, block_sizes, observation_weight = batch_gt_data[6:9]
+            losses['loss_mosaic_forward_consistency_roi'] = (
+                self.mosaic_forward_consistency_loss(
+                    fake_sequence,
+                    input_sequence,
+                    mask_sequence,
+                    phases,
+                    block_sizes,
+                    observation_weight,
+                )
             )
         if self.gan_loss and self.discriminator:
             fake_prediction = self.discriminator(fake_roi)

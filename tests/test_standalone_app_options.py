@@ -252,7 +252,8 @@ class StandaloneAppOptionTests(unittest.TestCase):
 
         for contract in [
             "preserveCurrentSource: Bool = false",
-            "stop(preserveSourceItem: canReuseCurrentSource)",
+            "preserveSourceItem: canReuseCurrentSource",
+            "preserveHLSSelection: false",
             "preserveCurrentSource: true",
             "sourcePlayer.seek(",
             "self.position = startSeconds",
@@ -747,7 +748,8 @@ class StandaloneAppOptionTests(unittest.TestCase):
         script = BUILD_SCRIPT.read_text()
 
         self.assertIn(
-            '$ROOT/model_weights/hf2500-plus-fc2-500-ema.pth', script
+            '$ROOT/model_weights/hf2500-plus-fc2-forward-consistency-w005-500-ema.pth',
+            script,
         )
         self.assertIn(
             '$ROOT/model_weights/lada_mosaic_restoration_model_generic_v1.2.pth',
@@ -884,9 +886,16 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertNotIn("load(.minFrameDuration)", pipeline)
         self.assertIn("let frameRate = try await track.load(.nominalFrameRate)", pipeline)
 
-        # The gate steps on an exact rational so 30000/1001 does not drift.
+        # The gate uses absolute rational time slots, so cluster shards do not
+        # restart the conversion phase at their own boundaries.
         self.assertIn("init(numerator: Int, denominator: Int) {", pipeline)
-        self.assertIn("intervalRemainder = step % frames", pipeline)
+        self.assertIn("private var lastSlot: Int64?", pipeline)
+        self.assertIn(
+            "Double(max(0, ptsNanoseconds)) * numerator / denominatorNanoseconds",
+            pipeline,
+        )
+        self.assertIn("+ 1e-8", pipeline)
+        self.assertIn("guard slot != lastSlot else { return false }", pipeline)
         self.assertIn(
             "let outputFPSNumerator = targetRate?.numerator ?? video.fpsNumerator",
             pipeline,

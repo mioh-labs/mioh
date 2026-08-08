@@ -34,6 +34,7 @@ public struct MiohClusterCapabilities: Codable, Hashable, Sendable {
   public let maximumRestorationClipLength: Int?
   public let supportsROIEnhancer: Bool?
   public let supportsRestorationEffects: Bool?
+  public let supportsFPSConversion: Bool?
   public let supportedInputExtensions: [String]?
   public let restorationAssetSHA256ByIdentifier: [String: String]?
   public let detectorAssetSHA256ByIdentifier: [String: String]?
@@ -54,6 +55,7 @@ public struct MiohClusterCapabilities: Codable, Hashable, Sendable {
     maximumRestorationClipLength: Int? = nil,
     supportsROIEnhancer: Bool? = nil,
     supportsRestorationEffects: Bool? = nil,
+    supportsFPSConversion: Bool? = nil,
     supportedInputExtensions: [String]? = nil,
     restorationAssetSHA256ByIdentifier: [String: String]? = nil,
     detectorAssetSHA256ByIdentifier: [String: String]? = nil,
@@ -73,6 +75,7 @@ public struct MiohClusterCapabilities: Codable, Hashable, Sendable {
     self.maximumRestorationClipLength = maximumRestorationClipLength
     self.supportsROIEnhancer = supportsROIEnhancer
     self.supportsRestorationEffects = supportsRestorationEffects
+    self.supportsFPSConversion = supportsFPSConversion
     self.supportedInputExtensions = supportedInputExtensions?.map {
       $0.lowercased()
     }.sorted()
@@ -304,7 +307,9 @@ public struct MiohClusterRestorationOptions: Codable, Hashable, Sendable {
           && roiEnhancerAssetSHA256.map(Self.isSHA256) == true))
       && (videoCodec == "h264" || videoCodec == "hevc")
       && bitrateMultiplier.isFinite && bitrateMultiplier > 0
-      && targetFPSNumerator == nil && targetFPSDenominator == nil
+      && ((targetFPSNumerator == nil && targetFPSDenominator == nil)
+        || (targetFPSNumerator.map { (1...120_000).contains($0) } == true
+          && targetFPSDenominator.map { (1...1_001).contains($0) } == true))
   }
 
   private static func isSHA256(_ value: String) -> Bool {

@@ -10,17 +10,19 @@ The dedicated application currently ships
 `basicvsrpp-v1.2-coreai-variable` generated from:
 
 ```text
-model_weights/hf2500-plus-fc2-500-ema.pth
+model_weights/hf2500-plus-fc2-forward-consistency-w005-500-ema.pth
 ```
 
 Expected SHA-256:
 
 ```text
-8706f83c4ea0dc1abd83544b21eaeba3bf7df4ea2ca1b327cd1d5fc8146a396f
+5bf6da33536500f5b130a2c1ed2794ae1fb707d68967f23cdfcc5b3134b7a1a4
 ```
 
-This is the `HF2500 + fc2_best 500-step EMA` checkpoint. It is not the old
-iter9000 model and not the generic v1.2 checkpoint.
+This is the `HF2500 + fc2_best 500-step + known-grid forward-consistency
+weight=0.05 / 500-step EMA` checkpoint. It is not the old iter9000 model and
+not the generic v1.2 checkpoint. The additional continuation applies the exact
+re-mosaic observation constraint only to complete, fully masked grid cells.
 
 ## Rebuilding after deleting `build/`
 

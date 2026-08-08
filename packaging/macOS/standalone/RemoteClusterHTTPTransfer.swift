@@ -33,6 +33,8 @@ struct RemoteClusterHTTPSourceIdentity: Sendable {
 /// It deliberately implements only the small surface AVURLAsset and the
 /// Worker uploader need: HEAD, one byte Range per GET, and bounded PUT.
 final class RemoteClusterHTTPTransferServer: @unchecked Sendable {
+  private static let uploadIdleTimeout: TimeInterval = 5 * 60
+
   private struct SourceSignature: Equatable, Sendable {
     let device: UInt64
     let inode: UInt64
@@ -793,7 +795,7 @@ final class RemoteClusterHTTPTransferServer: @unchecked Sendable {
       self.sendStatus(408, "Request Timeout", on: connection)
     }
     state.idleTimeout = timeout
-    queue.asyncAfter(deadline: .now() + 60, execute: timeout)
+    queue.asyncAfter(deadline: .now() + Self.uploadIdleTimeout, execute: timeout)
   }
 
   private func abortUpload(connectionID: UUID) {
@@ -996,6 +998,8 @@ private final class RemoteClusterTransferOnce: @unchecked Sendable {
 }
 
 enum RemoteClusterHTTPTransferClient {
+  private static let transferTimeout: TimeInterval = 30 * 60
+
   /// URLSession's file upload streams from disk and does not materialize the
   /// encoded shard as one Data allocation.
   static func upload(
@@ -1016,10 +1020,10 @@ enum RemoteClusterHTTPTransferClient {
     // `expiresAt` is the initial wire snapshot. The Coordinator can renew the
     // server-side lease while a long job runs, so deriving this timeout from a
     // now-stale descriptor would incorrectly cap a valid upload at 60 seconds.
-    request.timeoutInterval = 5 * 60
+    request.timeoutInterval = transferTimeout
     request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
     let configuration = URLSessionConfiguration.ephemeral
-    configuration.timeoutIntervalForRequest = 5 * 60
+    configuration.timeoutIntervalForRequest = transferTimeout
     configuration.timeoutIntervalForResource = 24 * 60 * 60
     configuration.urlCache = nil
     configuration.httpCookieStorage = nil
