@@ -959,9 +959,14 @@ final class RealtimePlayerController: ObservableObject {
   let restoredPlayer = AVQueuePlayer()
   let startupSegmentCount = 3
   let rebufferSegmentCount = 2
+  let hlsVODStartupSegmentCount = 10
+  let hlsVODRebufferSegmentCount = 6
   let driftToleranceSeconds = 0.080
-  let hlsDriftToleranceSeconds = 0.250
-  let hlsDriftSeekToleranceSeconds = 0.050
+  let driftCorrectionGraceSeconds = 0.350
+  let hlsDriftCorrectionGraceSeconds = 1.250
+  let hlsDriftToleranceSeconds = 1.250
+  let hlsDriftSeekToleranceSeconds = 0.300
+  let hlsDriftSeekCooldownSeconds = 2.000
 
   private var worker: Process?
   private var workerRetirementTask: Task<Void, Never>?
@@ -973,6 +978,7 @@ final class RealtimePlayerController: ObservableObject {
   private var nextSequence = 0
   private var releasedThroughSequence = -1
   private var queuedSegments: [PreviewSegment] = []
+  private var sourceBufferedSeconds = 0.0
   private var itemSegments: [ObjectIdentifier: PreviewSegment] = [:]
   private var notificationTokens: [NSObjectProtocol] = []
   private var timeObserver: Any?
@@ -993,6 +999,9 @@ final class RealtimePlayerController: ObservableObject {
   private var hlsMediaProxy: IPadAuthenticatedMediaProxy?
   private var hlsSourceIsReady = false
   private var hlsInitialSeekCompleted = false
+  private var hlsSourceReady = false
+  private var hlsSourceSeekCompleted = false
+  private var hlsSourceTimeOffset = 0.0
   private var hlsSeekInFlight = false
   private var hlsSeekRevision = 0
   /// AVPlayer's HLS clock can use a media presentation origin unrelated to
@@ -1001,6 +1010,7 @@ final class RealtimePlayerController: ObservableObject {
   private var hlsTimelineAnchorOffset: Double?
   private var hlsSeekToLiveWindowStart = false
   private var hlsSourceReachedEnd = false
+  private var hlsRestoredClockFallbackActive = false
   private var requestedStartSeconds = 0.0
   private var shouldPlay = true
   private var generationHasStarted = false
@@ -1008,7 +1018,11 @@ final class RealtimePlayerController: ObservableObject {
   private var generationReachedEOF = false
   private var sourceSeekNeedsBuffer = false
   private var previewSegmentSeconds = 2.0
+  private var currentRestoredItemIdentifier: ObjectIdentifier?
+  private var currentRestoredItemStartedAt = 0.0
+  private var lastHLSDriftSeekAt = 0.0
   private weak var runner: RestorationRunner?
+  private var activePreviewSettingsSignature: String?
   private var streamingSource: RealtimeStreamingSource?
   private var streamingSegmentCodecs: [Int: String] = [:]
   private var streamingEventConsumer: RealtimeStreamingEventConsumer?
@@ -1112,6 +1126,7 @@ final class RealtimePlayerController: ObservableObject {
       try FileManager.default.createDirectory(at: session, withIntermediateDirectories: true)
 
       self.runner = runner
+      activePreviewSettingsSignature = previewSettingsSignature(for: runner)
       sessionDirectory = session
       generation += 1
       let startingGeneration = generation
@@ -1408,6 +1423,7 @@ final class RealtimePlayerController: ObservableObject {
         ? max(0, playlist.segments.suffix(startupSegmentCount).first?.startSeconds ?? 0)
         : min(max(0, startSeconds), max(0, availableDuration - 0.001))
       self.runner = runner
+      activePreviewSettingsSignature = previewSettingsSignature(for: runner)
       sessionDirectory = session
       hlsSource = source
       previewInputURL = source.playbackURL
@@ -1419,6 +1435,7 @@ final class RealtimePlayerController: ObservableObject {
       position = target
       duration = availableDuration
       bufferedSeconds = 0
+      sourceBufferedSeconds = 0
       shouldPlay = autoPlay
       generationHasStarted = false
       generationStartPending = false
@@ -1426,11 +1443,18 @@ final class RealtimePlayerController: ObservableObject {
       sourceSeekNeedsBuffer = false
       hlsSourceIsReady = false
       hlsInitialSeekCompleted = false
+      hlsSourceReady = false
+      hlsSourceSeekCompleted = false
+      hlsSourceTimeOffset = 0
       hlsSeekInFlight = false
       hlsSeekRevision &+= 1
       hlsTimelineAnchorOffset = nil
       hlsSeekToLiveWindowStart = false
       hlsSourceReachedEnd = false
+      hlsRestoredClockFallbackActive = false
+      currentRestoredItemIdentifier = nil
+      currentRestoredItemStartedAt = 0
+      lastHLSDriftSeekAt = 0
       sourceOnlyPlayback = false
       isVRVideo = false
       isDetectingVR = false
@@ -1584,11 +1608,18 @@ final class RealtimePlayerController: ObservableObject {
       generationHasStarted = false
       generationStartPending = false
       hlsInitialSeekCompleted = false
+      hlsSourceReady = false
+      hlsSourceSeekCompleted = false
+      hlsSourceTimeOffset = 0
       hlsSeekInFlight = false
       hlsSeekRevision &+= 1
       hlsTimelineAnchorOffset = nil
       hlsSeekToLiveWindowStart = true
       hlsSourceReachedEnd = false
+      hlsRestoredClockFallbackActive = false
+      currentRestoredItemIdentifier = nil
+      currentRestoredItemStartedAt = 0
+      lastHLSDriftSeekAt = 0
       if shouldPlay {
         state = .buffering
         playbackDetail = "ライブHLSの更新位置へ追従中"
@@ -1678,6 +1709,7 @@ final class RealtimePlayerController: ObservableObject {
       self.sourcePlayer.replaceCurrentItem(with: item)
       self.sourcePlayer.volume = self.muted ? 0 : Float(self.volume)
       self.bufferedSeconds = 0
+      self.sourceBufferedSeconds = 0
       self.duration = prepared.duration
       self.installTimeObserver()
       self.installSourcePlaybackObservers(item: item, generation: startingGeneration)
@@ -1709,6 +1741,40 @@ final class RealtimePlayerController: ObservableObject {
     }
   }
 
+  private func shouldRestartPreviewForCurrentSettings() -> Bool {
+    guard let runner, let activePreviewSettingsSignature else {
+      return false
+    }
+    return previewSettingsSignature(for: runner) != activePreviewSettingsSignature
+  }
+
+  private func previewSettingsSignature(for runner: RestorationRunner) -> String {
+    [
+      "restoration=\(runner.previewRestorationModel)",
+      "customRestoration=\(runner.previewCustomRestorationModel)",
+      "detection=\(runner.previewDetectionModel)",
+      "customDetection=\(runner.previewCustomDetectionModel)",
+      "realtimeOptimization=\(runner.previewRealtimeOptimization)",
+      "preserveComposite=\(runner.preservesRealtimeCompositeParameters)",
+      "useMaxClip=\(runner.useMaxClipLength)",
+      "maxClip=\(runner.maxClipLength)",
+      "useRestoreMax=\(runner.useRestoreMaxFrames)",
+      "restoreMax=\(runner.restoreMaxFrames)",
+      "overlap=\(runner.restoreTemporalOverlap)",
+      "crossfade=\(runner.restoreCrossfade)",
+      "sharpen=\(runner.previewRealtimeOptimization ? 0 : runner.sharpenStrength)",
+      "detail=\(runner.previewRealtimeOptimization ? 0 : runner.detailBoost)",
+      "feather=\(runner.blendFeather)",
+      "texture=\(runner.previewRealtimeOptimization ? 0 : runner.textureMix)",
+      "smooth=\(runner.previewRealtimeOptimization ? 0 : runner.smoothStrength)",
+      "upscale=\(runner.previewRealtimeOptimization ? 1 : runner.effectUpscale)",
+      "roiEnhancer=\(runner.previewRealtimeOptimization ? "none" : runner.roiEnhancer)",
+      "roiModel=\(runner.previewRealtimeOptimization ? "" : runner.roiEnhancerModel)",
+      "roiScale=\(runner.previewRealtimeOptimization ? 1 : runner.roiEnhancerScale)",
+      "roiStrength=\(runner.previewRealtimeOptimization ? 0 : runner.roiEnhancerStrength)",
+    ].joined(separator: "|")
+  }
+
   func togglePlayback() {
     if state == .playing {
       shouldPlay = false
@@ -1717,6 +1783,13 @@ final class RealtimePlayerController: ObservableObject {
       state = .paused
     } else if state == .paused || state == .buffering {
       shouldPlay = true
+      if shouldRestartPreviewForCurrentSettings(),
+        let runner
+      {
+        shouldPlay = true
+        restartWithCurrentSettings(runner: runner)
+        return
+      }
       if sourceOnlyPlayback {
         if sourceSeekNeedsBuffer {
           resumeSourceAfterSeekIfBuffered()
@@ -1989,17 +2062,25 @@ final class RealtimePlayerController: ObservableObject {
     hlsNotificationTokens.removeAll()
     hlsSourceIsReady = false
     hlsInitialSeekCompleted = false
+    hlsSourceReady = false
+    hlsSourceSeekCompleted = false
+    hlsSourceTimeOffset = 0
     hlsSeekInFlight = false
     hlsSeekRevision &+= 1
     hlsTimelineAnchorOffset = nil
     hlsSeekToLiveWindowStart = false
     hlsSourceReachedEnd = false
+    hlsRestoredClockFallbackActive = false
+    currentRestoredItemIdentifier = nil
+    currentRestoredItemStartedAt = 0
+    lastHLSDriftSeekAt = 0
     sourceOnlyPlayback = false
     shouldPlay = false
     generationHasStarted = false
     generationStartPending = false
     generationReachedEOF = false
     sourceSeekNeedsBuffer = false
+    activePreviewSettingsSignature = nil
     sourcePlayer.pause()
     if !preserveSourceItem {
       sourcePlayer.replaceCurrentItem(with: nil)
@@ -2041,6 +2122,7 @@ final class RealtimePlayerController: ObservableObject {
     }
     state = .idle
     bufferedSeconds = 0
+    sourceBufferedSeconds = 0
     playbackDetail = ""
     if let retiringWorker {
       if retiringWorker.isRunning {
@@ -2379,8 +2461,7 @@ final class RealtimePlayerController: ObservableObject {
     guard shouldPlay else { return }
     guard state != .playing, !generationStartPending else { return }
     if hlsSource != nil {
-      guard hlsSourceIsReady, hlsInitialSeekCompleted,
-        hlsTimelineAnchorOffset != nil
+      guard hlsSourceClockIsReadyForSynchronizedPlayback
       else {
         if let item = sourcePlayer.currentItem {
           seekHLSClockWhenReady(item: item, generation: generation)
@@ -2397,7 +2478,7 @@ final class RealtimePlayerController: ObservableObject {
       return
     }
     let nominalRequired =
-      Double(generationHasStarted ? rebufferSegmentCount : startupSegmentCount)
+      Double(requiredSegmentCountForCurrentGeneration())
       * previewSegmentSeconds
     let required = min(
       nominalRequired,
@@ -2441,25 +2522,86 @@ final class RealtimePlayerController: ObservableObject {
     }
   }
 
+  private func requiredSegmentCountForCurrentGeneration() -> Int {
+    if hlsSource != nil, !isLiveHLSInput {
+      return generationHasStarted
+        ? hlsVODRebufferSegmentCount
+        : hlsVODStartupSegmentCount
+    }
+    return generationHasStarted ? rebufferSegmentCount : startupSegmentCount
+  }
+
   private func startPlayersFromCurrentPosition() {
     if hlsSource != nil {
-      guard hlsSourceIsReady, hlsInitialSeekCompleted,
-        hlsTimelineAnchorOffset != nil
+      guard hlsSourceClockIsReadyForSynchronizedPlayback
       else {
         state = .buffering
         playbackDetail = "HLS元動画の再生位置を準備中"
         return
       }
+      hlsRestoredClockFallbackActive = false
+      sourcePlayer.play()
+      if sourcePlayer.timeControlStatus == .playing {
+        restoredPlayer.play()
+        state = .playing
+        playbackDetail = ""
+      } else {
+        restoredPlayer.pause()
+        state = .buffering
+        playbackDetail = hlsSourceWaitingDescription()
+      }
+      return
     }
     sourcePlayer.play()
     restoredPlayer.play()
     state = .playing
   }
 
+  private var hlsSourceClockIsReadyForSynchronizedPlayback: Bool {
+    hlsSourceReady && hlsSourceSeekCompleted
+  }
+
+  private var canStartHLSWithRestoredClockFallback: Bool {
+    false
+  }
+
+  private var shouldPreferRestoredHLSPlayback: Bool {
+    false
+  }
+
+  private var canPlayRestoredWhileHLSSourceWaits: Bool {
+    false
+  }
+
+  @discardableResult
+  private func absorbHLSSourceWaitWithRestoredBuffer(_ detail: String) -> Bool {
+    guard canPlayRestoredWhileHLSSourceWaits else { return false }
+    restoredPlayer.play()
+    state = .playing
+    playbackDetail = String(
+      format: "HLS元動画待ちを復元バッファで吸収: %.1f秒残り / %@",
+      bufferedSeconds,
+      detail
+    )
+    return true
+  }
+
+  private func reanchorHLSClockToRestoredPlaybackIfNeeded() {
+    guard hlsSource != nil, generationHasStarted,
+      let active = queuedSegments.first
+    else { return }
+    let restoredLocalSeconds = restoredPlayer.currentTime().seconds
+    let sourceSeconds = sourcePlayer.currentTime().seconds
+    guard restoredLocalSeconds.isFinite, sourceSeconds.isFinite else { return }
+    hlsTimelineAnchorOffset = sourceSeconds - (active.startSeconds + restoredLocalSeconds)
+    hlsSourceTimeOffset = hlsTimelineAnchorOffset ?? hlsSourceTimeOffset
+  }
+
   /// Observes the original HLS player independently from restored segment
   /// items. The source is both the audio track and the authoritative clock,
-  /// so restoration must pause when it stalls and must fail visibly when
-  /// AVFoundation reports Cannot Open (or another terminal item error).
+  /// but restored HLS video is allowed to keep playing through short source
+  /// stalls when its own buffer is already ahead. Terminal AVFoundation item
+  /// errors still fail visibly.
   private func installHLSPlaybackObservers(
     item: AVPlayerItem,
     generation: Int
@@ -2576,6 +2718,7 @@ final class RealtimePlayerController: ObservableObject {
     switch item.status {
     case .failed:
       hlsSourceIsReady = false
+      hlsSourceReady = false
       fail(
         "HLS元動画を再生できません: "
           + (item.error?.localizedDescription ?? "Cannot Open")
@@ -2583,6 +2726,7 @@ final class RealtimePlayerController: ObservableObject {
       return
     case .unknown:
       hlsSourceIsReady = false
+      hlsSourceReady = false
       if shouldPlay {
         state = .loading
         playbackDetail = "HLS元動画を開いています"
@@ -2590,9 +2734,11 @@ final class RealtimePlayerController: ObservableObject {
       return
     case .readyToPlay:
       hlsSourceIsReady = true
+      hlsSourceReady = true
       seekHLSClockWhenReady(item: item, generation: generation)
     @unknown default:
       hlsSourceIsReady = false
+      hlsSourceReady = false
       if shouldPlay {
         state = .loading
         playbackDetail = "HLS元動画を開いています"
@@ -2600,7 +2746,7 @@ final class RealtimePlayerController: ObservableObject {
       return
     }
 
-    guard hlsInitialSeekCompleted else {
+    guard hlsSourceSeekCompleted || hlsRestoredClockFallbackActive else {
       if shouldPlay {
         state = .buffering
         playbackDetail = "HLS元動画の再生位置を準備中"
@@ -2620,6 +2766,7 @@ final class RealtimePlayerController: ObservableObject {
     switch sourcePlayer.timeControlStatus {
     case .playing:
       if !hlsSourceReachedEnd {
+        reanchorHLSClockToRestoredPlaybackIfNeeded()
         restoredPlayer.play()
         state = .playing
         playbackDetail = ""
@@ -2648,13 +2795,14 @@ final class RealtimePlayerController: ObservableObject {
     guard self.generation == generation, hlsSource != nil,
       sourcePlayer.currentItem === item,
       item.status == .readyToPlay,
-      hlsSourceIsReady,
-      !hlsInitialSeekCompleted,
+      hlsSourceReady,
+      !hlsSourceSeekCompleted,
       !hlsSeekInFlight
     else { return }
 
     let syntheticTarget = requestedStartSeconds
     let sourceTarget: Double
+    let sourceTimeOffset: Double
     if isLiveHLSInput {
       let seekableRanges = item.seekableTimeRanges.compactMap { value -> ClosedRange<Double>? in
         let range = value.timeRangeValue
@@ -2679,8 +2827,10 @@ final class RealtimePlayerController: ObservableObject {
           max(seekable.lowerBound, seekable.upperBound - distanceFromLiveEdge)
         )
       }
+      sourceTimeOffset = sourceTarget - syntheticTarget
     } else {
       sourceTarget = max(0, syntheticTarget)
+      sourceTimeOffset = 0
     }
 
     hlsSeekInFlight = true
@@ -2709,14 +2859,78 @@ final class RealtimePlayerController: ObservableObject {
           self.fail("HLS元動画の時間情報を取得できませんでした: Cannot Open")
           return
         }
+        self.hlsSourceTimeOffset = self.isLiveHLSInput
+          ? actualSourceTime - syntheticTarget
+          : sourceTimeOffset
         self.hlsTimelineAnchorOffset = actualSourceTime - syntheticTarget
         self.hlsInitialSeekCompleted = true
+        self.hlsSourceSeekCompleted = true
         self.hlsSeekToLiveWindowStart = false
         self.position = syntheticTarget
         if self.shouldPlay {
           self.state = .buffering
           self.playbackDetail = ""
           self.resumeIfBuffered()
+        } else {
+          self.state = .paused
+          self.playbackDetail = ""
+        }
+      }
+    }
+  }
+
+  private func currentRestoredTimelineSeconds() -> Double? {
+    guard let active = queuedSegments.first else { return nil }
+    let local = restoredPlayer.currentTime().seconds
+    guard local.isFinite else { return nil }
+    return max(0, active.startSeconds + local)
+  }
+
+  private func syncHLSSourceClockAfterRestoredFallback(
+    item: AVPlayerItem,
+    generation: Int,
+    revision: Int,
+    restoredTimeline: Double
+  ) {
+    guard hlsSource != nil, !isLiveHLSInput else { return }
+    let target = min(max(0, restoredTimeline), max(0, duration - 0.001))
+    sourcePlayer.seek(
+      to: CMTime(seconds: target, preferredTimescale: 600),
+      toleranceBefore: CMTime(seconds: hlsDriftSeekToleranceSeconds, preferredTimescale: 600),
+      toleranceAfter: CMTime(seconds: hlsDriftSeekToleranceSeconds, preferredTimescale: 600)
+    ) { [weak self, weak item] finished in
+      Task { @MainActor in
+        guard let self, let item,
+          self.generation == generation,
+          self.hlsSeekRevision == revision,
+          self.hlsSource != nil,
+          self.sourcePlayer.currentItem === item
+        else { return }
+        self.hlsSeekInFlight = false
+        guard finished else {
+          self.hlsRestoredClockFallbackActive = false
+          self.fail("HLS元動画の開始位置を設定できませんでした: Cannot Open")
+          return
+        }
+        let actualSourceTime = self.sourcePlayer.currentTime().seconds
+        guard actualSourceTime.isFinite else {
+          self.hlsRestoredClockFallbackActive = false
+          self.fail("HLS元動画の時間情報を取得できませんでした: Cannot Open")
+          return
+        }
+        let synchronizedTimeline =
+          self.currentRestoredTimelineSeconds() ?? target
+        self.hlsTimelineAnchorOffset = actualSourceTime - synchronizedTimeline
+        self.hlsSourceTimeOffset = actualSourceTime - synchronizedTimeline
+        self.hlsInitialSeekCompleted = true
+        self.hlsSourceSeekCompleted = true
+        self.hlsSeekToLiveWindowStart = false
+        self.hlsRestoredClockFallbackActive = false
+        if self.shouldPlay {
+          self.sourcePlayer.play()
+          self.restoredPlayer.play()
+          self.state = .playing
+          self.playbackDetail = ""
         } else {
           self.state = .paused
           self.playbackDetail = ""
@@ -2878,16 +3092,22 @@ final class RealtimePlayerController: ObservableObject {
 
   private func tick(sourceSeconds: Double) {
     guard sourceSeconds.isFinite else { return }
+    if hlsShouldUseRestoredClock {
+      tickRestored(seconds: restoredPlayer.currentTime().seconds)
+      return
+    }
     let playbackTimelineSeconds: Double
     if hlsSource != nil {
-      guard hlsSourceIsReady, hlsInitialSeekCompleted,
-        let hlsTimelineAnchorOffset
-      else {
-        position = requestedStartSeconds
+      guard hlsSourceClockIsReadyForSynchronizedPlayback else {
+        if generationHasStarted {
+          tickRestored(seconds: restoredPlayer.currentTime().seconds)
+        } else {
+          position = requestedStartSeconds
+        }
         return
       }
-      playbackTimelineSeconds = max(0, sourceSeconds - hlsTimelineAnchorOffset)
-      position = playbackTimelineSeconds
+      playbackTimelineSeconds = max(0, sourceSeconds - hlsSourceTimeOffset)
+      position = min(duration, playbackTimelineSeconds)
     } else if !sourceOnlyPlayback && !generationHasStarted
       && (state == .loading || state == .seeking || state == .buffering)
     {
@@ -2915,15 +3135,48 @@ final class RealtimePlayerController: ObservableObject {
       let active = queuedSegments.first,
       restoredPlayer.currentTime().seconds.isFinite
     else { return }
+    if hlsSource != nil,
+      let currentItem = restoredPlayer.currentItem
+    {
+      let itemIdentifier = ObjectIdentifier(currentItem)
+      let now = ProcessInfo.processInfo.systemUptime
+      if itemIdentifier != currentRestoredItemIdentifier {
+        currentRestoredItemIdentifier = itemIdentifier
+        currentRestoredItemStartedAt = now
+        return
+      }
+      let grace = hlsSource == nil
+        ? driftCorrectionGraceSeconds
+        : hlsDriftCorrectionGraceSeconds
+      guard now - currentRestoredItemStartedAt >= grace else {
+        return
+      }
+    }
     let restoredAbsolute = active.startSeconds + restoredPlayer.currentTime().seconds
     let allowedDrift = hlsSource == nil
       ? driftToleranceSeconds
       : hlsDriftToleranceSeconds
     if abs(restoredAbsolute - playbackTimelineSeconds) > allowedDrift {
+      if hlsSource != nil, restoredAbsolute > playbackTimelineSeconds {
+        // HLS VOD clocks can wobble backwards around segment boundaries. Do
+        // not seek restored video backwards: visually this looks like a brief
+        // rewind loop. Instead, treat the restored AVQueuePlayer as the stable
+        // presentation clock and re-anchor the source timeline to it.
+        hlsSourceTimeOffset = sourceSeconds - restoredAbsolute
+        hlsTimelineAnchorOffset = hlsSourceTimeOffset
+        return
+      }
       let local = max(0, playbackTimelineSeconds - active.startSeconds)
       let seekTolerance = hlsSource == nil
         ? CMTime.zero
         : CMTime(seconds: hlsDriftSeekToleranceSeconds, preferredTimescale: 600)
+      if hlsSource != nil {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastHLSDriftSeekAt >= hlsDriftSeekCooldownSeconds else {
+          return
+        }
+        lastHLSDriftSeekAt = now
+      }
       restoredPlayer.seek(
         to: CMTime(seconds: local, preferredTimescale: 600),
         toleranceBefore: seekTolerance,
@@ -2932,9 +3185,24 @@ final class RealtimePlayerController: ObservableObject {
     }
   }
 
+  private var hlsShouldUseRestoredClock: Bool {
+    false
+  }
+
+  private func tickRestored(seconds restoredLocalSeconds: Double) {
+    guard hlsShouldUseRestoredClock,
+      restoredLocalSeconds.isFinite,
+      let active = queuedSegments.first
+    else { return }
+    position = max(0, active.startSeconds + restoredLocalSeconds)
+    retireSegmentsBeforeCurrentItem()
+    updateBufferedDuration()
+  }
+
   private func updateSourceBufferedDuration() {
     guard let item = sourcePlayer.currentItem else {
-      bufferedSeconds = 0
+      sourceBufferedSeconds = 0
+      if sourceOnlyPlayback { bufferedSeconds = 0 }
       return
     }
     var furthestEnd = position
@@ -2945,7 +3213,10 @@ final class RealtimePlayerController: ObservableObject {
       guard start.isFinite, end.isFinite, start <= position + 0.25 else { continue }
       furthestEnd = max(furthestEnd, end)
     }
-    bufferedSeconds = max(0, furthestEnd - position)
+    sourceBufferedSeconds = max(0, furthestEnd - position)
+    if sourceOnlyPlayback {
+      bufferedSeconds = sourceBufferedSeconds
+    }
   }
 
   private func updateBufferedDuration() {
@@ -3036,6 +3307,9 @@ final class RealtimePlayerController: ObservableObject {
     itemSegments.removeAll()
     releasedThroughSequence = -1
     bufferedSeconds = 0
+    if hlsSource == nil {
+      sourceBufferedSeconds = 0
+    }
   }
 
   /// Installs or removes a non-owning stream consumer. Attaching in the
@@ -3093,11 +3367,18 @@ final class RealtimePlayerController: ObservableObject {
     hlsNotificationTokens.removeAll()
     hlsSourceIsReady = false
     hlsInitialSeekCompleted = false
+    hlsSourceReady = false
+    hlsSourceSeekCompleted = false
+    hlsSourceTimeOffset = 0
     hlsSeekInFlight = false
     hlsSeekRevision &+= 1
     hlsTimelineAnchorOffset = nil
     hlsSeekToLiveWindowStart = false
     hlsSourceReachedEnd = false
+    hlsRestoredClockFallbackActive = false
+    currentRestoredItemIdentifier = nil
+    currentRestoredItemStartedAt = 0
+    lastHLSDriftSeekAt = 0
     sourceSeekNeedsBuffer = false
     sourcePlayer.pause()
     restoredPlayer.pause()
@@ -3173,7 +3454,7 @@ struct RealtimePlayerView: View {
             Spacer()
           }
           if runner.previewRealtimeOptimization {
-            Text("復元は維持し、再生中だけROIエンハンサーと拡大後処理を省略します")
+            Text("復元は維持し、再生中は合成エフェクトとROIエンハンサーをバイパスします")
               .font(.caption)
               .foregroundStyle(.secondary)
           }
@@ -3183,16 +3464,11 @@ struct RealtimePlayerView: View {
       ZStack {
         Color.black
         if runner.previewProjectionMode == "通常" {
-          VideoPlayer(player: controller.sourcePlayer)
-            .opacity(
-              controller.showOriginal || controller.showsSourceFrameWhilePreparingRestoration
-                ? 1 : 0.001
-            )
-          VideoPlayer(player: controller.restoredPlayer)
-            .opacity(
-              controller.showOriginal || controller.showsSourceFrameWhilePreparingRestoration
-                ? 0.001 : 1
-            )
+          if controller.prefersSourceVideoLayer {
+            VideoPlayer(player: controller.sourcePlayer)
+          } else {
+            VideoPlayer(player: controller.restoredPlayer)
+          }
         } else {
           VRPreviewSceneView(
             playerItem: controller.sourceOnlyPlayback || controller.showOriginal
@@ -3350,7 +3626,22 @@ struct RealtimePlayerView: View {
 }
 
 private extension RealtimePlayerController {
+  var showsRestoredFrameWhileHLSBuffers: Bool {
+    hlsSource != nil
+      && !sourceOnlyPlayback
+      && !showOriginal
+      && generationHasStarted
+      && restoredPlayer.currentItem != nil
+      && (state == .loading || state == .buffering || state == .seeking)
+  }
+
+  var prefersSourceVideoLayer: Bool {
+    showOriginal
+      || (showsSourceFrameWhilePreparingRestoration && !showsRestoredFrameWhileHLSBuffers)
+  }
+
   var shouldShowProcessingOverlay: Bool {
+    if showsRestoredFrameWhileHLSBuffers { return false }
     if sourceOnlyPlayback {
       return state == .loading || state == .buffering || state == .seeking
     }

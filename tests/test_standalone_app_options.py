@@ -129,6 +129,8 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "event.generation == generation",
             "startupSegmentCount = 3",
             "rebufferSegmentCount = 2",
+            "hlsVODStartupSegmentCount = 10",
+            "hlsVODRebufferSegmentCount = 6",
             "generationReachedEOF",
             "driftToleranceSeconds = 0.080",
             "A seek is a generation boundary",
@@ -154,7 +156,11 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "private var generationHasStarted = false",
             "private var generationStartPending = false",
             "guard state != .playing, !generationStartPending else { return }",
-            "Double(generationHasStarted ? rebufferSegmentCount : startupSegmentCount)",
+            "Double(requiredSegmentCountForCurrentGeneration())",
+            "private func requiredSegmentCountForCurrentGeneration() -> Int",
+            "hlsSource != nil, !isLiveHLSInput",
+            "hlsVODRebufferSegmentCount",
+            "hlsVODStartupSegmentCount",
             "bufferedSeconds + 0.1 >= required",
             "private func startPlayersFromCurrentPosition()",
             "let startingGeneration = generation",
@@ -227,7 +233,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
         player = PLAYER_SOURCE.read_text()
 
         for contract in [
-            "Double(generationHasStarted ? rebufferSegmentCount : startupSegmentCount)",
+            "Double(requiredSegmentCountForCurrentGeneration())",
             "Start as soon as a short playable lead is available",
             "min(runner?.previewBufferLimit ?? 8, previewSegmentSeconds)",
         ]:
@@ -262,6 +268,29 @@ class StandaloneAppOptionTests(unittest.TestCase):
         ]:
             self.assertIn(contract, player)
         self.assertIn("if !preserveSourceItem", player)
+
+    def test_hls_buffering_keeps_the_restored_frame_visible_like_remote(self):
+        player = PLAYER_SOURCE.read_text()
+
+        for contract in [
+            "var showsRestoredFrameWhileHLSBuffers: Bool",
+            "hlsSource != nil",
+            "!sourceOnlyPlayback",
+            "!showOriginal",
+            "generationHasStarted",
+            "restoredPlayer.currentItem != nil",
+            "state == .loading || state == .buffering || state == .seeking",
+            "var prefersSourceVideoLayer: Bool",
+            "showsSourceFrameWhilePreparingRestoration && !showsRestoredFrameWhileHLSBuffers",
+            "controller.prefersSourceVideoLayer",
+            "if controller.prefersSourceVideoLayer",
+            "VideoPlayer(player: controller.sourcePlayer)",
+            "VideoPlayer(player: controller.restoredPlayer)",
+            "if showsRestoredFrameWhileHLSBuffers { return false }",
+        ]:
+            self.assertIn(contract, player)
+        self.assertNotIn("controller.prefersSourceVideoLayer\n                ? 1 : 0.001", player)
+        self.assertNotIn("controller.prefersSourceVideoLayer\n                ? 0.001 : 1", player)
 
     def test_playback_input_is_independent_from_export_input(self):
         player = PLAYER_SOURCE.read_text()
@@ -547,6 +576,68 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn('Picker("再生用検出モデル"', player)
         self.assertIn(
             'Toggle("リアルタイム最適化", isOn: $runner.previewRealtimeOptimization)',
+            player,
+        )
+        self.assertIn("var preservesRealtimeCompositeParameters: Bool", source)
+        self.assertIn("#if MIOH_PORTABLE_COREAI", source)
+        self.assertIn("let skipsCompositeParameters = previewRealtimeOptimization", source)
+        self.assertNotIn(
+            "let skipsCompositeParameters = previewRealtimeOptimization\n"
+            "      && !preservesRealtimeCompositeParameters",
+            source,
+        )
+        for contract in [
+            'add(&args, "--sharpen-strength", skipsCompositeParameters ? 0 : sharpenStrength)',
+            'add(&args, "--detail-boost", skipsCompositeParameters ? 0 : detailBoost)',
+            'add(&args, "--blend-feather", blendFeather)',
+            'add(&args, "--texture-mix", skipsCompositeParameters ? 0 : textureMix)',
+            'add(&args, "--smooth-strength", skipsCompositeParameters ? 0 : smoothStrength)',
+        ]:
+            self.assertIn(contract, source)
+        self.assertIn(
+            'add(&args, "--roi-enhancer", skipsCompositeParameters ? "none" : roiEnhancer)',
+            source,
+        )
+        self.assertIn(
+            'add(&args, "--effect-upscale", skipsCompositeParameters ? 1 : effectUpscale)',
+            source,
+        )
+        self.assertIn(
+            "let effectiveUpscale = skipsCompositeParameters ? 1 : effectUpscale",
+            source,
+        )
+        for contract in [
+            "let effectiveBlendFeather = blendFeather",
+            "let effectiveSharpenStrength = skipsCompositeParameters ? 0 : sharpenStrength",
+            "let effectiveDetailBoost = skipsCompositeParameters ? 0 : detailBoost",
+            "let effectiveTextureMix = skipsCompositeParameters ? 0 : textureMix",
+            "let effectiveSmoothStrength = skipsCompositeParameters ? 0 : smoothStrength",
+            "blendFeather: Float(effectiveBlendFeather)",
+            "sharpenStrength: Float(effectiveSharpenStrength)",
+            "detailBoost: Float(effectiveDetailBoost)",
+            "textureMix: Float(effectiveTextureMix)",
+            "smoothStrength: Float(effectiveSmoothStrength)",
+        ]:
+            self.assertIn(contract, source)
+        self.assertIn(
+            "sharpen > 0 || detail > 0 || texture > 0 || smoothing > 0 || upscale > 1",
+            NATIVE_PIPELINE_SOURCE.read_text(),
+        )
+        self.assertIn("private var activePreviewSettingsSignature: String?", player)
+        self.assertIn(
+            "activePreviewSettingsSignature = previewSettingsSignature(for: runner)",
+            player,
+        )
+        self.assertIn("private func shouldRestartPreviewForCurrentSettings()", player)
+        self.assertIn("private func previewSettingsSignature(for runner: RestorationRunner) -> String", player)
+        self.assertIn(
+            "if shouldRestartPreviewForCurrentSettings(),\n"
+            "        let runner\n"
+            "      {\n"
+            "        shouldPlay = true\n"
+            "        restartWithCurrentSettings(runner: runner)\n"
+            "        return\n"
+            "      }",
             player,
         )
         self.assertIn('if !controller.isVRVideo', player)

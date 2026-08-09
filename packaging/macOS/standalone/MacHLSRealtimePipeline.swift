@@ -20,17 +20,169 @@ enum MacHLSProductionEvent: Sendable {
 /// Converts an authenticated HLS media playlist into the same rolling,
 /// restored MP4 segments consumed by the normal macOS realtime player.
 ///
-/// Each HLS segment is restored with temporal context from its neighbours:
-/// after two downloads the first segment is emitted, after three downloads
-/// the centre segment is emitted and the oldest input is retired. This keeps
-/// latency bounded while avoiding an artificial BasicVSR++ boundary at every
-/// HLS cut. The final segment is flushed when a VOD playlist is exhausted.
+/// HLS segments are restored with temporal context from their neighbours. Live
+/// streams keep the old low-latency rolling 3-segment window; VOD streams batch
+/// several core segments per worker invocation so playback behaves closer to a
+/// local MP4 and avoids paying the worker/decode warm-up cost at every HLS cut.
 @MainActor
 final class MacHLSRealtimeProducer {
-  typealias Logger = (String) -> Void
+  typealias Logger = @Sendable (String) -> Void
   typealias EventSink = (MacHLSProductionEvent) -> Void
 
-  private struct RestorationSource {
+  private actor LocalSegmentCache {
+    struct Materialized: Sendable {
+      let url: URL
+      let cacheHit: Bool
+    }
+
+    static let shared = LocalSegmentCache(maximumBytes: 1_024 * 1_024 * 1_024)
+
+    private struct Entry {
+      let url: URL
+      let bytes: Int64
+      var lastAccess: Date
+      let pathExtension: String
+    }
+
+    private let maximumBytes: Int64
+    private var entries: [String: Entry] = [:]
+    private var totalBytes: Int64 = 0
+
+    init(maximumBytes: Int64) {
+      self.maximumBytes = max(64 * 1_024 * 1_024, maximumBytes)
+    }
+
+    func materialize(
+      segment: IPadHLSMediaSegment,
+      using downloader: IPadHLSResourceDownloader,
+      in sessionDirectory: URL,
+      cacheDirectory: URL
+    ) async throws -> Materialized {
+      let key = Self.cacheKey(for: segment)
+      if let cached = try cachedCopy(
+        for: key,
+        sequence: segment.sequence,
+        into: sessionDirectory
+      ) {
+        return Materialized(url: cached, cacheHit: true)
+      }
+
+      let downloadedURL = try await downloader.materialize(
+        segment: segment,
+        in: sessionDirectory
+      )
+      try importDownloadedSegment(
+        downloadedURL,
+        key: key,
+        cacheDirectory: cacheDirectory
+      )
+      return Materialized(url: downloadedURL, cacheHit: false)
+    }
+
+    private func cachedCopy(
+      for key: String,
+      sequence: Int64,
+      into sessionDirectory: URL
+    ) throws -> URL? {
+      guard var entry = entries[key] else { return nil }
+      guard FileManager.default.fileExists(atPath: entry.url.path) else {
+        totalBytes = max(0, totalBytes - entry.bytes)
+        entries[key] = nil
+        return nil
+      }
+      entry.lastAccess = Date()
+      entries[key] = entry
+      try FileManager.default.createDirectory(
+        at: sessionDirectory,
+        withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700]
+      )
+      let outputURL = sessionDirectory.appendingPathComponent(
+        "mioh-hls-cache-\(sequence)-\(UUID().uuidString.lowercased()).\(entry.pathExtension)",
+        isDirectory: false
+      )
+      do {
+        try FileManager.default.linkItem(at: entry.url, to: outputURL)
+      } catch {
+        try FileManager.default.copyItem(at: entry.url, to: outputURL)
+      }
+      return outputURL
+    }
+
+    private func importDownloadedSegment(
+      _ downloadedURL: URL,
+      key: String,
+      cacheDirectory: URL
+    ) throws {
+      let values = try downloadedURL.resourceValues(forKeys: [.fileSizeKey])
+      let bytes = Int64(max(0, values.fileSize ?? 0))
+      guard bytes > 0, bytes <= maximumBytes else { return }
+      try FileManager.default.createDirectory(
+        at: cacheDirectory,
+        withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700]
+      )
+      if let existing = entries[key] {
+        totalBytes = max(0, totalBytes - existing.bytes)
+        try? FileManager.default.removeItem(at: existing.url)
+      }
+      let pathExtension = normalizedPathExtension(downloadedURL.pathExtension)
+      let cacheURL = cacheDirectory.appendingPathComponent(
+        "\(UUID().uuidString.lowercased()).\(pathExtension)",
+        isDirectory: false
+      )
+      try FileManager.default.copyItem(at: downloadedURL, to: cacheURL)
+      entries[key] = Entry(
+        url: cacheURL,
+        bytes: bytes,
+        lastAccess: Date(),
+        pathExtension: pathExtension
+      )
+      totalBytes += bytes
+      try pruneIfNeeded(protecting: key)
+    }
+
+    private func pruneIfNeeded(protecting protectedKey: String) throws {
+      guard totalBytes > maximumBytes else { return }
+      let victims = entries
+        .filter { $0.key != protectedKey }
+        .sorted { $0.value.lastAccess < $1.value.lastAccess }
+      for (key, entry) in victims {
+        try? FileManager.default.removeItem(at: entry.url)
+        entries[key] = nil
+        totalBytes = max(0, totalBytes - entry.bytes)
+        if totalBytes <= maximumBytes { break }
+      }
+    }
+
+    private func normalizedPathExtension(_ value: String) -> String {
+      let sanitized = value.lowercased().filter {
+        $0.isLetter || $0.isNumber
+      }
+      return sanitized.isEmpty ? "mp4" : sanitized
+    }
+
+    private static func cacheKey(for segment: IPadHLSMediaSegment) -> String {
+      [
+        resourceKey(segment.resource),
+        resourceKey(segment.initializationResource),
+        "disc=\(segment.discontinuitySequence)",
+      ].joined(separator: "|")
+    }
+
+    private static func resourceKey(_ resource: IPadHLSResource?) -> String {
+      guard let resource else { return "nil" }
+      let range: String
+      if let byteRange = resource.byteRange {
+        range = "\(byteRange.offset)-\(byteRange.length)"
+      } else {
+        range = "full"
+      }
+      return "\(resource.url.absoluteString)#\(range)"
+    }
+  }
+
+  private struct RestorationSource: Sendable {
     let mediaSegment: IPadHLSMediaSegment
     let timelineStart: Double
     let localURL: URL
@@ -82,12 +234,15 @@ final class MacHLSRealtimeProducer {
   private let log: Logger
 
   private var downloader: IPadHLSResourceDownloader?
+  private var prefetchDownloader: IPadHLSResourceDownloader?
+  private var prefetchDownloaders: [IPadHLSResourceDownloader] = []
   private var activeProcess: Process?
   private var activeWorkerInput: Pipe?
   private var cancellationRequested = false
   private var nextOutputSequence = 0
   private var isRunActive = false
   private var completionWaiters: [CheckedContinuation<Void, Never>] = []
+  private let vodRestoreBatchCoreSegments = 6
 
   init(
     source: IPadResolvedMediaSource,
@@ -126,6 +281,10 @@ final class MacHLSRealtimeProducer {
     )
     let restoredDirectory = sessionDirectory.appendingPathComponent(
       "restored-hls",
+      isDirectory: true
+    )
+    let localSegmentCacheDirectory = resources.appendingPathComponent(
+      "hls-segment-cache",
       isDirectory: true
     )
     try FileManager.default.createDirectory(
@@ -168,7 +327,174 @@ final class MacHLSRealtimeProducer {
     var lastRefresh = Date.distantPast
     var consecutiveRefreshFailures = 0
     var restorationWindow: [RestorationSource] = []
+    var hasRestoredAnyWindow = false
+    var vodPrefetchTasks: [Int64: Task<Void, Never>] = [:]
+    var vodPrefetchResults: [Int64: Result<RestorationSource, Error>] = [:]
+    var vodPrefetchGeneration = UUID()
+    var vodPrefetchCompletionCount = 0
+    var vodPrefetchDownloader: IPadHLSResourceDownloader?
+    // Keep VOD prefetch independent from the restore window. Running downloads
+    // and completed inventory are intentionally tracked separately; otherwise
+    // completed segments keep occupying task slots until restoration consumes
+    // them, which makes prefetch refill appear coupled to BasicVSR++ throughput.
+    // Keep a bounded VOD inventory without hammering rate-limited hosts. The
+    // restore side consumes multi-segment batches, but the network side should
+    // stay polite; aggressive 64x6 bursts can trigger HTTP 429 on some HLS
+    // origins after a seek.
+    let maximumVODPrefetchSegments = 24
+    let maximumVODPrefetchDownloads = 3
+    func discardVODPrefetchResult(_ result: Result<RestorationSource, Error>) {
+      if case let .success(source) = result {
+        try? FileManager.default.removeItem(at: source.localURL)
+      }
+    }
+    func cancelVODPrefetch(resetDownloader: Bool = false) {
+      for task in vodPrefetchTasks.values { task.cancel() }
+      vodPrefetchTasks.removeAll(keepingCapacity: true)
+      for result in vodPrefetchResults.values {
+        discardVODPrefetchResult(result)
+      }
+      vodPrefetchResults.removeAll(keepingCapacity: true)
+      vodPrefetchGeneration = UUID()
+      vodPrefetchCompletionCount = 0
+      if resetDownloader {
+        vodPrefetchDownloader?.cancel()
+        if self.prefetchDownloader === vodPrefetchDownloader {
+          self.prefetchDownloader = nil
+        }
+        vodPrefetchDownloader = nil
+        self.prefetchDownloaders.removeAll(keepingCapacity: true)
+      }
+    }
+    func ensureVODPrefetchDownloader() -> IPadHLSResourceDownloader {
+      if let vodPrefetchDownloader { return vodPrefetchDownloader }
+      let created = makeDownloader(for: activeSource)
+      vodPrefetchDownloader = created
+      self.prefetchDownloader = created
+      self.prefetchDownloaders.append(created)
+      return created
+    }
+    func startVODPrefetchIfPossible() {
+      guard !playlist.isLive else { return }
+      let scheduled = Set(vodPrefetchTasks.keys).union(vodPrefetchResults.keys)
+      let availableDownloadSlots = max(
+        0,
+        maximumVODPrefetchDownloads - vodPrefetchTasks.count
+      )
+      let availableDepthSlots = max(
+        0,
+        maximumVODPrefetchSegments - scheduled.count
+      )
+      let availableSlots = min(availableDownloadSlots, availableDepthSlots)
+      guard availableSlots > 0 else { return }
+      let candidates = playlist.segments
+        .filter {
+          $0.sequence >= nextMediaSequence
+            && $0.sequence < Int64.max
+            && !scheduled.contains($0.sequence)
+        }
+        .sorted { $0.sequence < $1.sequence }
+        .prefix(availableSlots)
+      guard !candidates.isEmpty else { return }
+      for candidate in candidates {
+        let candidateStart = timelineStarts[candidate.sequence]
+          ?? candidate.startSeconds
+        let candidateEnd = candidateStart + candidate.duration
+        guard candidateStart.isFinite, candidateEnd.isFinite,
+          candidateEnd > startSeconds
+        else { continue }
+        let prefetchDownloader = ensureVODPrefetchDownloader()
+        let prefetchDirectory = sessionDirectory
+        let prefetchCacheDirectory = localSegmentCacheDirectory
+        let generation = vodPrefetchGeneration
+        if vodPrefetchTasks.isEmpty && vodPrefetchResults.isEmpty {
+          log(
+            "HLS先読み開始: 区間\(candidate.sequence)から最大\(maximumVODPrefetchSegments)本"
+              + "（同時\(maximumVODPrefetchDownloads)本）\n"
+          )
+        }
+        vodPrefetchTasks[candidate.sequence] = Task.detached(priority: .userInitiated) {
+          let startedAt = Date()
+          var completionLine: String?
+          let result: Result<RestorationSource, Error>
+          do {
+            let materialized = try await LocalSegmentCache.shared.materialize(
+              segment: candidate,
+              using: prefetchDownloader,
+              in: prefetchDirectory,
+              cacheDirectory: prefetchCacheDirectory
+            )
+            let elapsed = Date().timeIntervalSince(startedAt)
+            completionLine =
+              "HLS先読み完了: 区間\(candidate.sequence) / "
+                + (materialized.cacheHit ? "cache" : "network")
+                + " / \(String(format: "%.2f", elapsed))秒"
+            result = .success(
+              RestorationSource(
+                mediaSegment: candidate,
+                timelineStart: candidateStart,
+                localURL: materialized.url
+              )
+            )
+          } catch {
+            result = .failure(error)
+          }
+
+          let lineToEmit = completionLine
+          await MainActor.run {
+            guard vodPrefetchGeneration == generation,
+              !Task.isCancelled
+            else {
+              discardVODPrefetchResult(result)
+              return
+            }
+            vodPrefetchTasks[candidate.sequence] = nil
+            vodPrefetchResults[candidate.sequence] = result
+            vodPrefetchCompletionCount += 1
+            if let lineToEmit,
+              vodPrefetchCompletionCount <= maximumVODPrefetchDownloads
+                || vodPrefetchCompletionCount.isMultiple(of: 10)
+            {
+              self.log(
+                lineToEmit
+                  + " / 在庫\(vodPrefetchResults.count)/\(maximumVODPrefetchSegments)\n"
+              )
+            }
+            startVODPrefetchIfPossible()
+          }
+        }
+      }
+    }
+    func consumeVODPrefetch(
+      for sequence: Int64
+    ) async throws -> RestorationSource? {
+      guard !playlist.isLive else { return nil }
+      if let prefetchTask = vodPrefetchTasks[sequence] {
+        await prefetchTask.value
+      }
+      guard let result = vodPrefetchResults.removeValue(forKey: sequence)
+      else { return nil }
+      switch result {
+      case let .success(prefetchedSource):
+        guard prefetchedSource.mediaSegment.sequence == sequence else {
+          try? FileManager.default.removeItem(at: prefetchedSource.localURL)
+          return nil
+        }
+        log(
+          "HLS先読みヒット: 区間\(sequence) / 復元待ち中に取得済み\n"
+        )
+        return prefetchedSource
+      case let .failure(error):
+        if error is CancellationError { throw CancellationError() }
+        log(
+          "HLS区間\(sequence)の先読みを使用できません。通常取得へ戻します: "
+            + "\(error.localizedDescription)\n"
+        )
+        return nil
+      }
+    }
     defer {
+      cancelVODPrefetch(resetDownloader: true)
       for source in restorationWindow {
         try? FileManager.default.removeItem(at: source.localURL)
       }
@@ -237,6 +563,7 @@ final class MacHLSRealtimeProducer {
         )
         activeSource = refreshedSource
         playlist = refreshed
+        cancelVODPrefetch(resetDownloader: true)
         downloader.cancel()
         downloader = makeDownloader(for: activeSource)
         self.downloader = downloader
@@ -256,10 +583,12 @@ final class MacHLSRealtimeProducer {
           try await resetForLiveWindowJump(
             to: jumpPosition,
             restorationWindow: &restorationWindow,
+            hasLeftContext: hasRestoredAnyWindow,
             restoredDirectory: restoredDirectory,
             duration: duration,
             emit: emit
           )
+          hasRestoredAnyWindow = false
           log(
             "HLSライブ窓が先へ進んだため、復元キューを "
               + "\(formatDuration(jumpPosition)) へ追従しました\n"
@@ -284,6 +613,16 @@ final class MacHLSRealtimeProducer {
       }
       nextMediaSequence = selectedMediaSegment.sequence + 1
       var mediaSegment = selectedMediaSegment
+      if !playlist.isLive {
+        for staleSequence in vodPrefetchTasks.keys where staleSequence < mediaSegment.sequence {
+          vodPrefetchTasks.removeValue(forKey: staleSequence)?.cancel()
+        }
+        for staleSequence in vodPrefetchResults.keys where staleSequence < mediaSegment.sequence {
+          if let staleResult = vodPrefetchResults.removeValue(forKey: staleSequence) {
+            discardVODPrefetchResult(staleResult)
+          }
+        }
+      }
       var timelineStart = timelineStarts[mediaSegment.sequence]
         ?? mediaSegment.startSeconds
       var timelineEnd = timelineStart + mediaSegment.duration
@@ -294,100 +633,120 @@ final class MacHLSRealtimeProducer {
       }
       duration = max(duration, timelineEnd)
       if timelineEnd <= startSeconds { continue }
+      startVODPrefetchIfPossible()
 
       var localURL: URL?
       var downloadFailure: Error?
-      for retryIndex in 0...3 {
-        do {
-          localURL = try await downloader.materialize(
-            segment: mediaSegment,
-            in: sessionDirectory
-          )
-          downloadFailure = nil
-          break
-        } catch is CancellationError {
-          throw CancellationError()
-        } catch {
-          downloadFailure = error
-          guard retryIndex < 3 else { break }
-          log(
-            "HLS区間\(mediaSegment.sequence)のURLを更新して再試行します: "
-              + "\(error.localizedDescription)\n"
-          )
-          let refreshedSource: IPadResolvedMediaSource
+      let prefetchedSource = try await consumeVODPrefetch(
+        for: mediaSegment.sequence
+      )
+      if let prefetchedSource {
+        mediaSegment = prefetchedSource.mediaSegment
+        timelineStart = prefetchedSource.timelineStart
+        timelineEnd = prefetchedSource.timelineEnd
+        localURL = prefetchedSource.localURL
+      } else {
+        for retryIndex in 0...3 {
           do {
-            refreshedSource = try await resolveRefreshedSource(
-              activeSource: activeSource,
-              currentPlaylist: playlist,
-              preferOriginalURL: true
+            let materialized = try await LocalSegmentCache.shared.materialize(
+              segment: mediaSegment,
+              using: downloader,
+              in: sessionDirectory,
+              cacheDirectory: localSegmentCacheDirectory
             )
+            localURL = materialized.url
+            if materialized.cacheHit {
+              log("HLS区間\(mediaSegment.sequence)をローカルキャッシュから再利用しました\n")
+            }
+            downloadFailure = nil
+            break
           } catch is CancellationError {
             throw CancellationError()
           } catch {
-            if isEncryptedPlaylistFailure(error) { throw error }
             downloadFailure = error
-            try await sleep(seconds: min(2, 0.5 * Double(retryIndex + 1)))
-            continue
-          }
-          guard let refreshed = refreshedSource.hlsPlaylist else {
-            downloadFailure = ProductionError.invalidSource(
-              "HLS区間の更新後にメディアプレイリストがありません"
-            )
-            continue
-          }
-          if playlist.isLive {
-            try mergeTimelineStarts(
-              from: playlist,
-              refreshed: refreshed,
-              into: &timelineStarts,
-              currentDuration: duration
-            )
-          } else {
-            for segment in refreshed.segments {
-              timelineStarts[segment.sequence] = segment.startSeconds
-            }
-          }
-          activeSource = refreshedSource
-          playlist = refreshed
-          downloader.cancel()
-          downloader = makeDownloader(for: activeSource)
-          self.downloader = downloader
-
-          if let replacement = replacementSegment(
-            for: mediaSegment,
-            in: refreshed
-          ) {
-            mediaSegment = replacement
-            timelineStart = timelineStarts[replacement.sequence]
-              ?? replacement.startSeconds
-            timelineEnd = timelineStart + replacement.duration
-            nextMediaSequence = replacement.sequence + 1
-            continue
-          }
-          if refreshed.isLive,
-            let firstSequence = refreshed.segments.first?.sequence,
-            firstSequence > mediaSegment.sequence
-          {
-            let jumpPosition = timelineStarts[firstSequence]
-              ?? refreshed.segments[0].startSeconds
-            try await resetForLiveWindowJump(
-              to: jumpPosition,
-              restorationWindow: &restorationWindow,
-              restoredDirectory: restoredDirectory,
-              duration: duration,
-              emit: emit
-            )
-            nextMediaSequence = firstSequence
+            guard retryIndex < 3 else { break }
             log(
-              "期限切れ区間がライブ窓から外れたため、復元キューを "
-                + "\(formatDuration(jumpPosition)) へ追従しました\n"
+              "HLS区間\(mediaSegment.sequence)のURLを更新して再試行します: "
+                + "\(error.localizedDescription)\n"
             )
-            continue productionLoop
+            let refreshedSource: IPadResolvedMediaSource
+            do {
+              refreshedSource = try await resolveRefreshedSource(
+                activeSource: activeSource,
+                currentPlaylist: playlist,
+                preferOriginalURL: true
+              )
+            } catch is CancellationError {
+              throw CancellationError()
+            } catch {
+              if isEncryptedPlaylistFailure(error) { throw error }
+              downloadFailure = error
+              try await sleep(seconds: min(2, 0.5 * Double(retryIndex + 1)))
+              continue
+            }
+            guard let refreshed = refreshedSource.hlsPlaylist else {
+              downloadFailure = ProductionError.invalidSource(
+                "HLS区間の更新後にメディアプレイリストがありません"
+              )
+              continue
+            }
+            if playlist.isLive {
+              try mergeTimelineStarts(
+                from: playlist,
+                refreshed: refreshed,
+                into: &timelineStarts,
+                currentDuration: duration
+              )
+            } else {
+              for segment in refreshed.segments {
+                timelineStarts[segment.sequence] = segment.startSeconds
+              }
+            }
+            activeSource = refreshedSource
+            playlist = refreshed
+            cancelVODPrefetch(resetDownloader: true)
+            downloader.cancel()
+            downloader = makeDownloader(for: activeSource)
+            self.downloader = downloader
+
+            if let replacement = replacementSegment(
+              for: mediaSegment,
+              in: refreshed
+            ) {
+              mediaSegment = replacement
+              timelineStart = timelineStarts[replacement.sequence]
+                ?? replacement.startSeconds
+              timelineEnd = timelineStart + replacement.duration
+              nextMediaSequence = replacement.sequence + 1
+              continue
+            }
+            if refreshed.isLive,
+              let firstSequence = refreshed.segments.first?.sequence,
+              firstSequence > mediaSegment.sequence
+            {
+              let jumpPosition = timelineStarts[firstSequence]
+                ?? refreshed.segments[0].startSeconds
+              try await resetForLiveWindowJump(
+                to: jumpPosition,
+                restorationWindow: &restorationWindow,
+                hasLeftContext: hasRestoredAnyWindow,
+                restoredDirectory: restoredDirectory,
+                duration: duration,
+                emit: emit
+              )
+              hasRestoredAnyWindow = false
+              nextMediaSequence = firstSequence
+              log(
+                "期限切れ区間がライブ窓から外れたため、復元キューを "
+                  + "\(formatDuration(jumpPosition)) へ追従しました\n"
+              )
+              continue productionLoop
+            }
+            downloadFailure = ProductionError.invalidSource(
+              "更新後のプレイリストに区間\(mediaSegment.sequence)がありません"
+            )
+            try await sleep(seconds: min(2, 0.5 * Double(retryIndex + 1)))
           }
-          downloadFailure = ProductionError.invalidSource(
-            "更新後のプレイリストに区間\(mediaSegment.sequence)がありません"
-          )
-          try await sleep(seconds: min(2, 0.5 * Double(retryIndex + 1)))
         }
       }
       guard let localURL else {
@@ -402,12 +761,14 @@ final class MacHLSRealtimeProducer {
         timelineStart: timelineStart,
         localURL: localURL
       )
+      startVODPrefetchIfPossible()
 
       if let previous = restorationWindow.last,
         !canShareWindow(previous, restorationSource)
       {
         try await flushWindow(
           restorationWindow,
+          hasLeftContext: hasRestoredAnyWindow,
           restoredDirectory: restoredDirectory,
           requestedStartSeconds: startSeconds,
           duration: duration,
@@ -415,34 +776,60 @@ final class MacHLSRealtimeProducer {
         )
         removeMaterializedSources(restorationWindow)
         restorationWindow.removeAll(keepingCapacity: true)
+        hasRestoredAnyWindow = false
       }
 
       restorationWindow.append(restorationSource)
-      if restorationWindow.count == 2 {
-        try await restoreWindow(
-          restorationWindow,
-          coreIndex: 0,
-          restoredDirectory: restoredDirectory,
-          requestedStartSeconds: startSeconds,
-          duration: duration,
-          emit: emit
-        )
-      } else if restorationWindow.count == 3 {
-        try await restoreWindow(
-          restorationWindow,
-          coreIndex: 1,
-          restoredDirectory: restoredDirectory,
-          requestedStartSeconds: startSeconds,
-          duration: duration,
-          emit: emit
-        )
-        let expired = restorationWindow.removeFirst()
-        try? FileManager.default.removeItem(at: expired.localURL)
+      if playlist.isLive {
+        if restorationWindow.count == 2 {
+          try await restoreWindow(
+            restorationWindow,
+            coreIndex: 0,
+            restoredDirectory: restoredDirectory,
+            requestedStartSeconds: startSeconds,
+            duration: duration,
+            emit: emit
+          )
+          hasRestoredAnyWindow = true
+        } else if restorationWindow.count == 3 {
+          try await restoreWindow(
+            restorationWindow,
+            coreIndex: 1,
+            restoredDirectory: restoredDirectory,
+            requestedStartSeconds: startSeconds,
+            duration: duration,
+            emit: emit
+          )
+          hasRestoredAnyWindow = true
+          let expired = restorationWindow.removeFirst()
+          try? FileManager.default.removeItem(at: expired.localURL)
+        }
+      } else {
+        while true {
+          let coreStartIndex = hasRestoredAnyWindow ? 1 : 0
+          let requiredCount = coreStartIndex + vodRestoreBatchCoreSegments + 1
+          guard restorationWindow.count >= requiredCount else { break }
+          let coreEndIndex = coreStartIndex + vodRestoreBatchCoreSegments - 1
+          try await restoreWindow(
+            restorationWindow,
+            coreStartIndex: coreStartIndex,
+            coreEndIndex: coreEndIndex,
+            restoredDirectory: restoredDirectory,
+            requestedStartSeconds: startSeconds,
+            duration: duration,
+            emit: emit
+          )
+          let retired = Array(restorationWindow.prefix(vodRestoreBatchCoreSegments))
+          removeMaterializedSources(retired)
+          restorationWindow.removeFirst(vodRestoreBatchCoreSegments)
+          hasRestoredAnyWindow = true
+        }
       }
     }
 
     try await flushWindow(
       restorationWindow,
+      hasLeftContext: hasRestoredAnyWindow,
       restoredDirectory: restoredDirectory,
       requestedStartSeconds: startSeconds,
       duration: duration,
@@ -485,6 +872,9 @@ final class MacHLSRealtimeProducer {
     guard !cancellationRequested else { return }
     cancellationRequested = true
     downloader?.cancel()
+    prefetchDownloader?.cancel()
+    for downloader in prefetchDownloaders { downloader.cancel() }
+    prefetchDownloaders.removeAll(keepingCapacity: true)
     sendWorkerCommand(["command": "stop"])
     activeProcess?.terminate()
   }
@@ -652,15 +1042,16 @@ final class MacHLSRealtimeProducer {
   private func resetForLiveWindowJump(
     to position: Double,
     restorationWindow: inout [RestorationSource],
+    hasLeftContext: Bool,
     restoredDirectory: URL,
     duration: Double,
     emit: @escaping EventSink
   ) async throws {
-    // The first retained source has already been emitted whenever the rolling
-    // window contains two items. flushWindow restores only the last pending
-    // core, so this does not duplicate an earlier output segment.
+    // When a retained left-context source was already emitted, flush only the
+    // not-yet-emitted cores before discarding the live window.
     try await flushWindow(
       restorationWindow,
+      hasLeftContext: hasLeftContext,
       restoredDirectory: restoredDirectory,
       requestedStartSeconds: startSeconds,
       duration: duration,
@@ -677,15 +1068,19 @@ final class MacHLSRealtimeProducer {
 
   private func flushWindow(
     _ sources: [RestorationSource],
+    hasLeftContext: Bool,
     restoredDirectory: URL,
     requestedStartSeconds: Double,
     duration: Double,
     emit: @escaping EventSink
   ) async throws {
     guard !sources.isEmpty else { return }
+    let coreStartIndex = hasLeftContext && sources.count > 1 ? 1 : 0
+    guard sources.indices.contains(coreStartIndex) else { return }
     try await restoreWindow(
       sources,
-      coreIndex: sources.index(before: sources.endIndex),
+      coreStartIndex: coreStartIndex,
+      coreEndIndex: sources.index(before: sources.endIndex),
       restoredDirectory: restoredDirectory,
       requestedStartSeconds: requestedStartSeconds,
       duration: duration,
@@ -701,16 +1096,41 @@ final class MacHLSRealtimeProducer {
     duration: Double,
     emit: @escaping EventSink
   ) async throws {
+    try await restoreWindow(
+      sources,
+      coreStartIndex: coreIndex,
+      coreEndIndex: coreIndex,
+      restoredDirectory: restoredDirectory,
+      requestedStartSeconds: requestedStartSeconds,
+      duration: duration,
+      emit: emit
+    )
+  }
+
+  private func restoreWindow(
+    _ sources: [RestorationSource],
+    coreStartIndex: Int,
+    coreEndIndex: Int,
+    restoredDirectory: URL,
+    requestedStartSeconds: Double,
+    duration: Double,
+    emit: @escaping EventSink
+  ) async throws {
     try checkCancellation()
-    guard sources.indices.contains(coreIndex), !sources.isEmpty else {
+    guard sources.indices.contains(coreStartIndex),
+      sources.indices.contains(coreEndIndex),
+      coreStartIndex <= coreEndIndex,
+      !sources.isEmpty
+    else {
       throw ProductionError.invalidSource("連結区間の復元対象が不正です")
     }
-    let coreSource = sources[coreIndex]
+    let coreSource = sources[coreStartIndex]
+    let coreEndSource = sources[coreEndIndex]
     let requestedTimelineStart = max(
       coreSource.timelineStart,
       requestedStartSeconds
     )
-    guard requestedTimelineStart < coreSource.timelineEnd else { return }
+    guard requestedTimelineStart < coreEndSource.timelineEnd else { return }
 
     let assemblyURL = sessionDirectory.appendingPathComponent(
       "hls-window-\(nextOutputSequence)-\(UUID().uuidString.lowercased()).mp4",
@@ -718,25 +1138,32 @@ final class MacHLSRealtimeProducer {
     )
     defer { try? FileManager.default.removeItem(at: assemblyURL) }
 
+    let assemblyStartedAt = Date()
     var assembled: IPadHLSIntervalAssembler.Result
-    var assembledCoreIndex: Int
+    var assembledCoreStartIndex: Int
+    var assembledCoreEndIndex: Int
     do {
       assembled = try await IPadHLSIntervalAssembler.concatenate(
         inputURLs: sources.map(\.localURL),
         outputURL: assemblyURL,
         temporaryDirectory: sessionDirectory
       )
-      assembledCoreIndex = coreIndex
-      guard assembled.sourceOffsets.indices.contains(assembledCoreIndex) else {
+      assembledCoreStartIndex = coreStartIndex
+      assembledCoreEndIndex = coreEndIndex
+      guard assembled.sourceOffsets.indices.contains(assembledCoreStartIndex),
+        assembled.sourceOffsets.indices.contains(assembledCoreEndIndex),
+        assembled.sourceDurations.indices.contains(assembledCoreEndIndex)
+      else {
         throw ProductionError.invalidTimeline("連結区間の対応を取得できません")
       }
       try await IPadHLSIntervalAssembler.validateDecodableVideo(
         at: assemblyURL,
-        near: assembled.sourceOffsets[assembledCoreIndex]
+        near: assembled.sourceOffsets[assembledCoreStartIndex]
       )
     } catch is CancellationError {
       throw CancellationError()
     } catch {
+      guard coreStartIndex == coreEndIndex else { throw error }
       guard sources.count > 1 else { throw error }
       log(
         "HLS隣接区間の符号化条件が変化したため、対象区間だけで復元を続行します: "
@@ -748,7 +1175,8 @@ final class MacHLSRealtimeProducer {
         outputURL: assemblyURL,
         temporaryDirectory: sessionDirectory
       )
-      assembledCoreIndex = 0
+      assembledCoreStartIndex = 0
+      assembledCoreEndIndex = 0
       guard let coreOffset = assembled.sourceOffsets.first else {
         throw ProductionError.invalidTimeline("単一区間の対応を取得できません")
       }
@@ -757,15 +1185,17 @@ final class MacHLSRealtimeProducer {
         near: coreOffset
       )
     }
+    let assemblyElapsed = Date().timeIntervalSince(assemblyStartedAt)
 
-    guard assembled.sourceOffsets.indices.contains(assembledCoreIndex),
-      assembled.sourceDurations.indices.contains(assembledCoreIndex)
+    guard assembled.sourceOffsets.indices.contains(assembledCoreStartIndex),
+      assembled.sourceOffsets.indices.contains(assembledCoreEndIndex),
+      assembled.sourceDurations.indices.contains(assembledCoreEndIndex)
     else {
       throw ProductionError.invalidTimeline("連結区間の時間対応を取得できません")
     }
-    let coreMediaStart = assembled.sourceOffsets[assembledCoreIndex]
-    let coreMediaEnd = coreMediaStart
-      + assembled.sourceDurations[assembledCoreIndex]
+    let coreMediaStart = assembled.sourceOffsets[assembledCoreStartIndex]
+    let coreMediaEnd = assembled.sourceOffsets[assembledCoreEndIndex]
+      + assembled.sourceDurations[assembledCoreEndIndex]
     let requestedOffset = max(
       0,
       requestedTimelineStart - coreSource.timelineStart
@@ -788,6 +1218,14 @@ final class MacHLSRealtimeProducer {
     else {
       throw ProductionError.invalidTimeline("連結区間の復元範囲が不正です")
     }
+    if nextOutputSequence < 6 || nextOutputSequence.isMultiple(of: 10) {
+      log(
+        "HLS区間準備: 出力\(nextOutputSequence) / 入力\(sources.count)本 / "
+          + "連結+検証\(String(format: "%.2f", assemblyElapsed))秒 / "
+          + "復元対象\(String(format: "%.2f", coreMediaEnd - effectiveCoreMediaStart))秒 / "
+          + "デコード窓\(String(format: "%.2f", decodeEnd - decodeStart))秒\n"
+      )
+    }
 
     try await runWorker(
       inputURL: assemblyURL,
@@ -796,7 +1234,7 @@ final class MacHLSRealtimeProducer {
       coreMediaStartSeconds: effectiveCoreMediaStart,
       coreMediaEndSeconds: coreMediaEnd,
       coreTimelineStartSeconds: coreSource.timelineStart + requestedOffset,
-      coreTimelineEndSeconds: coreSource.timelineEnd,
+      coreTimelineEndSeconds: coreEndSource.timelineEnd,
       restoredDirectory: restoredDirectory,
       duration: duration,
       emit: emit
@@ -816,8 +1254,9 @@ final class MacHLSRealtimeProducer {
     emit: @escaping EventSink
   ) async throws {
     try checkCancellation()
+    let workerOutputSequenceStart = nextOutputSequence
     let workerDirectory = sessionDirectory.appendingPathComponent(
-      "worker-\(nextOutputSequence)-\(UUID().uuidString.lowercased())",
+      "worker-\(workerOutputSequenceStart)-\(UUID().uuidString.lowercased())",
       isDirectory: true
     )
     try FileManager.default.createDirectory(
@@ -860,6 +1299,9 @@ final class MacHLSRealtimeProducer {
     activeProcess = process
     activeWorkerInput = inputPipe
 
+    let workerStartedAt = Date()
+    var firstSegmentElapsed: TimeInterval?
+    var emittedSegmentCount = 0
     do {
       try process.run()
     } catch {
@@ -888,6 +1330,9 @@ final class MacHLSRealtimeProducer {
         guard event.generation == generation else { continue }
         switch event.kind {
         case "segment":
+          if firstSegmentElapsed == nil {
+            firstSegmentElapsed = Date().timeIntervalSince(workerStartedAt)
+          }
           guard let workerSequence = event.sequence,
             let startNs = event.startNs,
             let endNs = event.endNs,
@@ -934,6 +1379,7 @@ final class MacHLSRealtimeProducer {
           }
           let outputSequence = nextOutputSequence
           nextOutputSequence += 1
+          emittedSegmentCount += 1
           emit(
             .segment(
               sequence: outputSequence,
@@ -976,6 +1422,7 @@ final class MacHLSRealtimeProducer {
     }
 
     process.waitUntilExit()
+    let workerElapsed = Date().timeIntervalSince(workerStartedAt)
     activeProcess = nil
     activeWorkerInput = nil
     let errorData = await errorTask.value
@@ -994,6 +1441,18 @@ final class MacHLSRealtimeProducer {
     }
     if !standardError.isEmpty {
       log(standardError + "\n")
+    }
+    if workerOutputSequenceStart < 6
+      || workerOutputSequenceStart.isMultiple(of: 10)
+      || emittedSegmentCount > 1
+    {
+      log(
+        "HLS復元worker: 出力\(workerOutputSequenceStart)"
+          + "...\(max(workerOutputSequenceStart, nextOutputSequence - 1))"
+          + " / \(emittedSegmentCount)本 / 初回出力"
+          + "\(String(format: "%.2f", firstSegmentElapsed ?? workerElapsed))秒"
+          + " / 全体\(String(format: "%.2f", workerElapsed))秒\n"
+      )
     }
   }
 

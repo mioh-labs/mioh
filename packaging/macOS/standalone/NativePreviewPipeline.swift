@@ -2818,7 +2818,7 @@ private struct NativeRestoreEffects {
   let upscale: Int
 
   var isEnabled: Bool {
-    sharpen > 0 || detail > 0 || texture > 0 || smoothing > 0
+    sharpen > 0 || detail > 0 || texture > 0 || smoothing > 0 || upscale > 1
   }
 }
 

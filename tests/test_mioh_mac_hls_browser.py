@@ -100,6 +100,20 @@ class MacHLSBrowserContractTests(unittest.TestCase):
             self.interactive_browser,
         )
 
+    def test_browser_split_view_expands_to_full_tab_height(self):
+        _, browser = self.source_containing("MacMediaBrowserView")
+
+        self.assert_contracts(
+            browser,
+            [
+                "HSplitView {",
+                ".frame(minWidth: 500, minHeight: 430, maxHeight: .infinity)",
+                "maxHeight: .infinity",
+                ".frame(maxHeight: .infinity)",
+                ".frame(maxHeight: .infinity, alignment: .top)",
+            ],
+        )
+
     def test_browser_candidate_is_resolved_before_hls_restoration_starts(self):
         _, browser = self.source_containing("MacMediaBrowserController")
 
@@ -167,6 +181,21 @@ class MacHLSBrowserContractTests(unittest.TestCase):
             ],
         )
 
+    def test_hls_uses_restored_queue_buffer_not_source_loaded_ranges_for_ui_lead(self):
+        self.assertIn("private var sourceBufferedSeconds = 0.0", self.player)
+
+        update_source = self.player.split(
+            "private func updateSourceBufferedDuration()", 1
+        )[1].split("\n  private func ", 1)[0]
+        self.assertIn("sourceBufferedSeconds = max(0, furthestEnd - position)", update_source)
+        self.assertIn("if sourceOnlyPlayback", update_source)
+        self.assertIn("bufferedSeconds = sourceBufferedSeconds", update_source)
+
+        update_restored = self.player.split(
+            "private func updateBufferedDuration()", 1
+        )[1].split("\n  private func ", 1)[0]
+        self.assertIn("bufferedSeconds = max(0, last.endSeconds - position)", update_restored)
+
     def test_hls_source_item_observes_status_time_control_and_stalls(self):
         start_hls = self.player.split("func startHLS(", 1)[1]
         start_hls = start_hls.split("\n  private func ", 1)[0]
@@ -196,13 +225,86 @@ class MacHLSBrowserContractTests(unittest.TestCase):
         )
         self.assertIn("func updateHLSPlaybackState(", self.player)
 
+    def test_hls_audio_sync_pauses_restored_video_when_source_waits_like_remote(self):
+        self.assert_contracts(
+            self.player,
+            [
+                "private var hlsRestoredClockFallbackActive = false",
+                "func tickRestored(seconds restoredLocalSeconds: Double)",
+                "private var canPlayRestoredWhileHLSSourceWaits: Bool",
+                "private var canStartHLSWithRestoredClockFallback: Bool",
+                "private func absorbHLSSourceWaitWithRestoredBuffer(",
+                "private func reanchorHLSClockToRestoredPlaybackIfNeeded()",
+                "private func syncHLSSourceClockAfterRestoredFallback(",
+                "let hlsDriftCorrectionGraceSeconds = 1.250",
+                "let hlsDriftToleranceSeconds = 1.250",
+                "let hlsDriftSeekToleranceSeconds = 0.300",
+                "let hlsDriftSeekCooldownSeconds = 2.000",
+            ],
+        )
+        self.assertNotIn("private var restoredTimeObserver: Any?", self.player)
+        self.assertNotIn("restoredPlayer.addPeriodicTimeObserver(", self.player)
+        tick = self.player.split("private func tick(sourceSeconds:", 1)[1]
+        tick = tick.split("\n  private var ", 1)[0]
+        self.assertNotIn("sourcePlayer.timeControlStatus != .playing", self.player)
+        stalled_observer = self.player.split(
+            ".AVPlayerItemPlaybackStalled", 1
+        )[1].split("hlsNotificationTokens.append(stalled)", 1)[0]
+        self.assertIn("self.restoredPlayer.pause()", stalled_observer)
+        self.assertNotIn("absorbHLSSourceWaitWithRestoredBuffer", stalled_observer)
+
+        update_state = self.player.split(
+            "private func updateHLSPlaybackState(", 1
+        )[1].split("\n  private func ", 1)[0]
+        for contract in [
+            "case .waitingToPlayAtSpecifiedRate:",
+            "restoredPlayer.pause()",
+            "case .paused:",
+            "reanchorHLSClockToRestoredPlaybackIfNeeded()",
+        ]:
+            self.assertIn(contract, update_state)
+        self.assertNotIn("absorbHLSSourceWaitWithRestoredBuffer", update_state)
+
+        resume = self.player.split("private func resumeIfBuffered(", 1)[1]
+        resume = resume.split("\n  private func ", 1)[0]
+        self.assertIn("if hlsSource != nil {", resume)
+        self.assertNotIn("canStartHLSWithRestoredClockFallback", resume)
+
+        start_players = self.player.split(
+            "private func startPlayersFromCurrentPosition()", 1
+        )[1].split("\n  private var ", 1)[0]
+        self.assertNotIn("shouldPreferRestoredHLSPlayback", start_players)
+        self.assertNotIn("hlsRestoredClockFallbackActive = true", start_players)
+        self.assertIn("sourcePlayer.play()", start_players)
+        self.assertIn("if sourcePlayer.timeControlStatus == .playing", start_players)
+        self.assertIn("restoredPlayer.play()", start_players)
+        self.assertIn("restoredPlayer.pause()", start_players)
+
+    def test_vod_hls_waits_for_source_clock_before_playing_to_preserve_audio_sync(self):
+        resume = self.player.split("private func resumeIfBuffered(", 1)[1]
+        resume = resume.split("\n  private func ", 1)[0]
+        self.assertIn("if hlsSource != nil {", resume)
+        self.assertIn("guard hlsSourceClockIsReadyForSynchronizedPlayback", resume)
+
+        preference = self.player.split(
+            "private var shouldPreferRestoredHLSPlayback:", 1
+        )[1].split("\n  private var ", 1)[0]
+        self.assertIn("false", preference)
+
+        update_state = self.player.split(
+            "private func updateHLSPlaybackState(", 1
+        )[1].split("\n  private func ", 1)[0]
+        self.assertNotIn("if shouldPreferRestoredHLSPlayback", update_state)
+        self.assertNotIn("復元済みキューの再生を続行します", update_state)
+
     def test_hls_initial_seek_waits_for_ready_item_and_successful_completion(self):
         self.assert_contracts(
             self.player,
             [
                 "func seekHLSClockWhenReady(",
-                "hlsSourceIsReady",
-                "hlsInitialSeekCompleted",
+                "hlsSourceReady",
+                "hlsSourceSeekCompleted",
+                "hlsSourceTimeOffset",
             ],
         )
         seek_clock = self.player.split("func seekHLSClockWhenReady(", 1)[1]
@@ -215,19 +317,32 @@ class MacHLSBrowserContractTests(unittest.TestCase):
                 "finished in",
                 "guard finished",
                 "hlsInitialSeekCompleted",
+                "hlsSourceSeekCompleted",
             ],
         )
 
         resume = self.player.split("private func resumeIfBuffered(", 1)[1]
         resume = resume.split("\n  private func ", 1)[0]
-        self.assertIn("hlsSourceIsReady", resume)
-        self.assertIn("hlsInitialSeekCompleted", resume)
+        self.assertIn("hlsSourceClockIsReadyForSynchronizedPlayback", resume)
+        clock_ready = self.player.split(
+            "private var hlsSourceClockIsReadyForSynchronizedPlayback:", 1
+        )[1].split("\n  private var ", 1)[0]
+        self.assertIn("hlsSourceReady", clock_ready)
+        self.assertIn("hlsSourceSeekCompleted", clock_ready)
 
-    def test_live_hls_clock_is_mapped_to_restored_timeline_with_anchor(self):
-        self.assertIn("hlsTimelineAnchorOffset", self.player)
+    def test_live_hls_clock_is_mapped_to_remote_style_source_time_offset(self):
+        self.assertIn("hlsSourceTimeOffset", self.player)
         tick = self.player.split("private func tick(sourceSeconds:", 1)[1]
         tick = tick.split("\n  private func ", 1)[0]
-        self.assertIn("sourceSeconds - hlsTimelineAnchorOffset", tick)
+        self.assertIn("sourceSeconds - hlsSourceTimeOffset", tick)
+        self.assertIn("driftCorrectionGraceSeconds", tick)
+        self.assertIn("hlsDriftCorrectionGraceSeconds", tick)
+        self.assertIn("lastHLSDriftSeekAt", tick)
+        self.assertIn("hlsDriftSeekCooldownSeconds", tick)
+        self.assertIn("restoredAbsolute > playbackTimelineSeconds", tick)
+        self.assertIn("hlsSourceTimeOffset = sourceSeconds - restoredAbsolute", tick)
+        self.assertIn("currentRestoredItemIdentifier", tick)
+        self.assertIn("currentRestoredItemStartedAt", tick)
 
         seek_clock = self.player.split("func seekHLSClockWhenReady(", 1)[1]
         seek_clock = seek_clock.split("\n  private func ", 1)[0]
@@ -235,7 +350,8 @@ class MacHLSBrowserContractTests(unittest.TestCase):
             seek_clock,
             [
                 "isLiveHLSInput",
-                "hlsTimelineAnchorOffset =",
+                "sourceTimeOffset = sourceTarget - syntheticTarget",
+                "hlsSourceTimeOffset",
                 "requestedStartSeconds",
             ],
         )
