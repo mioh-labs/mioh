@@ -27,6 +27,79 @@ enum IPadAuthenticatedMediaProxyError: Error, LocalizedError, Equatable {
   }
 }
 
+/// Keeps loopback clients queued instead of returning a transient 503 before
+/// the shared origin transport gets a chance to apply its host congestion
+/// policy.  A permit is transferred directly to the oldest waiter on release,
+/// so the configured number of origin responses remains the hard upper bound.
+private actor IPadAuthenticatedMediaProxyOriginGate {
+  private let maximumActiveRequests: Int
+  private var activeRequests = 0
+  private var waiterOrder: [UUID] = []
+  private var waiters: [UUID: CheckedContinuation<Void, Error>] = [:]
+  private var stopped = false
+
+  init(maximumActiveRequests: Int) {
+    self.maximumActiveRequests = max(1, maximumActiveRequests)
+  }
+
+  nonisolated func acquire() async throws {
+    let waiterID = UUID()
+    try Task.checkCancellation()
+    try await withTaskCancellationHandler(operation: {
+      try Task.checkCancellation()
+      try await self.enqueue(waiterID: waiterID)
+    }, onCancel: {
+      Task { await self.cancel(waiterID: waiterID) }
+    })
+  }
+
+  private func enqueue(waiterID: UUID) async throws {
+    try Task.checkCancellation()
+    try await withCheckedThrowingContinuation {
+      (continuation: CheckedContinuation<Void, Error>) in
+      if stopped {
+        continuation.resume(throwing: CancellationError())
+      } else if activeRequests < maximumActiveRequests {
+        activeRequests += 1
+        continuation.resume()
+      } else {
+        waiterOrder.append(waiterID)
+        waiters[waiterID] = continuation
+      }
+    }
+  }
+
+  func release() {
+    while let waiterID = waiterOrder.first {
+      waiterOrder.removeFirst()
+      guard let continuation = waiters.removeValue(forKey: waiterID) else {
+        continue
+      }
+      continuation.resume()
+      return
+    }
+    activeRequests = max(0, activeRequests - 1)
+  }
+
+  func stop() {
+    stopped = true
+    let continuations = Array(waiters.values)
+    waiters.removeAll()
+    waiterOrder.removeAll()
+    for continuation in continuations {
+      continuation.resume(throwing: CancellationError())
+    }
+  }
+
+  private func cancel(waiterID: UUID) {
+    guard let continuation = waiters.removeValue(forKey: waiterID) else {
+      return
+    }
+    waiterOrder.removeAll { $0 == waiterID }
+    continuation.resume(throwing: CancellationError())
+  }
+}
+
 /// A short-lived, loopback-only bridge between AVPlayer and authenticated
 /// public HTTPS media. AVPlayer sees an opaque local URL; origin URLs and their
 /// credentials remain only in this process's in-memory target table.
@@ -34,9 +107,11 @@ enum IPadAuthenticatedMediaProxyError: Error, LocalizedError, Equatable {
 /// This proxy intentionally uses only public APIs. Call `stop()` as soon as the
 /// player no longer needs the stream.
 final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
+  private static let maximumRateLimitRetryCount = 2
+
   struct Configuration: Sendable, Equatable {
     var maximumConcurrentRequests = 4
-    var maximumMappedTargets = 4_096
+    var maximumMappedTargets = 32_768
     var maximumRequestHeaderBytes = 32 * 1_024
     var maximumResponseBytes = 64 * 1_024 * 1_024
     var maximumPlaylistBytes = 2 * 1_024 * 1_024
@@ -60,6 +135,7 @@ final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
     let context: IPadMediaRequestContext?
     let isPlaylist: Bool
     let resolutionPolicy: IPadMediaURLResolutionPolicy
+    let syntheticPlaylist: Data?
   }
 
   private struct LocalRequest {
@@ -80,7 +156,6 @@ final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
     case receive = "receive"
     case badRequest = "bad_request"
     case targetMissing = "target_missing"
-    case busy = "busy"
     case interaction = "interaction"
     case fetchTimeout = "fetch_timeout"
     case fetchNetwork = "fetch_network"
@@ -119,8 +194,7 @@ final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
   private var requestTasks: [ObjectIdentifier: Task<Void, Never>] = [:]
   private var targets: [String: TargetEntry] = [:]
   private var tokensByURL: [URL: [String]] = [:]
-  private var targetInsertionOrder: [String] = []
-  private var activeRequestCount = 0
+  private let originRequestGate: IPadAuthenticatedMediaProxyOriginGate
   private var didReportInteractionRequired = false
   private var stopped = false
   private var diagnostics = DiagnosticState()
@@ -131,6 +205,9 @@ final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
   ) {
     self.configuration = configuration
     self.onInteractionRequired = onInteractionRequired
+    originRequestGate = IPadAuthenticatedMediaProxyOriginGate(
+      maximumActiveRequests: configuration.maximumConcurrentRequests
+    )
   }
 
   deinit {
@@ -257,6 +334,96 @@ final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
     return localURL
   }
 
+  /// Produces a loopback-only one-variant master that pins AVPlayer to the
+  /// exact media playlist selected for restoration while retaining that
+  /// variant's separate AUDIO rendition group.
+  func localURL(
+    forSelectedHLSMaster metadata: IPadHLSMasterMetadata,
+    context: IPadMediaRequestContext? = nil,
+    resolutionPolicy: IPadMediaURLResolutionPolicy = .publicDiscovered
+  ) throws -> URL {
+    guard
+      let safeMasterURL = Self.sanitizedHTTPSURL(
+        metadata.masterURL,
+        resolutionPolicy: resolutionPolicy
+      ),
+      let safeVideoURL = Self.sanitizedHTTPSURL(
+        metadata.selectedVideoPlaylistURL,
+        resolutionPolicy: resolutionPolicy
+      )
+    else { throw IPadAuthenticatedMediaProxyError.unsafeTarget }
+
+    lock.lock()
+    guard !stopped, let listenerPort else {
+      lock.unlock()
+      throw IPadAuthenticatedMediaProxyError.notStarted
+    }
+    let existingTokens = Set(targets.keys)
+    do {
+      let videoToken = try registerTargetLocked(
+        url: safeVideoURL,
+        context: context,
+        isPlaylist: true,
+        resolutionPolicy: resolutionPolicy
+      )
+      guard let localVideoURL = Self.localURL(
+        port: listenerPort,
+        token: videoToken,
+        isPlaylist: true
+      ) else { throw IPadAuthenticatedMediaProxyError.listenerFailed }
+
+      var localAudioURLs: [URL: URL] = [:]
+      for rendition in metadata.audioRenditions {
+        guard let originAudioURL = rendition.url else { continue }
+        guard let safeAudioURL = Self.sanitizedHTTPSURL(
+          originAudioURL,
+          resolutionPolicy: resolutionPolicy
+        ) else { throw IPadAuthenticatedMediaProxyError.unsafeTarget }
+        let token = try registerTargetLocked(
+          url: safeAudioURL,
+          context: context,
+          isPlaylist: true,
+          resolutionPolicy: resolutionPolicy
+        )
+        guard let localAudioURL = Self.localURL(
+          port: listenerPort,
+          token: token,
+          isPlaylist: true
+        ) else { throw IPadAuthenticatedMediaProxyError.listenerFailed }
+        localAudioURLs[originAudioURL] = localAudioURL
+      }
+
+      let playlist = metadata.syntheticPlaylist(
+        videoPlaylistURL: localVideoURL,
+        audioPlaylistURLs: localAudioURLs
+      )
+      let playlistData = Data(playlist.utf8)
+      guard playlistData.count <= configuration.maximumPlaylistBytes else {
+        throw IPadAuthenticatedMediaProxyError.targetLimitExceeded
+      }
+      let masterToken = try registerTargetLocked(
+        url: safeMasterURL,
+        context: context,
+        isPlaylist: true,
+        resolutionPolicy: resolutionPolicy,
+        syntheticPlaylist: playlistData
+      )
+      diagnostics.localURLIssued = true
+      guard let localMasterURL = Self.localURL(
+        port: listenerPort,
+        token: masterToken,
+        isPlaylist: true
+      ) else { throw IPadAuthenticatedMediaProxyError.listenerFailed }
+      lock.unlock()
+      return localMasterURL
+    } catch {
+      let insertedTokens = targets.keys.filter { !existingTokens.contains($0) }
+      for token in insertedTokens { removeTargetLocked(token) }
+      lock.unlock()
+      throw error
+    }
+  }
+
   /// Stops the listener, cancels in-flight work, closes local connections, and
   /// removes every in-memory origin URL and credential context.
   func stop() {
@@ -279,11 +446,11 @@ final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
     requestTasks.removeAll()
     targets.removeAll()
     tokensByURL.removeAll()
-    targetInsertionOrder.removeAll()
-    activeRequestCount = 0
     lock.unlock()
 
     listener?.cancel()
+    let gate = originRequestGate
+    Task { await gate.stop() }
     for connection in connections { connection.cancel() }
     for headerTimeout in headerTimeouts { headerTimeout.cancel() }
     for task in tasks { task.cancel() }
@@ -356,8 +523,11 @@ final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
   private func accept(_ connection: NWConnection) {
     let identifier = ObjectIdentifier(connection)
     lock.lock()
-    guard !stopped,
-      connections.count < configuration.maximumConcurrentRequests * 2
+    let maximumPendingConnections = max(
+      16,
+      configuration.maximumConcurrentRequests * 4
+    )
+    guard !stopped, connections.count < maximumPendingConnections
     else {
       lock.unlock()
       connection.cancel()
@@ -436,22 +606,15 @@ final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
       sendError(statusCode: 400, on: connection)
       return
     }
-    guard beginOriginRequest() else {
-      recordFailure(.busy)
-      sendError(statusCode: 503, on: connection)
-      return
-    }
-    recordFetchStarted()
-
     let identifier = ObjectIdentifier(connection)
     let task = Task { [weak self, weak connection] in
       guard let self, let connection else { return }
-      defer {
-        self.endOriginRequest()
-        self.removeTask(for: identifier)
-      }
+      defer { self.removeTask(for: identifier) }
       do {
-        let response = try await self.fetch(request: request, entry: entry)
+        let response = try await self.fetchWithOriginPermit(
+          request: request,
+          entry: entry
+        )
         try Task.checkCancellation()
         self.send(response, on: connection)
       } catch is CancellationError {
@@ -472,7 +635,6 @@ final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
     if stopped {
       lock.unlock()
       task.cancel()
-      endOriginRequest()
       finishConnection(connection)
       return
     }
@@ -485,6 +647,18 @@ final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
     entry: TargetEntry
   ) async throws -> LocalResponse {
     try Task.checkCancellation()
+    if let syntheticPlaylist = entry.syntheticPlaylist {
+      let headers = [
+        ("Content-Type", "application/vnd.apple.mpegurl"),
+        ("Content-Length", String(syntheticPlaylist.count)),
+        ("Cache-Control", "no-store"),
+      ]
+      return LocalResponse(
+        statusCode: 200,
+        headers: headers,
+        body: localRequest.method == "HEAD" ? Data() : syntheticPlaylist
+      )
+    }
     guard
       let originURL = Self.originURL(
         for: entry.url,
@@ -585,6 +759,36 @@ final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
     )
   }
 
+  private func fetchWithOriginPermit(
+    request: LocalRequest,
+    entry: TargetEntry
+  ) async throws -> LocalResponse {
+    try await originRequestGate.acquire()
+    do {
+      var rateLimitRetryCount = 0
+      while true {
+        try Task.checkCancellation()
+        recordFetchStarted()
+        let response = try await fetch(request: request, entry: entry)
+        guard response.statusCode == 429,
+          request.method == "GET" || request.method == "HEAD",
+          rateLimitRetryCount < Self.maximumRateLimitRetryCount
+        else {
+          await originRequestGate.release()
+          return response
+        }
+
+        // Shared transport records Retry-After/the fallback host cooldown before
+        // completing `fetch`. Re-entering it here therefore waits behind that
+        // same cooldown and also keeps restoration prefetch from racing AVPlayer.
+        rateLimitRetryCount += 1
+      }
+    } catch {
+      await originRequestGate.release()
+      throw error
+    }
+  }
+
   private func rewritePlaylist(
     _ data: Data,
     relativeTo baseURL: URL,
@@ -603,52 +807,70 @@ final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
     rewrittenLines.reserveCapacity(lines.count)
     var nextURIIsPlaylist = false
 
-    for rawLine in lines {
-      try Task.checkCancellation()
-      let line = String(rawLine)
-      let trimmed = line.trimmingCharacters(in: .whitespaces)
-      if trimmed.isEmpty {
-        rewrittenLines.append(line)
-      } else if trimmed.hasPrefix("#") {
-        let uppercased = trimmed.uppercased()
-        let attributeURIIsPlaylist =
-          uppercased.hasPrefix("#EXT-X-MEDIA:")
-          || uppercased.hasPrefix("#EXT-X-I-FRAME-STREAM-INF:")
-          || uppercased.hasPrefix("#EXT-X-RENDITION-REPORT:")
-        rewrittenLines.append(
-          try rewriteURIAttributes(
-            in: line,
+    // Register every rewritten URI as one transaction.  A long media or
+    // separate-audio playlist must never evict a token already present in the
+    // same response; if the hard target bound is exceeded, roll back all new
+    // mappings and fail without publishing a partly-invalid playlist.
+    lock.lock()
+    guard !stopped, listenerPort != nil else {
+      lock.unlock()
+      throw IPadAuthenticatedMediaProxyError.notStarted
+    }
+    let existingTokens = Set(targets.keys)
+    do {
+      for rawLine in lines {
+        try Task.checkCancellation()
+        let line = String(rawLine)
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty {
+          rewrittenLines.append(line)
+        } else if trimmed.hasPrefix("#") {
+          let uppercased = trimmed.uppercased()
+          let attributeURIIsPlaylist =
+            uppercased.hasPrefix("#EXT-X-MEDIA:")
+            || uppercased.hasPrefix("#EXT-X-I-FRAME-STREAM-INF:")
+            || uppercased.hasPrefix("#EXT-X-RENDITION-REPORT:")
+          rewrittenLines.append(
+            try rewriteURIAttributes(
+              in: line,
+              relativeTo: baseURL,
+              context: context,
+              isPlaylist: attributeURIIsPlaylist,
+              resolutionPolicy: resolutionPolicy
+            )
+          )
+          if uppercased.hasPrefix("#EXT-X-STREAM-INF:") {
+            nextURIIsPlaylist = true
+          }
+        } else {
+          let leading = String(line.prefix { $0 == " " || $0 == "\t" })
+          let trailing = String(
+            line.reversed().prefix { $0 == " " || $0 == "\t" }.reversed()
+          )
+          let localURL = try mappedLocalURL(
+            for: trimmed,
             relativeTo: baseURL,
             context: context,
-            isPlaylist: attributeURIIsPlaylist,
+            isPlaylist: nextURIIsPlaylist,
             resolutionPolicy: resolutionPolicy
           )
-        )
-        if uppercased.hasPrefix("#EXT-X-STREAM-INF:") {
-          nextURIIsPlaylist = true
+          rewrittenLines.append(leading + localURL.absoluteString + trailing)
+          nextURIIsPlaylist = false
         }
-      } else {
-        let leading = String(line.prefix { $0 == " " || $0 == "\t" })
-        let trailing = String(
-          line.reversed().prefix { $0 == " " || $0 == "\t" }.reversed()
-        )
-        let localURL = try mappedLocalURL(
-          for: trimmed,
-          relativeTo: baseURL,
-          context: context,
-          isPlaylist: nextURIIsPlaylist,
-          resolutionPolicy: resolutionPolicy
-        )
-        rewrittenLines.append(leading + localURL.absoluteString + trailing)
-        nextURIIsPlaylist = false
       }
-    }
 
-    let separator = usesCRLF ? "\r\n" : "\n"
-    guard let result = rewrittenLines.joined(separator: separator).data(using: .utf8) else {
-      throw IPadAuthenticatedMediaProxyError.unsafeTarget
+      let separator = usesCRLF ? "\r\n" : "\n"
+      guard
+        let result = rewrittenLines.joined(separator: separator).data(using: .utf8)
+      else { throw IPadAuthenticatedMediaProxyError.unsafeTarget }
+      lock.unlock()
+      return result
+    } catch {
+      let insertedTokens = targets.keys.filter { !existingTokens.contains($0) }
+      for token in insertedTokens { removeTargetLocked(token) }
+      lock.unlock()
+      throw error
     }
-    return result
   }
 
   private func rewriteURIAttributes(
@@ -702,12 +924,23 @@ final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
       throw IPadAuthenticatedMediaProxyError.unsafeTarget
     }
     let pathExtension = safeURL.pathExtension.lowercased()
-    return try localURL(
-      for: safeURL,
+    guard let listenerPort else {
+      throw IPadAuthenticatedMediaProxyError.notStarted
+    }
+    let token = try registerTargetLocked(
+      url: safeURL,
       context: context,
       isPlaylist: isPlaylist || pathExtension == "m3u8" || pathExtension == "m3u",
       resolutionPolicy: resolutionPolicy
     )
+    guard
+      let localURL = Self.localURL(
+        port: listenerPort,
+        token: token,
+        isPlaylist: isPlaylist || pathExtension == "m3u8" || pathExtension == "m3u"
+      )
+    else { throw IPadAuthenticatedMediaProxyError.listenerFailed }
+    return localURL
   }
 
   private func parseLocalRequest(_ data: Data) -> LocalRequest? {
@@ -846,35 +1079,29 @@ final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
   private func target(for token: String) -> TargetEntry? {
     lock.lock()
     defer { lock.unlock() }
-    guard !stopped, let entry = targets[token] else { return nil }
-    touchTargetLocked(token)
-    return entry
+    guard !stopped else { return nil }
+    return targets[token]
   }
 
   private func registerTargetLocked(
     url: URL,
     context: IPadMediaRequestContext?,
     isPlaylist: Bool,
-    resolutionPolicy: IPadMediaURLResolutionPolicy
+    resolutionPolicy: IPadMediaURLResolutionPolicy,
+    syntheticPlaylist: Data? = nil
   ) throws -> String {
     if let existingTokens = tokensByURL[url] {
       for token in existingTokens {
         if let entry = targets[token], entry.context == context,
           entry.isPlaylist == isPlaylist,
-          entry.resolutionPolicy == resolutionPolicy
+          entry.resolutionPolicy == resolutionPolicy,
+          entry.syntheticPlaylist == syntheticPlaylist
         {
-          touchTargetLocked(token)
           return token
         }
       }
     }
 
-    while targets.count >= configuration.maximumMappedTargets,
-      let oldestToken = targetInsertionOrder.first
-    {
-      targetInsertionOrder.removeFirst()
-      removeTargetLocked(oldestToken)
-    }
     guard targets.count < configuration.maximumMappedTargets else {
       throw IPadAuthenticatedMediaProxyError.targetLimitExceeded
     }
@@ -887,10 +1114,10 @@ final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
       url: url,
       context: context,
       isPlaylist: isPlaylist,
-      resolutionPolicy: resolutionPolicy
+      resolutionPolicy: resolutionPolicy,
+      syntheticPlaylist: syntheticPlaylist
     )
     tokensByURL[url, default: []].append(token)
-    targetInsertionOrder.append(token)
     return token
   }
 
@@ -905,25 +1132,15 @@ final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
     }
   }
 
-  private func touchTargetLocked(_ token: String) {
-    targetInsertionOrder.removeAll { $0 == token }
-    targetInsertionOrder.append(token)
-  }
-
-  private func beginOriginRequest() -> Bool {
-    lock.lock()
-    defer { lock.unlock() }
-    guard !stopped, activeRequestCount < configuration.maximumConcurrentRequests else {
-      return false
-    }
-    activeRequestCount += 1
-    return true
-  }
-
-  private func endOriginRequest() {
-    lock.lock()
-    activeRequestCount = max(0, activeRequestCount - 1)
-    lock.unlock()
+  private static func localURL(
+    port: UInt16,
+    token: String,
+    isPlaylist: Bool
+  ) -> URL? {
+    let resourceName = isPlaylist ? "index.m3u8" : "resource"
+    return URL(
+      string: "http://127.0.0.1:\(port)/v1/\(token)/\(resourceName)"
+    )
   }
 
   private func removeTask(for identifier: ObjectIdentifier) {
@@ -1232,7 +1449,7 @@ private struct IPadAuthenticatedMediaOriginPayload {
   let response: HTTPURLResponse
 }
 
-private final class IPadAuthenticatedMediaOriginRequest: NSObject, @unchecked Sendable {
+private final class IPadAuthenticatedMediaOriginRequest: @unchecked Sendable {
   private let maximumResponseBytes: Int
   private let maximumRedirectCount: Int
   private let timeout: TimeInterval
@@ -1243,15 +1460,8 @@ private final class IPadAuthenticatedMediaOriginRequest: NSObject, @unchecked Se
   private let resolutionPolicy: IPadMediaURLResolutionPolicy
   private let onResponseStatus: @Sendable (Int) -> Void
   private let lock = NSLock()
-  private var continuation: CheckedContinuation<IPadAuthenticatedMediaOriginPayload, Error>?
-  private var session: URLSession?
-  private var task: URLSessionDataTask?
-  private var response: HTTPURLResponse?
-  private var receivedData = Data()
-  private var redirectCount = 0
-  private var didFinish = false
+  private var cancellation: IPadSharedHTTPRequestCancellation?
   private var cancellationRequested = false
-  private var expectsBody = true
 
   init(
     maximumResponseBytes: Int,
@@ -1277,211 +1487,72 @@ private final class IPadAuthenticatedMediaOriginRequest: NSObject, @unchecked Se
 
   func start(_ request: URLRequest) async throws -> IPadAuthenticatedMediaOriginPayload {
     try Task.checkCancellation()
-    return try await withTaskCancellationHandler {
-      try await withCheckedThrowingContinuation { continuation in
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = timeout
-        configuration.timeoutIntervalForResource = timeout
-        configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        configuration.urlCache = nil
-        configuration.httpCookieStorage = nil
-        configuration.httpCookieAcceptPolicy = .never
-        configuration.httpShouldSetCookies = false
-        configuration.urlCredentialStorage = nil
-        configuration.waitsForConnectivity = false
-        configuration.httpMaximumConnectionsPerHost = 2
-
-        let delegateQueue = OperationQueue()
-        delegateQueue.maxConcurrentOperationCount = 1
-        delegateQueue.qualityOfService = .userInitiated
-        let session = URLSession(
-          configuration: configuration,
-          delegate: self,
-          delegateQueue: delegateQueue
-        )
-        let task = session.dataTask(with: request)
-
-        lock.lock()
-        if cancellationRequested {
-          didFinish = true
-          lock.unlock()
-          session.invalidateAndCancel()
-          continuation.resume(throwing: CancellationError())
-          return
-        }
-        self.continuation = continuation
-        self.session = session
-        self.task = task
-        expectsBody = request.httpMethod?.uppercased() != "HEAD"
-        lock.unlock()
-        task.resume()
-      }
-    } onCancel: {
-      self.cancel()
+    let cancellation = IPadSharedHTTPRequestCancellation()
+    guard install(cancellation: cancellation) else {
+      throw CancellationError()
     }
+    defer {
+      cancellation.clear()
+      clear(cancellation: cancellation)
+    }
+    do {
+      let payload = try await IPadSharedHTTPTransport.shared.data(
+        for: request,
+        options: IPadSharedHTTPTransportOptions(
+          maximumResponseBytes: maximumResponseBytes,
+          maximumRedirectCount: maximumRedirectCount,
+          timeout: timeout,
+          resolutionPolicy: resolutionPolicy,
+          requestContext: requestContext,
+          requiresHTTPS: true,
+          hlsDeliveryDirectives: hlsDeliveryDirectives,
+          // Proxy requests are demanded by AVPlayer (playlist, separate
+          // audio, or the current media range), so they outrank speculative
+          // restoration prefetch on the same origin.
+          priority: .critical
+        ),
+        cancellation: cancellation
+      )
+      onResponseStatus(payload.response.statusCode)
+      return IPadAuthenticatedMediaOriginPayload(
+        data: payload.data,
+        response: payload.response
+      )
+    } catch let error as IPadSharedHTTPTransportError {
+      switch error {
+      case .unsafeURL, .insecureRedirect:
+        throw IPadAuthenticatedMediaProxyError.unsafeTarget
+      case .tooManyRedirects, .responseTooLarge:
+        throw IPadAuthenticatedMediaProxyError.targetLimitExceeded
+      case .missingResponse:
+        throw IPadAuthenticatedMediaProxyError.listenerFailed
+      }
+    }
+  }
+
+  private func install(
+    cancellation newCancellation: IPadSharedHTTPRequestCancellation
+  ) -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    guard !cancellationRequested else { return false }
+    cancellation = newCancellation
+    return true
+  }
+
+  private func clear(
+    cancellation completedCancellation: IPadSharedHTTPRequestCancellation
+  ) {
+    lock.lock()
+    if cancellation === completedCancellation { cancellation = nil }
+    lock.unlock()
   }
 
   private func cancel() {
     lock.lock()
     cancellationRequested = true
-    guard !didFinish, let continuation else {
-      let task = task
-      lock.unlock()
-      task?.cancel()
-      return
-    }
-    didFinish = true
-    let task = task
-    let session = session
-    self.continuation = nil
-    self.task = nil
-    self.session = nil
+    let cancellation = cancellation
     lock.unlock()
-    task?.cancel()
-    session?.invalidateAndCancel()
-    continuation.resume(throwing: CancellationError())
-  }
-
-  private func finish(
-    _ result: Result<IPadAuthenticatedMediaOriginPayload, Error>
-  ) {
-    lock.lock()
-    guard !didFinish, let continuation else {
-      lock.unlock()
-      return
-    }
-    didFinish = true
-    let task = task
-    let session = session
-    self.continuation = nil
-    self.task = nil
-    self.session = nil
-    lock.unlock()
-    task?.cancel()
-    session?.invalidateAndCancel()
-    continuation.resume(with: result)
-  }
-}
-
-extension IPadAuthenticatedMediaOriginRequest: URLSessionDataDelegate {
-  func urlSession(
-    _: URLSession,
-    dataTask _: URLSessionDataTask,
-    didReceive response: URLResponse,
-    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
-  ) {
-    guard let httpResponse = response as? HTTPURLResponse,
-      IPadAuthenticatedMediaProxy.sanitizedHTTPSURL(
-        httpResponse.url,
-        resolutionPolicy: resolutionPolicy
-      ) != nil
-    else {
-      completionHandler(.cancel)
-      finish(.failure(IPadAuthenticatedMediaProxyError.unsafeTarget))
-      return
-    }
-    onResponseStatus(httpResponse.statusCode)
-    if let error = IPadMediaURLResolver.interactionChallengeError(
-      response: httpResponse
-    ) {
-      completionHandler(.cancel)
-      finish(.failure(error))
-      return
-    }
-    lock.lock()
-    let shouldReadBody = expectsBody
-    lock.unlock()
-    if shouldReadBody,
-      httpResponse.expectedContentLength > Int64(maximumResponseBytes)
-    {
-      completionHandler(.cancel)
-      finish(.failure(IPadAuthenticatedMediaProxyError.targetLimitExceeded))
-      return
-    }
-    lock.lock()
-    self.response = httpResponse
-    lock.unlock()
-    completionHandler(.allow)
-  }
-
-  func urlSession(_: URLSession, dataTask _: URLSessionDataTask, didReceive data: Data) {
-    lock.lock()
-    let wouldOverflow = !didFinish && data.count > maximumResponseBytes - receivedData.count
-    if !didFinish, !wouldOverflow { receivedData.append(data) }
-    lock.unlock()
-    if wouldOverflow {
-      finish(.failure(IPadAuthenticatedMediaProxyError.targetLimitExceeded))
-    }
-  }
-
-  func urlSession(
-    _: URLSession,
-    task _: URLSessionTask,
-    willPerformHTTPRedirection response: HTTPURLResponse,
-    newRequest request: URLRequest,
-    completionHandler: @escaping (URLRequest?) -> Void
-  ) {
-    guard
-      let redirectURL = IPadAuthenticatedMediaProxy.sanitizedHTTPSURL(
-        request.url,
-        resolutionPolicy: resolutionPolicy
-      ),
-      let destination = IPadAuthenticatedMediaProxy.originURL(
-        for: redirectURL,
-        appendingHLSDeliveryDirectives: hlsDeliveryDirectives,
-        resolutionPolicy: resolutionPolicy
-      )
-    else {
-      completionHandler(nil)
-      finish(.failure(IPadAuthenticatedMediaProxyError.unsafeTarget))
-      return
-    }
-    if let error = IPadMediaURLResolver.interactionChallengeError(
-      response: response,
-      destinationURL: destination
-    ) {
-      completionHandler(nil)
-      finish(.failure(error))
-      return
-    }
-    lock.lock()
-    redirectCount += 1
-    let tooManyRedirects = redirectCount > maximumRedirectCount
-    lock.unlock()
-    guard !tooManyRedirects else {
-      completionHandler(nil)
-      finish(.failure(IPadAuthenticatedMediaProxyError.targetLimitExceeded))
-      return
-    }
-    Task {
-      await requestContext?.updateCookies(from: response)
-      var redirectedRequest = request
-      redirectedRequest.url = destination
-      redirectedRequest.httpMethod = method
-      redirectedRequest.timeoutInterval = timeout
-      if let rangeHeader {
-        redirectedRequest.setValue(rangeHeader, forHTTPHeaderField: "Range")
-      } else {
-        redirectedRequest.setValue(nil, forHTTPHeaderField: "Range")
-      }
-      requestContext?.applying(to: &redirectedRequest)
-      completionHandler(redirectedRequest)
-    }
-  }
-
-  func urlSession(_: URLSession, task _: URLSessionTask, didCompleteWithError error: Error?) {
-    if let error {
-      finish(.failure(error))
-      return
-    }
-    lock.lock()
-    let response = response
-    let data = receivedData
-    lock.unlock()
-    guard let response else {
-      finish(.failure(IPadAuthenticatedMediaProxyError.listenerFailed))
-      return
-    }
-    finish(.success(IPadAuthenticatedMediaOriginPayload(data: data, response: response)))
+    cancellation?.cancel()
   }
 }

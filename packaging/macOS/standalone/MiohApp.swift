@@ -211,6 +211,7 @@ private final class RemoteClusterProcessControl: @unchecked Sendable {
   private let input: Pipe
   private var launched = false
   private var cancellationRequested = false
+  private var stopSent = false
 
   init(process: Process, input: Pipe) {
     self.process = process
@@ -220,7 +221,9 @@ private final class RemoteClusterProcessControl: @unchecked Sendable {
   func didLaunch() {
     let cancelNow = lock.withLock {
       launched = true
-      return cancellationRequested
+      guard cancellationRequested, !stopSent else { return false }
+      stopSent = true
+      return true
     }
     if cancelNow { stopProcess() }
   }
@@ -228,17 +231,20 @@ private final class RemoteClusterProcessControl: @unchecked Sendable {
   func cancel() {
     let stopNow = lock.withLock {
       cancellationRequested = true
-      return launched
+      guard launched, !stopSent else { return false }
+      stopSent = true
+      return true
     }
     if stopNow { stopProcess() }
   }
 
   private func stopProcess() {
+    let handle = input.fileHandleForWriting
     if process.isRunning {
-      try? input.fileHandleForWriting.write(
-        contentsOf: Data("{\"command\":\"stop\"}\n".utf8)
+      _ = MacChildProcessPipe.write(
+        Data("{\"command\":\"stop\"}\n".utf8),
+        to: handle
       )
-      try? input.fileHandleForWriting.close()
       process.interrupt()
       DispatchQueue.global(qos: .utility).asyncAfter(
         deadline: .now() + 2
@@ -246,6 +252,7 @@ private final class RemoteClusterProcessControl: @unchecked Sendable {
         if process.isRunning { process.terminate() }
       }
     }
+    try? handle.close()
   }
 }
 
@@ -1296,7 +1303,8 @@ final class RestorationRunner: ObservableObject {
   func stop() {
     if runningNativeExport, let processInput {
       let command = Data("{\"command\":\"stop\"}\n".utf8)
-      try? processInput.fileHandleForWriting.write(contentsOf: command)
+      _ = MacChildProcessPipe.write(command, to: processInput.fileHandleForWriting)
+      self.processInput = nil
       try? processInput.fileHandleForWriting.close()
     }
     process?.interrupt()
@@ -1552,6 +1560,9 @@ final class RestorationRunner: ObservableObject {
     nativeEnvironment["TEMP"] = miohWorkDirectory.path
     nativeEnvironment["TMP"] = miohWorkDirectory.path
     task.environment = nativeEnvironment
+    guard MacChildProcessPipe.prepare(inputPipe.fileHandleForWriting) else {
+      throw CocoaError(.fileWriteUnknown)
+    }
     processInput = inputPipe
     nativeExportConfigurationURL = configurationURL
     nativeExportPreservesTemporaryFiles = keepTemp && !deleteSegments
@@ -2021,6 +2032,9 @@ final class RestorationRunner: ObservableObject {
     environment["TEMP"] = runtimeDirectory.path
     environment["TMP"] = runtimeDirectory.path
     task.environment = environment
+    guard MacChildProcessPipe.prepare(inputPipe.fileHandleForWriting) else {
+      throw CocoaError(.fileWriteUnknown)
+    }
 
     let capture = RemoteClusterOutputCapture()
     let result = RemoteClusterProcessResult()

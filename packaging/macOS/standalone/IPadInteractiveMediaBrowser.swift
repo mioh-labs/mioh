@@ -303,6 +303,7 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
   private static let maximumMediaSlotCount = 512
   private static let maximumMediaSlotTokenLength = 32
   private static let maximumCurrentSourceHistoryCount = 256
+  private static let inspectionStatusSettleNanoseconds: UInt64 = 1_500_000_000
 
   private let websiteDataStore: WKWebsiteDataStore
   private let messageHandlerProxy: IPadWeakInteractiveScriptMessageHandler
@@ -325,6 +326,7 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
   private var nextMediaActivationOrder = 0
   private var frameHeartbeatDates: [String: Date] = [:]
   private var quietTask: Task<Void, Never>?
+  private var inspectionStatusTask: Task<Void, Never>?
   private var challengeCompatibilityTask: Task<Void, Never>?
   private var mainFrameChallengeResponse = false
   private var mainFrameChallengeResponseGeneration: Int?
@@ -369,6 +371,8 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
   /// through more than one real `WindowProxy`. The original page remains the
   /// single user-visible return target.
   private var retainedPopupOpenerWebViews: [WKWebView] = []
+  private var canGoBackObservation: NSKeyValueObservation?
+  private var canGoForwardObservation: NSKeyValueObservation?
   private var webContentProcessTerminated = false
 
   override init() {
@@ -422,9 +426,29 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
   }
 
   private func attachDelegates(to webView: WKWebView) {
+    canGoBackObservation?.invalidate()
+    canGoForwardObservation?.invalidate()
     webView.navigationDelegate = self
     webView.uiDelegate = self
     webView.allowsBackForwardNavigationGestures = true
+    canGoBackObservation = webView.observe(
+      \.canGoBack,
+      options: [.initial, .new]
+    ) { [weak self, weak webView] _, _ in
+      Task { @MainActor in
+        guard let self, let webView, self.webView === webView else { return }
+        self.updateNavigationState()
+      }
+    }
+    canGoForwardObservation = webView.observe(
+      \.canGoForward,
+      options: [.initial, .new]
+    ) { [weak self, weak webView] _, _ in
+      Task { @MainActor in
+        guard let self, let webView, self.webView === webView else { return }
+        self.updateNavigationState()
+      }
+    }
   }
 
   private static func isAllowedTransientPopupURL(_ url: URL?) -> Bool {
@@ -610,6 +634,8 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
   private func adoptSettledWebView(_ settledWebView: WKWebView, status: String) {
     quietTask?.cancel()
     quietTask = nil
+    inspectionStatusTask?.cancel()
+    inspectionStatusTask = nil
     challengeCompatibilityTask?.cancel()
     challengeCompatibilityTask = nil
     challengeCompatibilityTimedOut = false
@@ -729,6 +755,8 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
     let stoppedDuringChallenge = challengeActive || mainFrameChallengeResponse
     quietTask?.cancel()
     quietTask = nil
+    inspectionStatusTask?.cancel()
+    inspectionStatusTask = nil
     challengeCompatibilityTask?.cancel()
     challengeCompatibilityTask = nil
     challengeCompatibilityTimedOut = false
@@ -814,6 +842,8 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
   func closePage() {
     quietTask?.cancel()
     quietTask = nil
+    inspectionStatusTask?.cancel()
+    inspectionStatusTask = nil
     challengeCompatibilityTask?.cancel()
     challengeCompatibilityTask = nil
     challengeCompatibilityTimedOut = false
@@ -892,8 +922,8 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
       websiteDataStore: websiteDataStore,
       messageHandlerProxy: messageHandlerProxy
     )
-    attachDelegates(to: replacement)
     webView = replacement
+    attachDelegates(to: replacement)
     webContentProcessTerminated = false
     isClosingPage = false
     navigationGeneration = nextGeneration(after: navigationGeneration)
@@ -1391,6 +1421,8 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
     nativeChallengeFrameNavigationCount = 0
     quietTask?.cancel()
     quietTask = nil
+    inspectionStatusTask?.cancel()
+    inspectionStatusTask = nil
     challengeCompatibilityTask?.cancel()
     challengeCompatibilityTask = nil
     challengeCompatibilityTimedOut = false
@@ -1459,6 +1491,7 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
       authorizedRouteURL = currentPageURL.absoluteString
     }
     noteSuccessfulPublicPageVisit()
+    updateNavigationState()
     inspectionRequested = true
     acceptingScriptCandidates = authorizedRouteToken != nil
     candidateRevision = nextGeneration(after: candidateRevision)
@@ -1467,6 +1500,7 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
       beginInspectionForCurrentRoute()
     } else {
       activateInspectionInKnownFrames()
+      scheduleInspectionStatusSettlement()
     }
   }
 
@@ -1814,6 +1848,9 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
     )
     let isPlaying = (body["isPlaying"] as? Bool) ?? false
     let isEnded = (body["isEnded"] as? Bool) ?? false
+    let isVisible = (body["isVisible"] as? Bool) ?? false
+    let visibilityAttested =
+      (body["visibilityAttested"] as? Bool) ?? false
     let isCompactFloatingOverlay =
       (body["isCompactFloatingOverlay"] as? Bool) ?? false
     let sourceChanged = existing?.generation != generation
@@ -1822,8 +1859,8 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
     let isStrongVisiblePlayback =
       (currentURL != nil || hasOpaqueSource) && isPlaying && !isEnded
       && !isCompactFloatingOverlay
-      && (body["isVisible"] as? Bool) == true
-      && (body["visibilityAttested"] as? Bool) == true
+      && isVisible
+      && visibilityAttested
       && renderedArea >= 4_096
     let wasStrongVisiblePlayback =
       existing.map {
@@ -1831,6 +1868,15 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
           && !$0.isCompactFloatingOverlay && $0.isVisible
           && $0.visibilityAttested && $0.renderedArea >= 4_096
       } ?? false
+    let summaryPresentationChanged =
+      sourceChanged || existing == nil
+      || existing?.isPlaying != isPlaying
+      || existing?.isEnded != isEnded
+      || existing?.isVisible != isVisible
+      || existing?.visibilityAttested != visibilityAttested
+      || existing?.renderedArea != renderedArea
+      || floatingClassificationChanged
+      || existing?.hasOpaqueSource != hasOpaqueSource
     if sourceChanged {
       if let oldURL = existing?.currentURL {
         rememberCurrentSourceURL(oldURL)
@@ -1866,8 +1912,8 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
       currentTime: currentTime,
       isPlaying: isPlaying,
       isEnded: isEnded,
-      isVisible: (body["isVisible"] as? Bool) ?? false,
-      visibilityAttested: (body["visibilityAttested"] as? Bool) ?? false,
+      isVisible: isVisible,
+      visibilityAttested: visibilityAttested,
       renderedArea: renderedArea,
       isCompactFloatingOverlay: isCompactFloatingOverlay,
       hasOpaqueSource: hasOpaqueSource,
@@ -1875,7 +1921,9 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
         sourceChanged ? Date() : (existing?.sourceActivatedAt ?? Date()),
       lastObservedAt: Date()
     )
-    refreshCandidateSummaries()
+    if summaryPresentationChanged {
+      refreshCandidateSummaries()
+    }
     if sourceChanged, currentURL != nil || hasOpaqueSource {
       scheduleReadyCandidate()
     }
@@ -3153,6 +3201,8 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
   }
 
   private func scheduleReadyCandidate() {
+    inspectionStatusTask?.cancel()
+    inspectionStatusTask = nil
     quietTask?.cancel()
     quietTask = Task { @MainActor [weak self] in
       do {
@@ -3168,6 +3218,44 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
         self.readyCandidateGeneration == Int.max
         ? 1 : self.readyCandidateGeneration + 1
       self.statusMessage = "再生可能性を確認した配信URLがあります。「配信を解析」を押してください。"
+    }
+  }
+
+  /// The instrumentation keeps observing after its initial scan. Do not leave
+  /// the UI in an indefinite "analysing" state when the current page simply
+  /// has not requested media yet; that makes an idle browser look frozen.
+  private func scheduleInspectionStatusSettlement() {
+    inspectionStatusTask?.cancel()
+    let generation = navigationGeneration
+    let routeToken = authorizedRouteToken
+    inspectionStatusTask = Task { @MainActor [weak self] in
+      do {
+        try await Task.sleep(
+          nanoseconds: Self.inspectionStatusSettleNanoseconds
+        )
+      } catch {
+        return
+      }
+      guard let self,
+        generation == self.navigationGeneration,
+        routeToken == self.authorizedRouteToken,
+        self.inspectionRequested,
+        !self.isLoading,
+        !self.challengeActive,
+        !self.isClosingPage,
+        self.statusMessage?.contains("解析しています") == true
+          || self.statusMessage == "配信候補を確認しています…"
+      else { return }
+      self.inspectionStatusTask = nil
+      if self.hasVerifiedMediaCandidate {
+        self.scheduleReadyCandidate()
+      } else if self.candidateCount > 0 {
+        self.statusMessage =
+          "配信候補を監視しています。ページ内の動画を再生してください。"
+      } else {
+        self.statusMessage =
+          "HLS通信を待っています。ページ内の動画を再生してください。"
+      }
     }
   }
 
@@ -3211,6 +3299,7 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
     activeSubframeChallengeChainIDs.removeAll()
     acceptingScriptCandidates = true
     activateInspectionInKnownFrames()
+    scheduleInspectionStatusSettlement()
   }
 
   private func activateInspection(in frame: WKFrameInfo?) {
@@ -3884,6 +3973,8 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
         if (!evidence) return;
         const root = advertisementOverlayRoot(source, evidence);
         if (!root) return;
+        if (source.getAttribute?.(advertisementOverlayMarker) === 'true'
+          || root.getAttribute?.(advertisementOverlayMarker) === 'true') return;
         try {
           source.setAttribute(advertisementOverlayMarker, 'true');
           root.setAttribute(advertisementOverlayMarker, 'true');
@@ -4466,6 +4557,7 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
       window.__miohInteractiveEmit = emit;
       window.__miohInteractiveInspectValue = inspectValue;
       window.__miohInteractiveScan = scan;
+      window.__miohInteractiveScheduleScan = scheduleScan;
       let observedPageURL = String(location.href);
       window.__miohInteractiveNotifyPageChange = () => {
         const currentPageURL = String(location.href);
@@ -4522,7 +4614,7 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
           post({type: 'frame-ready', frameDepth});
         }
         if (window !== window.top) emit(location.href, 'frame');
-        if (routeChanged) scan();
+        if (routeChanged) scheduleScan();
       };
       try {
         Object.defineProperty(window, '__miohInteractiveAuthorizeRoute', {
@@ -4543,7 +4635,7 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
         }
         inspectCurrentPerformanceResources();
         replayRecentResourceEntries();
-        scan();
+        scheduleScan();
         return true;
       };
       try {
@@ -4558,46 +4650,33 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
 
       try {
         const observer = new MutationObserver(mutations => {
-          let remainingElementBudget = maximumElementsPerScan;
-          let exceededElementBudget = false;
-          for (const mutation of mutations) {
-            if (remainingElementBudget <= 0) {
-              exceededElementBudget = true;
-              break;
-            }
+          let inspectedMutationCount = 0;
+          let shouldScan = false;
+          for (const mutation of mutations || []) {
+            if (inspectedMutationCount >= maximumElementsPerScan) break;
+            inspectedMutationCount += 1;
             if (mutation.type === 'attributes') {
               if (sourceAttributes.includes(mutation.attributeName)) {
                 inspectElement(mutation.target);
+                shouldScan = true;
               }
-              suppressHighConfidenceAdvertisementOverlays(mutation.target);
-              remainingElementBudget -= 1;
             }
             for (const node of mutation.addedNodes || []) {
-              if (remainingElementBudget <= 0) {
-                exceededElementBudget = true;
-                break;
-              }
               if (node.nodeType !== Node.ELEMENT_NODE) continue;
-              inspectElement(node);
-              suppressHighConfidenceAdvertisementOverlays(node);
-              remainingElementBudget -= 1;
-              for (const nested of node.querySelectorAll?.(mediaElementSelector) || []) {
-                if (remainingElementBudget <= 0) {
-                  exceededElementBudget = true;
-                  break;
-                }
-                inspectElement(nested);
-                remainingElementBudget -= 1;
-              }
+              if (node.matches?.(mediaElementSelector)) inspectElement(node);
+              // Descendant discovery and advertisement hiding can touch many
+              // nodes. Coalesce them into one idle scan instead of doing that
+              // work synchronously inside WebKit's mutation callback.
+              shouldScan = true;
             }
           }
-          if (exceededElementBudget) scheduleScan();
+          if (shouldScan) scheduleScan();
         });
         observer.observe(document, {
           subtree: true,
           childList: true,
           attributes: true,
-          attributeFilter: [...sourceAttributes, 'class', 'style']
+          attributeFilter: sourceAttributes
         });
       } catch (_) {}
       for (const eventName of [
@@ -4621,11 +4700,10 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
 
       post({type: 'frame-ready', frameDepth});
       if (window !== window.top) emit(location.href, 'frame');
-      document.addEventListener('DOMContentLoaded', scan, {once: true});
-      window.addEventListener('load', scan, {once: true});
+      document.addEventListener('DOMContentLoaded', scheduleScan, {once: true});
+      window.addEventListener('load', scheduleScan, {once: true});
       setInterval(() => {
         window.__miohInteractiveNotifyPageChange?.();
-        inspectCurrentPerformanceResources();
         reportChallengeState();
         for (const element of trackedMediaSlots.values()) {
           reportMediaSource(element, false, false);
@@ -4633,7 +4711,7 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
         retireDisconnectedMediaSlots();
         post({type: 'frame-heartbeat', frameDepth});
       }, heartbeatIntervalMilliseconds);
-      scan();
+      scheduleScan();
     })();
     """
 
@@ -4907,12 +4985,12 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
     (() => {
       'use strict';
       if (window.__miohInteractiveActiveInstalled) return;
-      if (!window.__miohInteractiveScan) return;
+      if (!window.__miohInteractiveScheduleScan) return;
       window.__miohInteractiveActiveInstalled = true;
       // Compatibility mode deliberately avoids modifying page APIs or DOM
       // prototypes. Dynamic DOM changes are covered by MutationObserver and
       // HLS networking is observed by the narrow page-world hook below.
-      window.__miohInteractiveScan?.();
+      window.__miohInteractiveScheduleScan?.();
     })();
     """
 }
@@ -5536,6 +5614,38 @@ extension IPadInteractiveMediaBrowser: WKUIDelegate {
     for navigationAction: WKNavigationAction,
     windowFeatures: WKWindowFeatures
   ) -> WKWebView? {
+    let opensNewWindow = navigationAction.targetFrame == nil
+    if webView === self.webView,
+      opensNewWindow,
+      navigationAction.sourceFrame.isMainFrame,
+      navigationAction.navigationType == .linkActivated,
+      !navigationAction.shouldPerformDownload,
+      (navigationAction.request.httpMethod ?? "GET").uppercased() == "GET",
+      let destinationURL = Self.sanitizedPublicHTTPSURL(
+        navigationAction.request.url
+      ),
+      !Self.isHighConfidenceAdvertisementNavigationURL(destinationURL)
+    {
+      // Ordinary links such as category and "+ More" should behave like
+      // same-window browser navigation. Keeping them in this WKWebView gives
+      // WebKit a real back/forward entry; script-created player windows still
+      // use the bounded popup compatibility path below.
+      navigationRefererURL = Self.sanitizedPublicHTTPSURL(
+        navigationAction.sourceFrame.request.url
+      )
+      prepareForMainNavigation()
+      addressText = destinationURL.absoluteString
+      statusMessage = "ページを読み込んでいます…"
+      isLoading = true
+      guard let navigation = webView.load(navigationAction.request) else {
+        isLoading = false
+        statusMessage = "リンク先のページ要求を開始できませんでした。"
+        updateNavigationState()
+        return nil
+      }
+      activeNavigation = navigation
+      return nil
+    }
     if Self.relaxedWebCompatibilityEnabled {
       guard webView === self.webView,
         navigationAction.targetFrame == nil,

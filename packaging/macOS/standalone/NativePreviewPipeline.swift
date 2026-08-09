@@ -2019,6 +2019,9 @@ private final class VariableRestorerBridge: NativeRestoring {
     process.standardInput = stdinPipe
     process.standardOutput = stdoutPipe
     process.standardError = stderrPipe
+    guard MacChildProcessPipe.prepare(stdinPipe.fileHandleForWriting) else {
+      throw NativePreviewError.restorer("unable to protect runner stdin")
+    }
     try process.run()
     input = stdinPipe.fileHandleForWriting
     output = stdoutPipe.fileHandleForReading
@@ -2026,8 +2029,8 @@ private final class VariableRestorerBridge: NativeRestoring {
 
   deinit {
     var stop = UInt16.max.littleEndian
-    try? withUnsafeBytes(of: &stop) { data in
-      try input.write(contentsOf: data)
+    withUnsafeBytes(of: &stop) { data in
+      _ = MacChildProcessPipe.write(Data(data), to: input)
     }
     input.closeFile()
     if process.isRunning {
@@ -2056,8 +2059,11 @@ private final class VariableRestorerBridge: NativeRestoring {
       memcpy(mapping, $0.baseAddress!, $0.count)
     }
     var command = UInt16(frameCount).littleEndian
-    try withUnsafeBytes(of: &command) { data in
-      try input.write(contentsOf: data)
+    let commandAccepted = withUnsafeBytes(of: &command) { data in
+      MacChildProcessPipe.write(Data(data), to: input)
+    }
+    guard commandAccepted else {
+      throw NativePreviewError.restorer("runner stdin is unavailable")
     }
     guard let response = try output.read(upToCount: 1),
       response == Data([0])
@@ -2140,13 +2146,16 @@ private final class FixedRestorerBridge: NativeRestoring {
     process.standardInput = stdinPipe
     process.standardOutput = stdoutPipe
     process.standardError = stderrPipe
+    guard MacChildProcessPipe.prepare(stdinPipe.fileHandleForWriting) else {
+      throw NativePreviewError.restorer("unable to protect fixed runner stdin")
+    }
     try process.run()
     input = stdinPipe.fileHandleForWriting
     output = stdoutPipe.fileHandleForReading
   }
 
   deinit {
-    try? input.write(contentsOf: Data([255]))
+    _ = MacChildProcessPipe.write(Data([255]), to: input)
     try? input.close()
     if process.isRunning {
       process.terminate()
@@ -2182,7 +2191,9 @@ private final class FixedRestorerBridge: NativeRestoring {
         )
       }
     }
-    try input.write(contentsOf: Data([0]))
+    guard MacChildProcessPipe.write(Data([0]), to: input) else {
+      throw NativePreviewError.restorer("fixed runner stdin is unavailable")
+    }
     guard let response = try output.read(upToCount: 1),
       response == Data([0])
     else {
