@@ -343,6 +343,13 @@ struct IPadMediaRequestContext: Sendable, Equatable {
 
   var cookies: [IPadMediaRequestCookie] { cookieSnapshot.read() }
 
+  /// Copies of a browser request context share one cookie snapshot/jar. The
+  /// identity lets the HTTP transport coalesce only requests whose redirect
+  /// cookie updates are guaranteed to reach the same credential context.
+  fileprivate var sharedTransportIdentity: ObjectIdentifier {
+    ObjectIdentifier(cookieSnapshot)
+  }
+
   init(
     cookies: [IPadMediaRequestCookie] = [],
     userAgent: String? = nil,
@@ -755,12 +762,235 @@ struct IPadHLSMediaSegment: Sendable, Equatable {
   }
 }
 
+struct IPadHLSAudioRendition: Sendable, Equatable {
+  let groupID: String
+  let name: String
+  let language: String?
+  let url: URL?
+  let isDefault: Bool
+  let autoSelect: Bool
+  let channels: String?
+
+  fileprivate func playlistLine(using url: URL?) -> String {
+    var attributes = [
+      "TYPE=AUDIO",
+      "GROUP-ID=\"\(Self.escaped(groupID))\"",
+      "NAME=\"\(Self.escaped(name))\"",
+      "DEFAULT=\(isDefault ? "YES" : "NO")",
+      "AUTOSELECT=\(autoSelect ? "YES" : "NO")",
+    ]
+    if let language, !language.isEmpty {
+      attributes.append("LANGUAGE=\"\(Self.escaped(language))\"")
+    }
+    if let channels, !channels.isEmpty {
+      attributes.append("CHANNELS=\"\(Self.escaped(channels))\"")
+    }
+    if let url {
+      attributes.append("URI=\"\(Self.escaped(url.absoluteString))\"")
+    }
+    return "#EXT-X-MEDIA:" + attributes.joined(separator: ",")
+  }
+
+  private static func escaped(_ value: String) -> String {
+    value.replacingOccurrences(of: "\\", with: "\\\\")
+      .replacingOccurrences(of: "\"", with: "\\\"")
+      .replacingOccurrences(of: "\r", with: "")
+      .replacingOccurrences(of: "\n", with: "")
+  }
+}
+
+/// A lower rendition retained from a parsed master for direct failover when
+/// the selected rendition's segment origin becomes unavailable or rate-limited.
+struct IPadHLSAlternativeVariant: Sendable, Equatable {
+  /// Master that declared this variant. This can differ from the currently
+  /// selected master when nested masters contribute their own fallback chain.
+  let masterURL: URL
+  /// URL declared by EXT-X-STREAM-INF. It may itself be another master, so the
+  /// final media-playlist URL is determined only when this fallback is used.
+  let playlistURL: URL
+  let bandwidth: Int64
+  let averageBandwidth: Int64?
+  let width: Int?
+  let height: Int?
+  let codecs: String?
+  let frameRate: Double?
+  let audioGroupID: String?
+  let audioRenditions: [IPadHLSAudioRendition]
+
+  fileprivate var hasAudioGroupMetadata: Bool {
+    audioGroupID != nil || !audioRenditions.isEmpty
+  }
+
+  fileprivate func inheritingAudioGroupIfMissing(
+    audioGroupID inheritedAudioGroupID: String?,
+    audioRenditions inheritedAudioRenditions: [IPadHLSAudioRendition]
+  ) -> IPadHLSAlternativeVariant {
+    guard !hasAudioGroupMetadata,
+      let inheritedAudioGroupID,
+      !inheritedAudioRenditions.isEmpty
+    else { return self }
+    return IPadHLSAlternativeVariant(
+      masterURL: masterURL,
+      playlistURL: playlistURL,
+      bandwidth: bandwidth,
+      averageBandwidth: averageBandwidth,
+      width: width,
+      height: height,
+      codecs: codecs,
+      frameRate: frameRate,
+      audioGroupID: inheritedAudioGroupID,
+      audioRenditions: inheritedAudioRenditions
+    )
+  }
+}
+
+/// Metadata retained from the master playlist after choosing the restoration
+/// rendition. AVPlayer can consume `syntheticPlaylist` to keep the exact video
+/// playlist used by restoration while also retaining a separate AUDIO group.
+struct IPadHLSMasterMetadata: Sendable, Equatable {
+  let masterURL: URL
+  let selectedVideoPlaylistURL: URL
+  let bandwidth: Int64
+  let averageBandwidth: Int64?
+  let width: Int?
+  let height: Int?
+  let codecs: String?
+  let frameRate: Double?
+  let audioGroupID: String?
+  let audioRenditions: [IPadHLSAudioRendition]
+  /// Remaining restoration-compatible variants, ordered from the next-best
+  /// rendition down. Keeping these URLs avoids reloading the parent master and
+  /// selecting the same rate-limited rendition again.
+  let alternativeVariants: [IPadHLSAlternativeVariant]
+
+  init(
+    masterURL: URL,
+    selectedVideoPlaylistURL: URL,
+    bandwidth: Int64,
+    averageBandwidth: Int64?,
+    width: Int?,
+    height: Int?,
+    codecs: String?,
+    frameRate: Double?,
+    audioGroupID: String?,
+    audioRenditions: [IPadHLSAudioRendition],
+    alternativeVariants: [IPadHLSAlternativeVariant] = []
+  ) {
+    self.masterURL = masterURL
+    self.selectedVideoPlaylistURL = selectedVideoPlaylistURL
+    self.bandwidth = bandwidth
+    self.averageBandwidth = averageBandwidth
+    self.width = width
+    self.height = height
+    self.codecs = codecs
+    self.frameRate = frameRate
+    self.audioGroupID = audioGroupID
+    self.audioRenditions = audioRenditions
+    self.alternativeVariants = alternativeVariants
+  }
+
+  var hasSeparateAudio: Bool {
+    audioRenditions.contains { $0.url != nil }
+  }
+
+  fileprivate var hasAudioGroupMetadata: Bool {
+    audioGroupID != nil || !audioRenditions.isEmpty
+  }
+
+  fileprivate func retainingAlternativeVariants(
+    _ variants: [IPadHLSAlternativeVariant]
+  ) -> IPadHLSMasterMetadata {
+    IPadHLSMasterMetadata(
+      masterURL: masterURL,
+      selectedVideoPlaylistURL: selectedVideoPlaylistURL,
+      bandwidth: bandwidth,
+      averageBandwidth: averageBandwidth,
+      width: width,
+      height: height,
+      codecs: codecs,
+      frameRate: frameRate,
+      audioGroupID: audioGroupID,
+      audioRenditions: audioRenditions,
+      alternativeVariants: variants
+    )
+  }
+
+  /// Builds a one-variant master. Callers that use an authenticated loopback
+  /// proxy pass its local video/audio URLs here; no origin credential needs to
+  /// be embedded in a file on disk.
+  func syntheticPlaylist(
+    videoPlaylistURL: URL? = nil,
+    audioPlaylistURLs: [URL: URL] = [:]
+  ) -> String {
+    let selectedVideoURL = videoPlaylistURL ?? selectedVideoPlaylistURL
+    var lines = ["#EXTM3U"]
+    for rendition in audioRenditions {
+      let replacement = rendition.url.flatMap { audioPlaylistURLs[$0] } ?? rendition.url
+      lines.append(rendition.playlistLine(using: replacement))
+    }
+
+    var streamAttributes = ["BANDWIDTH=\(max(1, bandwidth))"]
+    if let averageBandwidth, averageBandwidth > 0 {
+      streamAttributes.append("AVERAGE-BANDWIDTH=\(averageBandwidth)")
+    }
+    if let width, let height, width > 0, height > 0 {
+      streamAttributes.append("RESOLUTION=\(width)x\(height)")
+    }
+    if let frameRate, frameRate.isFinite, frameRate > 0 {
+      streamAttributes.append("FRAME-RATE=\(frameRate)")
+    }
+    if let codecs, !codecs.isEmpty {
+      let escaped = codecs.replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
+      streamAttributes.append("CODECS=\"\(escaped)\"")
+    }
+    if let audioGroupID, !audioGroupID.isEmpty {
+      let escaped = audioGroupID.replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
+      streamAttributes.append("AUDIO=\"\(escaped)\"")
+    }
+    lines.append("#EXT-X-STREAM-INF:" + streamAttributes.joined(separator: ","))
+    lines.append(selectedVideoURL.absoluteString)
+    return lines.joined(separator: "\n") + "\n"
+  }
+}
+
 struct IPadHLSMediaPlaylist: Sendable, Equatable {
   let url: URL
   let segments: [IPadHLSMediaSegment]
   let isLive: Bool
   let duration: TimeInterval
   let targetDuration: TimeInterval?
+  let masterMetadata: IPadHLSMasterMetadata?
+
+  init(
+    url: URL,
+    segments: [IPadHLSMediaSegment],
+    isLive: Bool,
+    duration: TimeInterval,
+    targetDuration: TimeInterval?,
+    masterMetadata: IPadHLSMasterMetadata? = nil
+  ) {
+    self.url = url
+    self.segments = segments
+    self.isLive = isLive
+    self.duration = duration
+    self.targetDuration = targetDuration
+    self.masterMetadata = masterMetadata
+  }
+
+  fileprivate func retainingMasterMetadata(
+    _ metadata: IPadHLSMasterMetadata
+  ) -> IPadHLSMediaPlaylist {
+    IPadHLSMediaPlaylist(
+      url: url,
+      segments: segments,
+      isLive: isLive,
+      duration: duration,
+      targetDuration: targetDuration,
+      masterMetadata: metadata
+    )
+  }
 }
 
 enum IPadMediaURLResolverError: LocalizedError, Sendable {
@@ -1016,6 +1246,112 @@ struct IPadMediaURLResolver: Sendable {
       policy: effectivePolicy,
       context: context
     )
+  }
+
+  /// Resolves the next lower restoration-compatible variant without probing
+  /// or reloading the parent master. This is used after a selected rendition's
+  /// media segments become rate-limited: retrying the submitted master would
+  /// simply choose the same highest rendition again.
+  func resolveNextHLSVariant(
+    for source: IPadResolvedMediaSource
+  ) async throws -> IPadResolvedMediaSource? {
+    try Task.checkCancellation()
+    guard source.kind == .hls,
+      let currentPlaylist = source.hlsPlaylist,
+      let currentMetadata = currentPlaylist.masterMetadata,
+      !currentMetadata.alternativeVariants.isEmpty
+    else { return nil }
+
+    let budget = IPadMediaResolutionBudget(
+      maximumRequests: maximumRequestCount,
+      maximumResponseBytes: maximumCumulativeResponseBytes,
+      timeout: resolutionTimeout
+    )
+    var lastError: Error?
+    var pendingInteractionURL: URL?
+    let alternatives = currentMetadata.alternativeVariants
+    for (index, alternative) in alternatives.enumerated() {
+      try Task.checkCancellation()
+      do {
+        // Go directly to the known variant URL. In particular, do not issue a
+        // HEAD request or revisit the master while its selected host is in a
+        // rate-limit cooldown.
+        let resolved = try await resolveHLS(
+          at: alternative.playlistURL,
+          depth: 0,
+          visited: [],
+          budget: budget,
+          policy: source.resolutionPolicy,
+          context: source.requestContext
+        )
+        let remainingOuterVariants = Array(alternatives.dropFirst(index + 1))
+        let nestedMetadata = resolved.playlist.masterMetadata
+        let inheritedNestedVariants = Self.inheritingAudioGroupIfMissing(
+          in: nestedMetadata?.alternativeVariants ?? [],
+          audioGroupID: alternative.audioGroupID,
+          audioRenditions: alternative.audioRenditions
+        )
+        let remainingVariants = Self.mergedAlternativeVariants(
+          inheritedNestedVariants,
+          remainingOuterVariants
+        )
+        let selectedMetadata: IPadHLSMasterMetadata
+        if let nestedMetadata,
+          nestedMetadata.hasAudioGroupMetadata
+        {
+          // The fallback URL can itself be a master whose AUDIO declaration
+          // is more precise than the parent variant. Preserve that genuine
+          // inner group while appending the remaining fallback chain.
+          selectedMetadata = nestedMetadata.retainingAlternativeVariants(
+            remainingVariants
+          )
+        } else {
+          selectedMetadata = IPadHLSMasterMetadata(
+            masterURL: alternative.masterURL,
+            selectedVideoPlaylistURL: resolved.playlist.url,
+            bandwidth: alternative.bandwidth,
+            averageBandwidth: alternative.averageBandwidth,
+            width: alternative.width,
+            height: alternative.height,
+            codecs: alternative.codecs,
+            frameRate: alternative.frameRate,
+            audioGroupID: alternative.audioGroupID,
+            audioRenditions: alternative.audioRenditions,
+            alternativeVariants: remainingVariants
+          )
+        }
+        let selectedPlaylist = resolved.playlist.retainingMasterMetadata(
+          selectedMetadata
+        )
+        return IPadResolvedMediaSource(
+          kind: .hls,
+          submittedURL: source.submittedURL,
+          playbackURL: source.playbackURL,
+          mediaURL: selectedPlaylist.url,
+          contentType: resolved.contentType ?? source.contentType,
+          hlsPlaylist: selectedPlaylist,
+          resolutionPolicy: source.resolutionPolicy,
+          requestContext: source.requestContext
+        )
+      } catch is CancellationError {
+        throw CancellationError()
+      } catch IPadMediaURLResolverError.interactionRequired(let challengedURL) {
+        pendingInteractionURL =
+          pendingInteractionURL ?? challengedURL ?? alternative.playlistURL
+        lastError = IPadMediaURLResolverError.interactionRequired(
+          pendingInteractionURL
+        )
+      } catch {
+        lastError = error
+      }
+    }
+    if let pendingInteractionURL {
+      throw IPadMediaURLResolverError.interactionRequired(
+        pendingInteractionURL
+      )
+    }
+    if let lastError { throw lastError }
+    return nil
   }
 
   /// Resolves static embed chains breadth-first. A page-level progressive URL
@@ -1411,7 +1747,8 @@ struct IPadMediaURLResolver: Sendable {
       timeout: min(requestTimeout, remainingTimeout),
       returnsAfterVideoResponse: method == "GET",
       resolutionPolicy: policy,
-      requestContext: context
+      requestContext: context,
+      priority: .critical
     )
     do {
       let payload = try await operation.start(request)
@@ -1482,19 +1819,76 @@ struct IPadMediaURLResolver: Sendable {
     try Self.rejectProtectedPlaylist(text)
 
     let variants = try Self.parseMasterVariants(text, relativeTo: finalURL)
+    let audioRenditions = try Self.parseMasterAudioRenditions(
+      text,
+      relativeTo: finalURL
+    )
     if !variants.isEmpty {
       let nextVisited = visited.union([finalURL])
       var lastError: Error?
       var pendingInteractionURL: URL?
-      for variant in try Self.restorationVariantOrder(variants).prefix(8) {
+      let orderedVariants = Array(
+        try Self.restorationVariantOrder(variants).prefix(8)
+      )
+      for (variantIndex, variant) in orderedVariants.enumerated() {
         do {
-          return try await resolveHLS(
+          let resolved = try await resolveHLS(
             at: variant.url,
             depth: depth + 1,
             visited: nextVisited,
             budget: budget,
             policy: policy,
             context: context
+          )
+          let matchingAudio = audioRenditions.filter {
+            $0.groupID == variant.audioGroupID
+          }
+          let remainingOuterVariants = Self.alternativeVariantMetadata(
+            Array(orderedVariants.dropFirst(variantIndex + 1)),
+            masterURL: finalURL,
+            audioRenditions: audioRenditions
+          )
+          let nestedMetadata = resolved.playlist.masterMetadata
+          let retainedAudioGroupID = matchingAudio.isEmpty
+            ? nil : variant.audioGroupID
+          let inheritedNestedVariants = Self.inheritingAudioGroupIfMissing(
+            in: nestedMetadata?.alternativeVariants ?? [],
+            audioGroupID: retainedAudioGroupID,
+            audioRenditions: matchingAudio
+          )
+          let remainingVariants = Self.mergedAlternativeVariants(
+            inheritedNestedVariants,
+            remainingOuterVariants
+          )
+          // A variant can point at another master playlist.  In that case the
+          // actual AUDIO group may be declared by the inner master. Do not
+          // replace that genuine inner group with a parent declaration.
+          if let nestedMetadata,
+            nestedMetadata.hasAudioGroupMetadata
+          {
+            return IPadResolvedHLS(
+              playlist: resolved.playlist.retainingMasterMetadata(
+                nestedMetadata.retainingAlternativeVariants(remainingVariants)
+              ),
+              contentType: resolved.contentType
+            )
+          }
+          let metadata = IPadHLSMasterMetadata(
+            masterURL: finalURL,
+            selectedVideoPlaylistURL: resolved.playlist.url,
+            bandwidth: variant.peakBandwidth,
+            averageBandwidth: variant.averageBandwidth,
+            width: variant.resolution?.width,
+            height: variant.resolution?.height,
+            codecs: variant.codecs,
+            frameRate: variant.frameRate,
+            audioGroupID: retainedAudioGroupID,
+            audioRenditions: matchingAudio,
+            alternativeVariants: remainingVariants
+          )
+          return IPadResolvedHLS(
+            playlist: resolved.playlist.retainingMasterMetadata(metadata),
+            contentType: resolved.contentType
           )
         } catch is CancellationError {
           throw CancellationError()
@@ -2107,20 +2501,29 @@ struct IPadMediaURLResolver: Sendable {
   ) throws -> [IPadHLSVariant] {
     let lines = normalizedPlaylistLines(text)
     var variants: [IPadHLSVariant] = []
-    var pendingVariant: (bandwidth: Int64, resolution: IPadHLSResolution?)?
+    var pendingVariant: IPadHLSVariant?
 
     for line in lines {
       if line.uppercased().hasPrefix("#EXT-X-STREAM-INF:") {
         let attributes = parseAttributeList(
           String(line.dropFirst("#EXT-X-STREAM-INF:".count))
         )
-        let bandwidth =
-          Int64(attributes["AVERAGE-BANDWIDTH"] ?? "")
-          ?? Int64(attributes["BANDWIDTH"] ?? "")
-          ?? 0
-        pendingVariant = (
-          bandwidth: max(0, bandwidth),
-          resolution: parseResolution(attributes["RESOLUTION"])
+        let peakBandwidth = max(0, Int64(attributes["BANDWIDTH"] ?? "") ?? 0)
+        let averageBandwidth = Int64(attributes["AVERAGE-BANDWIDTH"] ?? "")
+          .flatMap { $0 > 0 ? $0 : nil }
+        let effectiveBandwidth = averageBandwidth ?? peakBandwidth
+        let parsedFrameRate = Double(attributes["FRAME-RATE"] ?? "")
+        pendingVariant = IPadHLSVariant(
+          url: baseURL,
+          bandwidth: effectiveBandwidth,
+          peakBandwidth: max(peakBandwidth, effectiveBandwidth),
+          averageBandwidth: averageBandwidth,
+          resolution: parseResolution(attributes["RESOLUTION"]),
+          codecs: sanitizedMasterAttribute(attributes["CODECS"]),
+          frameRate: parsedFrameRate.flatMap {
+            $0.isFinite && $0 > 0 ? $0 : nil
+          },
+          audioGroupID: sanitizedMasterAttribute(attributes["AUDIO"])
         )
         continue
       }
@@ -2132,13 +2535,70 @@ struct IPadMediaURLResolver: Sendable {
           IPadHLSVariant(
             url: url,
             bandwidth: pending.bandwidth,
-            resolution: pending.resolution
+            peakBandwidth: pending.peakBandwidth,
+            averageBandwidth: pending.averageBandwidth,
+            resolution: pending.resolution,
+            codecs: pending.codecs,
+            frameRate: pending.frameRate,
+            audioGroupID: pending.audioGroupID
           )
         )
         pendingVariant = nil
       }
     }
     return variants
+  }
+
+  private static func parseMasterAudioRenditions(
+    _ text: String,
+    relativeTo baseURL: URL
+  ) throws -> [IPadHLSAudioRendition] {
+    var renditions: [IPadHLSAudioRendition] = []
+    for line in normalizedPlaylistLines(text) where
+      line.uppercased().hasPrefix("#EXT-X-MEDIA:")
+    {
+      let attributes = parseAttributeList(
+        String(line.dropFirst("#EXT-X-MEDIA:".count))
+      )
+      guard attributes["TYPE"]?.uppercased() == "AUDIO",
+        let groupID = sanitizedMasterAttribute(attributes["GROUP-ID"]),
+        !groupID.isEmpty
+      else { continue }
+      let name = sanitizedMasterAttribute(attributes["NAME"]) ?? groupID
+      let renditionURL: URL?
+      if let uri = attributes["URI"] {
+        guard let resolved = resolvedHTTPURL(uri, relativeTo: baseURL) else {
+          throw IPadMediaURLResolverError.invalidPlaylist(
+            "audio rendition URLが不正です"
+          )
+        }
+        renditionURL = resolved
+      } else {
+        // A missing URI explicitly denotes audio multiplexed into the selected
+        // video rendition and must remain represented in a synthetic master.
+        renditionURL = nil
+      }
+      renditions.append(
+        IPadHLSAudioRendition(
+          groupID: groupID,
+          name: name,
+          language: sanitizedMasterAttribute(attributes["LANGUAGE"]),
+          url: renditionURL,
+          isDefault: attributes["DEFAULT"]?.uppercased() == "YES",
+          autoSelect: attributes["AUTOSELECT"]?.uppercased() == "YES",
+          channels: sanitizedMasterAttribute(attributes["CHANNELS"])
+        )
+      )
+    }
+    return renditions
+  }
+
+  private static func sanitizedMasterAttribute(_ value: String?) -> String? {
+    guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !value.isEmpty, value.utf8.count <= 4_096,
+      value.rangeOfCharacter(from: .controlCharacters) == nil
+    else { return nil }
+    return value
   }
 
   private static func parseUnlabeledPlaylistReferences(
@@ -2182,6 +2642,58 @@ struct IPadMediaURLResolver: Sendable {
       width > 0, height > 0
     else { return nil }
     return IPadHLSResolution(width: width, height: height)
+  }
+
+  private static func alternativeVariantMetadata(
+    _ variants: [IPadHLSVariant],
+    masterURL: URL,
+    audioRenditions: [IPadHLSAudioRendition]
+  ) -> [IPadHLSAlternativeVariant] {
+    variants.map { variant in
+      let matchingAudio = audioRenditions.filter {
+        $0.groupID == variant.audioGroupID
+      }
+      return IPadHLSAlternativeVariant(
+        masterURL: masterURL,
+        playlistURL: variant.url,
+        bandwidth: variant.peakBandwidth,
+        averageBandwidth: variant.averageBandwidth,
+        width: variant.resolution?.width,
+        height: variant.resolution?.height,
+        codecs: variant.codecs,
+        frameRate: variant.frameRate,
+        audioGroupID: matchingAudio.isEmpty ? nil : variant.audioGroupID,
+        audioRenditions: matchingAudio
+      )
+    }
+  }
+
+  /// Nested masters should fall back within themselves before moving to the
+  /// next lower rendition of their parent master. Duplicate URLs are removed
+  /// without changing that order.
+  private static func mergedAlternativeVariants(
+    _ nested: [IPadHLSAlternativeVariant],
+    _ outer: [IPadHLSAlternativeVariant]
+  ) -> [IPadHLSAlternativeVariant] {
+    var seen: Set<URL> = []
+    return (nested + outer).filter { variant in
+      seen.insert(variant.playlistURL).inserted
+    }
+  }
+
+  /// An AUDIO group declared by a parent variant applies to renditions behind
+  /// its nested master unless an inner rendition declares its own group.
+  private static func inheritingAudioGroupIfMissing(
+    in variants: [IPadHLSAlternativeVariant],
+    audioGroupID: String?,
+    audioRenditions: [IPadHLSAudioRendition]
+  ) -> [IPadHLSAlternativeVariant] {
+    variants.map {
+      $0.inheritingAudioGroupIfMissing(
+        audioGroupID: audioGroupID,
+        audioRenditions: audioRenditions
+      )
+    }
   }
 
   /// BasicVSR++ retains a full clip of decoded frames. Prefer the best known
@@ -2510,7 +3022,10 @@ final class IPadHLSResourceDownloader: @unchecked Sendable {
     self.requestContext = requestContext
   }
 
-  func data(for resource: IPadHLSResource) async throws -> Data {
+  func data(
+    for resource: IPadHLSResource,
+    priority: IPadSharedHTTPTransportOptions.Priority = .normal
+  ) async throws -> Data {
     try Task.checkCancellation()
     guard let safeURL = IPadMediaURLResolver.sanitizedAbsoluteHTTPURL(resource.url) else {
       throw IPadMediaURLResolverError.unsafeURL
@@ -2522,6 +3037,10 @@ final class IPadHLSResourceDownloader: @unchecked Sendable {
     request.httpMethod = "GET"
     request.timeoutInterval = requestTimeout
     request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+    request.setValue(
+      "application/vnd.apple.mpegurl, application/x-mpegurl, video/*, audio/*, */*;q=0.5",
+      forHTTPHeaderField: "Accept"
+    )
     requestContext?.applying(to: &request)
     if let byteRange = resource.byteRange {
       guard byteRange.offset >= 0, byteRange.length > 0,
@@ -2540,7 +3059,9 @@ final class IPadHLSResourceDownloader: @unchecked Sendable {
       maximumRedirectCount: maximumRedirectCount,
       timeout: requestTimeout,
       resolutionPolicy: resolutionPolicy,
-      requestContext: requestContext
+      requestContext: requestContext,
+      priority: priority,
+      requiresHTTPS: safeURL.scheme?.lowercased() == "https"
     )
     let operationID = UUID()
     guard register(operation, id: operationID) else { throw CancellationError() }
@@ -2566,18 +3087,23 @@ final class IPadHLSResourceDownloader: @unchecked Sendable {
 
   func materialize(
     segment: IPadHLSMediaSegment,
-    in directory: URL
+    in directory: URL,
+    priority: IPadSharedHTTPTransportOptions.Priority = .normal
   ) async throws -> URL {
     try Task.checkCancellation()
     let initializationData: Data?
     if let initializationResource = segment.initializationResource {
       initializationData = try await cachedInitializationData(
-        for: initializationResource
+        for: initializationResource,
+        priority: priority
       )
     } else {
       initializationData = nil
     }
-    let downloadedSegmentData = try await data(for: segment.resource)
+    let downloadedSegmentData = try await data(
+      for: segment.resource,
+      priority: priority
+    )
     try Task.checkCancellation()
     try checkNotCancelled()
     guard !downloadedSegmentData.isEmpty else {
@@ -2678,10 +3204,11 @@ final class IPadHLSResourceDownloader: @unchecked Sendable {
   }
 
   private func cachedInitializationData(
-    for resource: IPadHLSResource
+    for resource: IPadHLSResource,
+    priority: IPadSharedHTTPTransportOptions.Priority
   ) async throws -> Data {
     if let cached = cachedInitializationValue(for: resource) { return cached }
-    let downloaded = try await data(for: resource)
+    let downloaded = try await data(for: resource, priority: priority)
     try checkNotCancelled()
     guard !downloaded.isEmpty else {
       throw IPadMediaURLResolverError.requestFailed(
@@ -2880,7 +3407,12 @@ private struct IPadHTMLPage {
 private struct IPadHLSVariant {
   let url: URL
   let bandwidth: Int64
+  let peakBandwidth: Int64
+  let averageBandwidth: Int64?
   let resolution: IPadHLSResolution?
+  let codecs: String?
+  let frameRate: Double?
+  let audioGroupID: String?
 }
 
 private struct IPadHLSResolution {
@@ -2938,23 +3470,35 @@ private struct IPadHTTPPayload {
   let response: HTTPURLResponse
 }
 
-private final class IPadBoundedHTTPRequest: NSObject, @unchecked Sendable {
-  private let maximumResponseBytes: Int
-  private let maximumRedirectCount: Int
-  private let timeout: TimeInterval
-  private let returnsAfterVideoResponse: Bool
-  private let resolutionPolicy: IPadMediaURLResolutionPolicy
-  private let requestContext: IPadMediaRequestContext?
-  private let lock = NSLock()
-  private var continuation: CheckedContinuation<IPadHTTPPayload, Error>?
-  private var session: URLSession?
-  private var task: URLSessionDataTask?
-  private var response: HTTPURLResponse?
-  private var receivedData = Data()
-  private var redirectCount = 0
-  private var cancellationRequested = false
-  private var didFinish = false
-  private var expectsResponseBody = true
+struct IPadSharedHTTPPayload: @unchecked Sendable {
+  let data: Data
+  let response: HTTPURLResponse
+}
+
+enum IPadSharedHTTPTransportError: Error, Sendable {
+  case unsafeURL
+  case insecureRedirect
+  case tooManyRedirects
+  case responseTooLarge(Int)
+  case missingResponse
+}
+
+struct IPadSharedHTTPTransportOptions: Sendable {
+  enum Priority: Int, Sendable {
+    case critical
+    case normal
+    case speculative
+  }
+
+  let maximumResponseBytes: Int
+  let maximumRedirectCount: Int
+  let timeout: TimeInterval
+  let returnsAfterVideoResponse: Bool
+  let resolutionPolicy: IPadMediaURLResolutionPolicy
+  let requestContext: IPadMediaRequestContext?
+  let requiresHTTPS: Bool
+  let hlsDeliveryDirectives: String?
+  let priority: Priority
 
   init(
     maximumResponseBytes: Int,
@@ -2962,144 +3506,1067 @@ private final class IPadBoundedHTTPRequest: NSObject, @unchecked Sendable {
     timeout: TimeInterval,
     returnsAfterVideoResponse: Bool = false,
     resolutionPolicy: IPadMediaURLResolutionPolicy = .userSubmitted,
-    requestContext: IPadMediaRequestContext? = nil
+    requestContext: IPadMediaRequestContext? = nil,
+    requiresHTTPS: Bool = false,
+    hlsDeliveryDirectives: String? = nil,
+    priority: Priority = .normal
   ) {
-    self.maximumResponseBytes = maximumResponseBytes
-    self.maximumRedirectCount = maximumRedirectCount
-    self.timeout = timeout
+    self.maximumResponseBytes = max(1_024, maximumResponseBytes)
+    self.maximumRedirectCount = max(0, maximumRedirectCount)
+    self.timeout = max(1, timeout)
     self.returnsAfterVideoResponse = returnsAfterVideoResponse
     self.resolutionPolicy = resolutionPolicy
     self.requestContext = requestContext
-  }
-
-  func start(_ request: URLRequest) async throws -> IPadHTTPPayload {
-    try Task.checkCancellation()
-    return try await withTaskCancellationHandler {
-      try await withCheckedThrowingContinuation { continuation in
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = timeout
-        configuration.timeoutIntervalForResource = timeout
-        configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        configuration.urlCache = nil
-        configuration.httpCookieStorage = nil
-        configuration.urlCredentialStorage = nil
-        configuration.waitsForConnectivity = false
-
-        let queue = OperationQueue()
-        queue.maxConcurrentOperationCount = 1
-        queue.qualityOfService = .userInitiated
-        let session = URLSession(configuration: configuration, delegate: self, delegateQueue: queue)
-        let task = session.dataTask(with: request)
-
-        lock.lock()
-        if cancellationRequested {
-          didFinish = true
-          lock.unlock()
-          session.invalidateAndCancel()
-          continuation.resume(throwing: CancellationError())
-          return
-        }
-        self.continuation = continuation
-        self.session = session
-        self.task = task
-        expectsResponseBody = request.httpMethod?.uppercased() != "HEAD"
-        lock.unlock()
-        task.resume()
-      }
-    } onCancel: {
-      self.cancel()
-    }
-  }
-
-  fileprivate func cancel() {
-    lock.lock()
-    cancellationRequested = true
-    guard !didFinish, let continuation else {
-      let task = task
-      lock.unlock()
-      task?.cancel()
-      return
-    }
-    didFinish = true
-    let task = task
-    let session = session
-    self.continuation = nil
-    self.task = nil
-    self.session = nil
-    lock.unlock()
-    task?.cancel()
-    session?.invalidateAndCancel()
-    continuation.resume(throwing: CancellationError())
-  }
-
-  private func finish(_ result: Result<IPadHTTPPayload, Error>) {
-    lock.lock()
-    guard !didFinish, let continuation else {
-      lock.unlock()
-      return
-    }
-    didFinish = true
-    let task = task
-    let session = session
-    self.continuation = nil
-    self.task = nil
-    self.session = nil
-    lock.unlock()
-    task?.cancel()
-    session?.invalidateAndCancel()
-    continuation.resume(with: result)
+    self.requiresHTTPS = requiresHTTPS
+    self.hlsDeliveryDirectives = hlsDeliveryDirectives
+    self.priority = priority
   }
 }
 
-extension IPadBoundedHTTPRequest: URLSessionDataDelegate {
+final class IPadSharedHTTPRequestCancellation: @unchecked Sendable {
+  private let lock = NSLock()
+  private var cancellation: (@Sendable () -> Void)?
+  private var isCancelled = false
+
+  var cancelled: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return isCancelled
+  }
+
+  fileprivate func install(_ cancellation: @escaping @Sendable () -> Void) {
+    lock.lock()
+    if isCancelled {
+      lock.unlock()
+      cancellation()
+      return
+    }
+    self.cancellation = cancellation
+    lock.unlock()
+  }
+
+  func clear() {
+    lock.lock()
+    cancellation = nil
+    lock.unlock()
+  }
+
+  func cancel() {
+    lock.lock()
+    guard !isCancelled else {
+      lock.unlock()
+      return
+    }
+    isCancelled = true
+    let cancellation = cancellation
+    self.cancellation = nil
+    lock.unlock()
+    cancellation?()
+  }
+}
+
+/// One congestion window is shared by the resolver, restoration downloader and
+/// AVPlayer loopback proxy. A 429 therefore pauses speculative segment traffic
+/// instead of allowing each subsystem to retry independently.
+private actor IPadHTTPOriginCoordinator {
+  static let shared = IPadHTTPOriginCoordinator()
+
+  private struct HostState {
+    var activeRequests = 0
+    var congestionWindow = 1.0
+    var additiveSuccesses = 0
+    var rateLimitStrikes = 0
+    var cooldownUntil = Date.distantPast
+    /// Requests that have not acquired an origin permit yet. Keeping these
+    /// separate from active requests lets a newly-arrived playback request
+    /// overtake speculative prefetch after a rate-limit cooldown.
+    var requestPriorities: [UUID: IPadSharedHTTPTransportOptions.Priority] = [:]
+    var activeRequestPriorities: [UUID: IPadSharedHTTPTransportOptions.Priority] = [:]
+  }
+
+  private var states: [String: HostState] = [:]
+  private let maximumCongestionWindow = 8.0
+
+  func acquire(
+    hostKey: String,
+    requestID: UUID,
+    priority: IPadSharedHTTPTransportOptions.Priority
+  ) async throws {
+    while true {
+      try Task.checkCancellation()
+      var state = states[hostKey] ?? HostState()
+      let storedPriority = state.requestPriorities[requestID] ?? priority
+      let effectivePriority =
+        storedPriority.rawValue <= priority.rawValue
+        ? storedPriority : priority
+      state.requestPriorities[requestID] = effectivePriority
+      let now = Date()
+      let fullLimit = max(1, Int(state.congestionWindow.rounded(.down)))
+      // Preserve headroom for playback-critical playlist/audio/current-media
+      // traffic when speculative restoration prefetch is saturating an origin.
+      let reservedSlots =
+        effectivePriority == .critical
+        ? 0 : (effectivePriority == .normal ? 1 : 2)
+      let limit = max(1, fullLimit - reservedSlots)
+      let higherPriorityIsWaiting = state.requestPriorities.contains {
+        pendingRequestID, pendingPriority in
+        pendingRequestID != requestID
+          && pendingPriority.rawValue < effectivePriority.rawValue
+      }
+      let speculativeRecoveryBlocked =
+        state.rateLimitStrikes > 0 && effectivePriority == .speculative
+      if now >= state.cooldownUntil, state.activeRequests < limit,
+        !higherPriorityIsWaiting, !speculativeRecoveryBlocked
+      {
+        state.requestPriorities.removeValue(forKey: requestID)
+        state.activeRequestPriorities[requestID] = effectivePriority
+        state.activeRequests += 1
+        states[hostKey] = state
+        return
+      }
+      // Persist the waiter before suspending. Without this write a critical
+      // AVPlayer request is invisible to speculative tasks waking from the
+      // same cooldown, so whichever polling task happens to run first wins.
+      states[hostKey] = state
+      let cooldownDelay = max(0, state.cooldownUntil.timeIntervalSince(now))
+      let delay = max(0.025, min(1, cooldownDelay))
+      try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+    }
+  }
+
+  func release(
+    hostKey: String,
+    requestID: UUID,
+    statusCode: Int?,
+    retryAfter: TimeInterval?
+  ) {
+    var state = states[hostKey] ?? HostState()
+    state.requestPriorities.removeValue(forKey: requestID)
+    state.activeRequestPriorities.removeValue(forKey: requestID)
+    state.activeRequests = max(0, state.activeRequests - 1)
+    applyOutcome(
+      statusCode: statusCode,
+      retryAfter: retryAfter,
+      to: &state
+    )
+    states[hostKey] = state
+  }
+
+  /// Attributes a completed response to an origin that did not own the active
+  /// request permit. This is used after a cross-origin redirect: the initial
+  /// origin's permit is still released exactly once, while a CDN response can
+  /// independently reduce that CDN's window or install its Retry-After delay.
+  func recordOutcome(
+    hostKey: String,
+    statusCode: Int?,
+    retryAfter: TimeInterval?
+  ) {
+    var state = states[hostKey] ?? HostState()
+    applyOutcome(
+      statusCode: statusCode,
+      retryAfter: retryAfter,
+      to: &state
+    )
+    states[hostKey] = state
+  }
+
+  private func applyOutcome(
+    statusCode: Int?,
+    retryAfter: TimeInterval?,
+    to state: inout HostState
+  ) {
+    let now = Date()
+    if statusCode == 429 {
+      state.rateLimitStrikes = min(8, state.rateLimitStrikes + 1)
+      state.congestionWindow = max(1, state.congestionWindow * 0.5)
+      state.additiveSuccesses = 0
+      let fallbackDelay = min(
+        30,
+        1.5 * pow(2, Double(max(0, state.rateLimitStrikes - 1)))
+      )
+      let delay = max(0.25, min(120, retryAfter ?? fallbackDelay))
+      state.cooldownUntil = max(
+        state.cooldownUntil,
+        now.addingTimeInterval(delay)
+      )
+    } else if let statusCode, (200...399).contains(statusCode) {
+      // Responses admitted before the 429 may finish during the cooldown. They
+      // are not evidence that the origin has recovered and must not reopen the
+      // congestion window. Once the cooldown expires, require a stable run of
+      // successes (at least four while recovering) before increasing it.
+      guard now >= state.cooldownUntil else { return }
+      state.additiveSuccesses += 1
+      let window = max(1, Int(state.congestionWindow.rounded(.up)))
+      let threshold =
+        state.rateLimitStrikes > 0
+        ? max(4, window * 2)
+        : max(4, window)
+      if state.additiveSuccesses >= threshold {
+        state.congestionWindow = min(
+          maximumCongestionWindow,
+          state.congestionWindow + 1
+        )
+        state.rateLimitStrikes = max(0, state.rateLimitStrikes - 1)
+        state.additiveSuccesses = 0
+      }
+    } else if let statusCode, (500...599).contains(statusCode) {
+      state.congestionWindow = max(1, state.congestionWindow * 0.75)
+      state.additiveSuccesses = 0
+      state.cooldownUntil = max(
+        state.cooldownUntil,
+        now.addingTimeInterval(0.25)
+      )
+    }
+  }
+
+  func promote(
+    hostKey: String,
+    requestID: UUID,
+    to priority: IPadSharedHTTPTransportOptions.Priority
+  ) {
+    var state = states[hostKey] ?? HostState()
+    if let existing = state.requestPriorities[requestID],
+      priority.rawValue < existing.rawValue
+    {
+      state.requestPriorities[requestID] = priority
+    } else if let existing = state.activeRequestPriorities[requestID],
+      priority.rawValue < existing.rawValue
+    {
+      state.activeRequestPriorities[requestID] = priority
+    } else if state.requestPriorities[requestID] == nil,
+      state.activeRequestPriorities[requestID] == nil
+    {
+      // Promotion can race the launch task's first actor hop. Record it as a
+      // waiter so acquire() observes the strongest subscribed priority.
+      state.requestPriorities[requestID] = priority
+    }
+    states[hostKey] = state
+  }
+
+  func cancelAcquire(hostKey: String, requestID: UUID) {
+    guard var state = states[hostKey] else { return }
+    state.requestPriorities.removeValue(forKey: requestID)
+    states[hostKey] = state
+  }
+
+  #if MIOH_TESTING
+    func isWaitingForTesting(hostKey: String, requestID: UUID) -> Bool {
+      states[hostKey]?.requestPriorities[requestID] != nil
+    }
+
+    func congestionWindowForTesting(hostKey: String) -> Double {
+      states[hostKey]?.congestionWindow ?? 1
+    }
+  #endif
+}
+
+/// A process-wide, long-lived URLSession with bounded body collection,
+/// redirect validation, host AIMD and URL+Range in-flight coalescing.
+final class IPadSharedHTTPTransport: NSObject, @unchecked Sendable {
+  static let shared = IPadSharedHTTPTransport()
+
+  private struct RequestKey: Hashable {
+    let method: String
+    let url: String
+    let headers: String
+    let contextIdentity: ObjectIdentifier?
+    let policy: String
+    let redirectLimit: Int
+    let timeoutMilliseconds: Int
+    let returnsAfterVideoResponse: Bool
+    let requiresHTTPS: Bool
+    let hlsDeliveryDirectives: String?
+  }
+
+  private struct Waiter {
+    let continuation: CheckedContinuation<IPadSharedHTTPPayload, Error>
+    let maximumResponseBytes: Int
+    let cancellation: IPadSharedHTTPRequestCancellation
+  }
+
+  private final class Entry {
+    let id = UUID()
+    let key: RequestKey
+    let request: URLRequest
+    let options: IPadSharedHTTPTransportOptions
+    let hostKey: String
+    var waiters: [UUID: Waiter]
+    var maximumResponseBytes: Int
+    var launchTask: Task<Void, Never>?
+    var task: URLSessionDataTask?
+    var permitAcquired = false
+    var response: HTTPURLResponse?
+    var data = Data()
+    var redirectCount = 0
+    var statusCode: Int?
+    var retryAfter: TimeInterval?
+
+    init(
+      key: RequestKey,
+      request: URLRequest,
+      options: IPadSharedHTTPTransportOptions,
+      hostKey: String,
+      waiterID: UUID,
+      waiter: Waiter
+    ) {
+      self.key = key
+      self.request = request
+      self.options = options
+      self.hostKey = hostKey
+      waiters = [waiterID: waiter]
+      maximumResponseBytes = waiter.maximumResponseBytes
+    }
+  }
+
+  private let lock = NSLock()
+  private var entriesByKey: [RequestKey: Entry] = [:]
+  private var entriesByID: [UUID: Entry] = [:]
+  private var entryIDByTaskIdentifier: [Int: UUID] = [:]
+
+  private lazy var session: URLSession = {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.timeoutIntervalForRequest = 120
+    configuration.timeoutIntervalForResource = 120
+    configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+    configuration.urlCache = nil
+    configuration.httpCookieStorage = nil
+    configuration.httpCookieAcceptPolicy = .never
+    configuration.httpShouldSetCookies = false
+    configuration.urlCredentialStorage = nil
+    configuration.waitsForConnectivity = false
+    configuration.httpMaximumConnectionsPerHost = 8
+    let queue = OperationQueue()
+    queue.maxConcurrentOperationCount = 1
+    queue.qualityOfService = .userInitiated
+    return URLSession(configuration: configuration, delegate: self, delegateQueue: queue)
+  }()
+
+  func data(
+    for request: URLRequest,
+    options: IPadSharedHTTPTransportOptions,
+    cancellation: IPadSharedHTTPRequestCancellation
+  ) async throws -> IPadSharedHTTPPayload {
+    try Task.checkCancellation()
+    let key = Self.requestKey(for: request, options: options)
+    let waiterID = UUID()
+    return try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { continuation in
+        let waiter = Waiter(
+          continuation: continuation,
+          maximumResponseBytes: options.maximumResponseBytes,
+          cancellation: cancellation
+        )
+        let entryToLaunch: Entry?
+        let entryToPromote: Entry?
+        lock.lock()
+        if let existing = entriesByKey[key] {
+          existing.waiters[waiterID] = waiter
+          existing.maximumResponseBytes = max(
+            existing.maximumResponseBytes,
+            options.maximumResponseBytes
+          )
+          entryToLaunch = nil
+          entryToPromote = existing
+        } else {
+          let entry = Entry(
+            key: key,
+            request: request,
+            options: options,
+            hostKey: Self.hostKey(for: request.url),
+            waiterID: waiterID,
+            waiter: waiter
+          )
+          entriesByKey[key] = entry
+          entriesByID[entry.id] = entry
+          entryToLaunch = entry
+          entryToPromote = nil
+        }
+        lock.unlock()
+
+        cancellation.install { [weak self] in
+          self?.cancelWaiter(key: key, waiterID: waiterID)
+        }
+        if let entryToPromote {
+          Task { [weak self] in
+            await IPadHTTPOriginCoordinator.shared.promote(
+              hostKey: entryToPromote.hostKey,
+              requestID: entryToPromote.id,
+              to: options.priority
+            )
+            // Promotion may win the actor hop before acquire(), so promote()
+            // can create the pending record. If the network entry completed in
+            // the meantime, remove that record before it can become a ghost
+            // high-priority waiter that blocks future normal/prefetch traffic.
+            guard let self, !self.containsEntry(entryToPromote) else { return }
+            await IPadHTTPOriginCoordinator.shared.cancelAcquire(
+              hostKey: entryToPromote.hostKey,
+              requestID: entryToPromote.id
+            )
+          }
+        }
+        if let entryToLaunch { launch(entryToLaunch) }
+      }
+    } onCancel: {
+      cancellation.cancel()
+    }
+  }
+
+  private func launch(_ entry: Entry) {
+    let launchTask = Task { [weak self] in
+      guard let self else { return }
+      var didAcquirePermit = false
+      do {
+        try await IPadHTTPOriginCoordinator.shared.acquire(
+          hostKey: entry.hostKey,
+          requestID: entry.id,
+          priority: entry.options.priority
+        )
+        didAcquirePermit = true
+        try Task.checkCancellation()
+      } catch {
+        if didAcquirePermit {
+          await IPadHTTPOriginCoordinator.shared.release(
+            hostKey: entry.hostKey,
+            requestID: entry.id,
+            statusCode: nil,
+            retryAfter: nil
+          )
+        } else {
+          await IPadHTTPOriginCoordinator.shared.cancelAcquire(
+            hostKey: entry.hostKey,
+            requestID: entry.id
+          )
+        }
+        self.finish(entryID: entry.id, result: .failure(error))
+        return
+      }
+
+      let task = self.session.dataTask(with: entry.request)
+      guard self.install(task: task, for: entry) else {
+        task.cancel()
+        await IPadHTTPOriginCoordinator.shared.release(
+          hostKey: entry.hostKey,
+          requestID: entry.id,
+          statusCode: nil,
+          retryAfter: nil
+        )
+        return
+      }
+      task.resume()
+    }
+    lock.lock()
+    if entriesByID[entry.id] === entry {
+      entry.launchTask = launchTask
+      lock.unlock()
+    } else {
+      lock.unlock()
+      launchTask.cancel()
+    }
+  }
+
+  private func install(task: URLSessionDataTask, for entry: Entry) -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    guard let current = entriesByID[entry.id], current === entry else {
+      return false
+    }
+    entry.permitAcquired = true
+    entry.task = task
+    entryIDByTaskIdentifier[task.taskIdentifier] = entry.id
+    return true
+  }
+
+  private func cancelWaiter(key: RequestKey, waiterID: UUID) {
+    let waiter: Waiter?
+    var emptyEntry: Entry?
+    lock.lock()
+    if let entry = entriesByKey[key] {
+      waiter = entry.waiters.removeValue(forKey: waiterID)
+      entry.maximumResponseBytes = entry.waiters.values
+        .map(\.maximumResponseBytes).max() ?? 0
+      if entry.waiters.isEmpty {
+        removeEntryLocked(entry)
+        emptyEntry = entry
+      }
+    } else {
+      waiter = nil
+    }
+    lock.unlock()
+    waiter?.continuation.resume(throwing: CancellationError())
+    if let emptyEntry {
+      emptyEntry.launchTask?.cancel()
+      emptyEntry.task?.cancel()
+      releasePermit(for: emptyEntry)
+    }
+  }
+
+  private func finish(
+    entryID: UUID,
+    result: Result<IPadSharedHTTPPayload, Error>,
+    cancelTask: Bool = false
+  ) {
+    let entry: Entry?
+    lock.lock()
+    if let current = entriesByID[entryID] {
+      removeEntryLocked(current)
+      entry = current
+    } else {
+      entry = nil
+    }
+    lock.unlock()
+    guard let entry else { return }
+    if cancelTask { entry.task?.cancel() }
+    guard entry.permitAcquired else {
+      resumeWaiters(for: entry, with: result)
+      return
+    }
+    Task {
+      await Self.releaseOriginPermit(
+        initialHostKey: entry.hostKey,
+        requestID: entry.id,
+        outcomeHostKey: Self.hostKey(for: entry.response?.url),
+        statusCode: entry.statusCode,
+        retryAfter: entry.retryAfter
+      )
+      self.resumeWaiters(for: entry, with: result)
+    }
+  }
+
+  private func resumeWaiters(
+    for entry: Entry,
+    with result: Result<IPadSharedHTTPPayload, Error>
+  ) {
+    for waiter in entry.waiters.values {
+      if waiter.cancellation.cancelled {
+        waiter.continuation.resume(throwing: CancellationError())
+        continue
+      }
+      switch result {
+      case .success(let payload)
+        where payload.data.count > waiter.maximumResponseBytes:
+        waiter.continuation.resume(
+          throwing: IPadSharedHTTPTransportError.responseTooLarge(
+            waiter.maximumResponseBytes
+          )
+        )
+      default:
+        waiter.continuation.resume(with: result)
+      }
+    }
+  }
+
+  private func releasePermit(for entry: Entry) {
+    guard entry.permitAcquired else { return }
+    Task {
+      await Self.releaseOriginPermit(
+        initialHostKey: entry.hostKey,
+        requestID: entry.id,
+        outcomeHostKey: Self.hostKey(for: entry.response?.url),
+        statusCode: entry.statusCode,
+        retryAfter: entry.retryAfter
+      )
+    }
+  }
+
+  /// Settles one acquired permit without confusing permit ownership with the
+  /// origin that produced the final response. A redirected response updates
+  /// the destination's AIMD/cooldown state, but never decrements its active
+  /// count because that origin did not own this request's permit. A final 429
+  /// also cools the initial route: another request through the same redirector
+  /// otherwise bypasses the destination state before redirecting there again.
+  private static func releaseOriginPermit(
+    initialHostKey: String,
+    requestID: UUID,
+    outcomeHostKey: String,
+    statusCode: Int?,
+    retryAfter: TimeInterval?
+  ) async {
+    let hasDistinctOutcomeOrigin =
+      outcomeHostKey != "unknown"
+      && outcomeHostKey != initialHostKey
+    let rateLimitedRedirectRoute =
+      hasDistinctOutcomeOrigin
+      && statusCode == 429
+    await IPadHTTPOriginCoordinator.shared.release(
+      hostKey: initialHostKey,
+      requestID: requestID,
+      statusCode: !hasDistinctOutcomeOrigin || rateLimitedRedirectRoute
+        ? statusCode : nil,
+      retryAfter: !hasDistinctOutcomeOrigin || rateLimitedRedirectRoute
+        ? retryAfter : nil
+    )
+    if hasDistinctOutcomeOrigin {
+      await IPadHTTPOriginCoordinator.shared.recordOutcome(
+        hostKey: outcomeHostKey,
+        statusCode: statusCode,
+        retryAfter: retryAfter
+      )
+    }
+  }
+
+  #if MIOH_TESTING
+    /// Exercises redirect-route cooldown, post-429 priority ordering and slow
+    /// AIMD recovery without depending on external DNS in the runtime harness.
+    static func redirectedOriginCooldownProbeForTesting() async throws -> TimeInterval {
+      let redirectorHostKey = "https://redirector.example:443"
+      let cdnHostKey = "https://cdn.example:443"
+      let redirectedRequestID = UUID()
+      try await IPadHTTPOriginCoordinator.shared.acquire(
+        hostKey: redirectorHostKey,
+        requestID: redirectedRequestID,
+        priority: .normal
+      )
+      await releaseOriginPermit(
+        initialHostKey: redirectorHostKey,
+        requestID: redirectedRequestID,
+        outcomeHostKey: cdnHostKey,
+        statusCode: 429,
+        retryAfter: 1
+      )
+
+      async let initialRouteElapsed = cooldownElapsedForTesting(
+        hostKey: redirectorHostKey
+      )
+      async let destinationElapsed = cooldownElapsedForTesting(
+        hostKey: cdnHostKey
+      )
+      let elapsedValues = try await (initialRouteElapsed, destinationElapsed)
+
+      try await verifyCriticalPriorityAfterRateLimitForTesting()
+      try await verifySlowAIMDRecoveryForTesting()
+      return min(elapsedValues.0, elapsedValues.1)
+    }
+
+    private static func cooldownElapsedForTesting(
+      hostKey: String
+    ) async throws -> TimeInterval {
+      let requestID = UUID()
+      let startedAt = Date()
+      try await IPadHTTPOriginCoordinator.shared.acquire(
+        hostKey: hostKey,
+        requestID: requestID,
+        priority: .critical
+      )
+      let elapsed = Date().timeIntervalSince(startedAt)
+      await IPadHTTPOriginCoordinator.shared.release(
+        hostKey: hostKey,
+        requestID: requestID,
+        statusCode: 200,
+        retryAfter: nil
+      )
+      return elapsed
+    }
+
+    private static func verifyCriticalPriorityAfterRateLimitForTesting() async throws {
+      let hostKey = "https://priority-\(UUID().uuidString).example:443"
+      let limiterID = UUID()
+      try await IPadHTTPOriginCoordinator.shared.acquire(
+        hostKey: hostKey,
+        requestID: limiterID,
+        priority: .critical
+      )
+      await IPadHTTPOriginCoordinator.shared.release(
+        hostKey: hostKey,
+        requestID: limiterID,
+        statusCode: 429,
+        retryAfter: 0
+      )
+      try await Task.sleep(nanoseconds: 300_000_000)
+
+      let blockerID = UUID()
+      try await IPadHTTPOriginCoordinator.shared.acquire(
+        hostKey: hostKey,
+        requestID: blockerID,
+        priority: .critical
+      )
+      let speculativeID = UUID()
+      let criticalID = UUID()
+      let firstPriority = try await withThrowingTaskGroup(
+        of: IPadSharedHTTPTransportOptions.Priority.self
+      ) { group in
+        group.addTask {
+          try await IPadHTTPOriginCoordinator.shared.acquire(
+            hostKey: hostKey,
+            requestID: speculativeID,
+            priority: .speculative
+          )
+          return .speculative
+        }
+        try await waitUntilQueuedForTesting(
+          hostKey: hostKey,
+          requestID: speculativeID
+        )
+
+        group.addTask {
+          try await IPadHTTPOriginCoordinator.shared.acquire(
+            hostKey: hostKey,
+            requestID: criticalID,
+            priority: .critical
+          )
+          return .critical
+        }
+        try await waitUntilQueuedForTesting(
+          hostKey: hostKey,
+          requestID: criticalID
+        )
+        await IPadHTTPOriginCoordinator.shared.release(
+          hostKey: hostKey,
+          requestID: blockerID,
+          statusCode: nil,
+          retryAfter: nil
+        )
+
+        guard let first = try await group.next() else {
+          throw IPadMediaURLResolverError.requestFailed(
+            "優先度probeが取得結果を返しませんでした"
+          )
+        }
+        guard first == .critical else {
+          throw IPadMediaURLResolverError.requestFailed(
+            "429後に先読みが再生要求を追い越しました"
+          )
+        }
+        await IPadHTTPOriginCoordinator.shared.release(
+          hostKey: hostKey,
+          requestID: criticalID,
+          statusCode: 200,
+          retryAfter: nil
+        )
+
+        // The speculative request must remain parked until a stable run of
+        // normal/critical successes clears the rate-limit strike. Feed the
+        // remaining three recovery successes through critical requests.
+        for _ in 0..<3 {
+          guard await IPadHTTPOriginCoordinator.shared.isWaitingForTesting(
+            hostKey: hostKey,
+            requestID: speculativeID
+          ) else {
+            throw IPadMediaURLResolverError.requestFailed(
+              "429後の回復中に先読みが早く再開しました"
+            )
+          }
+          let recoveryID = UUID()
+          try await IPadHTTPOriginCoordinator.shared.acquire(
+            hostKey: hostKey,
+            requestID: recoveryID,
+            priority: .critical
+          )
+          await IPadHTTPOriginCoordinator.shared.release(
+            hostKey: hostKey,
+            requestID: recoveryID,
+            statusCode: 200,
+            retryAfter: nil
+          )
+        }
+        guard let second = try await group.next() else {
+          throw IPadMediaURLResolverError.requestFailed(
+            "優先度probeの待機要求が完了しませんでした"
+          )
+        }
+        guard second == .speculative else {
+          throw IPadMediaURLResolverError.requestFailed(
+            "429後の先読み再開順序が不正です"
+          )
+        }
+        await IPadHTTPOriginCoordinator.shared.release(
+          hostKey: hostKey,
+          requestID: speculativeID,
+          statusCode: 200,
+          retryAfter: nil
+        )
+        return first
+      }
+      guard firstPriority == .critical else {
+        throw IPadMediaURLResolverError.requestFailed(
+          "429後に先読みが再生要求を追い越しました"
+        )
+      }
+    }
+
+    private static func waitUntilQueuedForTesting(
+      hostKey: String,
+      requestID: UUID
+    ) async throws {
+      for _ in 0..<100 {
+        if await IPadHTTPOriginCoordinator.shared.isWaitingForTesting(
+          hostKey: hostKey,
+          requestID: requestID
+        ) {
+          return
+        }
+        try await Task.sleep(nanoseconds: 5_000_000)
+      }
+      throw IPadMediaURLResolverError.requestFailed(
+        "優先度probeの待機要求を確認できませんでした"
+      )
+    }
+
+    private static func verifySlowAIMDRecoveryForTesting() async throws {
+      let hostKey = "https://aimd-\(UUID().uuidString).example:443"
+      let limiterID = UUID()
+      try await IPadHTTPOriginCoordinator.shared.acquire(
+        hostKey: hostKey,
+        requestID: limiterID,
+        priority: .critical
+      )
+      await IPadHTTPOriginCoordinator.shared.release(
+        hostKey: hostKey,
+        requestID: limiterID,
+        statusCode: 429,
+        retryAfter: 0
+      )
+      try await Task.sleep(nanoseconds: 300_000_000)
+
+      for successIndex in 1...4 {
+        let requestID = UUID()
+        try await IPadHTTPOriginCoordinator.shared.acquire(
+          hostKey: hostKey,
+          requestID: requestID,
+          priority: .critical
+        )
+        await IPadHTTPOriginCoordinator.shared.release(
+          hostKey: hostKey,
+          requestID: requestID,
+          statusCode: 200,
+          retryAfter: nil
+        )
+        let window = await IPadHTTPOriginCoordinator.shared
+          .congestionWindowForTesting(hostKey: hostKey)
+        let expectedWindow = successIndex < 4 ? 1.0 : 2.0
+        guard abs(window - expectedWindow) < 0.001 else {
+          throw IPadMediaURLResolverError.requestFailed(
+            "429後のAIMD回復が早すぎます"
+          )
+        }
+      }
+    }
+  #endif
+
+  private func removeEntryLocked(_ entry: Entry) {
+    entriesByID.removeValue(forKey: entry.id)
+    if entriesByKey[entry.key] === entry {
+      entriesByKey.removeValue(forKey: entry.key)
+    }
+    if let task = entry.task {
+      entryIDByTaskIdentifier.removeValue(forKey: task.taskIdentifier)
+    }
+  }
+
+  private func entry(for task: URLSessionTask) -> Entry? {
+    lock.lock()
+    defer { lock.unlock() }
+    guard let entryID = entryIDByTaskIdentifier[task.taskIdentifier] else {
+      return nil
+    }
+    return entriesByID[entryID]
+  }
+
+  private func containsEntry(_ entry: Entry) -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return entriesByID[entry.id] === entry
+  }
+
+  private static func requestKey(
+    for request: URLRequest,
+    options: IPadSharedHTTPTransportOptions
+  ) -> RequestKey {
+    let rawHeaders: [String: String] = request.allHTTPHeaderFields ?? [:]
+    let normalizedHeaders: [(name: String, value: String)] = rawHeaders.map {
+      (name: $0.key.lowercased(), value: $0.value)
+    }
+    let sortedHeaders: [(name: String, value: String)] = normalizedHeaders.sorted {
+      if $0.name == $1.name { return $0.value < $1.value }
+      return $0.name < $1.name
+    }
+    let serializedHeaders: [String] = sortedHeaders.map { header in
+      header.name + ":" + header.value
+    }
+    let headers = serializedHeaders.joined(separator: "\n")
+    return RequestKey(
+      method: request.httpMethod?.uppercased() ?? "GET",
+      url: request.url?.absoluteString ?? "",
+      headers: headers,
+      contextIdentity: options.requestContext?.sharedTransportIdentity,
+      policy: policyKey(options.resolutionPolicy),
+      redirectLimit: options.maximumRedirectCount,
+      timeoutMilliseconds: Int((options.timeout * 1_000).rounded()),
+      returnsAfterVideoResponse: options.returnsAfterVideoResponse,
+      requiresHTTPS: options.requiresHTTPS,
+      hlsDeliveryDirectives: options.hlsDeliveryDirectives
+    )
+  }
+
+  private static func policyKey(
+    _ policy: IPadMediaURLResolutionPolicy
+  ) -> String {
+    switch policy {
+    case .userSubmitted:
+      return "user"
+    case .publicDiscovered:
+      return "public"
+    case .visibleBrowserDiscovered(let origin):
+      return "visible:\(origin.absoluteString)"
+    case .submittedPageSameOrigin(let origin):
+      return "same-origin:\(origin.absoluteString)"
+    }
+  }
+
+  private static func hostKey(for url: URL?) -> String {
+    guard let url, let host = url.host?.lowercased() else { return "unknown" }
+    let scheme = url.scheme?.lowercased() ?? "https"
+    let port = url.port ?? (scheme == "https" ? 443 : 80)
+    return "\(scheme)://\(host):\(port)"
+  }
+
+  private static func retryAfterDelay(_ response: HTTPURLResponse) -> TimeInterval? {
+    guard let raw = response.value(forHTTPHeaderField: "Retry-After")?
+      .trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty
+    else { return nil }
+    if let seconds = TimeInterval(raw), seconds.isFinite, seconds >= 0 {
+      return min(120, seconds)
+    }
+    for format in [
+      "EEE',' dd MMM yyyy HH':'mm':'ss z",
+      "EEEE',' dd-MMM-yy HH':'mm':'ss z",
+      "EEE MMM d HH':'mm':'ss yyyy",
+    ] {
+      let formatter = DateFormatter()
+      formatter.locale = Locale(identifier: "en_US_POSIX")
+      formatter.timeZone = TimeZone(secondsFromGMT: 0)
+      formatter.dateFormat = format
+      if let date = formatter.date(from: raw) {
+        return max(0, min(120, date.timeIntervalSinceNow))
+      }
+    }
+    return nil
+  }
+
+  private static func appendingHLSDeliveryDirectives(
+    _ directives: String?,
+    to url: URL
+  ) -> URL? {
+    guard let directives else { return url }
+    var incoming: [String: String] = [:]
+    for pair in directives.split(separator: "&") {
+      let components = pair.split(separator: "=", maxSplits: 1)
+      guard components.count == 2 else { return nil }
+      incoming[String(components[0])] = String(components[1])
+    }
+    var components = URLComponents(url: url, resolvingAgainstBaseURL: true)
+    var queryItems = components?.queryItems ?? []
+    var existing: [String: String] = [:]
+    for item in queryItems where incoming[item.name] != nil {
+      guard existing[item.name] == nil else { return nil }
+      existing[item.name] = item.value ?? ""
+    }
+    if !existing.isEmpty {
+      guard existing == incoming else { return nil }
+      return url
+    }
+    queryItems.append(contentsOf: incoming.sorted { $0.key < $1.key }.map {
+      URLQueryItem(name: $0.key, value: $0.value)
+    })
+    components?.queryItems = queryItems
+    return components?.url
+  }
+}
+
+extension IPadSharedHTTPTransport: URLSessionDataDelegate {
   func urlSession(
     _: URLSession,
-    dataTask _: URLSessionDataTask,
+    dataTask: URLSessionDataTask,
     didReceive response: URLResponse,
     completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
   ) {
-    guard let httpResponse = response as? HTTPURLResponse else {
+    guard let entry = entry(for: dataTask),
+      let httpResponse = response as? HTTPURLResponse
+    else {
       completionHandler(.cancel)
-      finish(.failure(IPadMediaURLResolverError.requestFailed("HTTP応答ではありません")))
+      if let entry = entry(for: dataTask) {
+        finish(
+          entryID: entry.id,
+          result: .failure(IPadSharedHTTPTransportError.missingResponse),
+          cancelTask: true
+        )
+      }
+      return
+    }
+    guard
+      IPadMediaURLResolver.sanitizedAbsoluteHTTPURL(httpResponse.url ?? entry.request.url!)
+        != nil,
+      !entry.options.requiresHTTPS
+        || httpResponse.url?.scheme?.lowercased() == "https"
+    else {
+      completionHandler(.cancel)
+      finish(
+        entryID: entry.id,
+        result: .failure(IPadSharedHTTPTransportError.unsafeURL),
+        cancelTask: true
+      )
       return
     }
     if let error = IPadMediaURLResolver.interactionChallengeError(
       response: httpResponse
     ) {
       completionHandler(.cancel)
-      finish(.failure(error))
+      finish(entryID: entry.id, result: .failure(error), cancelTask: true)
       return
     }
-    if returnsAfterVideoResponse,
+    lock.lock()
+    entry.response = httpResponse
+    entry.statusCode = httpResponse.statusCode
+    entry.retryAfter = Self.retryAfterDelay(httpResponse)
+    let maximumResponseBytes = entry.maximumResponseBytes
+    lock.unlock()
+    if entry.options.returnsAfterVideoResponse,
       httpResponse.mimeType?.lowercased().hasPrefix("video/") == true
     {
       completionHandler(.cancel)
-      finish(.success(IPadHTTPPayload(data: Data(), response: httpResponse)))
+      finish(
+        entryID: entry.id,
+        result: .success(
+          IPadSharedHTTPPayload(data: Data(), response: httpResponse)
+        ),
+        cancelTask: true
+      )
       return
     }
-    lock.lock()
-    let responseBodyExpected = expectsResponseBody
-    lock.unlock()
-    if responseBodyExpected,
+    if entry.request.httpMethod?.uppercased() != "HEAD",
       httpResponse.expectedContentLength > Int64(maximumResponseBytes)
     {
       completionHandler(.cancel)
-      finish(.failure(IPadMediaURLResolverError.responseTooLarge(maximumResponseBytes)))
+      finish(
+        entryID: entry.id,
+        result: .failure(
+          IPadSharedHTTPTransportError.responseTooLarge(maximumResponseBytes)
+        ),
+        cancelTask: true
+      )
       return
     }
-    lock.lock()
-    self.response = httpResponse
-    lock.unlock()
     completionHandler(.allow)
   }
 
-  func urlSession(_: URLSession, dataTask _: URLSessionDataTask, didReceive data: Data) {
+  func urlSession(
+    _: URLSession,
+    dataTask: URLSessionDataTask,
+    didReceive data: Data
+  ) {
+    guard let entry = entry(for: dataTask) else { return }
     lock.lock()
-    let wouldOverflow = !didFinish && data.count > maximumResponseBytes - receivedData.count
-    if !didFinish, !wouldOverflow { receivedData.append(data) }
+    let wouldOverflow = data.count > entry.maximumResponseBytes - entry.data.count
+    if !wouldOverflow { entry.data.append(data) }
+    let maximumResponseBytes = entry.maximumResponseBytes
     lock.unlock()
     if wouldOverflow {
-      finish(.failure(IPadMediaURLResolverError.responseTooLarge(maximumResponseBytes)))
+      finish(
+        entryID: entry.id,
+        result: .failure(
+          IPadSharedHTTPTransportError.responseTooLarge(maximumResponseBytes)
+        ),
+        cancelTask: true
+      )
     }
   }
 
@@ -3110,11 +4577,37 @@ extension IPadBoundedHTTPRequest: URLSessionDataDelegate {
     newRequest request: URLRequest,
     completionHandler: @escaping (URLRequest?) -> Void
   ) {
-    guard let destination = request.url,
-      IPadMediaURLResolver.sanitizedAbsoluteHTTPURL(destination) != nil
+    guard let entry = entry(for: task) else {
+      completionHandler(nil)
+      return
+    }
+    guard let rawDestination = request.url,
+      let safeDestination = IPadMediaURLResolver.sanitizedAbsoluteHTTPURL(
+        rawDestination
+      ),
+      (!entry.options.requiresHTTPS
+        || safeDestination.scheme?.lowercased() == "https"),
+      IPadMediaURLResolver.isURL(
+        safeDestination,
+        allowedBy: entry.options.resolutionPolicy
+      ),
+      !IPadMediaURLResolver.isDisallowedDiscoveredLocalURL(
+        safeDestination,
+        pageURL: task.currentRequest?.url ?? entry.request.url!
+      ),
+      !(task.currentRequest?.url?.scheme?.lowercased() == "https"
+        && safeDestination.scheme?.lowercased() == "http"),
+      let destination = Self.appendingHLSDeliveryDirectives(
+        entry.options.hlsDeliveryDirectives,
+        to: safeDestination
+      )
     else {
       completionHandler(nil)
-      finish(.failure(IPadMediaURLResolverError.unsafeURL))
+      finish(
+        entryID: entry.id,
+        result: .failure(IPadSharedHTTPTransportError.unsafeURL),
+        cancelTask: true
+      )
       return
     }
     if let error = IPadMediaURLResolver.interactionChallengeError(
@@ -3122,61 +4615,163 @@ extension IPadBoundedHTTPRequest: URLSessionDataDelegate {
       destinationURL: destination
     ) {
       completionHandler(nil)
-      finish(.failure(error))
-      return
-    }
-    if !IPadMediaURLResolver.isURL(destination, allowedBy: resolutionPolicy) {
-      completionHandler(nil)
-      finish(.failure(IPadMediaURLResolverError.unsafeURL))
-      return
-    }
-    if let sourceURL = task.currentRequest?.url,
-      IPadMediaURLResolver.isDisallowedDiscoveredLocalURL(
-        destination,
-        pageURL: sourceURL
-      )
-    {
-      completionHandler(nil)
-      finish(.failure(IPadMediaURLResolverError.unsafeURL))
-      return
-    }
-    let sourceScheme = task.currentRequest?.url?.scheme?.lowercased()
-    let destinationScheme = destination.scheme?.lowercased()
-    if sourceScheme == "https", destinationScheme == "http" {
-      completionHandler(nil)
-      finish(.failure(IPadMediaURLResolverError.insecureRedirect))
+      finish(entryID: entry.id, result: .failure(error), cancelTask: true)
       return
     }
     lock.lock()
-    redirectCount += 1
-    let tooManyRedirects = redirectCount > maximumRedirectCount
+    entry.redirectCount += 1
+    let tooManyRedirects = entry.redirectCount > entry.options.maximumRedirectCount
     lock.unlock()
-    if tooManyRedirects {
+    guard !tooManyRedirects else {
       completionHandler(nil)
-      finish(.failure(IPadMediaURLResolverError.tooManyRedirects))
-    } else {
-      Task {
-        await requestContext?.updateCookies(from: response)
-        var redirectedRequest = request
-        requestContext?.applying(to: &redirectedRequest)
-        completionHandler(redirectedRequest)
+      finish(
+        entryID: entry.id,
+        result: .failure(IPadSharedHTTPTransportError.tooManyRedirects),
+        cancelTask: true
+      )
+      return
+    }
+    Task {
+      await entry.options.requestContext?.updateCookies(from: response)
+      var redirected = request
+      redirected.url = destination
+      redirected.httpMethod = entry.request.httpMethod
+      redirected.timeoutInterval = entry.options.timeout
+      redirected.setValue(
+        entry.request.value(forHTTPHeaderField: "Range"),
+        forHTTPHeaderField: "Range"
+      )
+      entry.options.requestContext?.applying(to: &redirected)
+      completionHandler(redirected)
+    }
+  }
+
+  func urlSession(
+    _: URLSession,
+    task: URLSessionTask,
+    didCompleteWithError error: Error?
+  ) {
+    guard let entry = entry(for: task) else { return }
+    if let error {
+      finish(entryID: entry.id, result: .failure(error))
+      return
+    }
+    lock.lock()
+    let response = entry.response
+    let data = entry.data
+    lock.unlock()
+    guard let response else {
+      finish(
+        entryID: entry.id,
+        result: .failure(IPadSharedHTTPTransportError.missingResponse)
+      )
+      return
+    }
+    finish(
+      entryID: entry.id,
+      result: .success(IPadSharedHTTPPayload(data: data, response: response))
+    )
+  }
+}
+
+private final class IPadBoundedHTTPRequest: @unchecked Sendable {
+  private let maximumResponseBytes: Int
+  private let maximumRedirectCount: Int
+  private let timeout: TimeInterval
+  private let returnsAfterVideoResponse: Bool
+  private let resolutionPolicy: IPadMediaURLResolutionPolicy
+  private let requestContext: IPadMediaRequestContext?
+  private let priority: IPadSharedHTTPTransportOptions.Priority
+  private let requiresHTTPS: Bool
+  private let lock = NSLock()
+  private var cancellation: IPadSharedHTTPRequestCancellation?
+  private var cancellationRequested = false
+
+  init(
+    maximumResponseBytes: Int,
+    maximumRedirectCount: Int,
+    timeout: TimeInterval,
+    returnsAfterVideoResponse: Bool = false,
+    resolutionPolicy: IPadMediaURLResolutionPolicy = .userSubmitted,
+    requestContext: IPadMediaRequestContext? = nil,
+    priority: IPadSharedHTTPTransportOptions.Priority = .normal,
+    requiresHTTPS: Bool = false
+  ) {
+    self.maximumResponseBytes = maximumResponseBytes
+    self.maximumRedirectCount = maximumRedirectCount
+    self.timeout = timeout
+    self.returnsAfterVideoResponse = returnsAfterVideoResponse
+    self.resolutionPolicy = resolutionPolicy
+    self.requestContext = requestContext
+    self.priority = priority
+    self.requiresHTTPS = requiresHTTPS
+  }
+
+  func start(_ request: URLRequest) async throws -> IPadHTTPPayload {
+    try Task.checkCancellation()
+    let cancellation = IPadSharedHTTPRequestCancellation()
+    guard install(cancellation: cancellation) else {
+      throw CancellationError()
+    }
+    defer {
+      cancellation.clear()
+      clear(cancellation: cancellation)
+    }
+    do {
+      let payload = try await IPadSharedHTTPTransport.shared.data(
+        for: request,
+        options: IPadSharedHTTPTransportOptions(
+          maximumResponseBytes: maximumResponseBytes,
+          maximumRedirectCount: maximumRedirectCount,
+          timeout: timeout,
+          returnsAfterVideoResponse: returnsAfterVideoResponse,
+          resolutionPolicy: resolutionPolicy,
+          requestContext: requestContext,
+          requiresHTTPS: requiresHTTPS,
+          priority: priority
+        ),
+        cancellation: cancellation
+      )
+      return IPadHTTPPayload(data: payload.data, response: payload.response)
+    } catch let error as IPadSharedHTTPTransportError {
+      switch error {
+      case .unsafeURL:
+        throw IPadMediaURLResolverError.unsafeURL
+      case .insecureRedirect:
+        throw IPadMediaURLResolverError.insecureRedirect
+      case .tooManyRedirects:
+        throw IPadMediaURLResolverError.tooManyRedirects
+      case .responseTooLarge(let maximumBytes):
+        throw IPadMediaURLResolverError.responseTooLarge(maximumBytes)
+      case .missingResponse:
+        throw IPadMediaURLResolverError.requestFailed("応答がありません")
       }
     }
   }
 
-  func urlSession(_: URLSession, task _: URLSessionTask, didCompleteWithError error: Error?) {
-    if let error {
-      finish(.failure(error))
-      return
-    }
+  private func install(
+    cancellation newCancellation: IPadSharedHTTPRequestCancellation
+  ) -> Bool {
     lock.lock()
-    let response = response
-    let data = receivedData
+    defer { lock.unlock() }
+    guard !cancellationRequested else { return false }
+    cancellation = newCancellation
+    return true
+  }
+
+  private func clear(
+    cancellation completedCancellation: IPadSharedHTTPRequestCancellation
+  ) {
+    lock.lock()
+    if cancellation === completedCancellation { cancellation = nil }
     lock.unlock()
-    guard let response else {
-      finish(.failure(IPadMediaURLResolverError.requestFailed("応答がありません")))
-      return
-    }
-    finish(.success(IPadHTTPPayload(data: data, response: response)))
+  }
+
+  fileprivate func cancel() {
+    lock.lock()
+    cancellationRequested = true
+    let cancellation = cancellation
+    lock.unlock()
+    cancellation?.cancel()
   }
 }

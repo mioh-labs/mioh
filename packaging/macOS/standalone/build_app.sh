@@ -101,6 +101,7 @@ xcrun swiftc \
   "$PACKAGE_DIR/IPadAuthenticatedMediaProxy.swift" \
   "$PACKAGE_DIR/IPadMPEGTSRemuxer.swift" \
   "$PACKAGE_DIR/IPadInteractiveMediaBrowser.swift" \
+  "$PACKAGE_DIR/MacChildProcessPipe.swift" \
   "$PACKAGE_DIR/MiohApp.swift" \
   "$PACKAGE_DIR/MacMediaBrowser.swift" \
   "$PACKAGE_DIR/MacHLSRealtimePipeline.swift" \
@@ -137,6 +138,7 @@ xcrun swiftc \
   -framework CoreVideo \
   -framework VideoToolbox \
   "$ROOT/packages/MiohRemoteKit/Sources/MiohRemoteKit/MiohHTTPRangeAsset.swift" \
+  "$PACKAGE_DIR/MacChildProcessPipe.swift" \
   "$PACKAGE_DIR/PreviewVideoToolboxEncoder.swift" \
   "$PACKAGE_DIR/NativePreviewPipeline.swift" \
   -o "$RESOURCES/bin/mioh-native-coreai-preview"
