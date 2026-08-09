@@ -3,7 +3,6 @@ set -euo pipefail
 
 ROOT="${0:A:h:h:h:h}"
 PACKAGE_DIR="$ROOT/packaging/macOS/standalone"
-REMOTE_APP_SOURCE_DIR="$ROOT/apps/MiohRemote/MiohRemote"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build/macos-standalone}"
 COREAI_DISTRIBUTION="${COREAI_DISTRIBUTION:-dedicated}"
 APP_BASENAME="${APP_BASENAME:-mioh}"
@@ -96,12 +95,12 @@ xcrun swiftc \
   -framework SceneKit \
   -framework WebKit \
   "${APP_SWIFT_FLAGS[@]}" \
-  "$REMOTE_APP_SOURCE_DIR/IPadBrowserLibraryStore.swift" \
-  "$REMOTE_APP_SOURCE_DIR/IPadWebMediaDiscovery.swift" \
-  "$REMOTE_APP_SOURCE_DIR/IPadMediaURLResolver.swift" \
-  "$REMOTE_APP_SOURCE_DIR/IPadAuthenticatedMediaProxy.swift" \
-  "$REMOTE_APP_SOURCE_DIR/IPadMPEGTSRemuxer.swift" \
-  "$REMOTE_APP_SOURCE_DIR/IPadInteractiveMediaBrowser.swift" \
+  "$PACKAGE_DIR/IPadBrowserLibraryStore.swift" \
+  "$PACKAGE_DIR/IPadWebMediaDiscovery.swift" \
+  "$PACKAGE_DIR/IPadMediaURLResolver.swift" \
+  "$PACKAGE_DIR/IPadAuthenticatedMediaProxy.swift" \
+  "$PACKAGE_DIR/IPadMPEGTSRemuxer.swift" \
+  "$PACKAGE_DIR/IPadInteractiveMediaBrowser.swift" \
   "$PACKAGE_DIR/MiohApp.swift" \
   "$PACKAGE_DIR/MacMediaBrowser.swift" \
   "$PACKAGE_DIR/MacHLSRealtimePipeline.swift" \
@@ -608,6 +607,7 @@ else
   print "Modeless distribution: skipping bundled model assets and Core ML/Core AI exports"
 fi
 
+if [[ "$MIOH_MODELESS_DISTRIBUTION" != 1 ]]; then
 # Cluster identity is derived from portable source assets, never from the
 # machine-specific compiled .aimodelc/.mlmodelc layout. Dedicated Macs and
 # portable iPad/Mac Workers can therefore compare the same model identity.
@@ -804,6 +804,7 @@ destination.write_text(
     encoding="utf-8",
 )
 PY
+fi
 
 cp "$ROOT/LICENSE.md" "$RESOURCES/LICENSE.md"
 ditto "$ROOT/LICENSES" "$RESOURCES/LICENSES"
