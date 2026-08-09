@@ -77,6 +77,7 @@ model_weights/hf2500-plus-fc2-forward-consistency-1500-ema.pth
 model_weights/lada_mosaic_restoration_model_generic_v1.2_full.pth
 
 # Local evaluation artifacts generated while tuning the restoration pipeline
+output/
 output/evaluation/seedvr2_mida024_maskonly_*/
 output/evaluation/seedvr2_mida024_maskonly_latest.txt
 
