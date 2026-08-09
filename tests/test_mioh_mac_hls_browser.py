@@ -7,8 +7,7 @@ PACKAGE = ROOT / "packaging" / "macOS" / "standalone"
 APP_SOURCE = PACKAGE / "MiohApp.swift"
 PLAYER_SOURCE = PACKAGE / "RealtimePlayer.swift"
 BUILD_SCRIPT = PACKAGE / "build_app.sh"
-REMOTE_APP_SOURCE = ROOT / "apps" / "MiohRemote" / "MiohRemote"
-INTERACTIVE_BROWSER_SOURCE = REMOTE_APP_SOURCE / "IPadInteractiveMediaBrowser.swift"
+INTERACTIVE_BROWSER_SOURCE = PACKAGE / "IPadInteractiveMediaBrowser.swift"
 
 
 class MacHLSBrowserContractTests(unittest.TestCase):
