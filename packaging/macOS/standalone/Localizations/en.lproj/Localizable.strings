@@ -50,6 +50,8 @@
 "再生用検出モデル" = "Preview Detection Model";
 "リアルタイム最適化" = "Realtime Optimization";
 "復元は維持し、再生中だけROIエンハンサーと拡大後処理を省略します" = "Keeps restoration enabled while skipping the ROI enhancer and upscaled post-processing during playback.";
+"復元は維持し、再生中は合成パラメータとROIエンハンサーを完全バイパスします" = "Keeps restoration enabled while fully bypassing composition parameters and the ROI enhancer during playback.";
+"復元は維持し、再生中は合成エフェクトとROIエンハンサーをバイパスします" = "Keeps restoration enabled while bypassing composition effects and the ROI enhancer during playback.";
 "モデルパス" = "Model Path";
 "カスタム" = "Custom";
 "最大クリップ長を指定" = "Specify Maximum Clip Length";

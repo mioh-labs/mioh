@@ -265,12 +265,19 @@ struct MacMediaBrowserView: View {
 
       HSplitView {
         IPadInteractiveBrowserWebView(browser: browser)
-          .frame(minWidth: 500, minHeight: 430)
+          .frame(minWidth: 500, minHeight: 430, maxHeight: .infinity)
         candidateList
-          .frame(minWidth: 250, idealWidth: 310, maxWidth: 390)
+          .frame(
+            minWidth: 250,
+            idealWidth: 310,
+            maxWidth: 390,
+            maxHeight: .infinity
+          )
       }
+      .frame(maxHeight: .infinity)
     }
     .padding(.vertical, 10)
+    .frame(maxHeight: .infinity)
     .onChange(of: browser.successfulPageVisit?.revision) { _, _ in
       controller.recordSuccessfulVisit(browser.successfulPageVisit)
     }
@@ -375,5 +382,6 @@ struct MacMediaBrowserView: View {
       }
     }
     .padding(10)
+    .frame(maxHeight: .infinity, alignment: .top)
   }
 }

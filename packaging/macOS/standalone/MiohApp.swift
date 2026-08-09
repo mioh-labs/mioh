@@ -834,6 +834,13 @@ final class RestorationRunner: ObservableObject {
   var previewDetectionModels: [String] { capabilities.previewDetectionModels }
   var supportsPythonEngine: Bool { capabilities.bundlesPythonRuntime }
   var usesPythonEngine: Bool { supportsPythonEngine && restorationEngine == "python" }
+  var preservesRealtimeCompositeParameters: Bool {
+#if MIOH_PORTABLE_COREAI
+    return false
+#else
+    return true
+#endif
+  }
 
   /// Resolve availability through the same asset lookup used at execution
   /// time.  The Web remote can therefore show every supported identifier but
@@ -2332,7 +2339,8 @@ final class RestorationRunner: ObservableObject {
     let previewModel = try resolvedPreviewRestorationModel(in: resources)
     try rejectUnsupportedCoreAIModel(previewModel)
     let detection = try resolvedPreviewDetectionModel(in: resources)
-    if !previewRealtimeOptimization && roiEnhancer != "none" {
+    let skipsCompositeParameters = previewRealtimeOptimization
+    if !skipsCompositeParameters && roiEnhancer != "none" {
       try rejectUnsupportedCoreAIModel(roiEnhancerModel)
     }
     var args = [
@@ -2375,19 +2383,19 @@ final class RestorationRunner: ObservableObject {
     }
     add(&args, "--restore-temporal-overlap", restoreTemporalOverlap)
     args.append(restoreCrossfade ? "--enable-crossfade" : "--disable-crossfade")
-    add(&args, "--sharpen-strength", sharpenStrength)
-    add(&args, "--detail-boost", detailBoost)
+    add(&args, "--sharpen-strength", skipsCompositeParameters ? 0 : sharpenStrength)
+    add(&args, "--detail-boost", skipsCompositeParameters ? 0 : detailBoost)
     add(&args, "--blend-feather", blendFeather)
-    add(&args, "--texture-mix", textureMix)
-    add(&args, "--smooth-strength", smoothStrength)
-    add(&args, "--roi-enhancer", previewRealtimeOptimization ? "none" : roiEnhancer)
-    if !previewRealtimeOptimization {
+    add(&args, "--texture-mix", skipsCompositeParameters ? 0 : textureMix)
+    add(&args, "--smooth-strength", skipsCompositeParameters ? 0 : smoothStrength)
+    add(&args, "--roi-enhancer", skipsCompositeParameters ? "none" : roiEnhancer)
+    if !skipsCompositeParameters {
       addOptional(&args, "--roi-enhancer-model", roiEnhancerModel)
     }
     add(&args, "--roi-enhancer-scale", roiEnhancerScale)
-    add(&args, "--roi-enhancer-strength", previewRealtimeOptimization ? 0 : roiEnhancerStrength)
+    add(&args, "--roi-enhancer-strength", skipsCompositeParameters ? 0 : roiEnhancerStrength)
     add(&args, "--roi-enhancer-tile", roiEnhancerTile)
-    add(&args, "--effect-upscale", previewRealtimeOptimization ? 1 : effectUpscale)
+    add(&args, "--effect-upscale", skipsCompositeParameters ? 1 : effectUpscale)
     add(&args, "--detection-empty-lookahead", detectionEmptyLookahead)
     addFlag(&args, "--detect-face-mosaics", detectFaceMosaics)
     add(&args, "--buffer-limit", previewBufferLimit)
@@ -3197,10 +3205,16 @@ final class RestorationRunner: ObservableObject {
     }
     let selectedPreviewDetectionModel = previewDetectionModel
     try rejectUnsupportedCoreAIModel(selectedPreviewDetectionModel)
-    let effectiveEnhancerStrength = previewRealtimeOptimization
+    let skipsCompositeParameters = previewRealtimeOptimization
+    let effectiveEnhancerStrength = skipsCompositeParameters
       ? 0
       : roiEnhancerStrength
-    let effectiveUpscale = previewRealtimeOptimization ? 1 : effectUpscale
+    let effectiveUpscale = skipsCompositeParameters ? 1 : effectUpscale
+    let effectiveBlendFeather = blendFeather
+    let effectiveSharpenStrength = skipsCompositeParameters ? 0 : sharpenStrength
+    let effectiveDetailBoost = skipsCompositeParameters ? 0 : detailBoost
+    let effectiveTextureMix = skipsCompositeParameters ? 0 : textureMix
+    let effectiveSmoothStrength = skipsCompositeParameters ? 0 : smoothStrength
     let executable = resources.appendingPathComponent(
       "bin/mioh-native-coreai-preview"
     )
@@ -3300,11 +3314,11 @@ final class RestorationRunner: ObservableObject {
       temporalOverlap: previewOverlap,
       ringCapacity: max(temporalFrames * 2, 24),
       confidenceThreshold: detection.confidenceThreshold,
-      blendFeather: Float(blendFeather),
-      sharpenStrength: Float(sharpenStrength),
-      detailBoost: Float(detailBoost),
-      textureMix: Float(textureMix),
-      smoothStrength: Float(smoothStrength),
+      blendFeather: Float(effectiveBlendFeather),
+      sharpenStrength: Float(effectiveSharpenStrength),
+      detailBoost: Float(effectiveDetailBoost),
+      textureMix: Float(effectiveTextureMix),
+      smoothStrength: Float(effectiveSmoothStrength),
       effectUpscale: effectiveUpscale,
       roiEnhancerModel: nativeEnhancer?.url.path,
       roiEnhancerStrength: nativeEnhancer == nil ? 0 : Float(effectiveEnhancerStrength),
