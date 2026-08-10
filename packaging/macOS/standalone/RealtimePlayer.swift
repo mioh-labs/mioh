@@ -1005,6 +1005,7 @@ final class RealtimePlayerController: ObservableObject {
   private var hlsProducer: MacHLSRealtimeProducer?
   private var hlsProducerRetirementTask: Task<Void, Never>?
   private var hlsMediaProxy: IPadAuthenticatedMediaProxy?
+  private var hlsAVFoundationCapture: MacHLSAVFoundationCapture?
   private var hlsSourceIsReady = false
   private var hlsInitialSeekCompleted = false
   private var hlsSourceReady = false
@@ -1536,13 +1537,19 @@ final class RealtimePlayerController: ObservableObject {
       streamingEventConsumer?(.reset(streaming))
 
       let useSafariCompatibleHLS = runner.previewUseSafariCompatibleHLS
+      let requestedHLSQuality = PreviewHLSQuality(
+        rawValue: runner.previewHLSQuality
+      ) ?? .automatic
+      let safariCompatiblePlaybackURL = requestedHLSQuality == .automatic
+        ? source.playbackURL
+        : source.mediaURL
       let avFoundationCapture: MacHLSAVFoundationCapture?
       let proxy: IPadAuthenticatedMediaProxy?
       if useSafariCompatibleHLS {
         // This compatibility mode never downloads media segments directly.
         // One AVURLAsset backs both the muted capture player and audible player.
         avFoundationCapture = MacHLSAVFoundationCapture(
-          url: source.playbackURL,
+          url: safariCompatiblePlaybackURL,
           outputDirectory: session.appendingPathComponent(
             "avfoundation-capture",
             isDirectory: true
@@ -1551,7 +1558,8 @@ final class RealtimePlayerController: ObservableObject {
           duration: availableDuration,
           isLive: playlist.isLive,
           generation: startingGeneration,
-          segmentSeconds: previewSegmentSeconds
+          segmentSeconds: previewSegmentSeconds,
+          forwardBufferSeconds: runner.previewBufferLimit
         )
         proxy = nil
         hlsMediaProxy = nil
@@ -1573,6 +1581,7 @@ final class RealtimePlayerController: ObservableObject {
         proxy = createdProxy
         hlsMediaProxy = createdProxy
       }
+      hlsAVFoundationCapture = avFoundationCapture
       let producer = MacHLSRealtimeProducer(
         source: source,
         runner: runner,
@@ -1582,6 +1591,7 @@ final class RealtimePlayerController: ObservableObject {
         generation: startingGeneration,
         resourceLoader: selectedResourceLoader,
         avFoundationCapture: avFoundationCapture,
+        allowsVariantFallback: requestedHLSQuality == .automatic,
         log: { [weak runner] text in
           Task { @MainActor in runner?.appendExternalLog(text) }
         }
@@ -1649,7 +1659,8 @@ final class RealtimePlayerController: ObservableObject {
             width: 1_920,
             height: 1_080
           )
-          sourceItem.preferredForwardBufferDuration = playlist.isLive
+          sourceItem.preferredForwardBufferDuration =
+            playlist.isLive || useSafariCompatibleHLS
             ? max(2, runner.previewBufferLimit)
             : min(6, max(2, runner.previewBufferLimit))
           var sourceItemInstalled = false
@@ -2274,10 +2285,11 @@ final class RealtimePlayerController: ObservableObject {
       return
     }
     if hlsSource != nil {
-      let sourceBufferSeconds = isLiveHLSInput
+      let sourceBufferSeconds = isLiveHLSInput || hlsAVFoundationCapture != nil
         ? max(2, seconds)
         : min(6, max(2, seconds))
       sourcePlayer.currentItem?.preferredForwardBufferDuration = sourceBufferSeconds
+      hlsAVFoundationCapture?.setForwardBufferDuration(seconds)
       hlsProducer?.updateOutputBufferLimits(hlsOutputBufferLimits(for: seconds))
       return
     }
@@ -2342,6 +2354,7 @@ final class RealtimePlayerController: ObservableObject {
     hlsProducer = nil
     hlsMediaProxy?.stop()
     hlsMediaProxy = nil
+    hlsAVFoundationCapture = nil
     if !preserveHLSSelection {
       hlsSource = nil
     }

@@ -1358,6 +1358,7 @@ struct IPadMediaURLResolver: Sendable {
   let maximumCumulativeResponseBytes: Int
   let resolutionTimeout: TimeInterval
   let resourceLoader: (any IPadHLSResourceLoading)?
+  let allowsAES128HLS: Bool
 
   init(
     maximumResponseBytes: Int = 2 * 1_024 * 1_024,
@@ -1366,7 +1367,8 @@ struct IPadMediaURLResolver: Sendable {
     maximumRequestCount: Int = 24,
     maximumCumulativeResponseBytes: Int = 8 * 1_024 * 1_024,
     resolutionTimeout: TimeInterval = 60,
-    resourceLoader: (any IPadHLSResourceLoading)? = nil
+    resourceLoader: (any IPadHLSResourceLoading)? = nil,
+    allowsAES128HLS: Bool = false
   ) {
     self.maximumResponseBytes = max(1_024, maximumResponseBytes)
     self.maximumRedirectCount = max(0, maximumRedirectCount)
@@ -1378,6 +1380,7 @@ struct IPadMediaURLResolver: Sendable {
     )
     self.resolutionTimeout = max(2, resolutionTimeout)
     self.resourceLoader = resourceLoader
+    self.allowsAES128HLS = allowsAES128HLS
   }
 
   func resolve(
@@ -2142,7 +2145,10 @@ struct IPadMediaURLResolver: Sendable {
     guard let text = String(data: payload.data, encoding: .utf8) else {
       throw IPadMediaURLResolverError.invalidPlaylist("UTF-8ではありません")
     }
-    try Self.rejectProtectedPlaylist(text)
+    try Self.rejectProtectedPlaylist(
+      text,
+      allowsAES128HLS: allowsAES128HLS
+    )
 
     let variants = try Self.parseMasterVariants(text, relativeTo: finalURL)
     let audioRenditions = try Self.parseMasterAudioRenditions(
@@ -2802,7 +2808,10 @@ struct IPadMediaURLResolver: Sendable {
     }
   }
 
-  private static func rejectProtectedPlaylist(_ text: String) throws {
+  private static func rejectProtectedPlaylist(
+    _ text: String,
+    allowsAES128HLS: Bool
+  ) throws {
     for rawLine in text.components(separatedBy: .newlines) {
       let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
       let uppercased = line.uppercased()
@@ -2811,7 +2820,11 @@ struct IPadMediaURLResolver: Sendable {
       }
       if uppercased.hasPrefix("#EXT-X-KEY:") {
         let attributes = parseAttributeList(String(line.dropFirst("#EXT-X-KEY:".count)))
-        if attributes["METHOD"]?.uppercased() != "NONE" {
+        let method = attributes["METHOD"]?.uppercased()
+        let isSupportedAES128 = allowsAES128HLS
+          && method == "AES-128"
+          && attributes["KEYFORMAT"] == nil
+        if method != "NONE" && !isSupportedAES128 {
           throw IPadMediaURLResolverError.encryptedPlaylist
         }
       }

@@ -521,6 +521,7 @@ final class MacHLSRealtimeProducer {
   private let log: Logger
   private let resourceLoader: (any IPadHLSResourceLoading)?
   private let avFoundationCapture: MacHLSAVFoundationCapture?
+  private let allowsVariantFallback: Bool
 
   private var downloader: IPadHLSResourceDownloader?
   private var prefetchDownloader: IPadHLSResourceDownloader?
@@ -558,6 +559,7 @@ final class MacHLSRealtimeProducer {
     generation: Int,
     resourceLoader: (any IPadHLSResourceLoading)? = nil,
     avFoundationCapture: MacHLSAVFoundationCapture? = nil,
+    allowsVariantFallback: Bool = true,
     log: @escaping Logger
   ) {
     self.source = source
@@ -568,6 +570,7 @@ final class MacHLSRealtimeProducer {
     self.generation = generation
     self.resourceLoader = resourceLoader
     self.avFoundationCapture = avFoundationCapture
+    self.allowsVariantFallback = allowsVariantFallback
     self.log = log
   }
 
@@ -1165,7 +1168,8 @@ final class MacHLSRealtimeProducer {
             }
             browserRelayRetryCount = 0
             if Self.isHTTPRateLimit(error) {
-              if !playlist.isLive, !didAttemptVariantFallback,
+              if allowsVariantFallback, !playlist.isLive,
+                !didAttemptVariantFallback,
                 !sameOriginVariantFallbackRejected
               {
                 didAttemptVariantFallback = true

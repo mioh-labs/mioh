@@ -124,6 +124,7 @@ final class MacMediaBrowserController: ObservableObject {
         let selection = try await Self.preferredHLS(
           from: candidates,
           resourceLoader: resolutionResourceLoader,
+          allowsAES128HLS: runner.previewUseSafariCompatibleHLS,
           progress: { [weak self] text in
             guard let self,
               self.resolutionIsCurrent(
@@ -139,7 +140,15 @@ final class MacMediaBrowserController: ObservableObject {
           id,
           navigationGeneration: navigationGeneration
         ) else { throw CancellationError() }
-        let source = selection.source
+        let requestedQuality = PreviewHLSQuality(
+          rawValue: runner.previewHLSQuality
+        ) ?? .automatic
+        let source = try await Self.source(
+          selection.source,
+          constrainedTo: requestedQuality,
+          resourceLoader: resolutionResourceLoader,
+          allowsAES128HLS: runner.previewUseSafariCompatibleHLS
+        )
         guard source.kind == .hls, source.hlsPlaylist != nil else {
           throw MacMediaBrowserError.hlsRequired
         }
@@ -164,6 +173,10 @@ final class MacMediaBrowserController: ObservableObject {
           : "HLSを検出しました。区間を連結しながら復元再生します。"
         runner.appendExternalLog(
           "ブラウザ: HLS入力を確認しました（\(self.selectedSourceHost.isEmpty ? "配信元" : self.selectedSourceHost)）\n"
+        )
+        runner.appendExternalLog(
+          "HLS画質: \(requestedQuality.label) / "
+            + "選択 \(Self.qualityDescription(source))\n"
         )
         runner.appendExternalLog(
           "HLS通信: Safari/WebKitのダウンロード通信を使用します\n"
@@ -219,9 +232,48 @@ final class MacMediaBrowserController: ObservableObject {
       && !Task.isCancelled
   }
 
+  private nonisolated static func source(
+    _ source: IPadResolvedMediaSource,
+    constrainedTo quality: PreviewHLSQuality,
+    resourceLoader: any IPadHLSResourceLoading,
+    allowsAES128HLS: Bool
+  ) async throws -> IPadResolvedMediaSource {
+    guard let targetHeight = quality.targetHeight else { return source }
+    var selected = source
+    let resolver = IPadMediaURLResolver(
+      resourceLoader: resourceLoader,
+      allowsAES128HLS: allowsAES128HLS
+    )
+
+    while let currentHeight = selected.hlsPlaylist?.masterMetadata?.height,
+      currentHeight > targetHeight
+    {
+      try Task.checkCancellation()
+      guard let lower = try await resolver.resolveNextHLSVariant(for: selected)
+      else { break }
+      selected = lower
+    }
+    return selected
+  }
+
+  private nonisolated static func qualityDescription(
+    _ source: IPadResolvedMediaSource
+  ) -> String {
+    guard let metadata = source.hlsPlaylist?.masterMetadata else {
+      return "解像度不明"
+    }
+    if let width = metadata.width, let height = metadata.height,
+      width > 0, height > 0
+    {
+      return "\(width)x\(height)"
+    }
+    return "解像度不明"
+  }
+
   private nonisolated static func preferredHLS(
     from candidates: [IPadWebMediaCandidate],
     resourceLoader: any IPadHLSResourceLoading,
+    allowsAES128HLS: Bool,
     progress: @escaping @MainActor (String) -> Void
   ) async throws -> PreferredHLSSelection {
     var sources: [IPadResolvedMediaSource] = []
@@ -236,7 +288,8 @@ final class MacMediaBrowserController: ObservableObject {
       try Task.checkCancellation()
       do {
         let source = try await IPadMediaURLResolver(
-          resourceLoader: resourceLoader
+          resourceLoader: resourceLoader,
+          allowsAES128HLS: allowsAES128HLS
         ).resolve(
           candidate.url.absoluteString,
           policy: resolutionPolicy(for: candidate),
