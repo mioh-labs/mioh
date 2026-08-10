@@ -549,6 +549,10 @@ final class MacHLSRealtimeProducer {
   private let vodSteadyRestoreBatchCoreSegments = 18
   private let vodSteadyRestoreBatchTargetSeconds = 36.0
   private let vodSteadyRestoreBatchMaximumBytes: Int64 = 384 * 1_024 * 1_024
+  // AVFoundation capture arrives sequentially at 2x, unlike the fast path's
+  // already-prefetched VOD inventory. Four steady cores amortize model/process
+  // startup without waiting so long that the initial restored queue drains.
+  private let avFoundationSteadyRestoreBatchCoreSegments = 4
 
   init(
     source: IPadResolvedMediaSource,
@@ -1520,31 +1524,32 @@ final class MacHLSRealtimeProducer {
         }
 
         restorationWindow.append(source)
-        // The capture player runs a few seconds ahead of audible playback.
-        // Restore one core at a time with its immediate temporal neighbours so
-        // production remains comfortably faster than the 1x capture clock.
-        if restorationWindow.count == 2 {
+        while true {
+          let coreStartIndex = hasRestoredAnyWindow ? 1 : 0
+          guard let coreSegmentCount = avFoundationCoreSegmentCountIfReady(
+            restorationWindow,
+            coreStartIndex: coreStartIndex,
+            hasLeftContext: hasRestoredAnyWindow
+          ) else { break }
+          let coreEndIndex = coreStartIndex + coreSegmentCount - 1
           try await restoreWindow(
             restorationWindow,
-            coreIndex: 0,
+            coreStartIndex: coreStartIndex,
+            coreEndIndex: coreEndIndex,
             restoredDirectory: restoredDirectory,
             requestedStartSeconds: startSeconds,
             duration: duration,
             emit: emit
           )
+          // Retain the final emitted core as left context and the un-emitted
+          // look-ahead source as right context, matching the fast VOD path.
+          let retirementCount = hasRestoredAnyWindow
+            ? coreSegmentCount
+            : max(0, coreSegmentCount - 1)
+          let retired = Array(restorationWindow.prefix(retirementCount))
+          removeMaterializedSources(retired)
+          restorationWindow.removeFirst(retirementCount)
           hasRestoredAnyWindow = true
-        } else if restorationWindow.count == 3 {
-          try await restoreWindow(
-            restorationWindow,
-            coreIndex: 1,
-            restoredDirectory: restoredDirectory,
-            requestedStartSeconds: startSeconds,
-            duration: duration,
-            emit: emit
-          )
-          hasRestoredAnyWindow = true
-          let expired = restorationWindow.removeFirst()
-          try? FileManager.default.removeItem(at: expired.localURL)
         }
       }
 
@@ -1568,6 +1573,24 @@ final class MacHLSRealtimeProducer {
       restorationWindow.removeAll(keepingCapacity: false)
       throw error
     }
+  }
+
+  /// The Safari-compatible source cannot materialize eighteen intervals in a
+  /// burst like the fast downloader. Start with two cores for low latency, then
+  /// restore four cores per worker so model/process startup is paid once for
+  /// eight seconds of output while the 2x capture keeps filling independently.
+  private func avFoundationCoreSegmentCountIfReady(
+    _ sources: [RestorationSource],
+    coreStartIndex: Int,
+    hasLeftContext: Bool
+  ) -> Int? {
+    guard coreStartIndex >= 0, coreStartIndex < sources.count else { return nil }
+    let availableCoreCount = sources.count - coreStartIndex - 1
+    let requiredCount = hasLeftContext
+      ? avFoundationSteadyRestoreBatchCoreSegments
+      : vodInitialRestoreBatchCoreSegments
+    guard availableCoreCount >= requiredCount else { return nil }
+    return requiredCount
   }
 
   /// May be called from a controller's nonisolated deinitializer. The actual

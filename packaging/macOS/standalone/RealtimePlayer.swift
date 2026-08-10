@@ -1543,13 +1543,9 @@ final class RealtimePlayerController: ObservableObject {
       let safariCompatiblePlaybackURL = requestedHLSQuality == .automatic
         ? source.playbackURL
         : source.mediaURL
-      let avFoundationCapture: MacHLSAVFoundationCapture?
-      let proxy: IPadAuthenticatedMediaProxy?
-      if useSafariCompatibleHLS {
-        // This compatibility mode never downloads media segments directly.
-        // One AVURLAsset backs both the muted capture player and audible player.
-        avFoundationCapture = MacHLSAVFoundationCapture(
-          url: safariCompatiblePlaybackURL,
+      let makeAVFoundationCapture: (URL) -> MacHLSAVFoundationCapture = { url in
+        MacHLSAVFoundationCapture(
+          url: url,
           outputDirectory: session.appendingPathComponent(
             "avfoundation-capture",
             isDirectory: true
@@ -1558,11 +1554,42 @@ final class RealtimePlayerController: ObservableObject {
           duration: availableDuration,
           isLive: playlist.isLive,
           generation: startingGeneration,
-          segmentSeconds: previewSegmentSeconds,
-          forwardBufferSeconds: runner.previewBufferLimit
+          segmentSeconds: self.previewSegmentSeconds,
+          forwardBufferSeconds: runner.previewBufferLimit,
+          log: { text in runner.appendExternalLog(text) }
         )
-        proxy = nil
-        hlsMediaProxy = nil
+      }
+      let avFoundationCapture: MacHLSAVFoundationCapture?
+      let proxy: IPadAuthenticatedMediaProxy?
+      if useSafariCompatibleHLS {
+        if selectedResourceLoader != nil {
+          // Browser-only CDNs (for example missav.ai/surrit.com) reject a new
+          // Foundation connection even though the same request succeeds in
+          // WebKit. Keep AVFoundation for decoding, seeking, audio, and AES,
+          // but feed its local playlist through the browser-backed proxy.
+          avFoundationCapture = nil
+          let createdProxy = IPadAuthenticatedMediaProxy(
+            resourceLoader: selectedResourceLoader
+          ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+              guard let self, self.generation == startingGeneration else { return }
+              self.degradeHLSSourcePlayback(
+                generation: startingGeneration,
+                reason: "HLSの認証情報を更新できませんでした"
+              )
+            }
+          }
+          proxy = createdProxy
+          hlsMediaProxy = createdProxy
+        } else {
+          // Direct/public HLS keeps the shortest path and one shared
+          // AVURLAsset for the muted capture and audible source clock.
+          avFoundationCapture = makeAVFoundationCapture(
+            safariCompatiblePlaybackURL
+          )
+          proxy = nil
+          hlsMediaProxy = nil
+        }
       } else {
         // Fast mode restores downloaded HLS intervals ahead of playback and
         // preserves the previous multi-segment prefetch behavior.
@@ -1582,27 +1609,10 @@ final class RealtimePlayerController: ObservableObject {
         hlsMediaProxy = createdProxy
       }
       hlsAVFoundationCapture = avFoundationCapture
-      let producer = MacHLSRealtimeProducer(
-        source: source,
-        runner: runner,
-        resources: resources,
-        sessionDirectory: session,
-        startSeconds: target,
-        generation: startingGeneration,
-        resourceLoader: selectedResourceLoader,
-        avFoundationCapture: avFoundationCapture,
-        allowsVariantFallback: requestedHLSQuality == .automatic,
-        log: { [weak runner] text in
-          Task { @MainActor in runner?.appendExternalLog(text) }
-        }
-      )
-      producer.updateOutputBufferLimits(
-        hlsOutputBufferLimits(for: runner.previewBufferLimit)
-      )
-      hlsProducer = producer
 
       hlsProductionTask = Task { @MainActor [weak self] in
         guard let self else { return }
+        var producer: MacHLSRealtimeProducer?
         do {
           if let previousControllerRetirement {
             await previousControllerRetirement.value
@@ -1619,31 +1629,42 @@ final class RealtimePlayerController: ObservableObject {
           try Task.checkCancellation()
           guard self.generation == startingGeneration else { return }
 
+          let activeAVFoundationCapture: MacHLSAVFoundationCapture?
           let sourceItem: AVPlayerItem
-          if let avFoundationCapture {
-            sourceItem = avFoundationCapture.makePlaybackItem()
+          if useSafariCompatibleHLS {
+            let capture: MacHLSAVFoundationCapture
+            if let avFoundationCapture {
+              capture = avFoundationCapture
+            } else if let proxy {
+              try await proxy.start()
+              let localPlaybackURL = try self.localHLSPlaybackURL(
+                proxy: proxy,
+                playlist: playlist,
+                source: source
+              )
+              capture = makeAVFoundationCapture(localPlaybackURL)
+              self.hlsAVFoundationCapture = capture
+              self.runner?.appendExternalLog(
+                "HLS通信: Safari/WebKit通信をローカル再生へ接続しました\n"
+              )
+            } else {
+              throw IPadMediaURLResolverError.requestFailed(
+                "Safari互換HLS再生を準備できませんでした"
+              )
+            }
+            activeAVFoundationCapture = capture
+            sourceItem = capture.makePlaybackItem()
             self.runner?.appendExternalLog(
               "HLS通信: Safari互換のAVFoundation映像取込を使用します\n"
             )
           } else if let proxy {
             try await proxy.start()
-            let localPlaybackURL: URL
-            if let masterMetadata = playlist.masterMetadata,
-              masterMetadata.hasSeparateAudio
-            {
-              localPlaybackURL = try proxy.localURL(
-                forSelectedHLSMaster: masterMetadata,
-                context: source.requestContext,
-                resolutionPolicy: source.resolutionPolicy
-              )
-            } else {
-              localPlaybackURL = try proxy.localURL(
-                for: playlist.url,
-                context: source.requestContext,
-                isPlaylist: true,
-                resolutionPolicy: source.resolutionPolicy
-              )
-            }
+            let localPlaybackURL = try self.localHLSPlaybackURL(
+              proxy: proxy,
+              playlist: playlist,
+              source: source
+            )
+            activeAVFoundationCapture = nil
             sourceItem = AVPlayerItem(
               asset: AVURLAsset(url: localPlaybackURL)
             )
@@ -1655,6 +1676,25 @@ final class RealtimePlayerController: ObservableObject {
               "HLS再生方式を準備できませんでした"
             )
           }
+          let createdProducer = MacHLSRealtimeProducer(
+            source: source,
+            runner: runner,
+            resources: resources,
+            sessionDirectory: session,
+            startSeconds: target,
+            generation: startingGeneration,
+            resourceLoader: selectedResourceLoader,
+            avFoundationCapture: activeAVFoundationCapture,
+            allowsVariantFallback: requestedHLSQuality == .automatic,
+            log: { text in
+              Task { @MainActor in runner.appendExternalLog(text) }
+            }
+          )
+          createdProducer.updateOutputBufferLimits(
+            self.hlsOutputBufferLimits(for: runner.previewBufferLimit)
+          )
+          producer = createdProducer
+          self.hlsProducer = createdProducer
           sourceItem.preferredMaximumResolution = CGSize(
             width: 1_920,
             height: 1_080
@@ -1685,7 +1725,7 @@ final class RealtimePlayerController: ObservableObject {
             }
           }
 
-          try await producer.run { [weak self] event in
+          try await createdProducer.run { [weak self] event in
             guard let self, self.generation == startingGeneration,
               !Task.isCancelled
             else { return }
@@ -1710,7 +1750,9 @@ final class RealtimePlayerController: ObservableObject {
           return
         } catch {
           guard self.generation == startingGeneration else { return }
-          if let fallback = producer.takePendingVariantFallbackSource() {
+          if let producer,
+            let fallback = producer.takePendingVariantFallbackSource()
+          {
             producer.cancel()
             let fallbackPosition = self.position.isFinite
               ? max(0, self.position)
@@ -1729,7 +1771,7 @@ final class RealtimePlayerController: ObservableObject {
             )
             return
           }
-          producer.cancel()
+          producer?.cancel()
           proxy?.stop()
           self.fail("HLSリアルタイム復元に失敗しました: \(error.localizedDescription)")
         }
@@ -1740,6 +1782,28 @@ final class RealtimePlayerController: ObservableObject {
       fail(error.localizedDescription)
       cleanupSession()
     }
+  }
+
+  private func localHLSPlaybackURL(
+    proxy: IPadAuthenticatedMediaProxy,
+    playlist: IPadHLSMediaPlaylist,
+    source: IPadResolvedMediaSource
+  ) throws -> URL {
+    if let masterMetadata = playlist.masterMetadata,
+      masterMetadata.hasSeparateAudio
+    {
+      return try proxy.localURL(
+        forSelectedHLSMaster: masterMetadata,
+        context: source.requestContext,
+        resolutionPolicy: source.resolutionPolicy
+      )
+    }
+    return try proxy.localURL(
+      for: playlist.url,
+      context: source.requestContext,
+      isPlaylist: true,
+      resolutionPolicy: source.resolutionPolicy
+    )
   }
 
   @discardableResult
@@ -3985,9 +4049,11 @@ final class RealtimePlayerController: ObservableObject {
   private func updateBufferedDuration() {
     guard let last = queuedSegments.last else {
       bufferedSeconds = 0
+      hlsAVFoundationCapture?.setRestoredBufferLead(0)
       return
     }
     bufferedSeconds = max(0, last.endSeconds - position)
+    hlsAVFoundationCapture?.setRestoredBufferLead(bufferedSeconds)
   }
 
   private func retireSegmentsBeforeCurrentItem() {
