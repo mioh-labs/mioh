@@ -108,6 +108,7 @@ private actor IPadAuthenticatedMediaProxyOriginGate {
 /// player no longer needs the stream.
 final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
   private static let maximumRateLimitRetryCount = 2
+  private static let relayedRateLimitRetryDelays: [TimeInterval] = [0.75, 1.5]
 
   struct Configuration: Sendable, Equatable {
     var maximumConcurrentRequests = 4
@@ -149,6 +150,9 @@ final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
     let statusCode: Int
     let headers: [(String, String)]
     let body: Data
+    /// True only when the shared URLSession transport has already recorded the
+    /// response in its per-origin cooldown coordinator.
+    let rateLimitRetryUsesSharedCooldown: Bool
   }
 
   private enum DiagnosticFailure: String {
@@ -181,6 +185,7 @@ final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
 
   private let configuration: Configuration
   private let onInteractionRequired: @Sendable (URL?) -> Void
+  private let resourceLoader: (any IPadHLSResourceLoading)?
   private let queue = DispatchQueue(
     label: "com.mioh.authenticated-media-proxy",
     qos: .userInitiated
@@ -201,9 +206,11 @@ final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
 
   init(
     configuration: Configuration = Configuration(),
+    resourceLoader: (any IPadHLSResourceLoading)? = nil,
     onInteractionRequired: @escaping @Sendable (URL?) -> Void = { _ in }
   ) {
     self.configuration = configuration
+    self.resourceLoader = resourceLoader
     self.onInteractionRequired = onInteractionRequired
     originRequestGate = IPadAuthenticatedMediaProxyOriginGate(
       maximumActiveRequests: configuration.maximumConcurrentRequests
@@ -656,7 +663,8 @@ final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
       return LocalResponse(
         statusCode: 200,
         headers: headers,
-        body: localRequest.method == "HEAD" ? Data() : syntheticPlaylist
+        body: localRequest.method == "HEAD" ? Data() : syntheticPlaylist,
+        rateLimitRetryUsesSharedCooldown: false
       )
     }
     guard
@@ -681,31 +689,53 @@ final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
     var request = URLRequest(url: originURL)
     request.httpMethod = originMethod
     request.timeoutInterval = configuration.requestTimeout
-    request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+    request.cachePolicy = entry.isPlaylist
+      ? .reloadIgnoringLocalAndRemoteCacheData
+      : .useProtocolCachePolicy
     request.httpShouldHandleCookies = false
-    request.setValue(
-      "application/vnd.apple.mpegurl, application/x-mpegurl, video/*, audio/*, */*;q=0.5",
-      forHTTPHeaderField: "Accept"
-    )
+    request.assumesHTTP3Capable = true
+    if entry.isPlaylist {
+      request.setValue(
+        "application/vnd.apple.mpegurl, application/x-mpegurl, */*;q=0.8",
+        forHTTPHeaderField: "Accept"
+      )
+    }
     if let range = originRange {
       request.setValue(range, forHTTPHeaderField: "Range")
     }
     entry.context?.applying(to: &request)
 
-    let operation = IPadAuthenticatedMediaOriginRequest(
-      maximumResponseBytes: configuration.maximumResponseBytes,
-      maximumRedirectCount: configuration.maximumRedirectCount,
-      timeout: configuration.requestTimeout,
-      rangeHeader: originRange,
-      method: originMethod,
-      requestContext: entry.context,
-      hlsDeliveryDirectives: localRequest.hlsDeliveryDirectives,
-      resolutionPolicy: entry.resolutionPolicy,
-      onResponseStatus: { [weak self] statusCode in
-        self?.recordOriginStatus(statusCode)
-      }
-    )
-    let payload = try await operation.start(request)
+    let payload: IPadAuthenticatedMediaOriginPayload
+    let rateLimitRetryUsesSharedCooldown: Bool
+    if let resourceLoader,
+      let loaded = try await resourceLoader.load(
+        request,
+        maximumResponseBytes: configuration.maximumResponseBytes,
+        resolutionPolicy: entry.resolutionPolicy
+      )
+    {
+      payload = IPadAuthenticatedMediaOriginPayload(
+        data: loaded.data,
+        response: loaded.response
+      )
+      rateLimitRetryUsesSharedCooldown = false
+    } else {
+      let operation = IPadAuthenticatedMediaOriginRequest(
+        maximumResponseBytes: configuration.maximumResponseBytes,
+        maximumRedirectCount: configuration.maximumRedirectCount,
+        timeout: configuration.requestTimeout,
+        rangeHeader: originRange,
+        method: originMethod,
+        requestContext: entry.context,
+        hlsDeliveryDirectives: localRequest.hlsDeliveryDirectives,
+        resolutionPolicy: entry.resolutionPolicy,
+        onResponseStatus: { [weak self] statusCode in
+          self?.recordOriginStatus(statusCode)
+        }
+      )
+      payload = try await operation.start(request)
+      rateLimitRetryUsesSharedCooldown = true
+    }
     if let error = IPadMediaURLResolver.interactionChallengeError(
       response: payload.response
     ) {
@@ -721,6 +751,7 @@ final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
     else {
       throw IPadAuthenticatedMediaProxyError.unsafeTarget
     }
+    recordOriginStatus(payload.response.statusCode)
 
     var transformedData = originMethod == "HEAD" ? Data() : payload.data
     var isRewrittenPlaylist = false
@@ -755,7 +786,8 @@ final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
     return LocalResponse(
       statusCode: payload.response.statusCode,
       headers: headers,
-      body: responseData
+      body: responseData,
+      rateLimitRetryUsesSharedCooldown: rateLimitRetryUsesSharedCooldown
     )
   }
 
@@ -769,7 +801,23 @@ final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
       while true {
         try Task.checkCancellation()
         recordFetchStarted()
-        let response = try await fetch(request: request, entry: entry)
+        let response: LocalResponse
+        do {
+          response = try await fetch(request: request, entry: entry)
+        } catch let error as IPadHLSResourceLoadingError {
+          guard error == .attemptedUnavailable,
+            request.method == "GET" || request.method == "HEAD",
+            rateLimitRetryCount < Self.maximumRateLimitRetryCount
+          else { throw error }
+          let delay = Self.relayedRateLimitRetryDelays[
+            min(rateLimitRetryCount, Self.relayedRateLimitRetryDelays.count - 1)
+          ]
+          rateLimitRetryCount += 1
+          try await Task.sleep(
+            nanoseconds: UInt64(delay * 1_000_000_000)
+          )
+          continue
+        }
         guard response.statusCode == 429,
           request.method == "GET" || request.method == "HEAD",
           rateLimitRetryCount < Self.maximumRateLimitRetryCount
@@ -778,9 +826,30 @@ final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
           return response
         }
 
-        // Shared transport records Retry-After/the fallback host cooldown before
-        // completing `fetch`. Re-entering it here therefore waits behind that
-        // same cooldown and also keeps restoration prefetch from racing AVPlayer.
+        if !response.rateLimitRetryUsesSharedCooldown {
+          // WebKit-backed loads do not pass through the native origin
+          // coordinator. Keep a transient browser-side 429 away from AVPlayer,
+          // which otherwise treats the first failed segment as a terminal audio
+          // source failure. The retry remains bounded and cancellable, and a
+          // numeric Retry-After can only lengthen the conservative fallback.
+          let fallbackDelay = Self.relayedRateLimitRetryDelays[
+            min(rateLimitRetryCount, Self.relayedRateLimitRetryDelays.count - 1)
+          ]
+          let retryAfterDelay = response.headers.first {
+            $0.0.caseInsensitiveCompare("Retry-After") == .orderedSame
+          }.flatMap { Double($0.1) }.map { min(120, max(0, $0)) } ?? 0
+          let delay = max(fallbackDelay, retryAfterDelay)
+          rateLimitRetryCount += 1
+          try await Task.sleep(
+            nanoseconds: UInt64(delay * 1_000_000_000)
+          )
+          continue
+        }
+
+        // Shared native transport records Retry-After/the fallback host
+        // cooldown before completing `fetch`. Re-entering it here therefore
+        // waits behind that same cooldown and also keeps restoration prefetch
+        // from racing AVPlayer.
         rateLimitRetryCount += 1
       }
     } catch {
@@ -1274,7 +1343,8 @@ final class IPadAuthenticatedMediaProxy: @unchecked Sendable {
           ("Content-Length", String(body.count)),
           ("Cache-Control", "no-store"),
         ],
-        body: body
+        body: body,
+        rateLimitRetryUsesSharedCooldown: false
       ),
       on: connection
     )

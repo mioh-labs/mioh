@@ -44,6 +44,21 @@ struct IPadWebMediaCandidate: Sendable, Equatable {
   let selectionState: SelectionState
   let discoveryRole: DiscoveryRole
   let mediaEvidence: IPadBrowserMediaEvidence?
+  /// Exact isolated-world document identity captured by the visible browser.
+  /// A browser relay may use this token to return to the same WKFrameInfo;
+  /// native/disconnected candidates deliberately leave it nil.
+  let browserDocumentToken: String?
+  /// True only when the page's successful Fetch/XHR observation proved that
+  /// replaying bytes through the same WebKit frame is available. Provisional
+  /// native/opaque observations may also set this after exact-frame binding.
+  let browserRelayEligible: Bool
+  /// True when relay eligibility came only from native currentSrc or a passive
+  /// performance/script association and must be proven on a VOD segment before
+  /// native playback. Fulfilled Fetch/XHR observations leave this false.
+  let browserRelayRequiresProbe: Bool
+  /// Mirrors only an explicitly observed Fetch `credentials: include` or XHR
+  /// `withCredentials = true`; unknown and ordinary media URLs stay false.
+  let browserRelayIncludesCredentials: Bool
 
   init(
     url: URL,
@@ -51,7 +66,11 @@ struct IPadWebMediaCandidate: Sendable, Equatable {
     interactionPageURL: URL? = nil,
     selectionState: SelectionState = .ordinary,
     discoveryRole: DiscoveryRole = .directHint,
-    mediaEvidence: IPadBrowserMediaEvidence? = nil
+    mediaEvidence: IPadBrowserMediaEvidence? = nil,
+    browserDocumentToken: String? = nil,
+    browserRelayEligible: Bool = false,
+    browserRelayRequiresProbe: Bool = false,
+    browserRelayIncludesCredentials: Bool = false
   ) {
     self.url = url
     self.requestContext = requestContext
@@ -59,6 +78,10 @@ struct IPadWebMediaCandidate: Sendable, Equatable {
     self.selectionState = selectionState
     self.discoveryRole = discoveryRole
     self.mediaEvidence = mediaEvidence
+    self.browserDocumentToken = browserDocumentToken
+    self.browserRelayEligible = browserRelayEligible
+    self.browserRelayRequiresProbe = browserRelayRequiresProbe
+    self.browserRelayIncludesCredentials = browserRelayIncludesCredentials
   }
 }
 

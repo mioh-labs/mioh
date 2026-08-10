@@ -999,6 +999,8 @@ final class RealtimePlayerController: ObservableObject {
   private var sourceCompatibilityJob: SourceCompatibilityJob?
   private var sessionDirectory: URL?
   private var hlsSource: IPadResolvedMediaSource?
+  private var hlsResourceLoader: (any IPadHLSResourceLoading)?
+  private var hlsBrowserHandoffLease: IPadBrowserMediaHandoffLease?
   private var hlsProductionTask: Task<Void, Never>?
   private var hlsProducer: MacHLSRealtimeProducer?
   private var hlsProducerRetirementTask: Task<Void, Never>?
@@ -1414,7 +1416,9 @@ final class RealtimePlayerController: ObservableObject {
     source: IPadResolvedMediaSource,
     runner: RestorationRunner,
     at startSeconds: Double = 0,
-    autoPlay: Bool = true
+    autoPlay: Bool = true,
+    resourceLoader: (any IPadHLSResourceLoading)? = nil,
+    browserHandoffLease: IPadBrowserMediaHandoffLease? = nil
   ) {
     guard source.kind == .hls,
       let playlist = source.hlsPlaylist,
@@ -1434,7 +1438,23 @@ final class RealtimePlayerController: ObservableObject {
       previousControllerHLSRetirement =
         previousController.hlsProducerRetirementTask
     }
+    // Seeks/settings and variant restarts reuse the browser transport selected
+    // for this HLS source. Supplying a new lease marks an explicit browser
+    // handoff, including the legitimate case where that candidate cannot use
+    // the relay and therefore supplies a nil loader.
+    let selectedBrowserHandoffLease =
+      browserHandoffLease ?? hlsBrowserHandoffLease
+    let selectedResourceLoader = browserHandoffLease == nil
+      ? (resourceLoader ?? hlsResourceLoader)
+      : resourceLoader
+    if hlsBrowserHandoffLease === selectedBrowserHandoffLease {
+      // `stop` owns release of the previous lease. Temporarily detach the same
+      // lease when this is an in-place HLS generation restart.
+      hlsBrowserHandoffLease = nil
+    }
     stop(preserveHLSSelection: false)
+    hlsResourceLoader = selectedResourceLoader
+    hlsBrowserHandoffLease = selectedBrowserHandoffLease
     Self.activeRestorationController = self
     let localWorkerRetirement = workerRetirementTask
     let localHLSRetirement = hlsProducerRetirementTask
@@ -1515,16 +1535,44 @@ final class RealtimePlayerController: ObservableObject {
       streamingSegmentCodecs.removeAll(keepingCapacity: true)
       streamingEventConsumer?(.reset(streaming))
 
-      let proxy = IPadAuthenticatedMediaProxy { [weak self] _ in
-        Task { @MainActor [weak self] in
-          guard let self, self.generation == startingGeneration else { return }
-          self.degradeHLSSourcePlayback(
-            generation: startingGeneration,
-            reason: "HLSの認証情報を更新できませんでした"
-          )
+      let useSafariCompatibleHLS = runner.previewUseSafariCompatibleHLS
+      let avFoundationCapture: MacHLSAVFoundationCapture?
+      let proxy: IPadAuthenticatedMediaProxy?
+      if useSafariCompatibleHLS {
+        // This compatibility mode never downloads media segments directly.
+        // One AVURLAsset backs both the muted capture player and audible player.
+        avFoundationCapture = MacHLSAVFoundationCapture(
+          url: source.playbackURL,
+          outputDirectory: session.appendingPathComponent(
+            "avfoundation-capture",
+            isDirectory: true
+          ),
+          startSeconds: target,
+          duration: availableDuration,
+          isLive: playlist.isLive,
+          generation: startingGeneration,
+          segmentSeconds: previewSegmentSeconds
+        )
+        proxy = nil
+        hlsMediaProxy = nil
+      } else {
+        // Fast mode restores downloaded HLS intervals ahead of playback and
+        // preserves the previous multi-segment prefetch behavior.
+        avFoundationCapture = nil
+        let createdProxy = IPadAuthenticatedMediaProxy(
+          resourceLoader: selectedResourceLoader
+        ) { [weak self] _ in
+          Task { @MainActor [weak self] in
+            guard let self, self.generation == startingGeneration else { return }
+            self.degradeHLSSourcePlayback(
+              generation: startingGeneration,
+              reason: "HLSの認証情報を更新できませんでした"
+            )
+          }
         }
+        proxy = createdProxy
+        hlsMediaProxy = createdProxy
       }
-      hlsMediaProxy = proxy
       let producer = MacHLSRealtimeProducer(
         source: source,
         runner: runner,
@@ -1532,6 +1580,8 @@ final class RealtimePlayerController: ObservableObject {
         sessionDirectory: session,
         startSeconds: target,
         generation: startingGeneration,
+        resourceLoader: selectedResourceLoader,
+        avFoundationCapture: avFoundationCapture,
         log: { [weak runner] text in
           Task { @MainActor in runner?.appendExternalLog(text) }
         }
@@ -1559,34 +1609,47 @@ final class RealtimePlayerController: ObservableObject {
           try Task.checkCancellation()
           guard self.generation == startingGeneration else { return }
 
-          try await proxy.start()
-          // Match MiohRemote: the audible source clock and restoration
-          // producer must consume the same selected media playlist. Opening
-          // the parent master here can choose another rendition with a
-          // different timestamp origin and makes A/V drift impossible to
-          // correct reliably.
-          let localPlaybackURL: URL
-          if let masterMetadata = playlist.masterMetadata,
-            masterMetadata.hasSeparateAudio
-          {
-            localPlaybackURL = try proxy.localURL(
-              forSelectedHLSMaster: masterMetadata,
-              context: source.requestContext,
-              resolutionPolicy: source.resolutionPolicy
+          let sourceItem: AVPlayerItem
+          if let avFoundationCapture {
+            sourceItem = avFoundationCapture.makePlaybackItem()
+            self.runner?.appendExternalLog(
+              "HLS通信: Safari互換のAVFoundation映像取込を使用します\n"
+            )
+          } else if let proxy {
+            try await proxy.start()
+            let localPlaybackURL: URL
+            if let masterMetadata = playlist.masterMetadata,
+              masterMetadata.hasSeparateAudio
+            {
+              localPlaybackURL = try proxy.localURL(
+                forSelectedHLSMaster: masterMetadata,
+                context: source.requestContext,
+                resolutionPolicy: source.resolutionPolicy
+              )
+            } else {
+              localPlaybackURL = try proxy.localURL(
+                for: playlist.url,
+                context: source.requestContext,
+                isPlaylist: true,
+                resolutionPolicy: source.resolutionPolicy
+              )
+            }
+            sourceItem = AVPlayerItem(
+              asset: AVURLAsset(url: localPlaybackURL)
+            )
+            self.runner?.appendExternalLog(
+              "HLS通信: 高速な区間先読み方式を使用します\n"
             )
           } else {
-            localPlaybackURL = try proxy.localURL(
-              for: playlist.url,
-              context: source.requestContext,
-              isPlaylist: true,
-              resolutionPolicy: source.resolutionPolicy
+            throw IPadMediaURLResolverError.requestFailed(
+              "HLS再生方式を準備できませんでした"
             )
           }
-          guard self.generation == startingGeneration else { return }
-
-          let item = AVPlayerItem(asset: AVURLAsset(url: localPlaybackURL))
-          item.preferredMaximumResolution = CGSize(width: 1_920, height: 1_080)
-          item.preferredForwardBufferDuration = playlist.isLive
+          sourceItem.preferredMaximumResolution = CGSize(
+            width: 1_920,
+            height: 1_080
+          )
+          sourceItem.preferredForwardBufferDuration = playlist.isLive
             ? max(2, runner.previewBufferLimit)
             : min(6, max(2, runner.previewBufferLimit))
           var sourceItemInstalled = false
@@ -1599,12 +1662,14 @@ final class RealtimePlayerController: ObservableObject {
           // window can move past the restoration start while the worker warms.
           if playlist.isLive {
             sourceItemInstalled = self.installPreparedHLSSourceItem(
-              item,
+              sourceItem,
               generation: startingGeneration
             )
             if sourceItemInstalled {
               self.runner?.appendExternalLog(
-                "HLS再生: 認証情報を保持したローカルプレイリストを準備しました\n"
+                useSafariCompatibleHLS
+                  ? "HLS再生: AVFoundation経路で音声を準備しました\n"
+                  : "HLS再生: 認証情報を保持したローカルプレイリストを準備しました\n"
               )
             }
           }
@@ -1617,13 +1682,14 @@ final class RealtimePlayerController: ObservableObject {
               case .segment = event
             {
               sourceItemInstalled = self.installPreparedHLSSourceItem(
-                item,
+                sourceItem,
                 generation: startingGeneration
               )
               if sourceItemInstalled {
                 self.runner?.appendExternalLog(
-                  "HLS再生: 復元先頭区間の準備後、認証情報を保持した"
-                    + "ローカルプレイリストを開きました\n"
+                  useSafariCompatibleHLS
+                    ? "HLS再生: 復元先頭区間の準備後、AVFoundation経路から音声を開始します\n"
+                    : "HLS再生: 復元先頭区間の準備後、認証情報を保持したローカルプレイリストを開きました\n"
                 )
               }
             }
@@ -1646,13 +1712,14 @@ final class RealtimePlayerController: ObservableObject {
               runner: runner,
               position: fallbackPosition,
               autoPlay: fallbackAutoPlay,
+              resourceLoader: selectedResourceLoader,
               generation: startingGeneration,
               reason: error.localizedDescription
             )
             return
           }
           producer.cancel()
-          proxy.stop()
+          proxy?.stop()
           self.fail("HLSリアルタイム復元に失敗しました: \(error.localizedDescription)")
         }
         guard self.generation == startingGeneration else { return }
@@ -1689,6 +1756,7 @@ final class RealtimePlayerController: ObservableObject {
     runner: RestorationRunner,
     position: Double,
     autoPlay: Bool,
+    resourceLoader: (any IPadHLSResourceLoading)?,
     generation expectedGeneration: Int,
     reason: String
   ) {
@@ -1712,7 +1780,8 @@ final class RealtimePlayerController: ObservableObject {
         source: fallbackSource,
         runner: runner,
         at: position,
-        autoPlay: autoPlay
+        autoPlay: autoPlay,
+        resourceLoader: resourceLoader
       )
     }
   }
@@ -1854,6 +1923,7 @@ final class RealtimePlayerController: ObservableObject {
       if queuedSegments.isEmpty {
         shouldPlay = false
         state = .ended
+        releaseHLSBrowserHandoffAfterTerminalEnd()
       } else {
         if !hlsRestoredClockFallbackActive {
           playbackDetail = ""
@@ -2275,6 +2345,13 @@ final class RealtimePlayerController: ObservableObject {
     if !preserveHLSSelection {
       hlsSource = nil
     }
+    // Stop is a terminal browser handoff boundary even when the resolved HLS
+    // source remains selected for a later retry. Keeping the lease here would
+    // leave its WebView suspended and make the next Browser handoff fail as
+    // already active. In-generation restarts detach and restore the same lease
+    // around this method in `startHLS`.
+    hlsResourceLoader = nil
+    releaseHLSBrowserHandoffLease()
     sourceCompatibilityJob?.cancel()
     sourceCompatibilityJob = nil
     sourceItemStatusObservation?.invalidate()
@@ -2693,6 +2770,7 @@ final class RealtimePlayerController: ObservableObject {
       if generationReachedEOF {
         shouldPlay = false
         state = .ended
+        releaseHLSBrowserHandoffAfterTerminalEnd()
       } else {
         state = .buffering
       }
@@ -3130,6 +3208,7 @@ final class RealtimePlayerController: ObservableObject {
       shouldPlay = false
       restoredPlayer.pause()
       state = .ended
+      releaseHLSBrowserHandoffAfterTerminalEnd()
     } else if shouldPlay, restoredPlayer.currentItem != nil {
       restoredPlayer.play()
       state = .playing
@@ -4028,6 +4107,23 @@ final class RealtimePlayerController: ObservableObject {
     self.sessionDirectory = nil
   }
 
+  private func releaseHLSBrowserHandoffLease() {
+    guard let lease = hlsBrowserHandoffLease else { return }
+    hlsBrowserHandoffLease = nil
+    // Publish the ending state before this turn can start another browser
+    // resolution. The asynchronous cleanup below then fully resumes WebKit.
+    lease.beginEnding()
+    Task { @MainActor in
+      await lease.end()
+    }
+  }
+
+  private func releaseHLSBrowserHandoffAfterTerminalEnd() {
+    guard state == .ended, hlsSource != nil else { return }
+    hlsResourceLoader = nil
+    releaseHLSBrowserHandoffLease()
+  }
+
   private func cleanupSourceCompatibility() {
     guard let sourceCompatibilityDirectory else { return }
     try? FileManager.default.removeItem(at: sourceCompatibilityDirectory)
@@ -4067,6 +4163,8 @@ final class RealtimePlayerController: ObservableObject {
     sourceSeekNeedsBuffer = false
     sourcePlayer.pause()
     restoredPlayer.pause()
+    hlsResourceLoader = nil
+    releaseHLSBrowserHandoffLease()
     errorMessage = message
     playbackDetail = ""
     state = .failed

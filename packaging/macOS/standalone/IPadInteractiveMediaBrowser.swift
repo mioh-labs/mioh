@@ -16,6 +16,941 @@ private final class IPadWeakInteractiveScriptMessageHandler: NSObject,
   }
 }
 
+/// Downloads one HLS resource through WebKit's own network process. This is
+/// the same transport used by the visible browser: its website data store,
+/// cookies, connection pool, HTTP/3 state and anti-tracking partition all stay
+/// inside WebKit. No JavaScript fetch, CORS relay, or Safari-header imitation
+/// is involved.
+@MainActor
+private final class IPadBrowserWebKitDownloadOperation: NSObject,
+  WKDownloadDelegate
+{
+  private weak var webView: WKWebView?
+  private let request: URLRequest
+  private let maximumResponseBytes: Int
+  private let resolutionPolicy: IPadMediaURLResolutionPolicy
+  private var continuation:
+    CheckedContinuation<IPadHLSResourceLoadResult, Error>?
+  private var download: WKDownload?
+  private var response: HTTPURLResponse?
+  private var destinationURL: URL?
+  private var redirectCount = 0
+  private var cancellationRequested = false
+  private var cancellationInProgress = false
+  private var finished = false
+
+  init(
+    webView: WKWebView,
+    request: URLRequest,
+    maximumResponseBytes: Int,
+    resolutionPolicy: IPadMediaURLResolutionPolicy
+  ) {
+    self.webView = webView
+    self.request = request
+    self.maximumResponseBytes = maximumResponseBytes
+    self.resolutionPolicy = resolutionPolicy
+  }
+
+  func run() async throws -> IPadHLSResourceLoadResult {
+    try Task.checkCancellation()
+    return try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation {
+        (continuation: CheckedContinuation<IPadHLSResourceLoadResult, Error>) in
+        self.continuation = continuation
+        guard let webView else {
+          finish(.failure(CancellationError()))
+          return
+        }
+        var browserRequest = request
+        // These values belong to WebKit's current page/session. Let WebKit
+        // supply them instead of replaying a native snapshot.
+        browserRequest.setValue(nil, forHTTPHeaderField: "Cookie")
+        browserRequest.setValue(nil, forHTTPHeaderField: "User-Agent")
+        browserRequest.setValue(nil, forHTTPHeaderField: "Origin")
+        browserRequest.httpShouldHandleCookies = true
+        webView.startDownload(using: browserRequest) { [weak self] download in
+          guard let self else {
+            download.cancel { _ in }
+            return
+          }
+          self.download = download
+          download.delegate = self
+          if Task.isCancelled || self.cancellationRequested || self.finished {
+            self.cancel()
+          }
+        }
+      }
+    } onCancel: {
+      Task { @MainActor [weak self] in
+        self?.cancel()
+      }
+    }
+  }
+
+  func download(
+    _ download: WKDownload,
+    decideDestinationUsing response: URLResponse,
+    suggestedFilename: String,
+    completionHandler: @escaping (URL?) -> Void
+  ) {
+    guard !finished, !cancellationRequested,
+      let httpResponse = response as? HTTPURLResponse,
+      let responseURL = httpResponse.url,
+      isAllowedResponseURL(responseURL)
+    else {
+      completionHandler(nil)
+      finish(.failure(IPadMediaURLResolverError.unsafeURL))
+      return
+    }
+    let method = (request.httpMethod ?? "GET").uppercased()
+    let expectedLength = response.expectedContentLength
+    if method != "HEAD", expectedLength > Int64(maximumResponseBytes) {
+      completionHandler(nil)
+      finish(
+        .failure(
+          IPadMediaURLResolverError.responseTooLarge(maximumResponseBytes)
+        )
+      )
+      return
+    }
+    self.response = httpResponse
+    let destination = FileManager.default.temporaryDirectory
+      .appendingPathComponent("mioh-webkit-hls-\(UUID().uuidString).download")
+    destinationURL = destination
+    completionHandler(destination)
+  }
+
+  func download(
+    _ download: WKDownload,
+    willPerformHTTPRedirection response: HTTPURLResponse,
+    newRequest: URLRequest,
+    decisionHandler: @escaping (WKDownload.RedirectPolicy) -> Void
+  ) {
+    guard !cancellationRequested else {
+      decisionHandler(.cancel)
+      return
+    }
+    redirectCount += 1
+    guard redirectCount <= 8, let url = newRequest.url,
+      url.scheme?.lowercased() == "https",
+      IPadMediaURLResolver.isURL(url, allowedBy: resolutionPolicy)
+    else {
+      decisionHandler(.cancel)
+      finish(.failure(IPadMediaURLResolverError.unsafeURL))
+      return
+    }
+    decisionHandler(.allow)
+  }
+
+  private func isAllowedResponseURL(_ url: URL) -> Bool {
+    #if MIOH_TESTING
+      if url.scheme?.lowercased() == "http",
+        url.host == "127.0.0.1" || url.host == "localhost"
+      {
+        return true
+      }
+    #endif
+    return url.scheme?.lowercased() == "https"
+      && IPadMediaURLResolver.isURL(url, allowedBy: resolutionPolicy)
+  }
+
+  func download(
+    _ download: WKDownload,
+    didReceive challenge: URLAuthenticationChallenge,
+    completionHandler: @escaping (
+      URLSession.AuthChallengeDisposition, URLCredential?
+    ) -> Void
+  ) {
+    completionHandler(.performDefaultHandling, nil)
+  }
+
+  func downloadDidFinish(_ download: WKDownload) {
+    guard !cancellationRequested else { return }
+    guard !finished, let response, let destinationURL else {
+      finish(
+        .failure(
+          IPadMediaURLResolverError.requestFailed(
+            "WebKit download completed without a response."
+          )
+        )
+      )
+      return
+    }
+    do {
+      let attributes = try FileManager.default.attributesOfItem(
+        atPath: destinationURL.path
+      )
+      let byteCount = (attributes[.size] as? NSNumber)?.intValue ?? 0
+      guard byteCount <= maximumResponseBytes else {
+        throw IPadMediaURLResolverError.responseTooLarge(maximumResponseBytes)
+      }
+      let method = (request.httpMethod ?? "GET").uppercased()
+      let data = method == "HEAD"
+        ? Data()
+        : try Data(contentsOf: destinationURL, options: .mappedIfSafe)
+      finish(
+        .success(IPadHLSResourceLoadResult(data: data, response: response))
+      )
+    } catch {
+      finish(.failure(error))
+    }
+  }
+
+  func download(
+    _ download: WKDownload,
+    didFailWithError error: Error,
+    resumeData: Data?
+  ) {
+    guard !cancellationRequested else { return }
+    finish(.failure(error))
+  }
+
+  private func cancel() {
+    guard !finished else { return }
+    cancellationRequested = true
+    guard let download, !cancellationInProgress else { return }
+    cancellationInProgress = true
+    // Do not resume the awaiting loader until WebKit confirms cancellation.
+    // Otherwise the handoff lease can resume embedded playback while the old
+    // authenticated download is still active in WebKit's network process.
+    download.delegate = nil
+    download.cancel { [weak self] _ in
+      Task { @MainActor [weak self] in
+        self?.finish(.failure(CancellationError()))
+      }
+    }
+  }
+
+  private func finish(
+    _ result: Result<IPadHLSResourceLoadResult, Error>
+  ) {
+    guard !finished else { return }
+    finished = true
+    download?.delegate = nil
+    download = nil
+    if let destinationURL {
+      try? FileManager.default.removeItem(at: destinationURL)
+    }
+    destinationURL = nil
+    let continuation = continuation
+    self.continuation = nil
+    continuation?.resume(with: result)
+  }
+}
+
+private enum IPadBrowserHLSFetchCacheMode: String, Sendable {
+  case live = "default"
+  case videoOnDemand = "force-cache"
+}
+
+/// Owns the browser side of one native HLS handoff. WebKit media suspension is
+/// deliberately paired: callers must await `end()` on every success, failure,
+/// and cancellation path before starting another handoff.
+@MainActor
+final class IPadBrowserMediaHandoffLease {
+  fileprivate weak var browser: IPadInteractiveMediaBrowser?
+  fileprivate let id: UUID
+  fileprivate let navigationGeneration: Int
+  private var hasEnded = false
+  private var resourceLoader: IPadBrowserHLSResourceLoader?
+
+  fileprivate init(
+    browser: IPadInteractiveMediaBrowser,
+    id: UUID,
+    navigationGeneration: Int
+  ) {
+    self.browser = browser
+    self.id = id
+    self.navigationGeneration = navigationGeneration
+  }
+
+  deinit {
+    let browser = browser
+    let leaseID = id
+    let generation = navigationGeneration
+    Task { @MainActor [weak browser] in
+      browser?.beginEndingMediaPlaybackHandoffLease(
+        id: leaseID,
+        navigationGeneration: generation
+      )
+      await browser?.endMediaPlaybackHandoffLease(
+        id: leaseID,
+        navigationGeneration: generation
+      )
+    }
+  }
+
+  /// Returns the WebKit download transport owned by this browser handoff.
+  /// Candidate ranking remains useful for selecting the HLS playlist, but it
+  /// does not gate network access: WebKit itself owns the authenticated page
+  /// session and applies its normal browser policy to every resource.
+  func resourceLoader(
+    for candidate: IPadWebMediaCandidate,
+    isLive: Bool,
+    retainingResolvedResourceURL: URL? = nil
+  ) async -> (any IPadHLSResourceLoading)? {
+    guard !hasEnded,
+      browser?.canDownloadHLSWithWebKit(
+        leaseID: id,
+        navigationGeneration: navigationGeneration
+      ) == true
+    else { return nil }
+    _ = candidate
+    if let resourceLoader {
+      await resourceLoader.updateCacheMode(
+        isLive ? .live : .videoOnDemand,
+        retainingResolvedResourceURL: retainingResolvedResourceURL
+      )
+      return resourceLoader
+    }
+    let loader = IPadBrowserHLSResourceLoader(
+      lease: self,
+      cacheMode: isLive ? .live : .videoOnDemand
+    )
+    resourceLoader = loader
+    return loader
+  }
+
+  /// Resumes every WebView captured by this lease. The ID check prevents an
+  /// old lease from releasing a later handoff that happens to reuse a page.
+  func beginEnding() {
+    guard !hasEnded else { return }
+    browser?.beginEndingMediaPlaybackHandoffLease(
+      id: id,
+      navigationGeneration: navigationGeneration
+    )
+  }
+
+  func end() async {
+    guard !hasEnded else { return }
+    hasEnded = true
+    browser?.beginEndingMediaPlaybackHandoffLease(
+      id: id,
+      navigationGeneration: navigationGeneration
+    )
+    let loader = resourceLoader
+    resourceLoader = nil
+    await loader?.cancel()
+    await browser?.endMediaPlaybackHandoffLease(
+      id: id,
+      navigationGeneration: navigationGeneration
+    )
+  }
+
+  fileprivate func download(
+    _ request: URLRequest,
+    maximumResponseBytes: Int,
+    resolutionPolicy: IPadMediaURLResolutionPolicy
+  ) async throws -> IPadHLSResourceLoadResult {
+    guard !hasEnded, let browser else { throw CancellationError() }
+    return try await browser.downloadHLSResourceWithWebKit(
+      request,
+      leaseID: id,
+      navigationGeneration: navigationGeneration,
+      maximumResponseBytes: maximumResponseBytes,
+      resolutionPolicy: resolutionPolicy
+    )
+  }
+}
+
+/// WebKit-backed HLS byte loader. Concurrent identical requests share one
+/// WKDownload and VOD segments remain briefly cached so AVPlayer and the
+/// restoration worker never issue the same browser download twice.
+private actor IPadBrowserHLSResourceLoader: IPadHLSResourceLoading {
+  private struct RequestKey: Hashable {
+    let url: String
+    let method: String
+    let range: String?
+    let timeoutMilliseconds: Int
+  }
+
+  private struct CacheKey: Hashable {
+    let url: String
+    let method: String
+    let range: String?
+  }
+
+  private struct CacheEntry {
+    let result: IPadHLSResourceLoadResult
+    let expiresAt: Date
+    var accessSequence: UInt64
+  }
+
+  private struct InFlightWaiter {
+    let method: String
+    let range: String?
+    let maximumResponseBytes: Int
+    let continuation: CheckedContinuation<IPadHLSResourceLoadResult?, Error>
+  }
+
+  private struct InFlight {
+    let id: UUID
+    let task: Task<IPadHLSResourceLoadResult?, Error>
+    let cacheKey: CacheKey
+    var waiters: [UUID: InFlightWaiter]
+  }
+
+  private weak var lease: IPadBrowserMediaHandoffLease?
+  private var cacheMode: IPadBrowserHLSFetchCacheMode
+  private let relayDispatchGate = IPadBrowserHLSRelayDispatchGate()
+  private var cache: [CacheKey: CacheEntry] = [:]
+  private var cacheBytes = 0
+  private var accessSequence: UInt64 = 0
+  private var oneShotLiveCacheKeys = Set<CacheKey>()
+  private var inFlight: [RequestKey: InFlight] = [:]
+  private var drainingTasks: [UUID: Task<IPadHLSResourceLoadResult?, Error>] = [:]
+  private var isCancelled = false
+
+  private static let maximumRelayResourceBytes = 32 * 1_024 * 1_024
+  private static let maximumCacheBytes = 64 * 1_024 * 1_024
+  private static let cacheLifetime: TimeInterval = 45
+  private static let maximumRangeHeaderBytes = 128
+
+  init(
+    lease: IPadBrowserMediaHandoffLease,
+    cacheMode: IPadBrowserHLSFetchCacheMode
+  ) {
+    self.lease = lease
+    self.cacheMode = cacheMode
+  }
+
+  func updateCacheMode(
+    _ newMode: IPadBrowserHLSFetchCacheMode,
+    retainingResolvedResourceURL: URL?
+  ) {
+    guard cacheMode != newMode || newMode == .live else { return }
+    cacheMode = newMode
+    oneShotLiveCacheKeys.removeAll()
+    guard newMode == .live else { return }
+    purgeExpiredCache()
+
+    // Live playlists must not enter the normal 45-second LRU because their
+    // contents change while the URL stays stable. Keep only the exact final
+    // playlist already downloaded by resolution, and consume it once when the
+    // proxy/producer starts. Every later refresh goes back through WKDownload.
+    let retainedKey = retainingResolvedResourceURL.flatMap { retainedURL in
+      cache.filter { key, entry in
+        key.method == "GET" && key.range == nil
+          && (key.url == retainedURL.absoluteString
+            || entry.result.response.url == retainedURL)
+      }.max { $0.value.accessSequence < $1.value.accessSequence }?.key
+    }
+    if let retainedKey, let retainedEntry = cache[retainedKey] {
+      cache = [retainedKey: retainedEntry]
+      cacheBytes = retainedEntry.result.data.count
+      oneShotLiveCacheKeys.insert(retainedKey)
+    } else {
+      cache.removeAll()
+      cacheBytes = 0
+    }
+  }
+
+  func load(
+    _ request: URLRequest,
+    maximumResponseBytes: Int,
+    resolutionPolicy: IPadMediaURLResolutionPolicy
+  ) async throws -> IPadHLSResourceLoadResult? {
+    try Task.checkCancellation()
+    guard !isCancelled else { throw CancellationError() }
+    guard maximumResponseBytes > 0 else {
+      throw IPadMediaURLResolverError.responseTooLarge(maximumResponseBytes)
+    }
+    guard let url = request.url,
+      Self.isSafeRelayURL(url),
+      IPadMediaURLResolver.isURL(url, allowedBy: resolutionPolicy)
+    else { throw IPadMediaURLResolverError.unsafeURL }
+    let method = (request.httpMethod ?? "GET").uppercased()
+    guard method == "GET" || method == "HEAD" else {
+      throw IPadMediaURLResolverError.unsafeURL
+    }
+    let range = request.value(forHTTPHeaderField: "Range")
+    if let range, !Self.isSafeRangeHeader(range) {
+      throw IPadMediaURLResolverError.invalidByteRange
+    }
+    // This actor exists only after the browser handoff accepted the candidate.
+    // Losing that lease is a terminal cancellation, not permission to retry
+    // through URLSession while the old page is being resumed.
+    guard let lease else { throw CancellationError() }
+    try Task.checkCancellation()
+    let timeoutSeconds = request.timeoutInterval.isFinite
+      && request.timeoutInterval > 0 ? request.timeoutInterval : 30
+    let timeoutMilliseconds = Int(
+      (min(120, max(1, timeoutSeconds)) * 1_000).rounded()
+    )
+    let requestedCacheKey = CacheKey(
+      url: url.absoluteString,
+      method: method,
+      range: range
+    )
+    if cacheMode == .live,
+      oneShotLiveCacheKeys.remove(requestedCacheKey) != nil,
+      let cached = removeCachedResult(
+        for: requestedCacheKey,
+        maximumResponseBytes: maximumResponseBytes
+      )
+    {
+      return cached
+    }
+    if cacheMode == .videoOnDemand {
+      purgeExpiredCache()
+      if let cached = cachedResult(
+        for: requestedCacheKey,
+        maximumResponseBytes: maximumResponseBytes
+      ) {
+        return cached
+      }
+    }
+
+    // WKDownload exposes the native HTTP response rather than a CORS-filtered
+    // JavaScript Response. Preserve Range so EXT-X-BYTERANGE and fMP4 do not
+    // download an entire large object under the bounded segment limit.
+    let relayRequest = request
+    let relayMethod = (relayRequest.httpMethod ?? "GET").uppercased()
+    let relayRange = relayRequest.value(forHTTPHeaderField: "Range")
+    let relayCacheKey = CacheKey(
+      url: url.absoluteString,
+      method: relayMethod,
+      range: relayRange
+    )
+    let requestKey = RequestKey(
+      url: url.absoluteString,
+      method: relayMethod,
+      range: relayRange,
+      timeoutMilliseconds: timeoutMilliseconds
+    )
+    let result = try await waitForInFlight(
+      requestKey: requestKey,
+      cacheKey: relayCacheKey,
+      request: relayRequest,
+      lease: lease,
+      resolutionPolicy: resolutionPolicy,
+      requestedMethod: method,
+      requestedRange: range,
+      maximumResponseBytes: maximumResponseBytes
+    )
+    try Task.checkCancellation()
+    return result
+  }
+
+  func cancel() async {
+    guard !isCancelled else { return }
+    isCancelled = true
+    let entries = Array(inFlight.values)
+    let draining = Array(drainingTasks.values)
+    inFlight.removeAll()
+    drainingTasks.removeAll()
+    cache.removeAll()
+    cacheBytes = 0
+    for entry in entries {
+      entry.task.cancel()
+      for waiter in entry.waiters.values {
+        waiter.continuation.resume(throwing: CancellationError())
+      }
+    }
+    for task in draining { task.cancel() }
+    // Each shared task completes only after WKDownload's cancel completion
+    // has fired, so lease.end() cannot resume embedded media too early.
+    for task in entries.map(\.task) + draining {
+      _ = await task.result
+    }
+  }
+
+  private func waitForInFlight(
+    requestKey: RequestKey,
+    cacheKey: CacheKey,
+    request: URLRequest,
+    lease: IPadBrowserMediaHandoffLease,
+    resolutionPolicy: IPadMediaURLResolutionPolicy,
+    requestedMethod: String,
+    requestedRange: String?,
+    maximumResponseBytes: Int
+  ) async throws -> IPadHLSResourceLoadResult? {
+    let waiterID = UUID()
+    return try await withTaskCancellationHandler(
+      operation: {
+        try Task.checkCancellation()
+        return try await withCheckedThrowingContinuation {
+          (continuation: CheckedContinuation<IPadHLSResourceLoadResult?, Error>) in
+          registerInFlightWaiter(
+            requestKey: requestKey,
+            cacheKey: cacheKey,
+            request: request,
+            lease: lease,
+            resolutionPolicy: resolutionPolicy,
+            waiterID: waiterID,
+            requestedMethod: requestedMethod,
+            requestedRange: requestedRange,
+            maximumResponseBytes: maximumResponseBytes,
+            continuation: continuation
+          )
+        }
+      },
+      onCancel: {
+        Task {
+          await self.cancelInFlightWaiter(
+            requestKey: requestKey,
+            waiterID: waiterID
+          )
+        }
+      }
+    )
+  }
+
+  private func registerInFlightWaiter(
+    requestKey: RequestKey,
+    cacheKey: CacheKey,
+    request: URLRequest,
+    lease: IPadBrowserMediaHandoffLease,
+    resolutionPolicy: IPadMediaURLResolutionPolicy,
+    waiterID: UUID,
+    requestedMethod: String,
+    requestedRange: String?,
+    maximumResponseBytes: Int,
+    continuation: CheckedContinuation<IPadHLSResourceLoadResult?, Error>
+  ) {
+    if Task.isCancelled || isCancelled {
+      continuation.resume(throwing: CancellationError())
+      return
+    }
+    let waiter = InFlightWaiter(
+      method: requestedMethod,
+      range: requestedRange,
+      maximumResponseBytes: maximumResponseBytes,
+      continuation: continuation
+    )
+    if var entry = inFlight[requestKey] {
+      entry.waiters[waiterID] = waiter
+      inFlight[requestKey] = entry
+      return
+    }
+
+    let relayDispatchGate = relayDispatchGate
+    let task = Task<IPadHLSResourceLoadResult?, Error> { [weak lease] in
+      guard let lease else { throw CancellationError() }
+      guard let loaded = try await relayDispatchGate.perform({
+        try await lease.download(
+          request,
+          maximumResponseBytes: Self.maximumRelayResourceBytes,
+          resolutionPolicy: resolutionPolicy
+        )
+      }) else { throw CancellationError() }
+      return loaded
+    }
+    let inFlightID = UUID()
+    inFlight[requestKey] = InFlight(
+      id: inFlightID,
+      task: task,
+      cacheKey: cacheKey,
+      waiters: [waiterID: waiter]
+    )
+    // The first continuation is registered before completion monitoring
+    // starts, so even an immediately completed WebKit fetch has an owner.
+    Task { [weak self] in
+      let result = await task.result
+      await self?.completeInFlight(
+        requestKey: requestKey,
+        inFlightID: inFlightID,
+        result: result
+      )
+    }
+  }
+
+  private func cancelInFlightWaiter(
+    requestKey: RequestKey,
+    waiterID: UUID
+  ) {
+    guard var entry = inFlight[requestKey],
+      let waiter = entry.waiters.removeValue(forKey: waiterID)
+    else { return }
+    if entry.waiters.isEmpty {
+      inFlight.removeValue(forKey: requestKey)
+      drainingTasks[entry.id] = entry.task
+      entry.task.cancel()
+    } else {
+      inFlight[requestKey] = entry
+    }
+    waiter.continuation.resume(throwing: CancellationError())
+  }
+
+  private func completeInFlight(
+    requestKey: RequestKey,
+    inFlightID: UUID,
+    result: Result<IPadHLSResourceLoadResult?, Error>
+  ) {
+    guard let entry = inFlight[requestKey], entry.id == inFlightID else {
+      drainingTasks.removeValue(forKey: inFlightID)
+      return
+    }
+    inFlight.removeValue(forKey: requestKey)
+    switch result {
+    case .success(let loaded):
+      if let waiter = entry.waiters.values.first {
+        do {
+          if let cacheResult = try Self.validatedResponse(
+            from: loaded,
+            requestedMethod: waiter.method,
+            requestedRange: waiter.range,
+            maximumResponseBytes: Self.maximumRelayResourceBytes
+          ) {
+            insertIntoCache(cacheResult, for: entry.cacheKey)
+          }
+        } catch {
+          // Every waiter below receives the validation error. Never retain a
+          // malformed partial response for a later cache hit.
+        }
+      }
+      for waiter in entry.waiters.values {
+        Self.resume(
+          waiter.continuation,
+          with: result,
+          method: waiter.method,
+          range: waiter.range,
+          maximumResponseBytes: waiter.maximumResponseBytes
+        )
+      }
+    case .failure(let error):
+      for waiter in entry.waiters.values {
+        waiter.continuation.resume(throwing: error)
+      }
+    }
+  }
+
+  private static func resume(
+    _ continuation: CheckedContinuation<IPadHLSResourceLoadResult?, Error>,
+    with result: Result<IPadHLSResourceLoadResult?, Error>,
+    method: String,
+    range: String?,
+    maximumResponseBytes: Int
+  ) {
+    switch result {
+    case .success(let loaded):
+      do {
+        continuation.resume(
+          returning: try validatedResponse(
+            from: loaded,
+            requestedMethod: method,
+            requestedRange: range,
+            maximumResponseBytes: maximumResponseBytes
+          )
+        )
+      } catch {
+        continuation.resume(throwing: error)
+      }
+    case .failure(let error):
+      continuation.resume(throwing: error)
+    }
+  }
+
+  private struct ParsedContentRange {
+    let lowerBound: Int
+    let upperBound: Int
+    let totalCount: Int?
+  }
+
+  private static func validatedResponse(
+    from loaded: IPadHLSResourceLoadResult?,
+    requestedMethod: String,
+    requestedRange: String?,
+    maximumResponseBytes: Int
+  ) throws -> IPadHLSResourceLoadResult? {
+    guard let loaded, let requestedRange else {
+      return try IPadHLSRelayRangeNormalizer.response(
+        from: loaded,
+        requestedMethod: requestedMethod,
+        requestedRange: nil,
+        maximumResponseBytes: maximumResponseBytes
+      )
+    }
+    guard loaded.response.statusCode == 206 else {
+      // A server may legally ignore Range and return 200. Keep the bounded
+      // native slicer for that case; preserve ordinary HTTP failures as-is.
+      return try IPadHLSRelayRangeNormalizer.response(
+        from: loaded,
+        requestedMethod: requestedMethod,
+        requestedRange: requestedRange,
+        maximumResponseBytes: maximumResponseBytes
+      )
+    }
+    guard let contentRange = parsedContentRange(loaded.response),
+      contentRangeMatchesRequest(contentRange, requestHeader: requestedRange)
+    else { throw IPadMediaURLResolverError.invalidByteRange }
+    let responseLength = contentRange.upperBound - contentRange.lowerBound + 1
+    guard responseLength <= maximumResponseBytes else {
+      throw IPadMediaURLResolverError.responseTooLarge(maximumResponseBytes)
+    }
+    if let contentLength = loaded.response.value(
+      forHTTPHeaderField: "Content-Length"
+    ).flatMap(Int.init), contentLength != responseLength {
+      throw IPadMediaURLResolverError.invalidByteRange
+    }
+    if requestedMethod != "HEAD", loaded.data.count != responseLength {
+      throw IPadMediaURLResolverError.invalidByteRange
+    }
+    return IPadHLSResourceLoadResult(
+      data: requestedMethod == "HEAD" ? Data() : loaded.data,
+      response: loaded.response
+    )
+  }
+
+  private static func parsedContentRange(
+    _ response: HTTPURLResponse
+  ) -> ParsedContentRange? {
+    guard let rawValue = response.value(forHTTPHeaderField: "Content-Range")?
+      .lowercased().trimmingCharacters(in: .whitespacesAndNewlines),
+      rawValue.hasPrefix("bytes ")
+    else { return nil }
+    let value = rawValue.dropFirst(6)
+    let slashParts = value.split(
+      separator: "/",
+      maxSplits: 1,
+      omittingEmptySubsequences: false
+    )
+    guard slashParts.count == 2 else { return nil }
+    let bounds = slashParts[0].split(
+      separator: "-",
+      maxSplits: 1,
+      omittingEmptySubsequences: false
+    )
+    guard bounds.count == 2,
+      let lower = Int(bounds[0]), let upper = Int(bounds[1]),
+      lower >= 0, upper >= lower
+    else { return nil }
+    let total: Int?
+    if slashParts[1] == "*" {
+      total = nil
+    } else {
+      guard let parsedTotal = Int(slashParts[1]), parsedTotal > upper else {
+        return nil
+      }
+      total = parsedTotal
+    }
+    return ParsedContentRange(
+      lowerBound: lower,
+      upperBound: upper,
+      totalCount: total
+    )
+  }
+
+  private static func contentRangeMatchesRequest(
+    _ contentRange: ParsedContentRange,
+    requestHeader: String
+  ) -> Bool {
+    guard requestHeader.hasPrefix("bytes=") else { return false }
+    let bounds = requestHeader.dropFirst(6).split(
+      separator: "-",
+      maxSplits: 1,
+      omittingEmptySubsequences: false
+    )
+    guard bounds.count == 2 else { return false }
+    if bounds[0].isEmpty {
+      guard let suffixLength = Int(bounds[1]), suffixLength > 0,
+        let totalCount = contentRange.totalCount
+      else { return false }
+      let expectedLower = max(0, totalCount - min(suffixLength, totalCount))
+      return contentRange.lowerBound == expectedLower
+        && contentRange.upperBound == totalCount - 1
+    }
+    guard let requestedLower = Int(bounds[0]),
+      requestedLower == contentRange.lowerBound
+    else { return false }
+    if bounds[1].isEmpty {
+      return contentRange.totalCount.map {
+        contentRange.upperBound == $0 - 1
+      } ?? true
+    }
+    guard let requestedUpper = Int(bounds[1]) else { return false }
+    let expectedUpper = contentRange.totalCount.map {
+      min(requestedUpper, $0 - 1)
+    } ?? requestedUpper
+    return contentRange.upperBound == expectedUpper
+  }
+
+  private func cachedResult(
+    for key: CacheKey,
+    maximumResponseBytes: Int
+  ) -> IPadHLSResourceLoadResult? {
+    guard var entry = cache[key],
+      entry.result.data.count <= maximumResponseBytes
+    else { return nil }
+    accessSequence &+= 1
+    entry.accessSequence = accessSequence
+    cache[key] = entry
+    return entry.result
+  }
+
+  private func removeCachedResult(
+    for key: CacheKey,
+    maximumResponseBytes: Int
+  ) -> IPadHLSResourceLoadResult? {
+    guard let entry = cache.removeValue(forKey: key) else { return nil }
+    cacheBytes -= entry.result.data.count
+    guard entry.result.data.count <= maximumResponseBytes else { return nil }
+    return entry.result
+  }
+
+  private func insertIntoCache(
+    _ result: IPadHLSResourceLoadResult,
+    for key: CacheKey
+  ) {
+    guard cacheMode == .videoOnDemand,
+      key.method == "GET", (200...299).contains(result.response.statusCode),
+      result.data.count <= Self.maximumCacheBytes
+    else { return }
+    if let prior = cache.removeValue(forKey: key) {
+      cacheBytes -= prior.result.data.count
+    }
+    accessSequence &+= 1
+    cache[key] = CacheEntry(
+      result: result,
+      expiresAt: Date().addingTimeInterval(Self.cacheLifetime),
+      accessSequence: accessSequence
+    )
+    cacheBytes += result.data.count
+    while cacheBytes > Self.maximumCacheBytes,
+      let oldest = cache.min(by: {
+        $0.value.accessSequence < $1.value.accessSequence
+      })
+    {
+      cacheBytes -= oldest.value.result.data.count
+      cache.removeValue(forKey: oldest.key)
+    }
+  }
+
+  private func purgeExpiredCache(now: Date = Date()) {
+    let expired = cache.filter { $0.value.expiresAt <= now }
+    for (key, entry) in expired {
+      cacheBytes -= entry.result.data.count
+      cache.removeValue(forKey: key)
+    }
+  }
+
+  private static func isSafeRelayURL(_ url: URL) -> Bool {
+    guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+      components.scheme?.lowercased() == "https",
+      components.user == nil, components.password == nil,
+      components.host?.isEmpty == false,
+      url.absoluteString.utf8.count <= 8_192,
+      url.absoluteString.rangeOfCharacter(from: .controlCharacters) == nil
+    else { return false }
+    components.fragment = nil
+    return components.url != nil
+  }
+
+  private static func isSafeRangeHeader(_ value: String) -> Bool {
+    guard value.utf8.count <= maximumRangeHeaderBytes,
+      value.range(
+        of: #"^bytes=([0-9]+-[0-9]*|-[0-9]+)$"#,
+        options: .regularExpression
+      )
+        != nil
+    else { return false }
+    return IPadHLSRelayRangeNormalizer.closedRange(
+      value,
+      dataCount: Int.max
+    ) != nil
+  }
+}
+
 /// Gives a user-created JavaScript window a real `WindowProxy` before it is
 /// adopted as the visible page. Strict mode bounds that temporary window;
 /// compatibility mode lets WebKit complete ordinary multi-stage navigation.
@@ -175,6 +1110,12 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
     /// Isolated-world document identity. Native navigation candidates do not
     /// have one and therefore can never inherit opaque MSE playback evidence.
     let documentToken: String?
+    /// True only when the page-world Fetch/XHR hook explicitly observed an
+    /// authenticated request for this URL.
+    let relayIncludesCredentials: Bool
+    /// The URL was observed in the exact document through a browser-side HLS
+    /// path that may need WebKit's network session for replay.
+    let relayEligible: Bool
     let observedAt: Date
 
     init(
@@ -186,6 +1127,8 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
       provenance: Provenance,
       activeRank: Int? = nil,
       documentToken: String? = nil,
+      relayIncludesCredentials: Bool = false,
+      relayEligible: Bool = false,
       observedAt: Date = Date()
     ) {
       self.url = url
@@ -196,8 +1139,20 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
       self.provenance = provenance
       self.activeRank = activeRank
       self.documentToken = documentToken
+      self.relayIncludesCredentials = relayIncludesCredentials
+      self.relayEligible = relayEligible
       self.observedAt = observedAt
     }
+  }
+
+  /// Relay authorization is deliberately stored separately from candidate
+  /// ranking. A URL may first arrive through a native navigation response and
+  /// later be observed by Fetch inside an exact subframe; collapsing those two
+  /// records by URL either loses the WebKit transport or mixes one frame's
+  /// credential bit with another frame's document token.
+  private struct RelayEvidenceKey: Hashable {
+    let url: String
+    let documentToken: String
   }
 
   private struct MediaSlotKey: Hashable {
@@ -215,6 +1170,10 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
     let currentTime: TimeInterval
     let isPlaying: Bool
     let isEnded: Bool
+    /// Viewport intersection plus local computed-style/tree visibility. This
+    /// deliberately does not imply IntersectionObserver v2 occlusion proof and
+    /// therefore must never authorize VPN or credential policy relaxation.
+    let isGeometricallyVisible: Bool
     let isVisible: Bool
     let visibilityAttested: Bool
     let renderedArea: Int
@@ -234,6 +1193,13 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
     let candidate: Candidate
     let state: MediaSlotState
     let includesObservedDuration: Bool
+  }
+
+  private struct MediaHandoffState {
+    let id: UUID
+    let navigationGeneration: Int
+    let visibleWebViewID: ObjectIdentifier
+    let suspendedWebViews: [WKWebView]
   }
 
   struct PreRollWait: Equatable {
@@ -285,6 +1251,7 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
     name: "com.mioh-labs.MiohRemote.instrumentation"
   )
   private static let maximumCandidateCount = 128
+  private static let maximumRelayEvidenceCount = 256
   private static let maximumCandidateURLLength = 8_192
   private static let maximumFrameDepth = 8
   private static let maximumKnownFrameCount = 64
@@ -311,6 +1278,7 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
     "mioh-hls-\(UUID().uuidString.lowercased())"
   private var pageNetworkObservationEpoch = UUID().uuidString.lowercased()
   private var candidates: [String: Candidate] = [:]
+  private var relayEvidence: [RelayEvidenceKey: Candidate] = [:]
   private var nextDiscoveryOrder = 0
   private var mediaSlots: [MediaSlotKey: MediaSlotState] = [:]
   private var currentSourceHistory = Set<String>()
@@ -374,6 +1342,11 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
   private var canGoBackObservation: NSKeyValueObservation?
   private var canGoForwardObservation: NSKeyValueObservation?
   private var webContentProcessTerminated = false
+  private var mediaHandoffState: MediaHandoffState?
+  private var endingMediaHandoffID: UUID?
+  private var mediaHandoffEndWaiters:
+    [UUID: [CheckedContinuation<Void, Never>]] = [:]
+  private var compatibilityHandoffLease: IPadBrowserMediaHandoffLease?
 
   override init() {
     // Cloudflare's WebView flow relies on ordinary DOM storage and cookies.
@@ -663,6 +1636,7 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
     mainFrameChallengeResponseGeneration = nil
     knownFrames.removeAll()
     candidates.removeAll()
+    relayEvidence.removeAll()
     candidateRevision = 0
     clearMediaSourceState()
     nextDiscoveryOrder = 0
@@ -799,6 +1773,220 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
     updateNavigationState()
   }
 
+  /// Suspends browser playback before native HLS takes ownership. Unlike a
+  /// one-shot pause, suspension prevents page JavaScript from immediately
+  /// restarting a cross-origin player while native code is acquiring bytes.
+  /// The returned lease must be ended on every terminal path.
+  func acquireMediaPlaybackHandoffLease() async throws
+    -> IPadBrowserMediaHandoffLease
+  {
+    try Task.checkCancellation()
+    while let activeState = mediaHandoffState {
+      guard endingMediaHandoffID == activeState.id else {
+        throw IPadMediaURLResolverError.requestFailed(
+          "ブラウザのHLS引き継ぎはすでに実行中です。"
+        )
+      }
+      // A stop followed immediately by another Browser action must wait until
+      // every captured WebView has completed its asynchronous unsuspend. The
+      // new generation/webView snapshot is intentionally captured only after
+      // this loop finishes.
+      await waitForMediaPlaybackHandoffEnd(id: activeState.id)
+      try Task.checkCancellation()
+    }
+    let leaseID = UUID()
+    let generation = navigationGeneration
+    let visibleWebView = webView
+    var mediaWebViews = [webView]
+    if let openingPageWebView {
+      mediaWebViews.append(openingPageWebView)
+    }
+    if let transientPopupWebView {
+      mediaWebViews.append(transientPopupWebView)
+    }
+    mediaWebViews.append(contentsOf: retainedPopupOpenerWebViews)
+
+    var uniqueWebViewIDs = Set<ObjectIdentifier>()
+    let uniqueWebViews = mediaWebViews.filter {
+      uniqueWebViewIDs.insert(ObjectIdentifier($0)).inserted
+    }
+    mediaHandoffState = MediaHandoffState(
+      id: leaseID,
+      navigationGeneration: generation,
+      visibleWebViewID: ObjectIdentifier(visibleWebView),
+      suspendedWebViews: uniqueWebViews
+    )
+
+    var suspendedWebViews: [WKWebView] = []
+    do {
+      for mediaWebView in uniqueWebViews {
+        try Task.checkCancellation()
+        await Self.setMediaPlaybackSuspended(true, on: mediaWebView)
+        suspendedWebViews.append(mediaWebView)
+        guard let state = mediaHandoffState,
+          state.id == leaseID,
+          state.navigationGeneration == generation,
+          navigationGeneration == generation,
+          webView === visibleWebView
+        else { throw CancellationError() }
+      }
+      try Task.checkCancellation()
+      return IPadBrowserMediaHandoffLease(
+        browser: self,
+        id: leaseID,
+        navigationGeneration: generation
+      )
+    } catch {
+      for mediaWebView in suspendedWebViews.reversed() {
+        await Self.setMediaPlaybackSuspended(false, on: mediaWebView)
+      }
+      if mediaHandoffState?.id == leaseID {
+        mediaHandoffState = nil
+      }
+      throw error
+    }
+  }
+
+  /// Compatibility wrapper for call sites that have not adopted the paired
+  /// lease API yet. New code should keep and explicitly end the returned lease.
+  func pauseMediaPlaybackForNativeHandoff() async {
+    guard compatibilityHandoffLease == nil else { return }
+    compatibilityHandoffLease = try? await acquireMediaPlaybackHandoffLease()
+  }
+
+  func resumeMediaPlaybackAfterNativeHandoff() async {
+    guard let lease = compatibilityHandoffLease else { return }
+    compatibilityHandoffLease = nil
+    await lease.end()
+  }
+
+  fileprivate func beginEndingMediaPlaybackHandoffLease(
+    id: UUID,
+    navigationGeneration expectedGeneration: Int
+  ) {
+    guard let state = mediaHandoffState,
+      state.id == id,
+      state.navigationGeneration == expectedGeneration
+    else { return }
+    endingMediaHandoffID = id
+  }
+
+  private func waitForMediaPlaybackHandoffEnd(id: UUID) async {
+    guard mediaHandoffState?.id == id, endingMediaHandoffID == id else {
+      return
+    }
+    await withCheckedContinuation {
+      (continuation: CheckedContinuation<Void, Never>) in
+      guard mediaHandoffState?.id == id, endingMediaHandoffID == id else {
+        continuation.resume()
+        return
+      }
+      mediaHandoffEndWaiters[id, default: []].append(continuation)
+    }
+  }
+
+  private func finishEndingMediaPlaybackHandoffLease(id: UUID) {
+    if endingMediaHandoffID == id {
+      endingMediaHandoffID = nil
+    }
+    let waiters = mediaHandoffEndWaiters.removeValue(forKey: id) ?? []
+    for waiter in waiters { waiter.resume() }
+  }
+
+  fileprivate func endMediaPlaybackHandoffLease(
+    id: UUID,
+    navigationGeneration expectedGeneration: Int
+  ) async {
+    beginEndingMediaPlaybackHandoffLease(
+      id: id,
+      navigationGeneration: expectedGeneration
+    )
+    guard let state = mediaHandoffState,
+      state.id == id,
+      state.navigationGeneration == expectedGeneration
+    else {
+      finishEndingMediaPlaybackHandoffLease(id: id)
+      return
+    }
+    for mediaWebView in state.suspendedWebViews.reversed() {
+      await Self.setMediaPlaybackSuspended(false, on: mediaWebView)
+    }
+    // Keep ownership until every resume completion arrives. Otherwise a new
+    // lease could suspend the same WebView while this old lease still has a
+    // delayed `false` completion capable of undoing the new suspension.
+    if mediaHandoffState?.id == id {
+      mediaHandoffState = nil
+    }
+    finishEndingMediaPlaybackHandoffLease(id: id)
+  }
+
+  private static func setMediaPlaybackSuspended(
+    _ suspended: Bool,
+    on mediaWebView: WKWebView
+  ) async {
+    await withCheckedContinuation {
+      (continuation: CheckedContinuation<Void, Never>) in
+      mediaWebView.setAllMediaPlaybackSuspended(suspended) {
+        continuation.resume()
+      }
+    }
+  }
+
+  fileprivate func canDownloadHLSWithWebKit(
+    leaseID: UUID,
+    navigationGeneration expectedGeneration: Int
+  ) -> Bool {
+    guard let state = mediaHandoffState,
+      state.id == leaseID,
+      state.navigationGeneration == expectedGeneration,
+      navigationGeneration == expectedGeneration,
+      state.visibleWebViewID == ObjectIdentifier(webView)
+    else { return false }
+    return webView.url != nil
+  }
+
+  fileprivate func downloadHLSResourceWithWebKit(
+    _ request: URLRequest,
+    leaseID: UUID,
+    navigationGeneration expectedGeneration: Int,
+    maximumResponseBytes: Int,
+    resolutionPolicy: IPadMediaURLResolutionPolicy
+  ) async throws -> IPadHLSResourceLoadResult {
+    try Task.checkCancellation()
+    guard maximumResponseBytes > 0 else {
+      throw IPadMediaURLResolverError.responseTooLarge(maximumResponseBytes)
+    }
+    guard let url = request.url,
+      url.scheme?.lowercased() == "https",
+      url.user == nil, url.password == nil,
+      IPadMediaURLResolver.isURL(url, allowedBy: resolutionPolicy)
+    else { throw IPadMediaURLResolverError.unsafeURL }
+    let method = (request.httpMethod ?? "GET").uppercased()
+    guard method == "GET" || method == "HEAD",
+      canDownloadHLSWithWebKit(
+        leaseID: leaseID,
+        navigationGeneration: expectedGeneration
+      )
+    else { throw CancellationError() }
+
+    let activeWebView = webView
+    let operation = IPadBrowserWebKitDownloadOperation(
+      webView: activeWebView,
+      request: request,
+      maximumResponseBytes: maximumResponseBytes,
+      resolutionPolicy: resolutionPolicy
+    )
+    let loaded = try await operation.run()
+    try Task.checkCancellation()
+    guard webView === activeWebView,
+      canDownloadHLSWithWebKit(
+        leaseID: leaseID,
+        navigationGeneration: expectedGeneration
+      )
+    else { throw CancellationError() }
+    return loaded
+  }
+
   /// Keeps the live WKWebView, its back/forward list and DOM owned by this
   /// controller while iOS suspends the app. Media is paused, but the page is
   /// deliberately not blanked or replaced.
@@ -869,6 +2057,7 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
     transientPopupCreationCount = 0
     mainNavigationRedirectCount = 0
     candidates.removeAll()
+    relayEvidence.removeAll()
     candidateRevision = 0
     clearMediaSourceState()
     acceptingScriptCandidates = false
@@ -1030,8 +2219,8 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
     )
     let eligibleSlots = currentSlots.filter {
       $0.state.hasOpaqueSource && !$0.state.isCompactFloatingOverlay
-        && $0.state.isPlaying && $0.state.isVisible
-        && $0.state.visibilityAttested && $0.state.renderedArea >= 4_096
+        && $0.state.isPlaying && $0.state.isGeometricallyVisible
+        && $0.state.renderedArea >= 4_096
     }
     let slotsByDocument = Dictionary(grouping: eligibleSlots, by: \.documentToken)
 
@@ -1051,8 +2240,9 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
         slots.map {
           $0.state.sourceActivatedAt.addingTimeInterval(12)
         }.max() ?? now
-      let matches = candidates.values.filter { candidate in
+      let matches = relayEvidence.values.filter { candidate in
         candidate.documentToken == documentToken
+          && isHLSRelayEvidenceCurrent(candidate)
           && Self.isOpaquePlaybackHLSResponse(candidate)
           && candidate.observedAt >= earliestObservation
           && candidate.observedAt <= latestObservation
@@ -1090,9 +2280,216 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
     case "page-fetch-hls-response", "page-xhr-hls-response",
       "fetch-media-response", "xhr-media-response":
       return true
+    case "performance", "script-text":
+      let value = candidate.url.absoluteString.lowercased()
+      return candidate.url.pathExtension.lowercased() == "m3u8"
+        || value.contains(".m3u8?")
     default:
       return false
     }
+  }
+
+  private static func isBrowserHLSRelaySourceKind(_ sourceKind: String) -> Bool {
+    switch sourceKind.lowercased() {
+    case "page-fetch-hls-response", "page-xhr-hls-response",
+      "fetch-media-response", "xhr-media-response":
+      return true
+    default:
+      return false
+    }
+  }
+
+  /// Native `<video src="https://...m3u8">` does not pass through page-world
+  /// Fetch/XHR, so it has no response hook to authorize the relay. The actual
+  /// currentSrc is still strong same-document evidence when the exact video is
+  /// actively playing, geometrically visible, recent, and not a compact ad.
+  /// This tuple is created only for one snapshot and always uses Fetch's safe
+  /// default credential mode; it is never stored as reusable network evidence.
+  private func nativePlaybackHLSRelayEvidence(
+    documentToken: String,
+    state: MediaSlotState,
+    now: Date
+  ) -> Candidate? {
+    guard isMediaDocumentCurrent(documentToken),
+      let currentURL = state.currentURL,
+      currentURL.scheme?.lowercased() == "https",
+      currentURL.user == nil, currentURL.password == nil,
+      currentURL.host?.isEmpty == false,
+      currentURL.pathExtension.lowercased() == "m3u8"
+        || currentURL.absoluteString.lowercased().contains(".m3u8?"),
+      state.isPlaying, !state.isEnded,
+      state.isGeometricallyVisible, state.renderedArea >= 4_096,
+      !state.isCompactFloatingOverlay,
+      now.timeIntervalSince(state.lastObservedAt) <= 5
+    else { return nil }
+    return Candidate(
+      url: currentURL,
+      sourceKind: "active-current-source",
+      frameDepth: state.frameDepth,
+      discoveryOrder: state.activationOrder,
+      frameURL: state.frameURL,
+      provenance: .script,
+      activeRank: 0,
+      documentToken: documentToken,
+      relayIncludesCredentials: false,
+      relayEligible: false,
+      observedAt: state.lastObservedAt
+    )
+  }
+
+  private static func isPageNetworkCredentialObservation(
+    _ sourceKind: String
+  ) -> Bool {
+    switch sourceKind.lowercased() {
+    case "page-fetch-hls-request", "page-fetch-hls-response",
+      "page-xhr-hls-request", "page-xhr-hls-response":
+      return true
+    default:
+      return false
+    }
+  }
+
+  private static func shouldRecordHLSRelayEvidence(
+    _ candidate: Candidate
+  ) -> Bool {
+    candidate.provenance == .script
+      && candidate.documentToken != nil
+      && (candidate.relayEligible || isOpaquePlaybackHLSResponse(candidate))
+  }
+
+  private static func isPassiveOpaquePlaybackHLSHint(
+    _ candidate: Candidate
+  ) -> Bool {
+    guard isOpaquePlaybackHLSResponse(candidate) else { return false }
+    switch candidate.sourceKind.lowercased() {
+    case "performance", "script-text":
+      return true
+    default:
+      return false
+    }
+  }
+
+  /// Re-authorizing an already playing route clears the JavaScript de-dup map
+  /// and replays Performance/script hints. Do not let that later receipt time
+  /// erase the same exact-frame hint originally observed around the current
+  /// opaque source activation. A genuinely new source generation moves the
+  /// activation window, so its newly matching observation replaces the old
+  /// one without carrying authorization across generations.
+  private func isInCurrentOpaquePlaybackActivationWindow(
+    _ candidate: Candidate
+  ) -> Bool {
+    guard Self.isPassiveOpaquePlaybackHLSHint(candidate),
+      let documentToken = candidate.documentToken,
+      isMediaDocumentCurrent(documentToken)
+    else { return false }
+    return mediaSlots.contains { key, state in
+      key.documentToken == documentToken
+        && state.hasOpaqueSource && !state.isEnded
+        && candidate.observedAt
+          >= state.sourceActivatedAt.addingTimeInterval(-5)
+        && candidate.observedAt
+          <= state.sourceActivatedAt.addingTimeInterval(12)
+    }
+  }
+
+  /// Keeps one coherent authorization tuple per URL and document. Evidence
+  /// selection always retains one complete observation: even within the same
+  /// frame, a successful response must not inherit the credential mode of a
+  /// different request for the same URL.
+  @discardableResult
+  private func recordHLSRelayEvidence(_ candidate: Candidate) -> Bool {
+    guard Self.shouldRecordHLSRelayEvidence(candidate),
+      let documentToken = candidate.documentToken
+    else { return false }
+    let key = RelayEvidenceKey(
+      url: candidate.url.absoluteString,
+      documentToken: documentToken
+    )
+    if let existing = relayEvidence[key] {
+      let existingOpaque = Self.isOpaquePlaybackHLSResponse(existing)
+      let candidateOpaque = Self.isOpaquePlaybackHLSResponse(candidate)
+      let useCandidateAsBase: Bool
+      if existing.relayEligible != candidate.relayEligible {
+        useCandidateAsBase = candidate.relayEligible
+      } else if !existing.relayEligible, existingOpaque != candidateOpaque {
+        useCandidateAsBase = candidateOpaque
+      } else if existing.sourceKind == candidate.sourceKind {
+        if Self.isPassiveOpaquePlaybackHLSHint(existing),
+          Self.isPassiveOpaquePlaybackHLSHint(candidate)
+        {
+          let existingInActivationWindow =
+            isInCurrentOpaquePlaybackActivationWindow(existing)
+          let candidateInActivationWindow =
+            isInCurrentOpaquePlaybackActivationWindow(candidate)
+          useCandidateAsBase =
+            existingInActivationWindow != candidateInActivationWindow
+            ? candidateInActivationWindow
+            : candidate.observedAt > existing.observedAt
+        } else {
+          useCandidateAsBase = candidate.observedAt > existing.observedAt
+        }
+      } else {
+        useCandidateAsBase = Self.isPreferred(candidate, over: existing)
+      }
+      let selected = useCandidateAsBase ? candidate : existing
+      let changed = existing.sourceKind != selected.sourceKind
+        || existing.frameDepth != selected.frameDepth
+        || existing.discoveryOrder != selected.discoveryOrder
+        || existing.frameURL != selected.frameURL
+        || existing.activeRank != selected.activeRank
+        || existing.relayIncludesCredentials
+          != selected.relayIncludesCredentials
+        || existing.relayEligible != selected.relayEligible
+        || existing.observedAt != selected.observedAt
+      if changed { relayEvidence[key] = selected }
+      return changed
+    }
+
+    if relayEvidence.count >= Self.maximumRelayEvidenceCount,
+      let oldest = relayEvidence.min(by: {
+        $0.value.observedAt < $1.value.observedAt
+      })?.key
+    {
+      relayEvidence.removeValue(forKey: oldest)
+    }
+    relayEvidence[key] = candidate
+    return true
+  }
+
+  private func removeHLSRelayEvidence(forURLKey urlKey: String) {
+    relayEvidence = relayEvidence.filter { $0.key.url != urlKey }
+  }
+
+  private func retireHLSRelayEvidence(
+    forDocumentToken documentToken: String
+  ) {
+    relayEvidence = relayEvidence.filter {
+      $0.key.documentToken != documentToken
+    }
+  }
+
+  private func isHLSRelayEvidenceCurrent(_ candidate: Candidate) -> Bool {
+    guard let documentToken = candidate.documentToken,
+      let frame = knownFrames[documentToken]
+    else { return false }
+    return !frame.isMainFrame || documentToken == mainDocumentToken
+  }
+
+  private func preferredHLSRelayEvidence(
+    forURLKey urlKey: String,
+    preferredDocumentToken: String?
+  ) -> Candidate? {
+    relayEvidence.values.filter {
+      $0.url.absoluteString == urlKey && $0.relayEligible
+        && isHLSRelayEvidenceCurrent($0)
+        && (preferredDocumentToken == nil
+          || $0.documentToken == preferredDocumentToken)
+    }.sorted { lhs, rhs in
+      if lhs.observedAt != rhs.observedAt {
+        return lhs.observedAt > rhs.observedAt
+      }
+      return Self.isPreferred(lhs, over: rhs)
+    }.first
   }
 
   func snapshotCandidates() async -> [IPadWebMediaCandidate] {
@@ -1136,37 +2533,68 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
       return []
     }
 
-    let activeStates = mediaSlots.compactMap { key, state -> MediaSlotState? in
+    let snapshotDate = Date()
+    let activeStates = mediaSlots.compactMap {
+      key, state -> (key: MediaSlotKey, state: MediaSlotState)? in
       guard isMediaDocumentCurrent(key.documentToken), state.currentURL != nil,
         !state.isEnded, !state.isCompactFloatingOverlay
       else {
         return nil
       }
-      return state
+      return (key, state)
     }.sorted { lhs, rhs in
-      if lhs.isVisible != rhs.isVisible { return lhs.isVisible }
-      if lhs.isPlaying != rhs.isPlaying { return lhs.isPlaying }
-      if lhs.renderedArea != rhs.renderedArea {
-        return lhs.renderedArea > rhs.renderedArea
+      if lhs.state.isPlaying != rhs.state.isPlaying { return lhs.state.isPlaying }
+      if lhs.state.isGeometricallyVisible != rhs.state.isGeometricallyVisible {
+        return lhs.state.isGeometricallyVisible
       }
-      return lhs.activationOrder > rhs.activationOrder
+      if lhs.state.isVisible != rhs.state.isVisible { return lhs.state.isVisible }
+      if lhs.state.renderedArea != rhs.state.renderedArea {
+        return lhs.state.renderedArea > rhs.state.renderedArea
+      }
+      return lhs.state.activationOrder > rhs.state.activationOrder
+    }
+    let nativeRelayEvidenceByURL = activeStates.reduce(
+      into: [String: Candidate]()
+    ) { result, entry in
+      guard let evidence = nativePlaybackHLSRelayEvidence(
+        documentToken: entry.key.documentToken,
+        state: entry.state,
+        now: snapshotDate
+      ) else { return }
+      // activeStates is strongest-first. Keep one complete URL/document tuple
+      // instead of mixing visibility from one frame with another frame token.
+      if result[evidence.url.absoluteString] == nil {
+        result[evidence.url.absoluteString] = evidence
+      }
     }
     let opaqueAssociations = opaquePlaybackAssociations()
+    let opaqueRelayEvidenceByURL = Dictionary(
+      uniqueKeysWithValues: opaqueAssociations.map {
+        ($0.candidate.url.absoluteString, $0.candidate)
+      }
+    )
     var activeURLKeys = Set(
-      activeStates.compactMap { $0.currentURL?.absoluteString }
+      activeStates.compactMap { $0.state.currentURL?.absoluteString }
     )
     activeURLKeys.formUnion(
       opaqueAssociations.map { $0.candidate.url.absoluteString }
     )
     let credentialAuthorizedURLKeys = Set(
-      activeStates.compactMap { state -> String? in
+      activeStates.compactMap { entry -> String? in
+        let state = entry.state
         guard state.isPlaying, state.isVisible, state.visibilityAttested,
           state.renderedArea >= 4_096
         else { return nil }
         return state.currentURL?.absoluteString
       }
     ).union(
-      opaqueAssociations.map { $0.candidate.url.absoluteString }
+      opaqueAssociations.compactMap { association -> String? in
+        let state = association.state
+        guard state.isVisible, state.visibilityAttested,
+          state.renderedArea >= 4_096
+        else { return nil }
+        return association.candidate.url.absoluteString
+      }
     )
     let supersededURLKeys = currentSourceHistory.subtracting(activeURLKeys)
 
@@ -1180,7 +2608,8 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
           includesObservedDuration: association.includesObservedDuration
         )
     }
-    for (rank, state) in activeStates.enumerated() {
+    for (rank, entry) in activeStates.enumerated() {
+      let state = entry.state
       guard let activeURL = state.currentURL,
         rankedActiveURLs.insert(activeURL.absoluteString).inserted
       else { continue }
@@ -1195,7 +2624,8 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
         discoveryOrder: state.activationOrder,
         frameURL: state.frameURL,
         provenance: .script,
-        activeRank: rank
+        activeRank: rank,
+        documentToken: entry.key.documentToken
       )
       if let index = snapshot.firstIndex(where: { $0.url == activeURL }) {
         let existing = snapshot[index]
@@ -1207,7 +2637,8 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
           discoveryOrder: observed.discoveryOrder,
           frameURL: keepNativeProvenance ? existing.frameURL : observed.frameURL,
           provenance: keepNativeProvenance ? existing.provenance : observed.provenance,
-          activeRank: rank
+          activeRank: rank,
+          documentToken: observed.documentToken ?? existing.documentToken
         )
       } else if snapshot.count < Self.maximumCandidateCount {
         snapshot.append(observed)
@@ -1244,6 +2675,24 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
       supersededURLKeys: supersededURLKeys,
       excludedURLKeys: floatingAdvertisementURLKeys
     ).map { candidate in
+      let urlKey = candidate.url.absoluteString
+      // A fulfilled Fetch/XHR observation is the strongest atomic transport
+      // tuple and must retain its explicit credential mode. Native currentSrc
+      // is the safe same-origin fallback; passive opaque association is last.
+      let nativeRelayEvidence = nativeRelayEvidenceByURL[urlKey].flatMap {
+        candidate.documentToken == nil
+          || $0.documentToken == candidate.documentToken ? $0 : nil
+      }
+      let opaqueRelayEvidence = opaqueRelayEvidenceByURL[urlKey].flatMap {
+        candidate.documentToken == nil
+          || $0.documentToken == candidate.documentToken ? $0 : nil
+      }
+      let selectedRelayEvidence = preferredHLSRelayEvidence(
+          forURLKey: urlKey,
+          preferredDocumentToken: candidate.documentToken
+        )
+        ?? nativeRelayEvidence
+        ?? opaqueRelayEvidence
       let relevantURLs = [candidate.url, candidate.frameURL, fallbackFrameURL].compactMap {
         $0
       }
@@ -1299,7 +2748,14 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
               ? .unverifiedMediaResponse
               : Self.isDirectMediaCandidate(candidate.url)
                 ? .directHint : .pageLead,
-        mediaEvidence: mediaEvidenceByURL[candidate.url.absoluteString]
+        mediaEvidence: mediaEvidenceByURL[candidate.url.absoluteString],
+        browserDocumentToken:
+          selectedRelayEvidence?.documentToken ?? candidate.documentToken,
+        browserRelayEligible: selectedRelayEvidence != nil,
+        browserRelayRequiresProbe:
+          selectedRelayEvidence.map { !$0.relayEligible } ?? false,
+        browserRelayIncludesCredentials:
+          selectedRelayEvidence?.relayIncludesCredentials ?? false
       )
     }
   }
@@ -1431,6 +2887,7 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
     mainFrameChallengeResponseGeneration = nil
     knownFrames.removeAll()
     candidates.removeAll()
+    relayEvidence.removeAll()
     candidateRevision = 0
     clearMediaSourceState()
     nextDiscoveryOrder = 0
@@ -1528,6 +2985,7 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
   }
 
   private func retireMediaSlots(forDocumentToken documentToken: String) {
+    retireHLSRelayEvidence(forDocumentToken: documentToken)
     let keys = mediaSlots.keys.filter { $0.documentToken == documentToken }
     guard !keys.isEmpty else { return }
     for key in keys {
@@ -1737,7 +3195,11 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
       }
       let inserted = reportedFloatingAdvertisementURLKeys.insert(key).inserted
       let removed = candidates.removeValue(forKey: key) != nil
-      if inserted || removed {
+      let removedRelayEvidence = relayEvidence.contains {
+        $0.key.url == key
+      }
+      removeHLSRelayEvidence(forURLKey: key)
+      if inserted || removed || removedRelayEvidence {
         candidateRevision = nextGeneration(after: candidateRevision)
         refreshCandidateSummaries()
       }
@@ -1756,7 +3218,11 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
         discoveryOrder: nextDiscoveryOrder,
         frameURL: trustedFrameURL,
         provenance: .script,
-        documentToken: documentToken
+        documentToken: documentToken,
+        relayIncludesCredentials:
+          Self.isPageNetworkCredentialObservation(sourceKind)
+          && body["includesCredentials"] as? Bool == true,
+        relayEligible: Self.isBrowserHLSRelaySourceKind(sourceKind)
       )
     )
   }
@@ -1848,6 +3314,8 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
     )
     let isPlaying = (body["isPlaying"] as? Bool) ?? false
     let isEnded = (body["isEnded"] as? Bool) ?? false
+    let isGeometricallyVisible =
+      (body["isGeometricallyVisible"] as? Bool) ?? false
     let isVisible = (body["isVisible"] as? Bool) ?? false
     let visibilityAttested =
       (body["visibilityAttested"] as? Bool) ?? false
@@ -1868,10 +3336,21 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
           && !$0.isCompactFloatingOverlay && $0.isVisible
           && $0.visibilityAttested && $0.renderedArea >= 4_096
       } ?? false
+    let isStrongGeometricPlayback =
+      (currentURL != nil || hasOpaqueSource) && isPlaying && !isEnded
+      && !isCompactFloatingOverlay && isGeometricallyVisible
+      && renderedArea >= 4_096
+    let wasStrongGeometricPlayback =
+      existing.map {
+        ($0.currentURL != nil || $0.hasOpaqueSource) && $0.isPlaying && !$0.isEnded
+          && !$0.isCompactFloatingOverlay && $0.isGeometricallyVisible
+          && $0.renderedArea >= 4_096
+      } ?? false
     let summaryPresentationChanged =
       sourceChanged || existing == nil
       || existing?.isPlaying != isPlaying
       || existing?.isEnded != isEnded
+      || existing?.isGeometricallyVisible != isGeometricallyVisible
       || existing?.isVisible != isVisible
       || existing?.visibilityAttested != visibilityAttested
       || existing?.renderedArea != renderedArea
@@ -1895,10 +3374,13 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
       // Re-rank immediately when a player is docked into, or removed from, a
       // compact floating overlay without changing currentSrc.
       mediaSourceRevision = nextGeneration(after: mediaSourceRevision)
-    } else if isStrongVisiblePlayback != wasStrongVisiblePlayback {
+    } else if isStrongVisiblePlayback != wasStrongVisiblePlayback
+      || isStrongGeometricPlayback != wasStrongGeometricPlayback
+    {
       // MSE commonly assigns blob: before `playing` and visual visibility are
-      // established. Wake the analyzer at that eligibility edge rather than
-      // waiting for its periodic safety retry.
+      // established. Wake the analyzer at either the strict resolver-policy
+      // edge or the geometry-only HLS relay edge rather than waiting for its
+      // periodic safety retry.
       mediaSourceRevision = nextGeneration(after: mediaSourceRevision)
     }
     mediaSlots[key] = MediaSlotState(
@@ -1912,6 +3394,7 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
       currentTime: currentTime,
       isPlaying: isPlaying,
       isEnded: isEnded,
+      isGeometricallyVisible: isGeometricallyVisible,
       isVisible: isVisible,
       visibilityAttested: visibilityAttested,
       renderedArea: renderedArea,
@@ -2852,6 +4335,7 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
       Self.sanitizedPublicHTTPSURL(
         knownFrames[targetPriorDocumentToken]?.request.url
       )?.absoluteString ?? destinationURL.absoluteString
+    retireHLSRelayEvidence(forDocumentToken: targetPriorDocumentToken)
     knownFrames.removeValue(forKey: targetPriorDocumentToken)
     subframeInspectionRouteTokens.removeValue(forKey: targetPriorDocumentToken)
     subframeDocumentEpochs[targetPriorDocumentToken] = nextEpoch
@@ -3105,43 +4589,52 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
     }
     let key = candidate.url.absoluteString
     if let existing = candidates[key] {
-      if existing.provenance != .script, candidate.provenance == .script {
-        return
-      }
-      let refreshedSameFrameObservation =
-        existing.provenance == .script && candidate.provenance == .script
-        && existing.documentToken != nil
-        && existing.documentToken == candidate.documentToken
-        && existing.sourceKind == candidate.sourceKind
-        && candidate.observedAt > existing.observedAt
-      let credentialUpgrade =
-        candidate.provenance != .script && existing.provenance == .script
-      let preferredUpgrade =
-        credentialUpgrade || Self.isPreferred(candidate, over: existing)
-      if refreshedSameFrameObservation || preferredUpgrade {
-        candidates[key] = candidate
-        candidateRevision = nextGeneration(after: candidateRevision)
-        refreshCandidateSummaries()
-        if Self.isReadyCandidate(candidate) {
-          scheduleReadyCandidate()
+      let relayEvidenceChanged = recordHLSRelayEvidence(candidate)
+      var replacement: Candidate?
+      if !(existing.provenance != .script && candidate.provenance == .script) {
+        let refreshedSameFrameObservation =
+          existing.provenance == .script && candidate.provenance == .script
+          && existing.documentToken != nil
+          && existing.documentToken == candidate.documentToken
+          && existing.sourceKind == candidate.sourceKind
+          && candidate.observedAt > existing.observedAt
+        let nativeProvenanceUpgrade =
+          candidate.provenance != .script && existing.provenance == .script
+        let preferredUpgrade =
+          nativeProvenanceUpgrade || Self.isPreferred(candidate, over: existing)
+        if refreshedSameFrameObservation || preferredUpgrade {
+          replacement = candidate
         }
+      }
+      guard relayEvidenceChanged || replacement != nil else { return }
+      if let replacement { candidates[key] = replacement }
+      candidateRevision = nextGeneration(after: candidateRevision)
+      refreshCandidateSummaries()
+      if Self.isReadyCandidate(replacement ?? existing) {
+        scheduleReadyCandidate()
       }
       return
     }
 
     nextDiscoveryOrder = nextDiscoveryOrder == Int.max ? 0 : nextDiscoveryOrder + 1
+    var inserted = false
     if candidates.count < Self.maximumCandidateCount {
       candidates[key] = candidate
+      inserted = true
     } else if let worst = candidates.values.max(by: {
       Self.isPreferred($0, over: $1)
     }),
       Self.isPreferred(candidate, over: worst)
     {
       candidates.removeValue(forKey: worst.url.absoluteString)
+      removeHLSRelayEvidence(forURLKey: worst.url.absoluteString)
       candidates[key] = candidate
+      inserted = true
     } else {
       return
     }
+    guard inserted else { return }
+    recordHLSRelayEvidence(candidate)
     candidateRevision = nextGeneration(after: candidateRevision)
     refreshCandidateSummaries()
 
@@ -3703,11 +5196,11 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
     case "page-fetch-hls-response", "page-xhr-hls-response":
       sourcePriority = 4
     case "fetch-response", "xhr-response": sourcePriority = 5
-    case "script-text": sourcePriority = 6
+    case "performance": sourcePriority = 6
     case "fetch", "xhr", "page-fetch-hls-request", "page-xhr-hls-request":
       sourcePriority = 6
-    case "setattribute": sourcePriority = 7
-    case "performance": sourcePriority = 8
+    case "script-text": sourcePriority = 7
+    case "setattribute": sourcePriority = 8
     case "frame", "iframe", "popup": sourcePriority = 9
     case "page": sourcePriority = 11
     default: sourcePriority = 10
@@ -4145,6 +5638,7 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
         const currentTime = Number.isFinite(rawCurrentTime) && rawCurrentTime >= 0
           ? Math.min(Math.floor(rawCurrentTime / 2) * 2, 604800) : 0;
         let renderedArea = 0;
+        let isGeometricallyVisible = false;
         let isVisible = false;
         let visibilityAttested = false;
         try {
@@ -4176,9 +5670,10 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
           // resolver policy.
           const visualProof = intersectionVisualVisibilityEnabled
             && intersection?.isVisuallyVisible === true;
+          isGeometricallyVisible = Boolean(intersection && localTreeVisible
+            && intersection.isIntersecting === true && renderedArea >= 4);
           visibilityAttested = Boolean(intersection && visualProof);
-          isVisible = visibilityAttested && localTreeVisible
-            && intersection.isIntersecting === true && renderedArea >= 4;
+          isVisible = visibilityAttested && isGeometricallyVisible;
         } catch (_) {}
         const isPlaying = !element.paused && !element.ended && element.readyState >= 2;
         const isEnded = element.ended === true;
@@ -4187,7 +5682,8 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
           : opaqueSourceToken ? 'opaque' : 'cleared';
         const signature = [
           slot.generation, state, currentURL || '', duration || 0, currentTime,
-          isPlaying ? 1 : 0, isEnded ? 1 : 0, isVisible ? 1 : 0,
+          isPlaying ? 1 : 0, isEnded ? 1 : 0,
+          isGeometricallyVisible ? 1 : 0, isVisible ? 1 : 0,
           visibilityAttested ? 1 : 0, Math.floor(renderedArea / 256),
           isCompactFloatingOverlay ? 1 : 0
         ].join('|');
@@ -4204,13 +5700,17 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
           currentTime,
           isPlaying,
           isEnded,
+          isGeometricallyVisible,
           isVisible,
           visibilityAttested,
           renderedArea,
           isCompactFloatingOverlay
         });
       };
-      const emit = (raw, kind, isCompactFloatingOverlay = false) => {
+      const emit = (
+        raw, kind, isCompactFloatingOverlay = false,
+        includesCredentials = false
+      ) => {
         if (!raw || typeof raw !== 'string') return;
         let resolved;
         try { resolved = new URL(raw, document.baseURI); } catch (_) { return; }
@@ -4230,25 +5730,35 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
           if (sourceKind === 'fetch' || sourceKind === 'xhr'
             || sourceKind === 'page-fetch-hls-request'
             || sourceKind === 'page-xhr-hls-request') return 4;
-          if (sourceKind === 'script-text') return 5;
-          if (sourceKind === 'setattribute') return 6;
-          if (sourceKind === 'performance') return 7;
+          if (sourceKind === 'performance') return 5;
+          if (sourceKind === 'script-text') return 6;
+          if (sourceKind === 'setattribute') return 7;
           if (sourceKind === 'frame' || sourceKind === 'iframe'
             || sourceKind === 'popup') return 8;
           return 9;
         })();
         const priorRank = seen.get(value);
-        if (Number.isInteger(priorRank) && priorRank <= evidenceRank) return;
+        const credentialUpgrade = includesCredentials === true
+          && (sourceKind === 'page-fetch-hls-request'
+            || sourceKind === 'page-fetch-hls-response'
+            || sourceKind === 'page-xhr-hls-request'
+            || sourceKind === 'page-xhr-hls-response');
+        if (Number.isInteger(priorRank) && priorRank <= evidenceRank
+          && !credentialUpgrade) return;
         seen.set(value, evidenceRank);
         post({
           type: 'candidate', url: value, kind: sourceKind, frameDepth,
-          isCompactFloatingOverlay: isCompactFloatingOverlay === true
+          isCompactFloatingOverlay: isCompactFloatingOverlay === true,
+          includesCredentials: includesCredentials === true
         });
       };
-      const inspectValue = (value, kind, isCompactFloatingOverlay = false) => {
+      const inspectValue = (
+        value, kind, isCompactFloatingOverlay = false,
+        includesCredentials = false
+      ) => {
         if (typeof value !== 'string') return;
         if (mediaPattern.test(value) || interestingPattern.test(value)) {
-          emit(value, kind, isCompactFloatingOverlay);
+          emit(value, kind, isCompactFloatingOverlay, includesCredentials);
         }
       };
       const inspectTextForMediaURLs = (text, kind) => {
@@ -4290,7 +5800,9 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
         }
         const currentPageURL = String(location.href);
         if (payload.pageURL !== currentPageURL) return;
-        const key = `${payload.kind}\n${payload.value}`;
+        const key = `${payload.kind}\n${
+          payload.includesCredentials === true ? 1 : 0
+        }\n${payload.value}`;
         if (pageNetworkBridgeSeen.has(key)) return;
         pageNetworkBridgeSeen.add(key);
         pageNetworkBridgeEventCount += 1;
@@ -4301,9 +5813,15 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
           // A page-world response can be forged by the page. It is emitted
           // only as a low-trust URL hint and is always fetched and parsed
           // again by the native public-network resolver.
-          emit(payload.value, payload.kind);
+          emit(
+            payload.value, payload.kind, false,
+            payload.includesCredentials === true
+          );
         } else {
-          inspectValue(payload.value, payload.kind);
+          inspectValue(
+            payload.value, payload.kind, false,
+            payload.includesCredentials === true
+          );
         }
       };
       const installPageNetworkBridge = (rawEventName, rawObservationEpoch) => {
@@ -4346,9 +5864,12 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
             kind,
             value,
             pageURL,
-            hlsResponse: payload?.hlsResponse === true
+            hlsResponse: payload?.hlsResponse === true,
+            includesCredentials: payload?.includesCredentials === true
           };
-          const key = `${kind}\n${pageURL}\n${value}`;
+          const key = `${kind}\n${pageURL}\n${
+            normalizedPayload.includesCredentials ? 1 : 0
+          }\n${value}`;
           // A page-world HLS response can be the first observable signal of
           // a pushState/replaceState player handoff. Notify native before the
           // candidate is accepted so the payload waits behind the new route
@@ -4799,6 +6320,20 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
         // default. Explicit null/non-string methods are not treated as GET.
         return init == null || init.method === undefined;
       };
+      const fetchIncludesCredentials = argumentsList => {
+        try {
+          const input = argumentsList[0];
+          const init = argumentsList.length > 1 ? argumentsList[1] : undefined;
+          if (init != null && init.credentials !== undefined) {
+            return String(init.credentials).toLowerCase() === 'include';
+          }
+          if (input != null && typeof input === 'object'
+            && input.credentials !== undefined) {
+            return String(input.credentials).toLowerCase() === 'include';
+          }
+        } catch (_) {}
+        return false;
+      };
       const normalizedURL = raw => {
         if (raw == null) return null;
         let value;
@@ -4841,7 +6376,9 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
         observationEpoch: observationState.observationEpoch,
         pageURL: synchronizeRoute()
       });
-      const dispatchHint = (rawURL, kind, hlsResponse, context) => {
+      const dispatchHint = (
+        rawURL, kind, hlsResponse, context, includesCredentials = false
+      ) => {
         const activePageURL = synchronizeRoute();
         if (!activePageURL || context?.pageURL !== activePageURL
           || observationState.routeEventCount >= maximumRouteEvents
@@ -4855,7 +6392,7 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
         }
         const key = `${context.observationEpoch}\n${context.pageURL}\n${kind}\n${
           hlsResponse === true ? 1 : 0
-        }\n${url}`;
+        }\n${includesCredentials === true ? 1 : 0}\n${url}`;
         if (observationState.seen.has(key)) return;
         observationState.seen.add(key);
         observationState.routeEventCount += 1;
@@ -4866,18 +6403,23 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
               url,
               kind,
               hlsResponse: hlsResponse === true,
+              includesCredentials: includesCredentials === true,
               pageURL: context.pageURL,
               observationEpoch: context.observationEpoch
             })
           }));
         } catch (_) {}
       };
-      const dispatchResponseHint = (rawURL, kind, hlsResponse, context) => {
+      const dispatchResponseHint = (
+        rawURL, kind, hlsResponse, context, includesCredentials = false
+      ) => {
         let value;
         try { value = String(rawURL || ''); } catch (_) { return; }
         if (hlsResponse !== true
           && !hlsURLPattern.test(value) && !hlsHintPattern.test(value)) return;
-        dispatchHint(value, kind, hlsResponse, context);
+        dispatchHint(
+          value, kind, hlsResponse, context, includesCredentials
+        );
       };
 
       let installedHookCount = 0;
@@ -4895,11 +6437,13 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
                 const readOnly = fetchUsesReadOnlyMethod(argumentsList);
                 if (readOnly) {
                   const context = requestContext();
+                  const includesCredentials = fetchIncludesCredentials(argumentsList);
                   dispatchHint(
                     argumentsList[0],
                     'page-fetch-hls-request',
                     false,
-                    context
+                    context,
+                    includesCredentials
                   );
                   result.then(response => {
                     try {
@@ -4910,7 +6454,8 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
                         response.url,
                         'page-fetch-hls-response',
                         isHLS,
-                        context
+                        context,
+                        includesCredentials
                       );
                     } catch (_) {}
                   }, () => {});
@@ -4936,13 +6481,19 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
               try {
                 const readOnly = isReadOnlyRequest(argumentsList[0]);
                 const context = readOnly ? requestContext() : null;
-                requestState.set(thisArgument, {readOnly, context});
+                requestState.set(thisArgument, {
+                  readOnly,
+                  context,
+                  rawURL: argumentsList[1],
+                  includesCredentials: false
+                });
                 if (readOnly) {
                   dispatchHint(
                     argumentsList[1],
                     'page-xhr-hls-request',
                     false,
-                    context
+                    context,
+                    false
                   );
                 }
                 if (!observedRequests.has(thisArgument)) {
@@ -4957,7 +6508,8 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
                           thisArgument.responseURL,
                           'page-xhr-hls-response',
                           isHLS,
-                          state.context
+                          state.context,
+                          state.includesCredentials === true
                         );
                       }
                     } catch (_) {}
@@ -4971,6 +6523,34 @@ final class IPadInteractiveMediaBrowser: NSObject, ObservableObject {
           XMLHttpRequest.prototype.open = observedOpen;
           if (XMLHttpRequest.prototype.open === observedOpen) {
             installedHookCount += 1;
+          }
+          if (typeof XMLHttpRequest.prototype.send === 'function') {
+            const originalSend = XMLHttpRequest.prototype.send;
+            const observedSend = new Proxy(originalSend, {
+              apply(target, thisArgument, argumentsList) {
+                // Preserve native send's return value and synchronous errors.
+                const result = reflectApply(
+                  target, thisArgument, argumentsList
+                );
+                try {
+                  const state = requestState.get(thisArgument);
+                  if (state?.readOnly === true) {
+                    state.includesCredentials =
+                      thisArgument.withCredentials === true;
+                    requestState.set(thisArgument, state);
+                    dispatchHint(
+                      state.rawURL,
+                      'page-xhr-hls-request',
+                      false,
+                      state.context,
+                      state.includesCredentials
+                    );
+                  }
+                } catch (_) {}
+                return result;
+              }
+            });
+            XMLHttpRequest.prototype.send = observedSend;
           }
         }
       } catch (_) {}
@@ -5425,6 +7005,7 @@ extension IPadInteractiveMediaBrowser: WKNavigationDelegate {
     authorizedRouteURL = nil
     clearSubframeNavigationState()
     candidates.removeAll()
+    relayEvidence.removeAll()
     candidateRevision = 0
     clearMediaSourceState()
     nextDiscoveryOrder = 0
