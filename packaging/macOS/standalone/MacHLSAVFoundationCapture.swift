@@ -43,6 +43,7 @@ final class MacHLSAVFoundationCapture {
   private let isLive: Bool
   private let generation: Int
   private let segmentSeconds: Double
+  private var forwardBufferSeconds: Double
   private let player = AVPlayer()
   private var captureTask: Task<Void, Never>?
   private var captureItem: AVPlayerItem?
@@ -57,7 +58,8 @@ final class MacHLSAVFoundationCapture {
     duration: Double,
     isLive: Bool,
     generation: Int,
-    segmentSeconds: Double
+    segmentSeconds: Double,
+    forwardBufferSeconds: Double
   ) {
     asset = AVURLAsset(url: url)
     self.outputDirectory = outputDirectory
@@ -66,6 +68,7 @@ final class MacHLSAVFoundationCapture {
     self.isLive = isLive
     self.generation = generation
     self.segmentSeconds = max(0.5, segmentSeconds)
+    self.forwardBufferSeconds = max(2, forwardBufferSeconds)
     player.isMuted = true
     player.automaticallyWaitsToMinimizeStalling = true
     player.preventsDisplaySleepDuringVideoPlayback = false
@@ -74,6 +77,11 @@ final class MacHLSAVFoundationCapture {
 
   func makePlaybackItem() -> AVPlayerItem {
     AVPlayerItem(asset: asset)
+  }
+
+  func setForwardBufferDuration(_ seconds: Double) {
+    forwardBufferSeconds = max(2, seconds.isFinite ? seconds : 8)
+    captureItem?.preferredForwardBufferDuration = forwardBufferSeconds
   }
 
   func segments() throws -> AsyncThrowingStream<CapturedSegment, Error> {
@@ -125,7 +133,10 @@ final class MacHLSAVFoundationCapture {
 
     let item = AVPlayerItem(asset: asset)
     item.preferredMaximumResolution = CGSize(width: 1_920, height: 1_080)
-    item.preferredForwardBufferDuration = max(6, segmentSeconds * 4)
+    item.preferredForwardBufferDuration = max(
+      forwardBufferSeconds,
+      segmentSeconds * 4
+    )
     let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
       kCVPixelBufferPixelFormatTypeKey as String:
         Int(kCVPixelFormatType_32BGRA),

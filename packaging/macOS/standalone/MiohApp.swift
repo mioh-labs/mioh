@@ -539,6 +539,33 @@ struct ROIEnhancerModelOption: Identifiable {
   var id: String { name }
 }
 
+enum PreviewHLSQuality: String, CaseIterable, Identifiable {
+  case automatic = "auto"
+  case p1080 = "1080p"
+  case p720 = "720p"
+  case p480 = "480p"
+
+  var id: String { rawValue }
+
+  var label: String {
+    switch self {
+    case .automatic: return "自動"
+    case .p1080: return "1080p固定"
+    case .p720: return "720p固定"
+    case .p480: return "480p固定"
+    }
+  }
+
+  var targetHeight: Int? {
+    switch self {
+    case .automatic: return nil
+    case .p1080: return 1_080
+    case .p720: return 720
+    case .p480: return 480
+    }
+  }
+}
+
 struct MiohUserDefaultsSnapshot: Codable {
   var inputPath: String?
   var outputPath: String?
@@ -614,6 +641,7 @@ struct MiohUserDefaultsSnapshot: Codable {
   var previewCustomDetectionModel: String?
   var previewRealtimeOptimization: Bool?
   var previewUseSafariCompatibleHLS: Bool?
+  var previewHLSQuality: String?
   var previewProjectionMode: String?
   var previewVideoLayout: String?
   var previewEye: String?
@@ -693,6 +721,7 @@ struct MiohUserDefaultsSnapshot: Codable {
       previewCustomDetectionModel: "",
       previewRealtimeOptimization: true,
       previewUseSafariCompatibleHLS: false,
+      previewHLSQuality: PreviewHLSQuality.automatic.rawValue,
       previewProjectionMode: "通常",
       previewVideoLayout: "SBS 左右",
       previewEye: "左目",
@@ -798,6 +827,7 @@ final class RestorationRunner: ObservableObject {
   @Published var previewCustomDetectionModel = ""
   @Published var previewRealtimeOptimization = true
   @Published var previewUseSafariCompatibleHLS = false
+  @Published var previewHLSQuality = PreviewHLSQuality.automatic.rawValue
   @Published var previewProjectionMode = "通常"
   @Published var previewVideoLayout = "SBS 左右"
   @Published var previewEye = "左目"
@@ -3064,6 +3094,7 @@ final class RestorationRunner: ObservableObject {
       previewCustomDetectionModel: previewCustomDetectionModel,
       previewRealtimeOptimization: previewRealtimeOptimization,
       previewUseSafariCompatibleHLS: previewUseSafariCompatibleHLS,
+      previewHLSQuality: previewHLSQuality,
       previewProjectionMode: previewProjectionMode,
       previewVideoLayout: previewVideoLayout,
       previewEye: previewEye,
@@ -3176,6 +3207,9 @@ final class RestorationRunner: ObservableObject {
     previewRealtimeOptimization = snapshot.previewRealtimeOptimization ?? true
     previewUseSafariCompatibleHLS =
       snapshot.previewUseSafariCompatibleHLS ?? false
+    previewHLSQuality = PreviewHLSQuality(
+      rawValue: snapshot.previewHLSQuality ?? ""
+    )?.rawValue ?? PreviewHLSQuality.automatic.rawValue
     previewProjectionMode = ["通常", "VR180", "360"].contains(snapshot.previewProjectionMode ?? "")
       ? snapshot.previewProjectionMode!
       : "通常"
@@ -4136,6 +4170,19 @@ struct ContentView: View {
         )
         .font(.caption)
         .foregroundStyle(.secondary)
+        Picker("HLS画質", selection: $runner.previewHLSQuality) {
+          ForEach(PreviewHLSQuality.allCases) { quality in
+            Text(quality.label).tag(quality.rawValue)
+          }
+        }
+        .pickerStyle(.menu)
+        Text(
+          runner.previewHLSQuality == PreviewHLSQuality.automatic.rawValue
+            ? "自動では配信状況に応じて画質を選びます。固定時は高速・Safari互換の両方で指定variantを使用します。"
+            : "指定画質以下で最も高いvariantを固定使用し、自動的な低画質への切り替えを行いません。"
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
         Text("変更は次回のHLS復元再生から適用されます。")
           .font(.caption)
           .foregroundStyle(.secondary)
@@ -4319,7 +4366,7 @@ struct ContentView: View {
           .foregroundStyle(.secondary)
       }
       Section("保存対象") {
-        Text("入力/出力、一時フォルダ、分割、復元、検出、出力、メモリ、再生バッファ、HLS通信方式まで保存します。ログ、進捗、実行中状態は保存しません。")
+        Text("入力/出力、一時フォルダ、分割、復元、検出、出力、メモリ、再生バッファ、HLS通信方式・画質まで保存します。ログ、進捗、実行中状態は保存しません。")
           .font(.caption)
           .foregroundStyle(.secondary)
       }

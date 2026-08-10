@@ -778,6 +778,9 @@ final class RemoteControlServer: ObservableObject {
       "projectionModes": ["通常", "VR180", "360"],
       "videoLayouts": ["Mono", "SBS 左右", "上下"],
       "eyes": ["左目", "右目"],
+      "hlsQualities": PreviewHLSQuality.allCases.map {
+        ["value": $0.rawValue, "label": $0.label]
+      },
       "mergeEncoders": ["copy", "h264", "hevc"],
     ]
   }
@@ -985,6 +988,7 @@ final class RemoteControlServer: ObservableObject {
       value.previewBufferLimit.isFinite, (1...60).contains(value.previewBufferLimit),
       runner.restorationModels.contains(value.previewRestorationModel ?? ""),
       runner.previewDetectionModels.contains(value.previewDetectionModel ?? ""),
+      PreviewHLSQuality(rawValue: value.previewHLSQuality ?? "") != nil,
       ["通常", "VR180", "360"].contains(value.previewProjectionMode ?? ""),
       ["Mono", "SBS 左右", "上下"].contains(value.previewVideoLayout ?? ""),
       ["左目", "右目"].contains(value.previewEye ?? ""),
@@ -2462,6 +2466,9 @@ private enum RemoteControlHTML {
       ]],
       ['memory',[
         ['メモリ管理',[['memoryCleanupInterval','掃除間隔','number',1,100,1],['cleanupTriggerGB','掃除開始空き容量（GB）','number',0,1024,0.1],['useMPSMemoryFraction','MPSメモリ比率を指定','bool'],['mpsMemoryFraction','MPSメモリ比率','number',0.01,1,0.01],['logMPSMemory','MPSメモリ統計を記録','bool']]]
+      ]],
+      ['settings',[
+        ['HLS再生',[['previewUseSafariCompatibleHLS','Safari互換通信','bool'],['previewHLSQuality','HLS画質','select','hlsQualities']]]
       ]],
       ['playback',[
         ['再生設定',[['previewRestorationModel','復元モデル','select','previewRestorationModels'],['previewCustomRestorationModel','復元モデルパス','modelValue'],['previewDetectionModel','再生用検出モデル','select','previewDetectionModels'],['previewCustomDetectionModel','検出モデルパス','modelValue'],['previewRealtimeOptimization','リアルタイム最適化','bool'],['previewBufferLimit','バッファ上限（秒）','range',1,60,1]]],
