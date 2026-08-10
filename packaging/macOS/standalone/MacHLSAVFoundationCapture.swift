@@ -4,6 +4,36 @@ import CoreVideo
 import Foundation
 import VideoToolbox
 
+struct MacHLSCaptureRatePolicy {
+  static let acceleratedRate: Float = 2
+
+  private var isWarmingUp = true
+  private var isFillingTarget = true
+
+  mutating func finishWarmup() -> Bool {
+    guard isWarmingUp else { return false }
+    isWarmingUp = false
+    return true
+  }
+
+  mutating func desiredRate(
+    bufferedSeconds: Double,
+    targetSeconds: Double,
+    isLive: Bool
+  ) -> Float {
+    guard !isLive, !isWarmingUp else { return 1 }
+    let target = max(2, targetSeconds.isFinite ? targetSeconds : 8)
+    let buffered = max(0, bufferedSeconds.isFinite ? bufferedSeconds : 0)
+    if buffered + 0.1 >= target {
+      isFillingTarget = false
+    } else if buffered <= max(2, target * 0.70) {
+      isFillingTarget = true
+    }
+    return isFillingTarget ? Self.acceleratedRate : 1
+  }
+
+}
+
 /// Captures HLS through AVFoundation's media stack instead of issuing raw
 /// playlist/segment requests. Some CDNs accept Safari/AVPlayer HLS playback but
 /// reject URLSession or WKDownload requests for the same segment with HTTP 429.
@@ -43,6 +73,7 @@ final class MacHLSAVFoundationCapture {
   private let isLive: Bool
   private let generation: Int
   private let segmentSeconds: Double
+  private let log: @MainActor (String) -> Void
   private var forwardBufferSeconds: Double
   private let player = AVPlayer()
   private var captureTask: Task<Void, Never>?
@@ -50,6 +81,10 @@ final class MacHLSAVFoundationCapture {
   private var videoOutput: AVPlayerItemVideoOutput?
   private var endObserver: NSObjectProtocol?
   private var didReachEnd = false
+  private var restoredBufferLeadSeconds = 0.0
+  private var ratePolicy = MacHLSCaptureRatePolicy()
+  private var requestedCaptureRate: Float = 1
+  private var capturePlaybackStarted = false
 
   init(
     url: URL,
@@ -59,7 +94,8 @@ final class MacHLSAVFoundationCapture {
     isLive: Bool,
     generation: Int,
     segmentSeconds: Double,
-    forwardBufferSeconds: Double
+    forwardBufferSeconds: Double,
+    log: @escaping @MainActor (String) -> Void = { _ in }
   ) {
     asset = AVURLAsset(url: url)
     self.outputDirectory = outputDirectory
@@ -69,6 +105,7 @@ final class MacHLSAVFoundationCapture {
     self.generation = generation
     self.segmentSeconds = max(0.5, segmentSeconds)
     self.forwardBufferSeconds = max(2, forwardBufferSeconds)
+    self.log = log
     player.isMuted = true
     player.automaticallyWaitsToMinimizeStalling = true
     player.preventsDisplaySleepDuringVideoPlayback = false
@@ -82,6 +119,12 @@ final class MacHLSAVFoundationCapture {
   func setForwardBufferDuration(_ seconds: Double) {
     forwardBufferSeconds = max(2, seconds.isFinite ? seconds : 8)
     captureItem?.preferredForwardBufferDuration = forwardBufferSeconds
+    updateCaptureRate()
+  }
+
+  func setRestoredBufferLead(_ seconds: Double) {
+    restoredBufferLeadSeconds = max(0, seconds.isFinite ? seconds : 0)
+    updateCaptureRate()
   }
 
   func segments() throws -> AsyncThrowingStream<CapturedSegment, Error> {
@@ -120,6 +163,8 @@ final class MacHLSAVFoundationCapture {
     }
     captureItem = nil
     videoOutput = nil
+    capturePlaybackStarted = false
+    requestedCaptureRate = 1
   }
 
   private func capture(
@@ -164,6 +209,9 @@ final class MacHLSAVFoundationCapture {
     let timelineOffset = actualStart - requestedStartSeconds
     output.requestNotificationOfMediaDataChange(withAdvanceInterval: 1.0 / 120.0)
     player.play()
+    capturePlaybackStarted = true
+    requestedCaptureRate = 1
+    updateCaptureRate()
 
     var pendingFrames: [(CVPixelBuffer, Int64)] = []
     var writer: MacHLSCaptureSegmentWriter?
@@ -183,6 +231,9 @@ final class MacHLSAVFoundationCapture {
         )
       )
       nextSequence += 1
+      if ratePolicy.finishWarmup() {
+        updateCaptureRate()
+      }
     }
 
     do {
@@ -312,6 +363,31 @@ final class MacHLSAVFoundationCapture {
       throw error
     }
     player.pause()
+  }
+
+  private func updateCaptureRate() {
+    let desired = ratePolicy.desiredRate(
+      bufferedSeconds: restoredBufferLeadSeconds,
+      targetSeconds: forwardBufferSeconds,
+      isLive: isLive
+    )
+    guard abs(desired - requestedCaptureRate) >= 0.05 else { return }
+    let previous = requestedCaptureRate
+    requestedCaptureRate = desired
+    guard capturePlaybackStarted, captureItem != nil else { return }
+    player.rate = desired
+    if desired > 1.05 {
+      log(
+        "HLS取込: 復元速度に余裕があるため"
+          + "\(String(format: "%.2f", desired))倍で先読みを増やします\n"
+      )
+    } else if previous > 1.05 {
+      log(
+        "HLS取込: 復元バッファ"
+          + "\(String(format: "%.1f", restoredBufferLeadSeconds))秒で"
+          + "1倍速へ戻します\n"
+      )
+    }
   }
 
   private func waitUntilReady(_ item: AVPlayerItem) async throws {
