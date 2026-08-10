@@ -737,6 +737,309 @@ struct IPadHLSResource: Sendable, Hashable {
   let byteRange: IPadHLSByteRange?
 }
 
+/// Optional byte transport used when the visible browser already owns the
+/// authenticated HLS network session. Returning `nil` declines the request and
+/// lets the normal URLSession transport handle it; an HTTP error response is a
+/// handled result and must be returned so callers can apply their usual retry
+/// policy without issuing a duplicate request through another transport.
+struct IPadHLSResourceLoadResult: @unchecked Sendable {
+  let data: Data
+  let response: HTTPURLResponse
+}
+
+/// WebKit may already have dispatched this request to the origin even though
+/// CORS, redirect policy, timeout, or the content process prevented delivery
+/// of readable bytes. Callers must retry the same loader with backoff instead
+/// of immediately duplicating the request through another transport.
+enum IPadHLSResourceLoadingError: Error, Sendable, Equatable, LocalizedError {
+  case attemptedUnavailable
+
+  var errorDescription: String? {
+    switch self {
+    case .attemptedUnavailable:
+      "ブラウザ経由の配信要求は送信されましたが、応答データを読み取れませんでした。"
+    }
+  }
+}
+
+protocol IPadHLSResourceLoading: AnyObject, Sendable {
+  func load(
+    _ request: URLRequest,
+    maximumResponseBytes: Int,
+    resolutionPolicy: IPadMediaURLResolutionPolicy
+  ) async throws -> IPadHLSResourceLoadResult?
+}
+
+/// Converts a browser-relayed byte range into a complete GET and reconstructs
+/// the partial response in native code. Cross-origin Fetch intentionally hides
+/// Content-Range unless the CDN exposes it through CORS, so forwarding Range to
+/// WebKit cannot reliably produce a standards-compliant local 206 response.
+enum IPadHLSRelayRangeNormalizer {
+  static func canonicalRequest(for request: URLRequest) -> URLRequest {
+    guard request.value(forHTTPHeaderField: "Range") != nil else { return request }
+    var canonical = request
+    canonical.httpMethod = "GET"
+    canonical.setValue(nil, forHTTPHeaderField: "Range")
+    return canonical
+  }
+
+  static func response(
+    from loaded: IPadHLSResourceLoadResult?,
+    requestedMethod: String,
+    requestedRange: String?,
+    maximumResponseBytes: Int
+  ) throws -> IPadHLSResourceLoadResult? {
+    guard let loaded else { return nil }
+    guard let requestedRange else {
+      guard loaded.data.count <= maximumResponseBytes else {
+        throw IPadMediaURLResolverError.responseTooLarge(maximumResponseBytes)
+      }
+      return loaded
+    }
+
+    // Preserve HTTP failures so callers can apply their normal 401/403/429
+    // policy. Only a complete successful representation is safe to slice.
+    guard loaded.response.statusCode == 200 else {
+      if requestedMethod != "HEAD", loaded.data.count > maximumResponseBytes {
+        throw IPadMediaURLResolverError.responseTooLarge(maximumResponseBytes)
+      }
+      return requestedMethod == "HEAD"
+        ? IPadHLSResourceLoadResult(data: Data(), response: loaded.response)
+        : loaded
+    }
+    guard let bounds = closedRange(
+      requestedRange,
+      dataCount: loaded.data.count
+    ) else {
+      throw IPadMediaURLResolverError.invalidByteRange
+    }
+    let length = bounds.upperBound - bounds.lowerBound + 1
+    guard requestedMethod == "HEAD" || length <= maximumResponseBytes else {
+      throw IPadMediaURLResolverError.responseTooLarge(maximumResponseBytes)
+    }
+    guard let response = synthesizedResponse(
+      from: loaded.response,
+      statusCode: 206,
+      contentLength: length,
+      contentRange:
+        "bytes \(bounds.lowerBound)-\(bounds.upperBound)/\(loaded.data.count)"
+    ) else {
+      throw IPadHLSResourceLoadingError.attemptedUnavailable
+    }
+    let data = requestedMethod == "HEAD"
+      ? Data()
+      : loaded.data.subdata(in: bounds.lowerBound..<(bounds.upperBound + 1))
+    return IPadHLSResourceLoadResult(data: data, response: response)
+  }
+
+  static func headResponse(
+    fromCompleteRepresentation loaded: IPadHLSResourceLoadResult
+  ) throws -> IPadHLSResourceLoadResult {
+    guard let response = synthesizedResponse(
+      from: loaded.response,
+      statusCode: loaded.response.statusCode,
+      contentLength: loaded.data.count,
+      contentRange: nil
+    ) else {
+      throw IPadHLSResourceLoadingError.attemptedUnavailable
+    }
+    return IPadHLSResourceLoadResult(data: Data(), response: response)
+  }
+
+  static func closedRange(
+    _ value: String,
+    dataCount: Int
+  ) -> ClosedRange<Int>? {
+    guard value.hasPrefix("bytes="), dataCount > 0 else { return nil }
+    let pieces = value.dropFirst(6).split(
+      separator: "-",
+      omittingEmptySubsequences: false
+    )
+    guard pieces.count == 2 else { return nil }
+    if pieces[0].isEmpty {
+      guard let suffixLength = Int(pieces[1]), suffixLength > 0 else {
+        return nil
+      }
+      return max(0, dataCount - min(suffixLength, dataCount))...(dataCount - 1)
+    }
+    guard let lower = Int(pieces[0]), lower >= 0, lower < dataCount else {
+      return nil
+    }
+    if pieces[1].isEmpty { return lower...(dataCount - 1) }
+    guard let upper = Int(pieces[1]), upper >= lower else {
+      return nil
+    }
+    // RFC 9110 permits a client to ask beyond the current representation;
+    // servers satisfy the overlap rather than rejecting the whole range.
+    return lower...min(upper, dataCount - 1)
+  }
+
+  private static func synthesizedResponse(
+    from response: HTTPURLResponse,
+    statusCode: Int,
+    contentLength: Int,
+    contentRange: String?
+  ) -> HTTPURLResponse? {
+    guard let url = response.url else { return nil }
+    var headers: [String: String] = [:]
+    for (rawName, rawValue) in response.allHeaderFields {
+      guard let name = rawName as? String else { continue }
+      if ["content-length", "content-range", "content-encoding", "accept-ranges"]
+        .contains(name.lowercased())
+      {
+        continue
+      }
+      headers[name] = String(describing: rawValue)
+    }
+    headers["Content-Length"] = String(contentLength)
+    if let contentRange {
+      headers["Content-Range"] = contentRange
+      headers["Accept-Ranges"] = "bytes"
+    }
+    return HTTPURLResponse(
+      url: url,
+      statusCode: statusCode,
+      httpVersion: "HTTP/1.1",
+      headerFields: headers
+    )
+  }
+}
+
+/// Serializes every distinct WebKit request belonging to one candidate loader.
+/// The native URLSession origin coordinator cannot see these requests, so this
+/// gate prevents AVPlayer, restoration and speculative prefetch from recreating
+/// a browser-session CDN burst. Identical loads still coalesce before the gate.
+actor IPadBrowserHLSRelayDispatchGate {
+  private var activeRequestID: UUID?
+  private var waiterOrder: [UUID] = []
+  private var cooldownUntil = Date.distantPast
+  private var rateLimitStrikes = 0
+
+  private let initialCooldown: TimeInterval
+  private let maximumCooldown: TimeInterval
+  private let pollingInterval: TimeInterval
+
+  init(
+    initialCooldown: TimeInterval = 1.5,
+    maximumCooldown: TimeInterval = 30,
+    pollingInterval: TimeInterval = 0.025
+  ) {
+    self.initialCooldown = max(0.025, initialCooldown)
+    self.maximumCooldown = max(self.initialCooldown, maximumCooldown)
+    self.pollingInterval = max(0.005, min(0.25, pollingInterval))
+  }
+
+  func perform(
+    _ operation: @escaping @Sendable () async throws
+      -> IPadHLSResourceLoadResult?
+  ) async throws -> IPadHLSResourceLoadResult? {
+    let requestID = UUID()
+    try await acquire(requestID: requestID)
+    do {
+      let loaded = try await operation()
+      release(
+        requestID: requestID,
+        response: loaded?.response,
+        attemptedUnavailable: false
+      )
+      return loaded
+    } catch {
+      release(
+        requestID: requestID,
+        response: nil,
+        attemptedUnavailable:
+          (error as? IPadHLSResourceLoadingError) == .attemptedUnavailable
+      )
+      throw error
+    }
+  }
+
+  private func acquire(requestID: UUID) async throws {
+    try Task.checkCancellation()
+    waiterOrder.append(requestID)
+    do {
+      while true {
+        try Task.checkCancellation()
+        let now = Date()
+        if activeRequestID == nil, waiterOrder.first == requestID,
+          now >= cooldownUntil
+        {
+          waiterOrder.removeFirst()
+          activeRequestID = requestID
+          return
+        }
+        let cooldownDelay = max(0, cooldownUntil.timeIntervalSince(now))
+        let delay = max(
+          pollingInterval,
+          min(0.25, cooldownDelay)
+        )
+        try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+      }
+    } catch {
+      waiterOrder.removeAll { $0 == requestID }
+      throw error
+    }
+  }
+
+  private func release(
+    requestID: UUID,
+    response: HTTPURLResponse?,
+    attemptedUnavailable: Bool
+  ) {
+    guard activeRequestID == requestID else { return }
+    activeRequestID = nil
+    let now = Date()
+    if response?.statusCode == 429 || attemptedUnavailable {
+      rateLimitStrikes = min(8, rateLimitStrikes + 1)
+      let exponent = max(0, min(5, rateLimitStrikes - 1))
+      let fallback = min(
+        maximumCooldown,
+        initialCooldown * pow(2, Double(exponent))
+      )
+      let retryAfter = response.flatMap {
+        Self.retryAfterDelay($0, now: now)
+      } ?? 0
+      cooldownUntil = max(
+        cooldownUntil,
+        now.addingTimeInterval(max(fallback, retryAfter))
+      )
+    } else if let statusCode = response?.statusCode,
+      (200...399).contains(statusCode), now >= cooldownUntil
+    {
+      rateLimitStrikes = 0
+    }
+  }
+
+  /// Internal for the transport runtime harness. Keeping the parser on the
+  /// gate ensures tests exercise the exact numeric and HTTP-date policy used
+  /// by production dispatches.
+  static func retryAfterDelay(
+    _ response: HTTPURLResponse,
+    now: Date
+  ) -> TimeInterval? {
+    guard let raw = response.value(forHTTPHeaderField: "Retry-After")?
+      .trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty
+    else { return nil }
+    if let seconds = TimeInterval(raw), seconds.isFinite, seconds >= 0 {
+      return min(120, seconds)
+    }
+    for format in [
+      "EEE',' dd MMM yyyy HH':'mm':'ss z",
+      "EEEE',' dd-MMM-yy HH':'mm':'ss z",
+      "EEE MMM d HH':'mm':'ss yyyy",
+    ] {
+      let formatter = DateFormatter()
+      formatter.locale = Locale(identifier: "en_US_POSIX")
+      formatter.timeZone = TimeZone(secondsFromGMT: 0)
+      formatter.dateFormat = format
+      if let date = formatter.date(from: raw) {
+        return max(0, min(120, date.timeIntervalSince(now)))
+      }
+    }
+    return nil
+  }
+}
+
 struct IPadHLSMediaSegment: Sendable, Equatable {
   let sequence: Int64
   let duration: TimeInterval
@@ -1054,6 +1357,7 @@ struct IPadMediaURLResolver: Sendable {
   let maximumRequestCount: Int
   let maximumCumulativeResponseBytes: Int
   let resolutionTimeout: TimeInterval
+  let resourceLoader: (any IPadHLSResourceLoading)?
 
   init(
     maximumResponseBytes: Int = 2 * 1_024 * 1_024,
@@ -1061,7 +1365,8 @@ struct IPadMediaURLResolver: Sendable {
     requestTimeout: TimeInterval = 20,
     maximumRequestCount: Int = 24,
     maximumCumulativeResponseBytes: Int = 8 * 1_024 * 1_024,
-    resolutionTimeout: TimeInterval = 60
+    resolutionTimeout: TimeInterval = 60,
+    resourceLoader: (any IPadHLSResourceLoading)? = nil
   ) {
     self.maximumResponseBytes = max(1_024, maximumResponseBytes)
     self.maximumRedirectCount = max(0, maximumRedirectCount)
@@ -1072,6 +1377,7 @@ struct IPadMediaURLResolver: Sendable {
       maximumCumulativeResponseBytes
     )
     self.resolutionTimeout = max(2, resolutionTimeout)
+    self.resourceLoader = resourceLoader
   }
 
   func resolve(
@@ -1736,11 +2042,31 @@ struct IPadMediaURLResolver: Sendable {
     request.httpMethod = method
     request.timeoutInterval = min(requestTimeout, remainingTimeout)
     request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+    if url.scheme?.lowercased() == "https" {
+      // WebKit commonly learns or races HTTP/3 for the same HLS CDN. The
+      // browser-authenticated path can therefore be accepted over QUIC while a
+      // fresh URLSession falls back to an independently rate-limited HTTP/2
+      // connection. This enables Foundation's built-in QUIC race without
+      // disabling its ordinary TCP fallback.
+      request.assumesHTTP3Capable = true
+    }
     request.setValue(
       "application/vnd.apple.mpegurl, application/x-mpegurl, video/*, text/html;q=0.8, */*;q=0.2",
       forHTTPHeaderField: "Accept"
     )
     context?.applying(to: &request)
+    if let resourceLoader,
+      let loaded = try await resourceLoader.load(
+        request,
+        maximumResponseBytes: maximumResponseBytes,
+        resolutionPolicy: policy
+      )
+    {
+      try Self.validateNoInteractionChallenge(loaded.response)
+      await context?.updateCookies(from: loaded.response)
+      try budget.consumeResponseBytes(loaded.data.count)
+      return IPadHTTPPayload(data: loaded.data, response: loaded.response)
+    }
     let operation = IPadBoundedHTTPRequest(
       maximumResponseBytes: maximumResponseBytes,
       maximumRedirectCount: maximumRedirectCount,
@@ -3003,6 +3329,7 @@ final class IPadHLSResourceDownloader: @unchecked Sendable {
   let requestTimeout: TimeInterval
   let resolutionPolicy: IPadMediaURLResolutionPolicy
   let requestContext: IPadMediaRequestContext?
+  let resourceLoader: (any IPadHLSResourceLoading)?
   private let lock = NSLock()
   private var activeOperations: [UUID: IPadBoundedHTTPRequest] = [:]
   private var initializationCache: [IPadHLSResource: Data] = [:]
@@ -3013,13 +3340,15 @@ final class IPadHLSResourceDownloader: @unchecked Sendable {
     maximumRedirectCount: Int = 6,
     requestTimeout: TimeInterval = 30,
     resolutionPolicy: IPadMediaURLResolutionPolicy = .userSubmitted,
-    requestContext: IPadMediaRequestContext? = nil
+    requestContext: IPadMediaRequestContext? = nil,
+    resourceLoader: (any IPadHLSResourceLoading)? = nil
   ) {
     self.maximumResourceBytes = max(1_024, maximumResourceBytes)
     self.maximumRedirectCount = max(0, maximumRedirectCount)
     self.requestTimeout = max(1, requestTimeout)
     self.resolutionPolicy = resolutionPolicy
     self.requestContext = requestContext
+    self.resourceLoader = resourceLoader
   }
 
   func data(
@@ -3036,11 +3365,13 @@ final class IPadHLSResourceDownloader: @unchecked Sendable {
     var request = URLRequest(url: safeURL)
     request.httpMethod = "GET"
     request.timeoutInterval = requestTimeout
-    request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-    request.setValue(
-      "application/vnd.apple.mpegurl, application/x-mpegurl, video/*, audio/*, */*;q=0.5",
-      forHTTPHeaderField: "Accept"
-    )
+    // Media segments are immutable in ordinary HLS playlists. Respect normal
+    // HTTP cache semantics so a CDN does not see a forced duplicate download
+    // immediately after WebKit played the same segment.
+    request.cachePolicy = .useProtocolCachePolicy
+    if safeURL.scheme?.lowercased() == "https" {
+      request.assumesHTTP3Capable = true
+    }
     requestContext?.applying(to: &request)
     if let byteRange = resource.byteRange {
       guard byteRange.offset >= 0, byteRange.length > 0,
@@ -3052,6 +3383,33 @@ final class IPadHLSResourceDownloader: @unchecked Sendable {
         "bytes=\(byteRange.offset)-\(end)",
         forHTTPHeaderField: "Range"
       )
+    }
+
+    if let resourceLoader,
+      let loaded = try await resourceLoader.load(
+        request,
+        maximumResponseBytes: maximumResourceBytes,
+        resolutionPolicy: resolutionPolicy
+      )
+    {
+      try IPadMediaURLResolver.validateNoInteractionChallenge(loaded.response)
+      await requestContext?.updateCookies(from: loaded.response)
+      try Task.checkCancellation()
+      if let byteRange = resource.byteRange {
+        // Preserve 401/403/429 as HTTP status errors. Treating every non-206
+        // response as a malformed range hides the browser relay's rate-limit
+        // signal and skips the producer's bounded cooldown/retry path.
+        try IPadMediaURLResolver.validateSuccessfulResponse(loaded.response)
+        guard loaded.response.statusCode == 206,
+          loaded.data.count == Int(byteRange.length),
+          Self.validContentRange(loaded.response, expected: byteRange)
+        else {
+          throw IPadMediaURLResolverError.invalidByteRange
+        }
+      } else {
+        try IPadMediaURLResolver.validateSuccessfulResponse(loaded.response)
+      }
+      return loaded.data
     }
 
     let operation = IPadBoundedHTTPRequest(
@@ -3073,6 +3431,7 @@ final class IPadHLSResourceDownloader: @unchecked Sendable {
     try Task.checkCancellation()
 
     if let byteRange = resource.byteRange {
+      try IPadMediaURLResolver.validateSuccessfulResponse(payload.response)
       guard payload.response.statusCode == 206,
         payload.data.count == Int(byteRange.length),
         Self.validContentRange(payload.response, expected: byteRange)
@@ -3776,6 +4135,8 @@ final class IPadSharedHTTPTransport: NSObject, @unchecked Sendable {
     let returnsAfterVideoResponse: Bool
     let requiresHTTPS: Bool
     let hlsDeliveryDirectives: String?
+    let assumesHTTP3Capable: Bool
+    let cachePolicy: UInt
   }
 
   private struct Waiter {
@@ -4393,7 +4754,9 @@ final class IPadSharedHTTPTransport: NSObject, @unchecked Sendable {
       timeoutMilliseconds: Int((options.timeout * 1_000).rounded()),
       returnsAfterVideoResponse: options.returnsAfterVideoResponse,
       requiresHTTPS: options.requiresHTTPS,
-      hlsDeliveryDirectives: options.hlsDeliveryDirectives
+      hlsDeliveryDirectives: options.hlsDeliveryDirectives,
+      assumesHTTP3Capable: request.assumesHTTP3Capable,
+      cachePolicy: request.cachePolicy.rawValue
     )
   }
 
@@ -4637,6 +5000,15 @@ extension IPadSharedHTTPTransport: URLSessionDataDelegate {
       redirected.url = destination
       redirected.httpMethod = entry.request.httpMethod
       redirected.timeoutInterval = entry.options.timeout
+      redirected.assumesHTTP3Capable = entry.request.assumesHTTP3Capable
+      // Preserve an explicitly selected representation across redirects.
+      // Binary HLS resource requests deliberately leave Accept unset so
+      // URLSession can use its ordinary request default instead of inheriting
+      // a playlist-only media type from the redirect response/request.
+      redirected.setValue(
+        entry.request.value(forHTTPHeaderField: "Accept"),
+        forHTTPHeaderField: "Accept"
+      )
       redirected.setValue(
         entry.request.value(forHTTPHeaderField: "Range"),
         forHTTPHeaderField: "Range"

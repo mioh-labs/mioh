@@ -129,8 +129,8 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "event.generation == generation",
             "startupSegmentCount = 3",
             "rebufferSegmentCount = 2",
-            "hlsVODStartupSegmentCount = 10",
-            "hlsVODRebufferSegmentCount = 6",
+            "hlsVODStartupSegmentCount = 3",
+            "hlsVODRebufferSegmentCount = 2",
             "generationReachedEOF",
             "driftToleranceSeconds = 0.080",
             "A seek is a generation boundary",
@@ -374,7 +374,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
             'Label("現在の設定をデフォルトに保存", systemImage: "square.and.arrow.down")',
             'Label("保存済みデフォルトを読み込み", systemImage: "arrow.clockwise")',
             'Label("初期値に戻す", systemImage: "trash")',
-            "入力/出力、一時フォルダ、分割、復元、検出、出力、メモリ、再生バッファまで保存します",
+            "入力/出力、一時フォルダ、分割、復元、検出、出力、メモリ、再生バッファ、HLS通信方式まで保存します",
         ]:
             self.assertIn(contract, source)
 

@@ -89,6 +89,7 @@ xcrun swiftc \
   -framework AVFoundation \
   -framework AVKit \
   -framework CoreMedia \
+  -framework CoreVideo \
   -framework Metal \
   -framework Network \
   -framework Security \
@@ -104,6 +105,7 @@ xcrun swiftc \
   "$PACKAGE_DIR/MacChildProcessPipe.swift" \
   "$PACKAGE_DIR/MiohApp.swift" \
   "$PACKAGE_DIR/MacMediaBrowser.swift" \
+  "$PACKAGE_DIR/MacHLSAVFoundationCapture.swift" \
   "$PACKAGE_DIR/MacHLSRealtimePipeline.swift" \
   "$PACKAGE_DIR/RealtimePlayer.swift" \
   "$PACKAGE_DIR/RemoteControlServer.swift" \

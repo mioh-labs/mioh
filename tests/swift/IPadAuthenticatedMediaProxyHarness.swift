@@ -18,16 +18,19 @@ private struct OriginRequestRecord: Sendable {
   let referer: String?
   let origin: String?
   let userAgent: String?
+  let accept: String?
   let range: String?
 }
 
 private final class ProxyOriginURLProtocol: URLProtocol, @unchecked Sendable {
   private static let lock = NSLock()
   private static var records: [OriginRequestRecord] = []
+  private static var transientRateLimitRequestCount = 0
 
   static func reset() {
     lock.lock()
     records.removeAll()
+    transientRateLimitRequestCount = 0
     lock.unlock()
   }
 
@@ -52,6 +55,7 @@ private final class ProxyOriginURLProtocol: URLProtocol, @unchecked Sendable {
       client?.urlProtocol(self, didFailWithError: URLError(.badURL))
       return
     }
+    let transientRateLimitAttempt: Int
     Self.lock.lock()
     Self.records.append(
       OriginRequestRecord(
@@ -61,9 +65,16 @@ private final class ProxyOriginURLProtocol: URLProtocol, @unchecked Sendable {
         referer: request.value(forHTTPHeaderField: "Referer"),
         origin: request.value(forHTTPHeaderField: "Origin"),
         userAgent: request.value(forHTTPHeaderField: "User-Agent"),
+        accept: request.value(forHTTPHeaderField: "Accept"),
         range: request.value(forHTTPHeaderField: "Range")
       )
     )
+    if url.path == "/transient-rate-limit.ts" {
+      Self.transientRateLimitRequestCount += 1
+      transientRateLimitAttempt = Self.transientRateLimitRequestCount
+    } else {
+      transientRateLimitAttempt = 0
+    }
     Self.lock.unlock()
 
     switch url.path {
@@ -152,6 +163,28 @@ private final class ProxyOriginURLProtocol: URLProtocol, @unchecked Sendable {
       )
 
     case "/redirected/segments/chunk.ts":
+      guard
+        let destination = URL(
+          string:
+            "https://1.1.1.1/redirected/segments/final-chunk.ts?segment=1%2B2"
+        ),
+        let response = HTTPURLResponse(
+          url: url,
+          statusCode: 302,
+          httpVersion: "HTTP/1.1",
+          headerFields: ["Location": destination.absoluteString]
+        )
+      else {
+        client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+        return
+      }
+      client?.urlProtocol(
+        self,
+        wasRedirectedTo: URLRequest(url: destination),
+        redirectResponse: response
+      )
+
+    case "/redirected/segments/final-chunk.ts":
       let fullBody = Data("segment-payload".utf8)
       if request.value(forHTTPHeaderField: "Range") == "bytes=1-3" {
         respond(
@@ -174,6 +207,31 @@ private final class ProxyOriginURLProtocol: URLProtocol, @unchecked Sendable {
         contentType: "audio/aac",
         bodyData: Data("audio".utf8)
       )
+
+    case let path where path.hasPrefix("/concurrency/"):
+      Thread.sleep(forTimeInterval: 0.15)
+      respond(
+        url: url,
+        contentType: "video/mp2t",
+        bodyData: Data("queued-media".utf8)
+      )
+
+    case "/transient-rate-limit.ts":
+      if transientRateLimitAttempt == 1 {
+        respond(
+          url: url,
+          statusCode: 429,
+          contentType: "text/plain",
+          headers: ["Retry-After": "1"],
+          bodyData: Data("slow-down".utf8)
+        )
+      } else {
+        respond(
+          url: url,
+          contentType: "video/mp2t",
+          bodyData: Data("recovered-after-cooldown".utf8)
+        )
+      }
 
     default:
       respond(
@@ -230,6 +288,112 @@ private final class ProxyOriginURLProtocol: URLProtocol, @unchecked Sendable {
     }
     client?.urlProtocolDidFinishLoading(self)
   }
+}
+
+private actor ProxyHarnessBrowserResourceLoader: IPadHLSResourceLoading {
+  private var requestCount = 0
+  private var rateLimitRequestCount = 0
+  private var attemptedRequestCount = 0
+  private var playlistRequestCount = 0
+
+  func load(
+    _ request: URLRequest,
+    maximumResponseBytes: Int,
+    resolutionPolicy: IPadMediaURLResolutionPolicy
+  ) async throws -> IPadHLSResourceLoadResult? {
+    guard let url = request.url else { return nil }
+    if [
+      "/browser-master.m3u8",
+      "/browser-audio.m3u8",
+      "/browser-media.m3u8",
+    ].contains(url.path) {
+      playlistRequestCount += 1
+      let text: String
+      switch url.path {
+      case "/browser-master.m3u8":
+        text = """
+          #EXTM3U
+          #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Main",URI="browser-audio.m3u8"
+          #EXT-X-STREAM-INF:BANDWIDTH=1000000,AUDIO="audio"
+          browser-media.m3u8
+          """
+      case "/browser-audio.m3u8":
+        text = """
+          #EXTM3U
+          #EXTINF:4,
+          browser-audio.aac
+          #EXT-X-ENDLIST
+          """
+      default:
+        text = """
+          #EXTM3U
+          #EXTINF:4,
+          browser-segment.ts
+          #EXT-X-ENDLIST
+          """
+      }
+      let body = Data(text.utf8)
+      guard body.count <= maximumResponseBytes,
+        let response = HTTPURLResponse(
+          url: url,
+          statusCode: 200,
+          httpVersion: "HTTP/3",
+          headerFields: [
+            "Content-Type": "application/vnd.apple.mpegurl",
+            "Content-Length": String(body.count),
+          ]
+        )
+      else {
+        throw ProxyHarnessFailure.assertion(
+          "could not construct browser playlist response"
+        )
+      }
+      return IPadHLSResourceLoadResult(data: body, response: response)
+    }
+    guard
+      url.path == "/browser-relay.ts" || url.path == "/browser-rate-limit.ts"
+        || url.path == "/browser-attempted.ts"
+    else { return nil }
+    requestCount += 1
+    let isRateLimitPath = url.path == "/browser-rate-limit.ts"
+    if isRateLimitPath { rateLimitRequestCount += 1 }
+    let isAttemptedPath = url.path == "/browser-attempted.ts"
+    if isAttemptedPath {
+      attemptedRequestCount += 1
+      if attemptedRequestCount <= 2 {
+        throw IPadHLSResourceLoadingError.attemptedUnavailable
+      }
+    }
+    let isRateLimited = isRateLimitPath && rateLimitRequestCount == 1
+    let body = Data(
+      (isRateLimited
+        ? "browser-rate-limited"
+        : isRateLimitPath
+          ? "browser-recovered"
+          : isAttemptedPath
+            ? "browser-recovered-after-attempt"
+            : "browser-relayed").utf8
+    )
+    var headers = [
+      "Content-Type": "video/mp2t",
+      "Content-Length": String(body.count),
+    ]
+    if isRateLimited { headers["Retry-After"] = "1" }
+    guard body.count <= maximumResponseBytes,
+      let response = HTTPURLResponse(
+        url: url,
+        statusCode: isRateLimited ? 429 : 200,
+        httpVersion: "HTTP/3",
+        headerFields: headers
+      )
+    else {
+      throw ProxyHarnessFailure.assertion("could not construct browser relay response")
+    }
+    return IPadHLSResourceLoadResult(data: body, response: response)
+  }
+
+  func count() -> Int { requestCount }
+  func playlistCount() -> Int { playlistRequestCount }
 }
 
 extension URLSessionConfiguration {
@@ -375,6 +539,255 @@ struct IPadAuthenticatedMediaProxyHarness {
     let llHLS = try await fetch(llHLSURL)
     try require(llHLS.response.statusCode == 200, "LL-HLS directive request failed")
 
+    let selectedVideoURL = requiredURL(
+      "https://1.1.1.1/redirected/variants/main.m3u8?variant=high%2Bmain"
+    )
+    let selectedAudioURL = requiredURL(
+      "https://1.1.1.1/redirected/audio/audio.m3u8?lang=ja%2Ben"
+    )
+    let selectedMasterURL = try proxy.localURL(
+      forSelectedHLSMaster: IPadHLSMasterMetadata(
+        masterURL: requiredURL("https://1.1.1.1/origin/master.m3u8"),
+        selectedVideoPlaylistURL: selectedVideoURL,
+        bandwidth: 4_000_000,
+        averageBandwidth: 3_500_000,
+        width: 1_920,
+        height: 1_080,
+        codecs: "avc1.640028,mp4a.40.2",
+        frameRate: 29.97,
+        audioGroupID: "audio",
+        audioRenditions: [
+          IPadHLSAudioRendition(
+            groupID: "audio",
+            name: "Japanese",
+            language: "ja",
+            url: selectedAudioURL,
+            isDefault: true,
+            autoSelect: true,
+            channels: "2"
+          )
+        ]
+      ),
+      context: context,
+      resolutionPolicy: .publicDiscovered
+    )
+    let selectedMaster = try await fetch(selectedMasterURL)
+    let selectedMasterText = String(decoding: selectedMaster.data, as: UTF8.self)
+    let selectedChildren = localURLs(in: selectedMasterText)
+    try require(
+      selectedChildren.count == 2,
+      "synthetic selected master did not retain video + separate audio"
+    )
+    try require(
+      selectedMasterText.contains("#EXT-X-MEDIA:TYPE=AUDIO")
+        && selectedMasterText.contains("AUDIO=\"audio\"")
+        && !selectedMasterText.contains("https://1.1.1.1"),
+      "synthetic selected master exposed origin URLs or lost AUDIO metadata"
+    )
+
+    let queuedURLs = try (0..<6).map { index in
+      try proxy.localURL(
+        for: requiredURL("https://1.1.1.1/concurrency/\(index).ts"),
+        context: context,
+        isPlaylist: false,
+        resolutionPolicy: .publicDiscovered
+      )
+    }
+    let queuedStatuses = try await withThrowingTaskGroup(of: Int.self) { group in
+      for url in queuedURLs {
+        group.addTask { try await fetch(url).response.statusCode }
+      }
+      var statuses: [Int] = []
+      for try await status in group { statuses.append(status) }
+      return statuses
+    }
+    try require(
+      queuedStatuses.count == 6 && queuedStatuses.allSatisfy { $0 == 200 },
+      "requests above the four-origin limit were rejected instead of queued"
+    )
+
+    let transientRateLimitURL = try proxy.localURL(
+      for: requiredURL("https://1.1.1.1/transient-rate-limit.ts"),
+      context: context,
+      isPlaylist: false,
+      resolutionPolicy: .publicDiscovered
+    )
+    let rateLimitStartedAt = Date()
+    let recoveredRateLimitResponse = try await fetch(transientRateLimitURL)
+    let rateLimitElapsed = Date().timeIntervalSince(rateLimitStartedAt)
+    try require(
+      recoveredRateLimitResponse.response.statusCode == 200
+        && recoveredRateLimitResponse.data == Data("recovered-after-cooldown".utf8),
+      "transient origin 429 leaked through the loopback proxy"
+    )
+    let rateLimitOriginRequests = ProxyOriginURLProtocol.snapshot().filter {
+      URL(string: $0.url)?.path == "/transient-rate-limit.ts"
+    }
+    try require(
+      rateLimitOriginRequests.count == 2,
+      "transient origin 429 was not retried exactly once"
+    )
+    try require(
+      rateLimitElapsed >= 0.75,
+      "transient origin 429 retry bypassed the shared Retry-After cooldown"
+    )
+
+    let browserResourceLoader = ProxyHarnessBrowserResourceLoader()
+    let relayProxy = IPadAuthenticatedMediaProxy(
+      resourceLoader: browserResourceLoader
+    )
+    defer { relayProxy.stop() }
+    try await relayProxy.start()
+    let browserRelayURL = try relayProxy.localURL(
+      for: requiredURL("https://1.1.1.1/browser-relay.ts"),
+      context: context,
+      isPlaylist: false,
+      resolutionPolicy: .publicDiscovered
+    )
+    let browserRelay = try await fetch(browserRelayURL)
+    try require(
+      browserRelay.response.statusCode == 200
+        && browserRelay.data == Data("browser-relayed".utf8),
+      "browser resource relay was not used by the loopback proxy"
+    )
+    let browserRateLimitURL = try relayProxy.localURL(
+      for: requiredURL("https://1.1.1.1/browser-rate-limit.ts"),
+      context: context,
+      isPlaylist: false,
+      resolutionPolicy: .publicDiscovered
+    )
+    let browserRateLimitStartedAt = Date()
+    let browserRateLimit = try await fetch(browserRateLimitURL)
+    let browserRateLimitElapsed = Date().timeIntervalSince(
+      browserRateLimitStartedAt
+    )
+    try require(
+      browserRateLimit.response.statusCode == 200
+        && browserRateLimit.data == Data("browser-recovered".utf8),
+      "transient browser relay 429 leaked through the loopback proxy"
+    )
+    let browserRelayRequestCount = await browserResourceLoader.count()
+    try require(
+      browserRelayRequestCount == 3,
+      "browser relay 429 was not retried exactly once"
+    )
+    try require(
+      browserRateLimitElapsed >= 0.75,
+      "browser relay 429 retry bypassed its bounded Retry-After delay"
+    )
+    let browserAttemptedURL = try relayProxy.localURL(
+      for: requiredURL("https://1.1.1.1/browser-attempted.ts"),
+      context: context,
+      isPlaylist: false,
+      resolutionPolicy: .publicDiscovered
+    )
+    let browserAttemptedStartedAt = Date()
+    let browserAttempted = try await fetch(browserAttemptedURL)
+    let browserAttemptedElapsed = Date().timeIntervalSince(
+      browserAttemptedStartedAt
+    )
+    try require(
+      browserAttempted.response.statusCode == 200
+        && browserAttempted.data
+          == Data("browser-recovered-after-attempt".utf8),
+      "post-dispatch browser relay failure leaked through the loopback proxy"
+    )
+    let browserAttemptedRequestCount = await browserResourceLoader.count()
+    try require(
+      browserAttemptedRequestCount == 6,
+      "post-dispatch browser relay failure did not use two bounded retries"
+    )
+    try require(
+      browserAttemptedElapsed >= 2.0,
+      "post-dispatch browser relay retry bypassed its bounded delays"
+    )
+    try require(
+      !ProxyOriginURLProtocol.snapshot().contains {
+        let path = URL(string: $0.url)?.path
+        return path == "/browser-relay.ts" || path == "/browser-rate-limit.ts"
+          || path == "/browser-attempted.ts"
+      },
+      "browser-relayed resource leaked into the native URLSession transport"
+    )
+
+    let browserMasterURL = try relayProxy.localURL(
+      for: requiredURL("https://1.1.1.1/browser-master.m3u8"),
+      context: context,
+      isPlaylist: true,
+      resolutionPolicy: .publicDiscovered
+    )
+    let browserMaster = try await fetch(browserMasterURL)
+    let browserMasterText = String(decoding: browserMaster.data, as: UTF8.self)
+    let browserChildPlaylists = localURLs(in: browserMasterText)
+    try require(
+      browserMaster.response.statusCode == 200
+        && browserChildPlaylists.count == 2,
+      "browser master playlist was not relayed and rewritten"
+    )
+    for childURL in browserChildPlaylists {
+      let child = try await fetch(childURL)
+      let childText = String(decoding: child.data, as: UTF8.self)
+      try require(
+        child.response.statusCode == 200
+          && localURLs(in: childText).count == 1,
+        "browser audio/media playlist was not relayed and rewritten"
+      )
+    }
+    let browserPlaylistRequestCount = await browserResourceLoader.playlistCount()
+    try require(
+      browserPlaylistRequestCount == 3,
+      "playlist or alternate-audio request bypassed the browser loader"
+    )
+    try require(
+      !ProxyOriginURLProtocol.snapshot().contains {
+        [
+          "/browser-master.m3u8",
+          "/browser-audio.m3u8",
+          "/browser-media.m3u8",
+        ].contains(URL(string: $0.url)?.path ?? "")
+      },
+      "browser playlist leaked into the native URLSession transport"
+    )
+
+    let largeProxy = IPadAuthenticatedMediaProxy()
+    defer { largeProxy.stop() }
+    try await largeProxy.start()
+    let largeRenditions = (0..<4_100).map { index in
+      IPadHLSAudioRendition(
+        groupID: "large-audio",
+        name: "Audio \(index)",
+        language: nil,
+        url: requiredURL("https://1.1.1.1/large/audio-\(index).m3u8"),
+        isDefault: index == 0,
+        autoSelect: true,
+        channels: "2"
+      )
+    }
+    let largeMasterURL = try largeProxy.localURL(
+      forSelectedHLSMaster: IPadHLSMasterMetadata(
+        masterURL: requiredURL("https://1.1.1.1/large/master.m3u8"),
+        selectedVideoPlaylistURL: requiredURL(
+          "https://1.1.1.1/large/video.m3u8"
+        ),
+        bandwidth: 4_000_000,
+        averageBandwidth: nil,
+        width: 1_920,
+        height: 1_080,
+        codecs: "avc1.640028,mp4a.40.2",
+        frameRate: 29.97,
+        audioGroupID: "large-audio",
+        audioRenditions: largeRenditions
+      ),
+      resolutionPolicy: .publicDiscovered
+    )
+    let largeMaster = try await fetch(largeMasterURL)
+    let largeLocalURLs = localURLs(in: String(decoding: largeMaster.data, as: UTF8.self))
+    try require(
+      largeLocalURLs.count == 4_101
+        && Set(largeLocalURLs.map(\.absoluteString)).count == 4_101,
+      "synthetic master with more than 4096 references lost or evicted tokens"
+    )
+
     let records = ProxyOriginURLProtocol.snapshot()
     try verifyOriginRequests(records)
   }
@@ -390,6 +803,7 @@ struct IPadAuthenticatedMediaProxyHarness {
       "/keys/key.bin",
       "/redirected/init/init.mp4",
       "/redirected/segments/chunk.ts",
+      "/redirected/segments/final-chunk.ts",
     ]
     for path in requiredPaths {
       try require(
@@ -397,6 +811,12 @@ struct IPadAuthenticatedMediaProxyHarness {
         "origin path was not requested: \(path)"
       )
     }
+    let playlistPaths: Set<String> = [
+      "/origin/master.m3u8",
+      "/redirected/master.m3u8",
+      "/redirected/audio/audio.m3u8",
+      "/redirected/variants/main.m3u8",
+    ]
     for record in records {
       try require(
         record.userAgent == "MiohProxyHarness/1.0",
@@ -418,6 +838,18 @@ struct IPadAuthenticatedMediaProxyHarness {
         record.cookie?.contains(expectedCookie) == true,
         "Cookie was lost for \(record.url)"
       )
+      let path = URL(string: record.url)?.path ?? ""
+      if playlistPaths.contains(path) {
+        try require(
+          record.accept?.lowercased().contains("mpegurl") == true,
+          "playlist Accept was lost for \(record.url)"
+        )
+      } else {
+        try require(
+          record.accept?.lowercased().contains("mpegurl") != true,
+          "playlist Accept leaked to a binary resource: \(record.url)"
+        )
+      }
     }
 
     try require(
@@ -464,6 +896,14 @@ struct IPadAuthenticatedMediaProxyHarness {
           && $0.range == "bytes=1-3"
       },
       "segment query or Range was not preserved"
+    )
+    try require(
+      records.contains {
+        $0.url.contains("/redirected/segments/final-chunk.ts?segment=1%2B2")
+          && $0.range == "bytes=1-3"
+          && $0.accept?.lowercased().contains("mpegurl") != true
+      },
+      "redirected segment inherited playlist Accept or lost Range"
     )
     try require(
       records.contains {

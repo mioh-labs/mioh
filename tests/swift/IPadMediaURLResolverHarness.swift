@@ -20,6 +20,44 @@ private func endpoint(_ path: String, relativeTo baseURL: URL) -> URL {
   URL(string: path, relativeTo: baseURL)!.absoluteURL
 }
 
+private actor RelayDispatchProbe {
+  private var active = 0
+  private var maximumActive = 0
+  private var starts: [Date] = []
+
+  func begin() {
+    active += 1
+    maximumActive = max(maximumActive, active)
+    starts.append(Date())
+  }
+
+  func end() {
+    active -= 1
+  }
+
+  func snapshot() -> (maximumActive: Int, starts: [Date]) {
+    (maximumActive, starts)
+  }
+}
+
+private final class FixedStatusResourceLoader: IPadHLSResourceLoading,
+  @unchecked Sendable
+{
+  let result: IPadHLSResourceLoadResult
+
+  init(result: IPadHLSResourceLoadResult) {
+    self.result = result
+  }
+
+  func load(
+    _ request: URLRequest,
+    maximumResponseBytes: Int,
+    resolutionPolicy: IPadMediaURLResolutionPolicy
+  ) async throws -> IPadHLSResourceLoadResult? {
+    result
+  }
+}
+
 @main
 private struct IPadMediaURLResolverHarness {
   static func main() async throws {
@@ -30,6 +68,12 @@ private struct IPadMediaURLResolverHarness {
     switch CommandLine.arguments[1] {
     case "master":
       try await verifyMasterPlaylist(relativeTo: baseURL)
+    case "nested-master-audio":
+      try await verifyNestedMasterAudio(relativeTo: baseURL)
+    case "variant-failover":
+      try await verifyVariantFailover(relativeTo: baseURL)
+    case "parent-audio-nested-failover":
+      try await verifyParentAudioNestedFailover(relativeTo: baseURL)
     case "discontinuity":
       try await verifyDiscontinuityMetadata(relativeTo: baseURL)
     case "png-prefixed-ts":
@@ -80,9 +124,325 @@ private struct IPadMediaURLResolverHarness {
       try await verifyUnlabeledPlaylistReference(relativeTo: baseURL)
     case "media-limits":
       try verifyMediaLimits()
+    case "shared-transport":
+      try await verifySharedTransport(relativeTo: baseURL)
+    case "shared-cancellation":
+      try await verifySharedCancellation(relativeTo: baseURL)
+    case "rate-limit-cooldown":
+      try await verifyRateLimitCooldown(relativeTo: baseURL)
+    case "redirect-origin-cooldown":
+      try await verifyRedirectOriginCooldown()
+    case "browser-relay-range-normalizer":
+      try await verifyBrowserRelayRangeNormalizer(relativeTo: baseURL)
+    case "browser-relay-dispatch-gate":
+      try await verifyBrowserRelayDispatchGate(relativeTo: baseURL)
     default:
       throw ResolverHarnessFailure.usage
     }
+  }
+
+  private static func verifyBrowserRelayRangeNormalizer(
+    relativeTo baseURL: URL
+  ) async throws {
+    let url = endpoint("relay/segment.mp4", relativeTo: baseURL)
+    let bytes = Data((0..<10).map(UInt8.init))
+    let completeResponse = try HTTPURLResponse(
+      url: url,
+      statusCode: 200,
+      httpVersion: "HTTP/1.1",
+      headerFields: ["Content-Type": "video/mp4"]
+    ).unwrap(or: ResolverHarnessFailure.assertion("complete response is invalid"))
+    let complete = IPadHLSResourceLoadResult(
+      data: bytes,
+      response: completeResponse
+    )
+
+    var rangedRequest = URLRequest(url: url)
+    rangedRequest.httpMethod = "GET"
+    rangedRequest.setValue("bytes=2-5", forHTTPHeaderField: "Range")
+    let canonical = IPadHLSRelayRangeNormalizer.canonicalRequest(
+      for: rangedRequest
+    )
+    try require(canonical.httpMethod == "GET", "range did not canonicalize to GET")
+    try require(
+      canonical.value(forHTTPHeaderField: "Range") == nil,
+      "canonical full GET retained Range"
+    )
+
+    var headRangeRequest = rangedRequest
+    headRangeRequest.httpMethod = "HEAD"
+    let canonicalHEAD = IPadHLSRelayRangeNormalizer.canonicalRequest(
+      for: headRangeRequest
+    )
+    try require(
+      canonicalHEAD.httpMethod == "GET"
+        && canonicalHEAD.value(forHTTPHeaderField: "Range") == nil,
+      "HEAD range did not canonicalize to a full GET"
+    )
+
+    let cases: [(String, String, [UInt8], String, Int)] = [
+      ("bytes=2-5", "GET", [2, 3, 4, 5], "bytes 2-5/10", 4),
+      ("bytes=6-", "GET", [6, 7, 8, 9], "bytes 6-9/10", 4),
+      ("bytes=-3", "GET", [7, 8, 9], "bytes 7-9/10", 3),
+      ("bytes=8-99", "GET", [8, 9], "bytes 8-9/10", 2),
+      ("bytes=1-3", "HEAD", [], "bytes 1-3/10", 3),
+    ]
+    for (range, method, expectedBytes, expectedContentRange, expectedLength) in cases {
+      let partial = try IPadHLSRelayRangeNormalizer.response(
+        from: complete,
+        requestedMethod: method,
+        requestedRange: range,
+        maximumResponseBytes: 4
+      ).unwrap(or: ResolverHarnessFailure.assertion("range response was declined"))
+      try require(partial.response.statusCode == 206, "range was not a 206")
+      try require(
+        partial.data == Data(expectedBytes),
+        "wrong bytes synthesized for \(method) \(range)"
+      )
+      try require(
+        partial.response.value(forHTTPHeaderField: "Content-Range")
+          == expectedContentRange,
+        "missing or wrong synthesized Content-Range for \(range)"
+      )
+      try require(
+        partial.response.value(forHTTPHeaderField: "Accept-Ranges") == "bytes",
+        "missing synthesized Accept-Ranges for \(range)"
+      )
+      try require(
+        partial.response.value(forHTTPHeaderField: "Content-Length")
+          == String(expectedLength),
+        "wrong synthesized Content-Length for \(method) \(range)"
+      )
+    }
+
+    let rateLimitResponse = try HTTPURLResponse(
+      url: url,
+      statusCode: 429,
+      httpVersion: "HTTP/1.1",
+      headerFields: nil
+    ).unwrap(or: ResolverHarnessFailure.assertion("range 429 is invalid"))
+    let downloader = IPadHLSResourceDownloader(
+      maximumResourceBytes: 1_024,
+      requestTimeout: 1,
+      resourceLoader: FixedStatusResourceLoader(
+        result: IPadHLSResourceLoadResult(
+          data: Data(),
+          response: rateLimitResponse
+        )
+      )
+    )
+    do {
+      _ = try await downloader.data(
+        for: IPadHLSResource(
+          url: url,
+          byteRange: IPadHLSByteRange(offset: 0, length: 2)
+        )
+      )
+      throw ResolverHarnessFailure.assertion(
+        "byte-range HTTP 429 unexpectedly succeeded"
+      )
+    } catch IPadMediaURLResolverError.invalidHTTPStatus(429) {
+      // The producer must see 429, not a generic invalid-byte-range failure.
+    }
+  }
+
+  private static func verifyBrowserRelayDispatchGate(
+    relativeTo baseURL: URL
+  ) async throws {
+    let url = endpoint("relay/serialized.ts", relativeTo: baseURL)
+    let okResponse = try HTTPURLResponse(
+      url: url,
+      statusCode: 200,
+      httpVersion: "HTTP/1.1",
+      headerFields: nil
+    ).unwrap(or: ResolverHarnessFailure.assertion("success response is invalid"))
+    let ok = IPadHLSResourceLoadResult(data: Data([1]), response: okResponse)
+
+    let serialGate = IPadBrowserHLSRelayDispatchGate(
+      initialCooldown: 0.1,
+      maximumCooldown: 1,
+      pollingInterval: 0.005
+    )
+    let probe = RelayDispatchProbe()
+    try await withThrowingTaskGroup(of: Void.self) { group in
+      for _ in 0..<5 {
+        group.addTask {
+          _ = try await serialGate.perform {
+            await probe.begin()
+            do {
+              try await Task.sleep(nanoseconds: 35_000_000)
+              await probe.end()
+              return ok
+            } catch {
+              await probe.end()
+              throw error
+            }
+          }
+        }
+      }
+      try await group.waitForAll()
+    }
+    let serialSnapshot = await probe.snapshot()
+    try require(
+      serialSnapshot.maximumActive == 1,
+      "distinct WebKit relays overlapped"
+    )
+    try require(
+      serialSnapshot.starts.count == 5,
+      "not every serialized relay was dispatched"
+    )
+
+    let rateLimitResponse = try HTTPURLResponse(
+      url: url,
+      statusCode: 429,
+      httpVersion: "HTTP/1.1",
+      headerFields: ["Retry-After": "0.20"]
+    ).unwrap(or: ResolverHarnessFailure.assertion("429 response is invalid"))
+    let rateLimited = IPadHLSResourceLoadResult(
+      data: Data(),
+      response: rateLimitResponse
+    )
+    let cooldownGate = IPadBrowserHLSRelayDispatchGate(
+      initialCooldown: 0.1,
+      maximumCooldown: 1,
+      pollingInterval: 0.005
+    )
+    _ = try await cooldownGate.perform { rateLimited }
+    let nextStartedAt = Date()
+    _ = try await cooldownGate.perform { ok }
+    try require(
+      Date().timeIntervalSince(nextStartedAt) >= 0.17,
+      "Retry-After did not delay the next browser relay dispatch"
+    )
+
+    let attemptedGate = IPadBrowserHLSRelayDispatchGate(
+      initialCooldown: 0.1,
+      maximumCooldown: 1,
+      pollingInterval: 0.005
+    )
+    do {
+      _ = try await attemptedGate.perform {
+        throw IPadHLSResourceLoadingError.attemptedUnavailable
+      }
+      throw ResolverHarnessFailure.assertion(
+        "attempted-unavailable relay unexpectedly succeeded"
+      )
+    } catch IPadHLSResourceLoadingError.attemptedUnavailable {
+      // Expected: the next dispatch must still observe a conservative pause.
+    }
+    let attemptedNextStartedAt = Date()
+    _ = try await attemptedGate.perform { ok }
+    try require(
+      Date().timeIntervalSince(attemptedNextStartedAt) >= 0.08,
+      "attempted-unavailable did not delay the next browser relay dispatch"
+    )
+
+    let parserNow = Date(timeIntervalSince1970: 1_700_000_000)
+    let numericDelay = IPadBrowserHLSRelayDispatchGate.retryAfterDelay(
+      rateLimitResponse,
+      now: parserNow
+    )
+    try require(
+      numericDelay.map { abs($0 - 0.2) < 0.001 } == true,
+      "numeric Retry-After was not parsed"
+    )
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone(secondsFromGMT: 0)
+    formatter.dateFormat = "EEE',' dd MMM yyyy HH':'mm':'ss z"
+    let retryDate = formatter.string(from: parserNow.addingTimeInterval(60))
+    let dateResponse = try HTTPURLResponse(
+      url: url,
+      statusCode: 429,
+      httpVersion: "HTTP/1.1",
+      headerFields: ["Retry-After": retryDate]
+    ).unwrap(or: ResolverHarnessFailure.assertion("dated 429 response is invalid"))
+    let dateDelay = IPadBrowserHLSRelayDispatchGate.retryAfterDelay(
+      dateResponse,
+      now: parserNow
+    )
+    try require(
+      dateDelay.map { abs($0 - 60) < 0.001 } == true,
+      "HTTP-date Retry-After was not parsed"
+    )
+  }
+
+  private static func verifySharedTransport(relativeTo baseURL: URL) async throws {
+    let resource = IPadHLSResource(
+      url: endpoint("shared/segment.ts", relativeTo: baseURL),
+      byteRange: nil
+    )
+    let firstDownloader = IPadHLSResourceDownloader(requestTimeout: 3)
+    let secondDownloader = IPadHLSResourceDownloader(requestTimeout: 3)
+    async let first = firstDownloader.data(for: resource, priority: .speculative)
+    async let second = secondDownloader.data(for: resource, priority: .critical)
+    let (firstData, secondData) = try await (first, second)
+    try require(firstData == Data("shared-media".utf8), "first shared body is wrong")
+    try require(secondData == firstData, "coalesced waiter received different data")
+  }
+
+  private static func verifySharedCancellation(relativeTo baseURL: URL) async throws {
+    let resource = IPadHLSResource(
+      url: endpoint("shared/cancel.ts", relativeTo: baseURL),
+      byteRange: nil
+    )
+    let firstDownloader = IPadHLSResourceDownloader(requestTimeout: 3)
+    let secondDownloader = IPadHLSResourceDownloader(requestTimeout: 3)
+    let first = Task {
+      try await firstDownloader.data(for: resource, priority: .speculative)
+    }
+    let second = Task {
+      try await secondDownloader.data(for: resource, priority: .critical)
+    }
+    try await Task.sleep(nanoseconds: 50_000_000)
+    first.cancel()
+    do {
+      _ = try await first.value
+      throw ResolverHarnessFailure.assertion("cancelled subscriber succeeded")
+    } catch is CancellationError {
+      // Expected: only this subscriber leaves the shared operation.
+    }
+    let secondData = try await second.value
+    try require(
+      secondData == Data("shared-media".utf8),
+      "cancelling one subscriber cancelled the shared origin request"
+    )
+  }
+
+  private static func verifyRateLimitCooldown(relativeTo baseURL: URL) async throws {
+    let downloader = IPadHLSResourceDownloader(requestTimeout: 3)
+    do {
+      _ = try await downloader.data(
+        for: IPadHLSResource(
+          url: endpoint("rate-limit/first.ts", relativeTo: baseURL),
+          byteRange: nil
+        ),
+        priority: .speculative
+      )
+      throw ResolverHarnessFailure.assertion("429 response unexpectedly succeeded")
+    } catch IPadMediaURLResolverError.invalidHTTPStatus(429) {
+      // Expected.
+    }
+    let startedAt = Date()
+    let recovered = try await downloader.data(
+      for: IPadHLSResource(
+        url: endpoint("rate-limit/second.ts", relativeTo: baseURL),
+        byteRange: nil
+      ),
+      priority: .critical
+    )
+    let elapsed = Date().timeIntervalSince(startedAt)
+    try require(recovered == Data("after-cooldown".utf8), "cooldown fetch failed")
+    try require(elapsed >= 0.75, "Retry-After host cooldown was not shared")
+  }
+
+  private static func verifyRedirectOriginCooldown() async throws {
+    let elapsed = try await IPadSharedHTTPTransport
+      .redirectedOriginCooldownProbeForTesting()
+    try require(
+      elapsed >= 0.75,
+      "redirect destination Retry-After did not delay a direct CDN request"
+    )
   }
 
   private static func verifyMediaLimits() throws {
@@ -310,6 +670,48 @@ private struct IPadMediaURLResolverHarness {
     try require(playlist.segments.count == 2, "unexpected media segment count")
     try require(!playlist.isLive, "ENDLIST playlist was reported as live")
     try require(abs(playlist.duration - 4.0) < 0.001, "playlist duration is incorrect")
+    let masterMetadata = try playlist.masterMetadata.unwrap(
+      or: ResolverHarnessFailure.assertion("master metadata was not retained")
+    )
+    try require(
+      masterMetadata.masterURL == submittedURL,
+      "master URL was not retained"
+    )
+    try require(
+      masterMetadata.selectedVideoPlaylistURL == source.mediaURL,
+      "selected video playlist URL was not retained"
+    )
+    try require(
+      masterMetadata.audioGroupID == "audio-main"
+        && masterMetadata.audioRenditions.count == 1,
+      "selected AUDIO group was not retained"
+    )
+    let audioRendition = try masterMetadata.audioRenditions.first.unwrap(
+      or: ResolverHarnessFailure.assertion("separate audio rendition is absent")
+    )
+    let audioURL = try audioRendition.url.unwrap(
+      or: ResolverHarnessFailure.assertion("separate audio URL is absent")
+    )
+    try require(
+      audioURL.path == "/hls/audio/japanese.m3u8"
+        && audioURL.absoluteString.contains("token=a%2Bb"),
+      "separate audio URL was not resolved exactly"
+    )
+    let localVideoURL = URL(string: "http://127.0.0.1:1234/video/index.m3u8")!
+    let localAudioURL = URL(string: "http://127.0.0.1:1234/audio/index.m3u8")!
+    let syntheticMaster = masterMetadata.syntheticPlaylist(
+      videoPlaylistURL: localVideoURL,
+      audioPlaylistURLs: [audioURL: localAudioURL]
+    )
+    try require(
+      syntheticMaster.contains("#EXT-X-MEDIA:TYPE=AUDIO")
+        && syntheticMaster.contains("AUDIO=\"audio-main\"")
+        && syntheticMaster.contains(localVideoURL.absoluteString)
+        && syntheticMaster.contains(localAudioURL.absoluteString)
+        && !syntheticMaster.contains("low/index.m3u8")
+        && !syntheticMaster.contains("ultra/index.m3u8"),
+      "synthetic one-variant master did not preserve selected video + audio"
+    )
 
     let first = playlist.segments[0]
     let second = playlist.segments[1]
@@ -357,6 +759,253 @@ private struct IPadMediaURLResolverHarness {
       secondSegmentData == Data("HI".utf8),
       "implicit byte range downloaded the wrong bytes"
     )
+  }
+
+  private static func verifyNestedMasterAudio(
+    relativeTo baseURL: URL
+  ) async throws {
+    let resolver = IPadMediaURLResolver(requestTimeout: 3)
+    let outerURL = endpoint("nested-audio/outer.m3u8", relativeTo: baseURL)
+    let source = try await resolver.resolve(outerURL.absoluteString)
+    let playlist = try source.hlsPlaylist.unwrap(
+      or: ResolverHarnessFailure.assertion("nested HLS playlist is absent")
+    )
+    let metadata = try playlist.masterMetadata.unwrap(
+      or: ResolverHarnessFailure.assertion(
+        "nested inner master metadata was not retained"
+      )
+    )
+    try require(
+      metadata.masterURL.path == "/nested-audio/inner/master.m3u8",
+      "outer video-only master replaced the inner audio master metadata"
+    )
+    try require(
+      metadata.audioGroupID == "inner-audio"
+        && metadata.audioRenditions.count == 1
+        && metadata.audioRenditions.first?.url?.path
+          == "/nested-audio/inner/audio.m3u8",
+      "inner separate AUDIO group was lost"
+    )
+    try require(
+      metadata.selectedVideoPlaylistURL.path
+        == "/nested-audio/inner/video.m3u8",
+      "inner selected video playlist URL was lost"
+    )
+  }
+
+  private static func verifyVariantFailover(
+    relativeTo baseURL: URL
+  ) async throws {
+    let host = try baseURL.host.unwrap(
+      or: ResolverHarnessFailure.assertion("fixture host is missing")
+    )
+    let sessionCookie = try IPadMediaRequestCookie(
+      name: "variant_session",
+      value: "allowed",
+      domain: host,
+      path: "/variant-switch"
+    ).unwrap(or: ResolverHarnessFailure.assertion("variant cookie is invalid"))
+    let context = IPadMediaRequestContext(
+      cookies: [sessionCookie],
+      userAgent: "MiohVariantHarness/1.0",
+      referer: endpoint("watch/page?secret=removed", relativeTo: baseURL)
+    )
+    let resolver = IPadMediaURLResolver(requestTimeout: 3)
+    let submittedURL = endpoint("variant-switch/master.m3u8", relativeTo: baseURL)
+    let selected1080 = try await resolver.resolve(
+      submittedURL.absoluteString,
+      context: context
+    )
+
+    func verifySourceIdentity(
+      _ source: IPadResolvedMediaSource,
+      label: String
+    ) throws {
+      try require(source.kind == .hls, "\(label) source is not HLS")
+      try require(
+        source.submittedURL == submittedURL,
+        "\(label) changed the submitted URL"
+      )
+      try require(
+        source.playbackURL == selected1080.playbackURL,
+        "\(label) changed the playback URL"
+      )
+      try require(
+        source.resolutionPolicy == selected1080.resolutionPolicy,
+        "\(label) changed the resolution policy"
+      )
+      try require(
+        source.requestContext == context,
+        "\(label) did not preserve the request context"
+      )
+    }
+
+    try verifySourceIdentity(selected1080, label: "1080p")
+    let playlist1080 = try selected1080.hlsPlaylist.unwrap(
+      or: ResolverHarnessFailure.assertion("1080p playlist is absent")
+    )
+    let metadata1080 = try playlist1080.masterMetadata.unwrap(
+      or: ResolverHarnessFailure.assertion("1080p metadata is absent")
+    )
+    try require(
+      selected1080.mediaURL.path == "/variant-switch/1080/video.m3u8",
+      "the initial 1080p variant was not selected"
+    )
+    try require(
+      metadata1080.masterURL.path == "/variant-switch/1080/master.m3u8"
+        && metadata1080.audioGroupID == "inner-audio"
+        && metadata1080.audioRenditions.first?.url?.path
+          == "/variant-switch/1080/audio.m3u8",
+      "nested 1080p AUDIO metadata was replaced by the outer master"
+    )
+    try require(
+      metadata1080.alternativeVariants.map { $0.playlistURL.path }
+        == [
+          "/variant-switch/720/index.m3u8",
+          "/variant-switch/480/index.m3u8",
+        ],
+      "lower outer variants were not retained after nested 1080p selection"
+    )
+    let pending720 = try metadata1080.alternativeVariants.first.unwrap(
+      or: ResolverHarnessFailure.assertion("720p alternative is absent")
+    )
+    try require(
+      pending720.masterURL == submittedURL
+        && pending720.bandwidth == 3_000_000
+        && pending720.averageBandwidth == 2_750_000
+        && pending720.width == 1_280
+        && pending720.height == 720
+        && pending720.codecs == "avc1.64001f,mp4a.40.2"
+        && pending720.audioGroupID == "lower-audio"
+        && pending720.audioRenditions.first?.url?.path
+          == "/variant-switch/audio/lower.m3u8",
+      "720p alternative metadata is incomplete"
+    )
+
+    let candidate720 = try await resolver.resolveNextHLSVariant(for: selected1080)
+    let selected720 = try candidate720.unwrap(
+      or: ResolverHarnessFailure.assertion("720p failover is absent")
+    )
+    try verifySourceIdentity(selected720, label: "720p")
+    let playlist720 = try selected720.hlsPlaylist.unwrap(
+      or: ResolverHarnessFailure.assertion("720p playlist is absent")
+    )
+    let metadata720 = try playlist720.masterMetadata.unwrap(
+      or: ResolverHarnessFailure.assertion("720p metadata is absent")
+    )
+    try require(
+      selected720.mediaURL.path == "/variant-switch/720/index.m3u8"
+        && metadata720.selectedVideoPlaylistURL == selected720.mediaURL
+        && metadata720.masterURL == submittedURL
+        && metadata720.width == 1_280
+        && metadata720.height == 720,
+      "720p failover did not update selected metadata"
+    )
+    try require(
+      metadata720.audioGroupID == "lower-audio"
+        && metadata720.audioRenditions.first?.url?.path
+          == "/variant-switch/audio/lower.m3u8",
+      "720p AUDIO metadata was not retained"
+    )
+    try require(
+      metadata720.alternativeVariants.map { $0.playlistURL.path }
+        == ["/variant-switch/480/index.m3u8"],
+      "720p failover did not retain only the remaining 480p variant"
+    )
+
+    let candidate480 = try await resolver.resolveNextHLSVariant(for: selected720)
+    let selected480 = try candidate480.unwrap(
+      or: ResolverHarnessFailure.assertion("480p failover is absent")
+    )
+    try verifySourceIdentity(selected480, label: "480p")
+    let playlist480 = try selected480.hlsPlaylist.unwrap(
+      or: ResolverHarnessFailure.assertion("480p playlist is absent")
+    )
+    let metadata480 = try playlist480.masterMetadata.unwrap(
+      or: ResolverHarnessFailure.assertion("480p metadata is absent")
+    )
+    try require(
+      selected480.mediaURL.path == "/variant-switch/480/index.m3u8"
+        && metadata480.selectedVideoPlaylistURL == selected480.mediaURL
+        && metadata480.width == 854
+        && metadata480.height == 480
+        && metadata480.audioGroupID == nil
+        && metadata480.audioRenditions.isEmpty
+        && metadata480.alternativeVariants.isEmpty,
+      "480p failover metadata is incorrect"
+    )
+    let exhausted = try await resolver.resolveNextHLSVariant(for: selected480)
+    try require(exhausted == nil, "exhausted variant chain did not return nil")
+  }
+
+  private static func verifyParentAudioNestedFailover(
+    relativeTo baseURL: URL
+  ) async throws {
+    let resolver = IPadMediaURLResolver(requestTimeout: 3)
+    let submittedURL = endpoint(
+      "parent-audio-nested/master.m3u8",
+      relativeTo: baseURL
+    )
+    var current = try await resolver.resolve(submittedURL.absoluteString)
+    let expectedVideoPaths = [
+      "/parent-audio-nested/inner/1080.m3u8",
+      "/parent-audio-nested/inner/720.m3u8",
+      "/parent-audio-nested/inner/480.m3u8",
+      "/parent-audio-nested/inner/360.m3u8",
+    ]
+    let expectedAlternativePaths = [
+      "/parent-audio-nested/inner/720.m3u8",
+      "/parent-audio-nested/inner/480.m3u8",
+      "/parent-audio-nested/inner/360.m3u8",
+    ]
+
+    for index in expectedVideoPaths.indices {
+      try require(
+        current.mediaURL.path == expectedVideoPaths[index],
+        "nested fallback selected the wrong video at index \(index)"
+      )
+      let playlist = try current.hlsPlaylist.unwrap(
+        or: ResolverHarnessFailure.assertion(
+          "nested fallback playlist is absent at index \(index)"
+        )
+      )
+      let metadata = try playlist.masterMetadata.unwrap(
+        or: ResolverHarnessFailure.assertion(
+          "nested fallback metadata is absent at index \(index)"
+        )
+      )
+      if index < 3 {
+        try require(
+          metadata.audioGroupID == "parent-audio"
+            && metadata.audioRenditions.first?.url?.path
+              == "/parent-audio-nested/parent/audio.m3u8",
+          "parent AUDIO was lost on compatible inner rendition \(index)"
+        )
+      } else {
+        try require(
+          metadata.audioGroupID == "inner-audio"
+            && metadata.audioRenditions.first?.url?.path
+              == "/parent-audio-nested/inner/audio/inner.m3u8",
+          "genuine inner AUDIO was overwritten by the parent group"
+        )
+      }
+      try require(
+        metadata.alternativeVariants.map { $0.playlistURL.path }
+          == Array(expectedAlternativePaths.dropFirst(index)),
+        "nested AUDIO fallback order changed at index \(index)"
+      )
+
+      let next = try await resolver.resolveNextHLSVariant(for: current)
+      if index == expectedVideoPaths.count - 1 {
+        try require(next == nil, "nested AUDIO fallback chain did not exhaust")
+      } else {
+        current = try next.unwrap(
+          or: ResolverHarnessFailure.assertion(
+            "nested AUDIO fallback ended at index \(index)"
+          )
+        )
+      }
+    }
   }
 
   private static func verifyDiscontinuityMetadata(

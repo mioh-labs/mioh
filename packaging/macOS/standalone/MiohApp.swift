@@ -613,6 +613,7 @@ struct MiohUserDefaultsSnapshot: Codable {
   var previewDetectionModel: String?
   var previewCustomDetectionModel: String?
   var previewRealtimeOptimization: Bool?
+  var previewUseSafariCompatibleHLS: Bool?
   var previewProjectionMode: String?
   var previewVideoLayout: String?
   var previewEye: String?
@@ -691,6 +692,7 @@ struct MiohUserDefaultsSnapshot: Codable {
       previewDetectionModel: capabilities.previewDetectionModel,
       previewCustomDetectionModel: "",
       previewRealtimeOptimization: true,
+      previewUseSafariCompatibleHLS: false,
       previewProjectionMode: "通常",
       previewVideoLayout: "SBS 左右",
       previewEye: "左目",
@@ -795,6 +797,7 @@ final class RestorationRunner: ObservableObject {
   @Published var previewDetectionModel: String
   @Published var previewCustomDetectionModel = ""
   @Published var previewRealtimeOptimization = true
+  @Published var previewUseSafariCompatibleHLS = false
   @Published var previewProjectionMode = "通常"
   @Published var previewVideoLayout = "SBS 左右"
   @Published var previewEye = "左目"
@@ -3060,6 +3063,7 @@ final class RestorationRunner: ObservableObject {
       previewDetectionModel: previewDetectionModel,
       previewCustomDetectionModel: previewCustomDetectionModel,
       previewRealtimeOptimization: previewRealtimeOptimization,
+      previewUseSafariCompatibleHLS: previewUseSafariCompatibleHLS,
       previewProjectionMode: previewProjectionMode,
       previewVideoLayout: previewVideoLayout,
       previewEye: previewEye,
@@ -3170,6 +3174,8 @@ final class RestorationRunner: ObservableObject {
     ) ? snapshot.previewDetectionModel! : capabilities.previewDetectionModel
     previewCustomDetectionModel = snapshot.previewCustomDetectionModel ?? ""
     previewRealtimeOptimization = snapshot.previewRealtimeOptimization ?? true
+    previewUseSafariCompatibleHLS =
+      snapshot.previewUseSafariCompatibleHLS ?? false
     previewProjectionMode = ["通常", "VR180", "360"].contains(snapshot.previewProjectionMode ?? "")
       ? snapshot.previewProjectionMode!
       : "通常"
@@ -4114,6 +4120,26 @@ struct ContentView: View {
 
   private var settingsTab: some View {
     Form {
+      Section("HLS再生") {
+        Picker(
+          "HLS通信",
+          selection: $runner.previewUseSafariCompatibleHLS
+        ) {
+          Text("高速（区間先読み）").tag(false)
+          Text("Safari互換（429回避）").tag(true)
+        }
+        .pickerStyle(.segmented)
+        Text(
+          runner.previewUseSafariCompatibleHLS
+            ? "AVFoundationの映像を取り込むため低速ですが、HTTP 429を回避しやすい方式です。"
+            : "HLS区間を並行して先読みする高速方式です。配信元によってはHTTP 429になる場合があります。"
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        Text("変更は次回のHLS復元再生から適用されます。")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      }
       Section("ローカルネットワーク操作") {
         Toggle(
           "Webリモコンを有効にする",
@@ -4293,7 +4319,7 @@ struct ContentView: View {
           .foregroundStyle(.secondary)
       }
       Section("保存対象") {
-        Text("入力/出力、一時フォルダ、分割、復元、検出、出力、メモリ、再生バッファまで保存します。ログ、進捗、実行中状態は保存しません。")
+        Text("入力/出力、一時フォルダ、分割、復元、検出、出力、メモリ、再生バッファ、HLS通信方式まで保存します。ログ、進捗、実行中状態は保存しません。")
           .font(.caption)
           .foregroundStyle(.secondary)
       }

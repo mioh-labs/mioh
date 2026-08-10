@@ -519,6 +519,8 @@ final class MacHLSRealtimeProducer {
   private let startSeconds: Double
   private let generation: Int
   private let log: Logger
+  private let resourceLoader: (any IPadHLSResourceLoading)?
+  private let avFoundationCapture: MacHLSAVFoundationCapture?
 
   private var downloader: IPadHLSResourceDownloader?
   private var prefetchDownloader: IPadHLSResourceDownloader?
@@ -538,6 +540,7 @@ final class MacHLSRealtimeProducer {
   private var retainedOutputBytes: Int64 = 0
   private var outputCreditWaiters: [CheckedContinuation<Void, Never>] = []
   private var pendingVariantFallbackSource: IPadResolvedMediaSource?
+  private var sameOriginVariantFallbackRejected = false
   private let intervalAssemblyWorker = IntervalAssemblyWorker()
   private let mediaFileWorker = MediaFileWorker()
   private let vodInitialRestoreBatchCoreSegments = 2
@@ -553,6 +556,8 @@ final class MacHLSRealtimeProducer {
     sessionDirectory: URL,
     startSeconds: Double,
     generation: Int,
+    resourceLoader: (any IPadHLSResourceLoading)? = nil,
+    avFoundationCapture: MacHLSAVFoundationCapture? = nil,
     log: @escaping Logger
   ) {
     self.source = source
@@ -561,6 +566,8 @@ final class MacHLSRealtimeProducer {
     self.sessionDirectory = sessionDirectory
     self.startSeconds = max(0, startSeconds.isFinite ? startSeconds : 0)
     self.generation = generation
+    self.resourceLoader = resourceLoader
+    self.avFoundationCapture = avFoundationCapture
     self.log = log
   }
 
@@ -614,12 +621,33 @@ final class MacHLSRealtimeProducer {
       "restored-hls",
       isDirectory: true
     )
-    let localSegmentCacheDirectory = try Self.userSegmentCacheDirectory()
     try FileManager.default.createDirectory(
       at: restoredDirectory,
       withIntermediateDirectories: true,
       attributes: [.posixPermissions: 0o700]
     )
+
+    if let avFoundationCapture {
+      let timelineStarts = Dictionary(
+        playlist.segments.map { ($0.sequence, $0.startSeconds) },
+        uniquingKeysWith: { first, _ in first }
+      )
+      var duration = maximumTimelineEnd(
+        playlist: playlist,
+        timelineStarts: timelineStarts
+      )
+      if !playlist.isLive { duration = max(duration, playlist.duration) }
+      try await runAVFoundationCapture(
+        avFoundationCapture,
+        playlist: playlist,
+        restoredDirectory: restoredDirectory,
+        duration: duration,
+        emit: emit
+      )
+      return
+    }
+
+    let localSegmentCacheDirectory = try Self.userSegmentCacheDirectory()
 
     var activeSource = source
     var downloader = makeDownloader(for: activeSource)
@@ -719,7 +747,8 @@ final class MacHLSRealtimeProducer {
 
     func suspendVODPrefetchAfterRateLimit(
       seconds: TimeInterval,
-      triggeredByPrefetch: Bool = false
+      triggeredByPrefetch: Bool = false,
+      reason: String = "HTTP 429"
     ) async {
       let hadPrefetchActivity =
         triggeredByPrefetch || !vodPrefetchTasks.isEmpty
@@ -754,7 +783,7 @@ final class MacHLSRealtimeProducer {
         vodPrefetchSuspendedUntil > previousSuspension
       {
         log(
-          "HLS先読みをHTTP 429のため"
+          "HLS先読みを\(reason)のため"
             + "\(String(format: "%.1f", boundedPause))秒停止します\n"
         )
       }
@@ -864,10 +893,13 @@ final class MacHLSRealtimeProducer {
 
           let lineToEmit = completionLine
           let rateLimited: Bool
+          let browserRelayUnavailable: Bool
           if case let .failure(error) = result {
             rateLimited = Self.isHTTPRateLimit(error)
+            browserRelayUnavailable = Self.isBrowserRelayAttemptedUnavailable(error)
           } else {
             rateLimited = false
+            browserRelayUnavailable = false
           }
           let shouldSuspendPrefetch = await MainActor.run { () -> Bool in
             guard vodPrefetchGeneration == generation,
@@ -896,6 +928,15 @@ final class MacHLSRealtimeProducer {
                 Date().addingTimeInterval(8)
               )
               return true
+            } else if browserRelayUnavailable {
+              // A CORS-hidden response or WebKit bridge failure may already
+              // have reached the CDN. Stop every speculative sibling before
+              // retrying so three prefetch slots cannot multiply that request.
+              vodPrefetchSuspendedUntil = max(
+                vodPrefetchSuspendedUntil,
+                Date().addingTimeInterval(8)
+              )
+              return true
             } else {
               startVODPrefetchIfPossible()
               return false
@@ -904,7 +945,9 @@ final class MacHLSRealtimeProducer {
           if shouldSuspendPrefetch {
             await suspendVODPrefetchAfterRateLimit(
               seconds: 8,
-              triggeredByPrefetch: true
+              triggeredByPrefetch: true,
+              reason: rateLimited
+                ? "HTTP 429" : "WebKit HLS通信の再試行待ち"
             )
           }
         }
@@ -1078,6 +1121,7 @@ final class MacHLSRealtimeProducer {
         localURL = prefetchedSource.localURL
       } else {
         var ordinaryRetryCount = 0
+        var browserRelayRetryCount = 0
         var didAttemptVariantFallback = false
         while true {
           try checkCancellation()
@@ -1101,12 +1145,35 @@ final class MacHLSRealtimeProducer {
             throw CancellationError()
           } catch {
             downloadFailure = error
+            if Self.isBrowserRelayAttemptedUnavailable(error) {
+              guard browserRelayRetryCount < 3 else { break }
+              browserRelayRetryCount += 1
+              let retryDelay = Self.rateLimitRetryDelay(
+                forConsecutiveFailure: browserRelayRetryCount
+              )
+              await suspendVODPrefetchAfterRateLimit(
+                seconds: retryDelay,
+                reason: "WebKit HLS通信の再試行待ち"
+              )
+              log(
+                "HLS区間\(mediaSegment.sequence)のWebKit通信が完了しなかったため、"
+                  + "\(String(format: "%.1f", retryDelay))秒待機して"
+                  + "同じ区間を再取得します（バッファ中）\n"
+              )
+              try await sleep(seconds: retryDelay)
+              continue
+            }
+            browserRelayRetryCount = 0
             if Self.isHTTPRateLimit(error) {
-              if !playlist.isLive, !didAttemptVariantFallback {
+              if !playlist.isLive, !didAttemptVariantFallback,
+                !sameOriginVariantFallbackRejected
+              {
                 didAttemptVariantFallback = true
                 let fallbackSource: IPadResolvedMediaSource?
                 do {
-                  fallbackSource = try await IPadMediaURLResolver()
+                  fallbackSource = try await IPadMediaURLResolver(
+                    resourceLoader: resourceLoader
+                  )
                     .resolveNextHLSVariant(for: activeSource)
                 } catch is CancellationError {
                   throw CancellationError()
@@ -1117,13 +1184,28 @@ final class MacHLSRealtimeProducer {
                   fallbackSource = nil
                 }
                 if let fallbackSource {
-                  pendingVariantFallbackSource = fallbackSource
-                  log(
-                    "HLS variantをHTTP 429のため切り替えます: "
-                      + "\(Self.variantDescription(activeSource)) → "
-                      + "\(Self.variantDescription(fallbackSource))\n"
-                  )
-                  throw ProductionError.variantFallbackPrepared
+                  if Self.sharesPrimaryMediaOrigin(
+                    activeSource,
+                    fallbackSource
+                  ) {
+                    sameOriginVariantFallbackRejected = true
+                    // The master/variant hosts can differ while every media URI
+                    // is ultimately served by one CDN. Restarting the player at
+                    // a lower rendition then spends another playlist request
+                    // but immediately hits the same origin cooldown again.
+                    log(
+                      "HLSの低いvariantも同じ区間配信元を使用するため、"
+                        + "品質を切り替えず待機します\n"
+                    )
+                  } else {
+                    pendingVariantFallbackSource = fallbackSource
+                    log(
+                      "HLS variantをHTTP 429のため切り替えます: "
+                        + "\(Self.variantDescription(activeSource)) → "
+                        + "\(Self.variantDescription(fallbackSource))\n"
+                    )
+                    throw ProductionError.variantFallbackPrepared
+                  }
                 }
               }
 
@@ -1368,6 +1450,122 @@ final class MacHLSRealtimeProducer {
     }
   }
 
+  /// Feeds the restoration worker with short MP4s encoded from AVPlayer's
+  /// decoded frames. No HLS playlist, init segment, or media segment is fetched
+  /// by URLSession/WKDownload on this path; AVFoundation owns all origin I/O.
+  private func runAVFoundationCapture(
+    _ capture: MacHLSAVFoundationCapture,
+    playlist: IPadHLSMediaPlaylist,
+    restoredDirectory: URL,
+    duration: Double,
+    emit: @escaping EventSink
+  ) async throws {
+    emit(.ready(duration: duration, isLive: playlist.isLive))
+    log(
+      "HLSリアルタイム復元を開始: "
+        + "Safariと同じAVFoundation映像経路"
+        + (playlist.isLive ? " / ライブ\n" : " / \(formatDuration(duration))\n")
+    )
+    log(
+      "HLS通信: 区間URLを再取得せず、AVPlayerのデコード済み映像を復元します\n"
+    )
+
+    var restorationWindow: [RestorationSource] = []
+    var hasRestoredAnyWindow = false
+    var lastTimelineEnd = startSeconds
+    let stream = try capture.segments()
+    defer { capture.cancel() }
+
+    do {
+      for try await captured in stream {
+        try checkCancellation()
+        guard captured.endSeconds > captured.startSeconds else {
+          try? FileManager.default.removeItem(at: captured.url)
+          continue
+        }
+        let resource = IPadHLSResource(url: captured.url, byteRange: nil)
+        let mediaSegment = IPadHLSMediaSegment(
+          sequence: Int64(captured.sequence),
+          duration: captured.endSeconds - captured.startSeconds,
+          resource: resource,
+          initializationResource: nil,
+          startSeconds: captured.startSeconds
+        )
+        let source = RestorationSource(
+          mediaSegment: mediaSegment,
+          timelineStart: captured.startSeconds,
+          localURL: captured.url
+        )
+        lastTimelineEnd = max(lastTimelineEnd, captured.endSeconds)
+
+        if let previous = restorationWindow.last,
+          captured.startSeconds > previous.timelineEnd + 0.5
+        {
+          try await flushWindow(
+            restorationWindow,
+            hasLeftContext: hasRestoredAnyWindow,
+            restoredDirectory: restoredDirectory,
+            requestedStartSeconds: startSeconds,
+            duration: duration,
+            emit: emit
+          )
+          removeMaterializedSources(restorationWindow)
+          restorationWindow.removeAll(keepingCapacity: true)
+          hasRestoredAnyWindow = false
+          emit(.discontinuity(position: captured.startSeconds))
+        }
+
+        restorationWindow.append(source)
+        // The capture player runs a few seconds ahead of audible playback.
+        // Restore one core at a time with its immediate temporal neighbours so
+        // production remains comfortably faster than the 1x capture clock.
+        if restorationWindow.count == 2 {
+          try await restoreWindow(
+            restorationWindow,
+            coreIndex: 0,
+            restoredDirectory: restoredDirectory,
+            requestedStartSeconds: startSeconds,
+            duration: duration,
+            emit: emit
+          )
+          hasRestoredAnyWindow = true
+        } else if restorationWindow.count == 3 {
+          try await restoreWindow(
+            restorationWindow,
+            coreIndex: 1,
+            restoredDirectory: restoredDirectory,
+            requestedStartSeconds: startSeconds,
+            duration: duration,
+            emit: emit
+          )
+          hasRestoredAnyWindow = true
+          let expired = restorationWindow.removeFirst()
+          try? FileManager.default.removeItem(at: expired.localURL)
+        }
+      }
+
+      try await flushWindow(
+        restorationWindow,
+        hasLeftContext: hasRestoredAnyWindow,
+        restoredDirectory: restoredDirectory,
+        requestedStartSeconds: startSeconds,
+        duration: max(duration, lastTimelineEnd),
+        emit: emit
+      )
+      removeMaterializedSources(restorationWindow)
+      restorationWindow.removeAll(keepingCapacity: false)
+      try checkCancellation()
+      let finalDuration = max(duration, lastTimelineEnd)
+      emit(.progress(position: finalDuration, duration: finalDuration))
+      emit(.ended(duration: finalDuration))
+      log("AVFoundation HLS復元が配信末尾へ到達しました\n")
+    } catch {
+      removeMaterializedSources(restorationWindow)
+      restorationWindow.removeAll(keepingCapacity: false)
+      throw error
+    }
+  }
+
   /// May be called from a controller's nonisolated deinitializer. The actual
   /// Process and downloader mutation remains serialized on the main actor.
   nonisolated func cancel() {
@@ -1397,6 +1595,7 @@ final class MacHLSRealtimeProducer {
     guard !cancellationRequested else { return }
     cancellationRequested = true
     resumeOutputCreditWaiters()
+    avFoundationCapture?.cancel()
     downloader?.cancel()
     prefetchDownloader?.cancel()
     for downloader in prefetchDownloaders { downloader.cancel() }
@@ -1583,7 +1782,8 @@ final class MacHLSRealtimeProducer {
       maximumRedirectCount: 6,
       requestTimeout: 30,
       resolutionPolicy: resolvedSource.resolutionPolicy,
-      requestContext: resolvedSource.requestContext ?? source.requestContext
+      requestContext: resolvedSource.requestContext ?? source.requestContext,
+      resourceLoader: resourceLoader
     )
   }
 
@@ -1623,7 +1823,9 @@ final class MacHLSRealtimeProducer {
     for candidate in candidates {
       try checkCancellation()
       do {
-        let resolved = try await IPadMediaURLResolver().resolve(
+        let resolved = try await IPadMediaURLResolver(
+          resourceLoader: resourceLoader
+        ).resolve(
           candidate.absoluteString,
           policy: source.resolutionPolicy,
           context: activeSource.requestContext ?? source.requestContext
@@ -1742,6 +1944,15 @@ final class MacHLSRealtimeProducer {
     httpStatusCode(in: error) == 429
   }
 
+  private nonisolated static func isBrowserRelayAttemptedUnavailable(
+    _ error: Error
+  ) -> Bool {
+    guard let loadingError = error as? IPadHLSResourceLoadingError else {
+      return false
+    }
+    return loadingError == .attemptedUnavailable
+  }
+
   private nonisolated static func rateLimitRetryDelay(
     forConsecutiveFailure failureCount: Int
   ) -> TimeInterval {
@@ -1767,6 +1978,27 @@ final class MacHLSRealtimeProducer {
       resolution = "解像度不明"
     }
     return "\(host) / \(resolution)"
+  }
+
+  private nonisolated static func sharesPrimaryMediaOrigin(
+    _ lhs: IPadResolvedMediaSource,
+    _ rhs: IPadResolvedMediaSource
+  ) -> Bool {
+    guard let left = primaryMediaOriginKey(lhs),
+      let right = primaryMediaOriginKey(rhs)
+    else { return false }
+    return left == right
+  }
+
+  private nonisolated static func primaryMediaOriginKey(
+    _ source: IPadResolvedMediaSource
+  ) -> String? {
+    guard let url = source.hlsPlaylist?.segments.first?.resource.url,
+      let scheme = url.scheme?.lowercased(),
+      let host = url.host?.lowercased()
+    else { return nil }
+    let port = url.port ?? (scheme == "https" ? 443 : 80)
+    return "\(scheme)://\(host):\(port)"
   }
 
   /// Only responses that plausibly indicate an expired or revoked signed media
