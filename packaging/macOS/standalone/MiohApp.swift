@@ -745,6 +745,7 @@ final class RestorationRunner: ObservableObject {
   }
   @Published var sourceInfo: SourceMediaInfo?
   @Published var sourceInfoFailure: String?
+  @Published var sourceBatchSummary: String?
   @Published var outputURL: URL?
   @Published var progress = 0.0
   @Published var status = "待機中"
@@ -848,6 +849,13 @@ final class RestorationRunner: ObservableObject {
   private var nativeExportPreservesTemporaryFiles = false
   private var runningNativeExport = false
   private var nativeExportLastProgressBucket = -1
+  private var nativeExportBatchPending: [MacNativeExportBatchItem] = []
+  private var nativeExportBatchCurrent: MacNativeExportBatchItem?
+  private var nativeExportBatchResources: URL?
+  private var nativeExportBatchTotal = 0
+  private var nativeExportBatchCompleted = 0
+  private var nativeExportBatchActive = false
+  private var nativeExportBatchStopRequested = false
   private var lineBuffer = ""
   private var logHistory = ""
   private var activeProgress: [String: AppProgressEvent] = [:]
@@ -1017,7 +1025,25 @@ final class RestorationRunner: ObservableObject {
   private func refreshSourceInfo(for url: URL?) {
     sourceInfo = nil
     sourceInfoFailure = nil
+    sourceBatchSummary = nil
     guard let url else { return }
+    if (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+      let candidates = (try? FileManager.default.contentsOfDirectory(
+        at: url,
+        includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+        options: [.skipsHiddenFiles]
+      )) ?? []
+      let count = candidates.filter { candidate in
+        guard MacNativeExportBatchPlanner.videoExtensions.contains(
+          candidate.pathExtension.lowercased()
+        ), let values = try? candidate.resourceValues(forKeys: [
+          .isRegularFileKey, .isSymbolicLinkKey,
+        ]) else { return false }
+        return values.isRegularFile == true && values.isSymbolicLink != true
+      }.count
+      sourceBatchSummary = "バッチ入力: 直下の対応動画 \(count)本"
+      return
+    }
     Task { [weak self] in
       let probed = await SourceMediaProbe.read(url: url)
       await MainActor.run { [weak self] in
@@ -1233,6 +1259,7 @@ final class RestorationRunner: ObservableObject {
     do {
       normalizeModelSelections()
       let resources = try resourceDirectory()
+      resetNativeExportBatchState()
       if usesPythonEngine {
         let pythonTask = try makePythonExportTask(
           resources: resources,
@@ -1243,25 +1270,17 @@ final class RestorationRunner: ObservableObject {
         appendPythonExportStartLog(input: inputURL, output: outputURL)
         return
       }
-      let nativeOutputURL = resolvedOutputFile(
+      let plan = try MacNativeExportBatchPlanner.plan(
         input: inputURL,
-        selectedOutput: outputURL
+        selectedOutput: outputURL,
+        overwrite: overwrite
       )
-      let nativeTask = try makeNativeExportTask(
-        resources: resources,
-        input: inputURL,
-        output: nativeOutputURL
-      )
-      try launch(nativeTask.process, pipe: nativeTask.output)
-      appendNativeExportStartLog(
-        input: inputURL,
-        output: nativeOutputURL,
-        configuration: nativeTask.configuration
-      )
+      try launchNativeExportPlan(plan, resources: resources)
     } catch {
       isRunning = false
       status = "エラー"
       cleanupNativeExportArtifacts()
+      resetNativeExportBatchState()
       appendLog(error.localizedDescription + "\n")
     }
   }
@@ -1270,21 +1289,182 @@ final class RestorationRunner: ObservableObject {
     input: URL,
     selectedOutput: URL
   ) -> URL {
-    var isDirectory: ObjCBool = false
-    let exists = FileManager.default.fileExists(
-      atPath: selectedOutput.path,
-      isDirectory: &isDirectory
+    MacNativeExportBatchPlanner.resolvedOutputFile(
+      input: input,
+      selectedOutput: selectedOutput
     )
-    let selectedDirectory = (exists && isDirectory.boolValue)
-      || selectedOutput.hasDirectoryPath
-      || selectedOutput.pathExtension.isEmpty
-    guard selectedDirectory else { return selectedOutput }
+  }
 
-    let stem = input.deletingPathExtension().lastPathComponent
-    let ext = input.pathExtension.isEmpty ? "mp4" : input.pathExtension
-    return selectedOutput
-      .appendingPathComponent("\(stem)-UC")
-      .appendingPathExtension(ext)
+  private func launchNativeExportPlan(
+    _ plan: MacNativeExportBatchPlan,
+    resources: URL
+  ) throws {
+    lineBuffer = ""
+    logHistory = ""
+    activeProgress.removeAll()
+    activeProgressOrder.removeAll()
+    nativeExportLastProgressBucket = -1
+    log = ""
+    progress = 0
+    nativeExportBatchPending = plan.items
+    nativeExportBatchCurrent = nil
+    nativeExportBatchResources = resources
+    nativeExportBatchTotal = plan.items.count
+    nativeExportBatchCompleted = 0
+    nativeExportBatchActive = true
+    nativeExportBatchStopRequested = false
+
+    if plan.isDirectoryBatch {
+      appendLog(
+        "======================================================================\n"
+          + "Swiftネイティブ・バッチ書き出し\n"
+          + "======================================================================\n"
+          + "検出: \(plan.discoveredCount)本 / 未処理: \(plan.items.count)本"
+          + " / 出力済みスキップ: \(plan.skippedOutputs.count)本\n"
+          + "======================================================================\n\n"
+      )
+      for skipped in plan.skippedOutputs.prefix(20) {
+        appendLog("スキップ（出力済み）: \(skipped.lastPathComponent)\n")
+      }
+      if plan.skippedOutputs.count > 20 {
+        appendLog("ほか \(plan.skippedOutputs.count - 20)本をスキップ\n")
+      }
+      if !plan.skippedOutputs.isEmpty { appendLog("\n") }
+    }
+
+    guard !plan.items.isEmpty else {
+      progress = 1
+      status = "完了（未処理なし）"
+      isRunning = false
+      appendLog("未処理の動画はありません。\n")
+      resetNativeExportBatchState()
+      return
+    }
+    isRunning = true
+    try launchNextNativeExportBatchItem()
+  }
+
+  private func launchNextNativeExportBatchItem() throws {
+    guard nativeExportBatchActive,
+      !nativeExportBatchStopRequested,
+      let resources = nativeExportBatchResources,
+      let item = nativeExportBatchPending.first
+    else { return }
+    let itemIndex = nativeExportBatchCompleted + 1
+    let nativeTask = try makeNativeExportTask(
+      resources: resources,
+      input: item.input,
+      output: item.output
+    )
+    nativeExportBatchCurrent = item
+    activeProgress.removeAll()
+    activeProgressOrder.removeAll()
+    nativeExportLastProgressBucket = -1
+    lineBuffer = ""
+    status = nativeExportBatchTotal > 1
+      ? "バッチ \(itemIndex)/\(nativeExportBatchTotal) 準備中"
+      : "準備中"
+
+    let pipe = nativeTask.output
+    pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+      let data = handle.availableData
+      guard !data.isEmpty, let text = String(data: data, encoding: .utf8)
+      else { return }
+      Task { @MainActor in self?.consume(text) }
+    }
+    nativeTask.process.terminationHandler = { [weak self, weak pipe] completed in
+      pipe?.fileHandleForReading.readabilityHandler = nil
+      Task { @MainActor in
+        self?.finishNativeExportBatchItem(completed)
+      }
+    }
+    process = nativeTask.process
+    try nativeTask.process.run()
+    nativeExportBatchPending.removeFirst()
+    if nativeExportBatchTotal > 1 {
+      appendLog(
+        "----------------------------------------------------------------------\n"
+          + "バッチ \(itemIndex)/\(nativeExportBatchTotal): "
+          + item.input.lastPathComponent + "\n"
+          + "----------------------------------------------------------------------\n"
+      )
+    }
+    appendNativeExportStartLog(
+      input: item.input,
+      output: item.output,
+      configuration: nativeTask.configuration
+    )
+  }
+
+  private func finishNativeExportBatchItem(_ completedProcess: Process) {
+    if !lineBuffer.isEmpty {
+      let finalLine = lineBuffer
+      lineBuffer = ""
+      consumeLine(finalLine)
+    }
+    activeProgress.removeAll()
+    activeProgressOrder.removeAll()
+    rebuildVisibleLog()
+    process = nil
+    processInput = nil
+    cleanupNativeExportArtifacts()
+
+    guard completedProcess.terminationStatus == 0 else {
+      nativeExportBatchPending.removeAll()
+      isRunning = false
+      status = completedProcess.terminationReason == .uncaughtSignal
+        || nativeExportBatchStopRequested ? "停止" : "エラー"
+      resetNativeExportBatchState()
+      return
+    }
+
+    nativeExportBatchCompleted += 1
+    progress = nativeExportBatchTotal > 0
+      ? Double(nativeExportBatchCompleted) / Double(nativeExportBatchTotal)
+      : 1
+    if nativeExportBatchTotal > 1 {
+      appendLog(
+        "バッチ完了: \(nativeExportBatchCompleted)/\(nativeExportBatchTotal)\n\n"
+      )
+    }
+    nativeExportBatchCurrent = nil
+
+    guard !nativeExportBatchStopRequested,
+      !nativeExportBatchPending.isEmpty
+    else {
+      isRunning = false
+      status = nativeExportBatchStopRequested ? "停止" : "完了"
+      progress = nativeExportBatchStopRequested ? progress : 1
+      if !nativeExportBatchStopRequested, nativeExportBatchTotal > 1 {
+        appendLog(
+          "======================================================================\n"
+            + "バッチ処理完了: \(nativeExportBatchCompleted)本\n"
+            + "======================================================================\n"
+        )
+      }
+      resetNativeExportBatchState()
+      return
+    }
+
+    do {
+      try launchNextNativeExportBatchItem()
+    } catch {
+      isRunning = false
+      status = "エラー"
+      cleanupNativeExportArtifacts()
+      appendLog(error.localizedDescription + "\n")
+      resetNativeExportBatchState()
+    }
+  }
+
+  private func resetNativeExportBatchState() {
+    nativeExportBatchPending.removeAll()
+    nativeExportBatchCurrent = nil
+    nativeExportBatchResources = nil
+    nativeExportBatchTotal = 0
+    nativeExportBatchCompleted = 0
+    nativeExportBatchActive = false
+    nativeExportBatchStopRequested = false
   }
 
   private func launch(_ task: Process, pipe: Pipe) throws {
@@ -1334,6 +1514,10 @@ final class RestorationRunner: ObservableObject {
   }
 
   func stop() {
+    if nativeExportBatchActive {
+      nativeExportBatchStopRequested = true
+      nativeExportBatchPending.removeAll()
+    }
     if runningNativeExport, let processInput {
       let command = Data("{\"command\":\"stop\"}\n".utf8)
       _ = MacChildProcessPipe.write(command, to: processInput.fileHandleForWriting)
@@ -3645,8 +3829,18 @@ final class RestorationRunner: ObservableObject {
   }
 
   private func setProgress(_ percent: Double) {
-    progress = min(max(percent / 100, 0), 1)
-    status = "処理中 \(Int(percent))%"
+    let unitProgress = min(max(percent / 100, 0), 1)
+    if nativeExportBatchActive, nativeExportBatchTotal > 1 {
+      progress = min(
+        1,
+        (Double(nativeExportBatchCompleted) + unitProgress)
+          / Double(nativeExportBatchTotal)
+      )
+      status = "処理中 \(nativeExportBatchCompleted + 1)/\(nativeExportBatchTotal) \(Int(percent))%"
+    } else {
+      progress = unitProgress
+      status = "処理中 \(Int(percent))%"
+    }
   }
 
   func appendExternalLog(_ text: String) {
@@ -3729,13 +3923,19 @@ struct PathRow: View {
 struct SourceInfoRow: View {
   let info: SourceMediaInfo?
   let failure: String?
+  let batchSummary: String?
 
   var body: some View {
     HStack(alignment: .top, spacing: 12) {
       Image(systemName: "info.circle")
         .frame(width: 20)
         .foregroundStyle(.secondary)
-      if let info {
+      if let batchSummary {
+        Text(batchSummary)
+          .font(.caption)
+          .foregroundStyle(.secondary)
+          .frame(maxWidth: .infinity, alignment: .leading)
+      } else if let info {
         VStack(alignment: .leading, spacing: 4) {
           HStack(spacing: 18) {
             field("解像度", info.resolutionText)
@@ -3911,7 +4111,8 @@ struct ContentView: View {
         if runner.inputURL != nil {
           SourceInfoRow(
             info: runner.sourceInfo,
-            failure: runner.sourceInfoFailure
+            failure: runner.sourceInfoFailure,
+            batchSummary: runner.sourceBatchSummary
           )
         }
         PathRow(title: "出力", icon: "externaldrive", url: runner.outputURL, action: runner.chooseOutput)
