@@ -56,6 +56,7 @@ private struct NativePreviewConfiguration: Decodable {
   let temporalBatchFrames: Int
   let temporalOverlap: Int?
   let ringCapacity: Int
+  let nativeParallelWorkers: Int?
   let confidenceThreshold: Float
   let iouThreshold: Float
   let contextFraction: Float
@@ -2847,7 +2848,7 @@ private struct NativeRestoreEffects {
 /// There is deliberately no one-square-per-window shortcut here. Each
 /// tracked frame keeps its own crop while the whole scene shares only the two
 /// resize scale factors, exactly like ``MosaicDetector.Clip``.
-private final class NativeFrameProcessor {
+private final class NativeFrameProcessor: @unchecked Sendable {
   private let outputPool: CVPixelBufferPool
   private let outputAllocationAttributes: CFDictionary
   private let outputBufferLimit: Int
@@ -4490,6 +4491,17 @@ private final class NativeFrameProcessor {
   }
 }
 
+private struct NativeProcessedBatch: @unchecked Sendable {
+  let outputs: [CVPixelBuffer]
+  let restoredSceneCount: Int
+}
+
+private struct NativePendingProcessingBatch {
+  let detectedBatch: DetectedBatch
+  let processor: NativeFrameProcessor
+  let task: Task<NativeProcessedBatch, Error>
+}
+
 private final class PreviewControl: @unchecked Sendable {
   private let condition = NSCondition()
   private var stopped = false
@@ -5093,54 +5105,66 @@ private struct NativePreviewPipeline {
       )
     }
 #endif
-    let restorer: any NativeRestoring
-    if let fixedFrames = config.restorationFrameCount {
-      restorer = try FixedRestorerBridge(
-        runner: URL(fileURLWithPath: config.restorationRunner),
-        model: URL(fileURLWithPath: config.restorationModels),
-        frameCount: fixedFrames
-      )
-    } else {
-      restorer = try VariableRestorerBridge(
-        runner: URL(fileURLWithPath: config.restorationRunner),
-        models: URL(fileURLWithPath: config.restorationModels),
-        maximumFrames: config.temporalBatchFrames
-      )
-    }
-    let roiEnhancer: NativeROIEnhancer?
-    if let modelPath = config.roiEnhancerModel,
-      (config.roiEnhancerStrength ?? 0) > 0
-    {
-      roiEnhancer = try await NativeROIEnhancer(
-        modelURL: URL(fileURLWithPath: modelPath),
-        scale: config.roiEnhancerScale ?? 4,
-        strength: config.roiEnhancerStrength ?? 0
-      )
-    } else {
-      roiEnhancer = nil
-    }
-    let processor = try NativeFrameProcessor(
-      width: video.width,
-      height: video.height,
-      restorer: restorer,
-      roiEnhancer: roiEnhancer,
-      blendFeather: config.blendFeather ?? 1,
-      effects: NativeRestoreEffects(
-        sharpen: max(0, min(2, config.sharpenStrength ?? 0)),
-        detail: max(0, min(1, config.detailBoost ?? 0)),
-        texture: max(0, min(1, config.textureMix ?? 0)),
-        smoothing: max(0, min(1, config.smoothStrength ?? 0)),
-        upscale: max(1, min(4, config.effectUpscale ?? 1))
-      ),
-      // One batch may be in VideoToolbox, one remains the current output,
-      // and one temporary generation can exist while an overlapping scene
-      // replaces that output. Crossfade owns at most two overlap tails.
-      outputBufferLimit: max(
-        64,
-        config.temporalBatchFrames * 3 + overlap * 2 + 16
-      ),
-      detectionEmptyLookahead: config.detectionEmptyLookahead ?? 0
+    let nativeParallelWorkers = config.isExport && !config.isWorker
+      ? min(max(config.nativeParallelWorkers ?? 1, 1), 3)
+      : 1
+    let restoreEffects = NativeRestoreEffects(
+      sharpen: max(0, min(2, config.sharpenStrength ?? 0)),
+      detail: max(0, min(1, config.detailBoost ?? 0)),
+      texture: max(0, min(1, config.textureMix ?? 0)),
+      smoothing: max(0, min(1, config.smoothStrength ?? 0)),
+      upscale: max(1, min(4, config.effectUpscale ?? 1))
     )
+    // Every lane can transiently retain the current full output batch, the
+    // previous composited generation and a second generation while another
+    // mosaic scene is composited. Do not divide this pool by the lane count:
+    // doing so deadlocks multi-lane exports on dense/multiple detections.
+    let perProcessorOutputLimit = max(
+      64,
+      config.temporalBatchFrames * 3 + overlap * 2 + 16
+    )
+    var processors: [NativeFrameProcessor] = []
+    processors.reserveCapacity(nativeParallelWorkers)
+    for _ in 0..<nativeParallelWorkers {
+      let restorer: any NativeRestoring
+      if let fixedFrames = config.restorationFrameCount {
+        restorer = try FixedRestorerBridge(
+          runner: URL(fileURLWithPath: config.restorationRunner),
+          model: URL(fileURLWithPath: config.restorationModels),
+          frameCount: fixedFrames
+        )
+      } else {
+        restorer = try VariableRestorerBridge(
+          runner: URL(fileURLWithPath: config.restorationRunner),
+          models: URL(fileURLWithPath: config.restorationModels),
+          maximumFrames: config.temporalBatchFrames
+        )
+      }
+      let roiEnhancer: NativeROIEnhancer?
+      if let modelPath = config.roiEnhancerModel,
+        (config.roiEnhancerStrength ?? 0) > 0
+      {
+        roiEnhancer = try await NativeROIEnhancer(
+          modelURL: URL(fileURLWithPath: modelPath),
+          scale: config.roiEnhancerScale ?? 4,
+          strength: config.roiEnhancerStrength ?? 0
+        )
+      } else {
+        roiEnhancer = nil
+      }
+      processors.append(
+        try NativeFrameProcessor(
+          width: video.width,
+          height: video.height,
+          restorer: restorer,
+          roiEnhancer: roiEnhancer,
+          blendFeather: config.blendFeather ?? 1,
+          effects: restoreEffects,
+          outputBufferLimit: perProcessorOutputLimit,
+          detectionEmptyLookahead: config.detectionEmptyLookahead ?? 0
+        )
+      )
+    }
     let codec: AVVideoCodecType
     switch config.videoCodec?.lowercased() {
     case "h264":
@@ -5198,10 +5222,9 @@ private struct NativePreviewPipeline {
       "segment_seconds": writerSegmentSeconds,
       "requested_segment_seconds": requestedSegmentSeconds,
       "internal_segment_seconds": writerSegmentSeconds,
-      "output_buffer_limit": max(
-        64,
-        config.temporalBatchFrames * 3 + overlap * 2 + 16
-      ),
+      "output_buffer_limit": perProcessorOutputLimit
+        * nativeParallelWorkers,
+      "native_parallel_workers": nativeParallelWorkers,
       "h264_display_order_recovery":
         decoder.repairsMalformedH264DisplayOrder,
       "pipeline": config.isExport
@@ -5212,6 +5235,8 @@ private struct NativePreviewPipeline {
     ])
     try decoder.start()
     var pendingEncoding: Task<([SegmentEvent], Int), Error>?
+    var pendingProcessing: [NativePendingProcessingBatch] = []
+    pendingProcessing.reserveCapacity(nativeParallelWorkers)
     do {
       var nextSequence = 0
       var decodedFrames = 0
@@ -5243,10 +5268,217 @@ private struct NativePreviewPipeline {
         return true
       }
 
-      // Keep at most two detected batches resident: one being restored and
-      // one being prepared. This overlaps detection CPU/Core AI work with the
-      // current restoration without allowing memory to grow with clip length.
-      let availableBatchSlots = DispatchSemaphore(value: 1)
+      // Each native lane owns an independent Core AI runner and processor.
+      // Detection may fill one batch per lane while the ordered consumer
+      // returns completed batches to VideoToolbox in original PTS order.
+      let availableBatchSlots = DispatchSemaphore(
+        value: nativeParallelWorkers
+      )
+      var nextProcessorIndex = 0
+
+      func encodeProcessedBatch(
+        _ pending: NativePendingProcessingBatch,
+        result: NativeProcessedBatch
+      ) async throws {
+        let detectedBatch = pending.detectedBatch
+        let batch = detectedBatch.frames
+        let outputs = result.outputs
+        restoredBatches += result.restoredSceneCount
+        if let encodingTask = pendingEncoding {
+          let (segments, completedNextSequence) = try await encodingTask.value
+          for segment in segments {
+            emitSegment(segment, generation: config.generation)
+            completedSegments.append(segment)
+          }
+          nextSequence = completedNextSequence
+        }
+        // A completed detached Task retains its captured frame array until
+        // the handle is released. Drop it before crossfade allocates the next
+        // generation of pixel buffers.
+        pendingEncoding = nil
+        let startingSequence = nextSequence
+        var framesToEncode: [ProcessedFrame] = []
+        if (config.crossfade ?? false), overlap > 0 {
+          let prefixCount = min(detectedBatch.skipPrefix, outputs.count)
+          let matchedCount = min(prefixCount, deferredCrossfadeTail.count)
+          if matchedCount > 0 {
+            for index in 0..<matchedCount {
+              framesToEncode.append(
+                ProcessedFrame(
+                  pixelBuffer: try pending.processor.crossfade(
+                    earlier: deferredCrossfadeTail[index].pixelBuffer,
+                    later: outputs[index],
+                    laterWeight: Float(index + 1)
+                      / Float(matchedCount + 1)
+                  ),
+                  ptsNanoseconds:
+                    deferredCrossfadeTail[index].ptsNanoseconds
+                )
+              )
+            }
+          }
+          if deferredCrossfadeTail.count > matchedCount {
+            framesToEncode.append(
+              contentsOf: deferredCrossfadeTail[matchedCount...]
+            )
+          }
+          if prefixCount > matchedCount {
+            for index in matchedCount..<prefixCount {
+              framesToEncode.append(
+                ProcessedFrame(
+                  pixelBuffer: outputs[index],
+                  ptsNanoseconds: batch[index].frame.ptsNanoseconds
+                )
+              )
+            }
+          }
+          let uniqueCount = max(0, outputs.count - prefixCount)
+          let tailCount = min(overlap, uniqueCount)
+          let bodyEnd = outputs.count - tailCount
+          if prefixCount < bodyEnd {
+            for index in prefixCount..<bodyEnd {
+              framesToEncode.append(
+                ProcessedFrame(
+                  pixelBuffer: outputs[index],
+                  ptsNanoseconds: batch[index].frame.ptsNanoseconds
+                )
+              )
+            }
+          }
+          deferredCrossfadeTail = []
+          if tailCount > 0 {
+            for index in bodyEnd..<outputs.count {
+              deferredCrossfadeTail.append(
+                ProcessedFrame(
+                  pixelBuffer: outputs[index],
+                  ptsNanoseconds: batch[index].frame.ptsNanoseconds
+                )
+              )
+            }
+          }
+        } else {
+          for index in detectedBatch.skipPrefix..<outputs.count {
+            framesToEncode.append(
+              ProcessedFrame(
+                pixelBuffer: outputs[index],
+                ptsNanoseconds: batch[index].frame.ptsNanoseconds
+              )
+            )
+          }
+        }
+        let acceptedFrames = framesToEncode.filter { frame in
+          let accepted: Bool
+          if var gate = postRestorationFrameRateGate {
+            accepted = gate.accepts(frame.ptsNanoseconds)
+            postRestorationFrameRateGate = gate
+          } else {
+            accepted = true
+          }
+          return accepted && belongsToCoreOutput(frame.ptsNanoseconds)
+        }
+        pendingEncoding = Task.detached(priority: .userInitiated) {
+          var completedSegments: [SegmentEvent] = []
+          var encodingNextSequence = startingSequence
+          for frame in acceptedFrames {
+            guard (
+              config.isExport
+                ? !control.shouldStop()
+                : control.waitForCapacity(
+                  nextSequence: encodingNextSequence,
+                  segmentSeconds: config.segmentSeconds
+                )
+            ) else {
+              break
+            }
+            if let segment = try await writer.append(
+              pixelBuffer: frame.pixelBuffer,
+              ptsNanoseconds: frame.ptsNanoseconds
+            ) {
+              completedSegments.append(segment)
+              encodingNextSequence = segment.sequence + 1
+            }
+          }
+          return (completedSegments, encodingNextSequence)
+        }
+        encodedFrames += acceptedFrames.count
+        if config.isExport, let last = batch.last {
+          let position = Double(last.frame.ptsNanoseconds) / 1_000_000_000
+          let percent = min(
+            100,
+            max(0, position / max(0.001, video.durationSeconds) * 100)
+          )
+          let elapsed = max(0.001, Date().timeIntervalSince(wallStart))
+          let throughput = Double(encodedFrames) / elapsed
+          let eta = percent > 0
+            ? elapsed * max(0, 100 - percent) / percent
+            : 0
+          emit([
+            "kind": "export_progress",
+            "generation": config.generation,
+            "percent": percent,
+            "position_seconds": position,
+            "duration_seconds": video.durationSeconds,
+            "encoded_frames": encodedFrames,
+            "elapsed_seconds": elapsed,
+            "throughput_fps": throughput,
+            "eta_seconds": eta,
+          ])
+        }
+      }
+
+      func launchProcessing(_ detectedBatch: DetectedBatch) {
+        let processor = processors[nextProcessorIndex]
+        nextProcessorIndex = (nextProcessorIndex + 1) % processors.count
+        let batch = detectedBatch.frames
+        let task = Task.detached(priority: .userInitiated) {
+          let outputs = try await processor.process(batch)
+          return NativeProcessedBatch(
+            outputs: outputs,
+            restoredSceneCount: processor.lastRestoredSceneCount
+          )
+        }
+        pendingProcessing.append(
+          NativePendingProcessingBatch(
+            detectedBatch: detectedBatch,
+            processor: processor,
+            task: task
+          )
+        )
+      }
+
+      func drainNextProcessing() async throws {
+        guard !pendingProcessing.isEmpty else { return }
+        let pending = pendingProcessing.removeFirst()
+        do {
+          // Results are consumed in input order, preserving overlap,
+          // frame-rate gating and writer PTS. Releasing this one slot now
+          // lets detection enqueue the next batch immediately instead of
+          // waiting for every lane in a fixed wave to finish.
+          let result = try await pending.task.value
+          try await encodeProcessedBatch(pending, result: result)
+          availableBatchSlots.signal()
+        } catch {
+          pending.task.cancel()
+          _ = try? await pending.task.value
+          availableBatchSlots.signal()
+          throw error
+        }
+      }
+
+      func flushProcessing() async throws {
+        while !pendingProcessing.isEmpty {
+          try await drainNextProcessing()
+        }
+      }
+
+      func cancelPendingProcessing() async {
+        let wave = pendingProcessing
+        pendingProcessing.removeAll(keepingCapacity: false)
+        for pending in wave { pending.task.cancel() }
+        for pending in wave { _ = try? await pending.task.value }
+        for _ in wave { availableBatchSlots.signal() }
+      }
+
       let detectionEvents = AsyncThrowingStream<
         DetectionPipelineEvent, Error
       > { continuation in
@@ -5432,174 +5664,25 @@ private struct NativePreviewPipeline {
         }
         continuation.onTermination = { _ in
           detectionTask.cancel()
-          availableBatchSlots.signal()
-          availableBatchSlots.signal()
+          for _ in 0...nativeParallelWorkers {
+            availableBatchSlots.signal()
+          }
         }
       }
 
       for try await event in detectionEvents {
         switch event {
         case .batch(let detectedBatch):
-          do {
-            let batch = detectedBatch.frames
-            let outputs = try await processor.process(batch)
-            restoredBatches += processor.lastRestoredSceneCount
-            if let encodingTask = pendingEncoding {
-              let (segments, completedNextSequence) =
-                try await encodingTask.value
-              for segment in segments {
-                emitSegment(segment, generation: config.generation)
-                completedSegments.append(segment)
-              }
-              nextSequence = completedNextSequence
-            }
-            // A completed detached Task retains its captured frame array until
-            // the handle is released. Drop it before crossfade allocates the
-            // next generation of pixel buffers.
-            pendingEncoding = nil
-            let startingSequence = nextSequence
-            var framesToEncode: [ProcessedFrame] = []
-            if (config.crossfade ?? false), overlap > 0 {
-              let prefixCount = min(detectedBatch.skipPrefix, outputs.count)
-              let matchedCount = min(prefixCount, deferredCrossfadeTail.count)
-              if matchedCount > 0 {
-                for index in 0..<matchedCount {
-                  framesToEncode.append(
-                    ProcessedFrame(
-                      pixelBuffer: try processor.crossfade(
-                        earlier: deferredCrossfadeTail[index].pixelBuffer,
-                        later: outputs[index],
-                        laterWeight: Float(index + 1)
-                          / Float(matchedCount + 1)
-                      ),
-                      ptsNanoseconds:
-                        deferredCrossfadeTail[index].ptsNanoseconds
-                    )
-                  )
-                }
-              }
-              if deferredCrossfadeTail.count > matchedCount {
-                framesToEncode.append(
-                  contentsOf: deferredCrossfadeTail[matchedCount...]
-                )
-              }
-              if prefixCount > matchedCount {
-                for index in matchedCount..<prefixCount {
-                  framesToEncode.append(
-                    ProcessedFrame(
-                      pixelBuffer: outputs[index],
-                      ptsNanoseconds: batch[index].frame.ptsNanoseconds
-                    )
-                  )
-                }
-              }
-              let uniqueCount = max(0, outputs.count - prefixCount)
-              let tailCount = min(overlap, uniqueCount)
-              let bodyEnd = outputs.count - tailCount
-              if prefixCount < bodyEnd {
-                for index in prefixCount..<bodyEnd {
-                  framesToEncode.append(
-                    ProcessedFrame(
-                      pixelBuffer: outputs[index],
-                      ptsNanoseconds: batch[index].frame.ptsNanoseconds
-                    )
-                  )
-                }
-              }
-              deferredCrossfadeTail = []
-              if tailCount > 0 {
-                for index in bodyEnd..<outputs.count {
-                  deferredCrossfadeTail.append(
-                    ProcessedFrame(
-                      pixelBuffer: outputs[index],
-                      ptsNanoseconds: batch[index].frame.ptsNanoseconds
-                    )
-                  )
-                }
-              }
-            } else {
-              for index in detectedBatch.skipPrefix..<outputs.count {
-                framesToEncode.append(
-                  ProcessedFrame(
-                    pixelBuffer: outputs[index],
-                    ptsNanoseconds: batch[index].frame.ptsNanoseconds
-                  )
-                )
-              }
-            }
-            let acceptedFrames = framesToEncode.filter { frame in
-              let accepted: Bool
-              if var gate = postRestorationFrameRateGate {
-                accepted = gate.accepts(frame.ptsNanoseconds)
-                postRestorationFrameRateGate = gate
-              } else {
-                accepted = true
-              }
-              return accepted && belongsToCoreOutput(frame.ptsNanoseconds)
-            }
-            pendingEncoding = Task.detached(priority: .userInitiated) {
-              var completedSegments: [SegmentEvent] = []
-              var encodingNextSequence = startingSequence
-              for frame in acceptedFrames {
-                guard (
-                  config.isExport
-                    ? !control.shouldStop()
-                    : control.waitForCapacity(
-                      nextSequence: encodingNextSequence,
-                      segmentSeconds: config.segmentSeconds
-                    )
-                ) else {
-                  break
-                }
-                if let segment = try await writer.append(
-                  pixelBuffer: frame.pixelBuffer,
-                  ptsNanoseconds: frame.ptsNanoseconds
-                ) {
-                  completedSegments.append(segment)
-                  encodingNextSequence = segment.sequence + 1
-                }
-              }
-              return (
-                completedSegments,
-                encodingNextSequence
-              )
-            }
-            encodedFrames += acceptedFrames.count
-            if config.isExport,
-              let last = batch.last
-            {
-              let position = Double(last.frame.ptsNanoseconds) / 1_000_000_000
-              let percent = min(
-                100,
-                max(0, position / max(0.001, video.durationSeconds) * 100)
-              )
-              let elapsed = max(0.001, Date().timeIntervalSince(wallStart))
-              let throughput = Double(encodedFrames) / elapsed
-              let eta = percent > 0
-                ? elapsed * max(0, 100 - percent) / percent
-                : 0
-              emit([
-                "kind": "export_progress",
-                "generation": config.generation,
-                "percent": percent,
-                "position_seconds": position,
-                "duration_seconds": video.durationSeconds,
-                "encoded_frames": encodedFrames,
-                "elapsed_seconds": elapsed,
-                "throughput_fps": throughput,
-                "eta_seconds": eta,
-              ])
-            }
-            availableBatchSlots.signal()
-          } catch {
-            availableBatchSlots.signal()
-            throw error
+          launchProcessing(detectedBatch)
+          if pendingProcessing.count == nativeParallelWorkers {
+            try await drainNextProcessing()
           }
         case .finished(
           let completedDecodedFrames,
           let completedDetectedFrames,
           let completedDetectionSeconds
         ):
+          try await flushProcessing()
           decodedFrames = completedDecodedFrames
           detectedFrames = completedDetectedFrames
           detectionSeconds = completedDetectionSeconds
@@ -5607,9 +5690,12 @@ private struct NativePreviewPipeline {
       }
 
       if control.shouldStop() {
+        await cancelPendingProcessing()
         pendingEncoding?.cancel()
         _ = try? await pendingEncoding?.value
         pendingEncoding = nil
+      } else {
+        try await flushProcessing()
       }
       if !control.shouldStop() {
         if let encodingTask = pendingEncoding {
@@ -5713,9 +5799,16 @@ private struct NativePreviewPipeline {
           "output_fps": Double(outputFPSNumerator)
             / Double(outputFPSDenominator),
           "detection_seconds": detectionSeconds,
-          "preparation_seconds": processor.preparationSeconds,
-          "restoration_seconds": processor.restorationSeconds,
-          "composition_seconds": processor.compositionSeconds,
+          "preparation_seconds": processors.reduce(0) {
+            $0 + $1.preparationSeconds
+          },
+          "restoration_seconds": processors.reduce(0) {
+            $0 + $1.restorationSeconds
+          },
+          "composition_seconds": processors.reduce(0) {
+            $0 + $1.compositionSeconds
+          },
+          "native_parallel_workers": nativeParallelWorkers,
           "elapsed_seconds": elapsed,
           "throughput_fps": Double(decodedFrames) / elapsed,
         ])
@@ -5729,6 +5822,9 @@ private struct NativePreviewPipeline {
         emit(ended)
       }
     } catch {
+      for pending in pendingProcessing { pending.task.cancel() }
+      for pending in pendingProcessing { _ = try? await pending.task.value }
+      pendingProcessing.removeAll(keepingCapacity: false)
       pendingEncoding?.cancel()
       _ = try? await pendingEncoding?.value
       await decoder.stop()

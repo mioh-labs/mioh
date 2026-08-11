@@ -82,6 +82,7 @@ struct NativeExportConfiguration: Codable, Sendable {
   let temporalBatchFrames: Int
   let temporalOverlap: Int
   let ringCapacity: Int
+  let nativeParallelWorkers: Int
   let confidenceThreshold: Float
   let iouThreshold: Float = 0.7
   let contextFraction: Float = 0.30
@@ -578,6 +579,7 @@ struct MiohUserDefaultsSnapshot: Codable {
   var restorationEngine: String?
 
   var parallelWorkers: Int
+  var nativeParallelWorkers: Int?
   var executor: String
   var useSegmentCount: Bool
   var segmentCount: Int
@@ -663,6 +665,7 @@ struct MiohUserDefaultsSnapshot: Codable {
       overwrite: false,
       restorationEngine: "native",
       parallelWorkers: 1,
+      nativeParallelWorkers: 1,
       executor: "process",
       useSegmentCount: true,
       segmentCount: 4,
@@ -764,6 +767,7 @@ final class RestorationRunner: ObservableObject {
   @Published var restorationEngine = "native"
 
   @Published var parallelWorkers = 1
+  @Published var nativeParallelWorkers = 1
   @Published var executor = "process"
   @Published var useSegmentCount = true
   @Published var segmentCount = 4
@@ -1561,11 +1565,9 @@ final class RestorationRunner: ObservableObject {
         "Swiftネイティブ書き出しに未対応のモデル指定です"
       )
     }
-    // Swift owns the decoder/detector/restorer/encoder pipeline and schedules
-    // those stages concurrently inside one process. Device selection, tensor
-    // precision, worker count, executor and merge strategy belonged to the
-    // removed Python runtime, so they are normalized while loading defaults
-    // instead of becoming runtime failure conditions.
+    // Swift owns the decoder/detector/restorer/encoder pipeline. The native
+    // lane count controls its independent Core AI restoration runners;
+    // Python device, precision, executor and merge options remain separate.
     guard encodingMode == "preset",
       encoderOptions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
       !useQuality, !useQMin, !useQMax,
@@ -1736,6 +1738,7 @@ final class RestorationRunner: ObservableObject {
       temporalBatchFrames: clipFrames,
       temporalOverlap: overlap,
       ringCapacity: max(clipFrames + overlap + 8, 32),
+      nativeParallelWorkers: min(max(nativeParallelWorkers, 1), 3),
       confidenceThreshold: detection.confidenceThreshold,
       blendFeather: Float(blendFeather),
       sharpenStrength: Float(sharpenStrength),
@@ -2201,6 +2204,7 @@ final class RestorationRunner: ObservableObject {
       temporalBatchFrames: clipFrames,
       temporalOverlap: overlap,
       ringCapacity: max(clipFrames + overlap + 8, 32),
+      nativeParallelWorkers: 1,
       confidenceThreshold: detection.confidenceThreshold,
       blendFeather: request.options.blendFeather,
       sharpenStrength: request.options.sharpenStrength,
@@ -2840,6 +2844,7 @@ final class RestorationRunner: ObservableObject {
       検出モデル: \(detectionModel)
       分割: \(splitDescription)
       復元Clip長: \(configuration.temporalBatchFrames)フレーム
+      ネイティブ並列数: \(configuration.nativeParallelWorkers)レーン
       Temporal overlap: \(configuration.temporalOverlap)フレーム
       Crossfade: \(configuration.crossfade ? "有効" : "無効")
       シャープ: \(String(format: "%.2f", configuration.sharpenStrength))
@@ -3220,6 +3225,7 @@ final class RestorationRunner: ObservableObject {
       overwrite: overwrite,
       restorationEngine: restorationEngine,
       parallelWorkers: parallelWorkers,
+      nativeParallelWorkers: nativeParallelWorkers,
       executor: executor,
       useSegmentCount: useSegmentCount,
       segmentCount: segmentCount,
@@ -3309,10 +3315,14 @@ final class RestorationRunner: ObservableObject {
         ? snapshot.executor : "process"
     } else {
       // Kept in the persisted schema for backward-compatible decoding only.
-      // Native export uses one process with an internally pipelined scheduler.
+      // Native export uses nativeParallelWorkers instead of this Python field.
       parallelWorkers = 1
       executor = "process"
     }
+    nativeParallelWorkers = min(
+      max(snapshot.nativeParallelWorkers ?? 1, 1),
+      3
+    )
     useSegmentCount = snapshot.useSegmentCount
     segmentCount = min(max(snapshot.segmentCount, 1), 128)
     segmentDuration = min(max(snapshot.segmentDuration, 10), 3600)
@@ -4162,9 +4172,19 @@ struct ContentView: View {
             .disabled(runner.noSplit)
         } else {
           LabeledContent("実行方式") {
-            Text("Swiftネイティブ（自動段階並列）")
+            Text("Swiftネイティブ（段階並列）")
           }
-          Text("デコード・検出・復元・エンコードを1プロセス内で並行実行します")
+          Picker("ネイティブ並列数", selection: $runner.nativeParallelWorkers) {
+            Text("1 — 標準").tag(1)
+            Text("2 — 高負荷").tag(2)
+            Text("3 — 最大").tag(3)
+          }
+          .pickerStyle(.segmented)
+          Text(
+            runner.nativeParallelWorkers == 1
+              ? "復元runnerを1つ使用します"
+              : "復元runnerを\(runner.nativeParallelWorkers)つ使用し、連続バッチを同時処理します"
+          )
             .font(.caption)
             .foregroundStyle(.secondary)
         }
