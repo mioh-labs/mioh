@@ -153,6 +153,14 @@ private enum SourceFrameRate {
     }
     return max(1, x)
   }
+
+  static func matches(
+    _ lhs: (numerator: Int, denominator: Int),
+    _ rhs: (numerator: Int, denominator: Int)
+  ) -> Bool {
+    Int64(lhs.numerator) * Int64(rhs.denominator)
+      == Int64(rhs.numerator) * Int64(lhs.denominator)
+  }
 }
 
 private struct DecodedFrame: @unchecked Sendable {
@@ -4745,8 +4753,86 @@ private enum NativeExportSupport {
       temporaryDirectory: workingDirectory,
       failureMessage: "映像と音声の結合に失敗しました"
     )
+    try validateExportSynchronization(
+      source: source,
+      output: part,
+      ffmpeg: ffmpeg,
+      workingDirectory: workingDirectory
+    )
     try? FileManager.default.removeItem(at: output)
     try FileManager.default.moveItem(at: part, to: output)
+  }
+
+  private static func validateExportSynchronization(
+    source: URL,
+    output: URL,
+    ffmpeg: URL,
+    workingDirectory: URL
+  ) throws {
+    guard let sourceVideo = try streamDuration(
+      source,
+      selector: "v:0",
+      ffmpeg: ffmpeg,
+      workingDirectory: workingDirectory
+    ), let sourceAudio = try streamDuration(
+      source,
+      selector: "a:0",
+      ffmpeg: ffmpeg,
+      workingDirectory: workingDirectory
+    ), let outputVideo = try streamDuration(
+      output,
+      selector: "v:0",
+      ffmpeg: ffmpeg,
+      workingDirectory: workingDirectory
+    ), let outputAudio = try streamDuration(
+      output,
+      selector: "a:0",
+      ffmpeg: ffmpeg,
+      workingDirectory: workingDirectory
+    ) else {
+      return
+    }
+    let sourceDifference = sourceAudio - sourceVideo
+    let outputDifference = outputAudio - outputVideo
+    let addedDrift = abs(outputDifference - sourceDifference)
+    guard addedDrift <= 0.5 else {
+      try? FileManager.default.removeItem(at: output)
+      throw NativePreviewError.export(
+        String(
+          format:
+            "音声同期の検証に失敗しました（元のA/V差 %.3f秒、出力 %.3f秒、増加 %.3f秒）",
+          sourceDifference,
+          outputDifference,
+          addedDrift
+        )
+      )
+    }
+  }
+
+  private static func streamDuration(
+    _ media: URL,
+    selector: String,
+    ffmpeg: URL,
+    workingDirectory: URL
+  ) throws -> Double? {
+    let ffprobe = ffmpeg.deletingLastPathComponent()
+      .appendingPathComponent("ffprobe")
+    guard FileManager.default.isExecutableFile(atPath: ffprobe.path) else {
+      return nil
+    }
+    let result = try runProcess(
+      executable: ffprobe,
+      arguments: [
+        "-v", "error", "-select_streams", selector,
+        "-show_entries", "stream=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        media.path,
+      ],
+      temporaryDirectory: workingDirectory,
+      failureMessage: "音声同期の確認に失敗しました"
+    )
+    return result.split(whereSeparator: \.isNewline)
+      .lazy.compactMap { Double($0) }.first
   }
 
   /// Concatenate a cluster worker's completed video segments without reading
@@ -4920,7 +5006,8 @@ private struct NativePreviewPipeline {
     )
     let video = try await decoder.description()
     let sourceFPS = Double(video.fpsNumerator) / Double(video.fpsDenominator)
-    let targetRate: (numerator: Int, denominator: Int)? = config.targetFPS.map {
+    let requestedTargetRate: (numerator: Int, denominator: Int)? =
+      config.targetFPS.map {
       requested in
       if let denominator = config.targetFPSDenominator {
         return (max(1, requested), max(1, denominator))
@@ -4930,6 +5017,19 @@ private struct NativePreviewPipeline {
         sourceNumerator: video.fpsNumerator,
         sourceDenominator: video.fpsDenominator
       )
+    }
+    // A nominal 29.97fps source can carry small timestamp jitter (common in
+    // downloaded HLS recordings). Running an identical 30000/1001 request
+    // through the down-conversion slot gate can classify adjacent source
+    // frames into one slot, then compact the resulting holes in the CFR
+    // writer. Preserve every decoded frame when the requested rate already
+    // equals the source rate.
+    let sourceRate = (
+      numerator: video.fpsNumerator,
+      denominator: video.fpsDenominator
+    )
+    let targetRate = requestedTargetRate.flatMap { requested in
+      SourceFrameRate.matches(requested, sourceRate) ? nil : requested
     }
     let targetFPSValue = targetRate.map {
       Double($0.numerator) / Double($0.denominator)

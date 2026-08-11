@@ -103,6 +103,7 @@ xcrun swiftc \
   "$PACKAGE_DIR/IPadMPEGTSRemuxer.swift" \
   "$PACKAGE_DIR/IPadInteractiveMediaBrowser.swift" \
   "$PACKAGE_DIR/MacChildProcessPipe.swift" \
+  "$PACKAGE_DIR/MacNativeExportBatch.swift" \
   "$PACKAGE_DIR/MiohApp.swift" \
   "$PACKAGE_DIR/MacMediaBrowser.swift" \
   "$PACKAGE_DIR/MacHLSAVFoundationCapture.swift" \
