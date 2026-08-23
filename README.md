@@ -37,6 +37,41 @@ build/macos-standalone-universal/mioh-universal-0.14.3-unsigned.dmg
 See [packaging/macOS/README.md](packaging/macOS/README.md) for full build
 notes, model download/export steps, and requirements.
 
+### Build mioh upscaler
+
+`mioh upscaler` is a separate Apple Silicon application for FlashVSR/AdcSR
+upscaling and MiniMax H3 video generation. It is not embedded in the universal
+app or its DMG. The repository includes the Swift sources, packaging scripts,
+and the minimal vendored FlashVSR build-time sources required to compile it.
+Model weights and converted model packages remain external.
+
+Requirements:
+
+- Apple Silicon Mac
+- Xcode and Command Line Tools with the macOS 27 SDK
+- Network access on the first build to download the arm64 FFmpeg tools
+
+From the repository root:
+
+```zsh
+packaging/macOS/upscaler/build_app.sh
+```
+
+The build creates:
+
+```text
+build/mioh-upscaler/mioh upscaler.app
+build/mioh-upscaler/mioh-upscaler-0.14.3-unsigned.dmg
+```
+
+The DMG contains an alias to `/Applications`. When a selected upscaler model
+is missing, version 0.14.3 can download, convert, and configure it from the
+first-launch model setup screen; the user chooses the external model folder.
+MiniMax H3 model assets are selected separately from the **動画生成** tab.
+
+See [packaging/macOS/upscaler/README.md](packaging/macOS/upscaler/README.md)
+for model locations and implementation details.
+
 <div align="center">
 
 ## 💛 Support mioh
