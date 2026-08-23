@@ -106,7 +106,7 @@ private struct UpscalerContentView: View {
       applicationIcon
       VStack(alignment: .leading, spacing: 2) {
         Text("動画生成").font(.title2.weight(.semibold))
-        Text("MiniMax H3 / 10Eros-Max H3")
+        Text("MiniMax H3")
           .font(.caption).foregroundStyle(.secondary)
       }
       Spacer()

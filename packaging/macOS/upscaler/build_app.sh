@@ -77,7 +77,7 @@ xcrun swiftc \
   "$FLASHVSR_NATIVE_PIPELINE" "$FLASHVSR_NATIVE_RUNNER" \
   -o "$RESOURCES/bin/flashvsr-coreai-video"
 
-# MiniMax H3 / 10Eros-Max H3 belongs to mioh upscaler. Only the native Swift
+# MiniMax H3 belongs to mioh upscaler. Only the native Swift
 # runner is bundled; model graphs, tokenizer and manifest remain external.
 xcrun swiftc \
   -O -parse-as-library -target arm64-apple-macosx27.0 \

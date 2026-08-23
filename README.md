@@ -68,6 +68,8 @@ The DMG contains an alias to `/Applications`. When a selected upscaler model
 is missing, version 0.14.3 can download, convert, and configure it from the
 first-launch model setup screen; the user chooses the external model folder.
 MiniMax H3 model assets are selected separately from the **動画生成** tab.
+The one-time external model preparation procedure is documented in
+[docs/minimax_h3_coreai_build.md](docs/minimax_h3_coreai_build.md).
 
 See [packaging/macOS/upscaler/README.md](packaging/macOS/upscaler/README.md)
 for model locations and implementation details.
