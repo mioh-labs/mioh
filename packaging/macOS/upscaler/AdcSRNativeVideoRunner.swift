@@ -14,6 +14,7 @@ import VideoToolbox
 
 // Kept in the standalone upscaler target; Mioh itself does not link this runner.
 private let adcSRTileOverlap = 16
+private let adcSRLowFrequencyAnchorStrength: Float = 1
 
 private func adcSRRationalFrameRate(_ fps: Double) -> (numerator: Int, denominator: Int) {
   let candidates = [
@@ -195,6 +196,10 @@ private struct AdcSRTile: Hashable {
   let y: Int
   let validWidth: Int
   let validHeight: Int
+  let blendLeft: Int
+  let blendRight: Int
+  let blendTop: Int
+  let blendBottom: Int
 }
 
 @available(macOS 27.0, *)
@@ -203,17 +208,27 @@ private func adcSRTiles(width: Int, height: Int) -> [AdcSRTile] {
   let step = side - adcSRTileOverlap
   func starts(_ extent: Int) -> [Int] {
     guard extent > side else { return [0] }
-    var result = Array(Swift.stride(from: 0, through: extent - side, by: step))
-    if result.last != extent - side { result.append(extent - side) }
-    return result
+    let span = extent - side
+    let intervalCount = max(1, Int(ceil(Double(span) / Double(step))))
+    return (0...intervalCount).map { index in
+      Int((Double(index) * Double(span) / Double(intervalCount)).rounded())
+    }
   }
-  return starts(height).flatMap { y in
-    starts(width).map { x in
+  let horizontal = starts(width)
+  let vertical = starts(height)
+  return vertical.enumerated().flatMap { yIndex, y in
+    horizontal.enumerated().map { xIndex, x in
       AdcSRTile(
         x: x,
         y: y,
         validWidth: min(side, width - x),
-        validHeight: min(side, height - y)
+        validHeight: min(side, height - y),
+        blendLeft: xIndex > 0 ? max(0, horizontal[xIndex - 1] + side - x) : 0,
+        blendRight: xIndex + 1 < horizontal.count
+          ? max(0, x + side - horizontal[xIndex + 1]) : 0,
+        blendTop: yIndex > 0 ? max(0, vertical[yIndex - 1] + side - y) : 0,
+        blendBottom: yIndex + 1 < vertical.count
+          ? max(0, y + side - vertical[yIndex + 1]) : 0
       )
     }
   }
@@ -706,12 +721,67 @@ private final class AdcSRMetalCompositor {
   #include <metal_stdlib>
   using namespace metal;
 
+  inline float sample_planar_128(
+      device const float *values,
+      uint channel,
+      float2 location) {
+    constexpr uint side = 128;
+    constexpr uint plane = side * side;
+    const float2 point = clamp(location, float2(0.0f), float2(127.0f));
+    const uint2 lower = uint2(floor(point));
+    const uint2 upper = min(lower + uint2(1), uint2(127));
+    const float2 fraction = point - float2(lower);
+    const uint offset = channel * plane;
+    const float top = mix(
+      values[offset + lower.y * side + lower.x],
+      values[offset + lower.y * side + upper.x],
+      fraction.x
+    );
+    const float bottom = mix(
+      values[offset + upper.y * side + lower.x],
+      values[offset + upper.y * side + upper.x],
+      fraction.x
+    );
+    return mix(top, bottom, fraction.y);
+  }
+
+  inline float raised_cosine(float position, uint extent) {
+    if (extent == 0) return 1.0f;
+    const float phase = clamp(position / float(extent), 0.0f, 1.0f);
+    return 0.5f - 0.5f * cos(3.14159265358979323846f * phase);
+  }
+
+  kernel void downsample_adcsr(
+      device const float *sr [[buffer(0)]],
+      device float *low [[buffer(1)]],
+      uint2 gid [[thread_position_in_grid]]) {
+    constexpr uint lowSide = 128;
+    constexpr uint highSide = 512;
+    if (gid.x >= lowSide || gid.y >= lowSide) return;
+    const uint lowPlane = lowSide * lowSide;
+    const uint highPlane = highSide * highSide;
+    for (uint channel = 0; channel < 3; ++channel) {
+      float sum = 0.0f;
+      const uint highX = gid.x * 4;
+      const uint highY = gid.y * 4;
+      for (uint dy = 0; dy < 4; ++dy) {
+        for (uint dx = 0; dx < 4; ++dx) {
+          sum += sr[channel * highPlane + (highY + dy) * highSide + highX + dx];
+        }
+      }
+      low[channel * lowPlane + gid.y * lowSide + gid.x] = sum * (1.0f / 16.0f);
+    }
+  }
+
   kernel void accumulate_adcsr(
       device const float *sr [[buffer(0)]],
-      device float4 *canvas [[buffer(1)]],
-      constant uint4 &layout [[buffer(2)]],
-      constant uint2 &validSize [[buffer(3)]],
-      constant uint &feather [[buffer(4)]],
+      device const float *srLow [[buffer(1)]],
+      device const float *lr [[buffer(2)]],
+      device float4 *canvas [[buffer(3)]],
+      constant uint4 &layout [[buffer(4)]],
+      constant uint2 &validSize [[buffer(5)]],
+      constant uint4 &blendMargins [[buffer(6)]],
+      constant float &lowFrequencyAnchorStrength [[buffer(7)]],
       uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= validSize.x || gid.y >= validSize.y) return;
     const uint tileSide = 512;
@@ -719,13 +789,39 @@ private final class AdcSRMetalCompositor {
     const uint tilePixel = gid.y * tileSide + gid.x;
     float wx = 1.0f;
     float wy = 1.0f;
-    if (gid.x < feather) wx = float(gid.x + 1) / float(feather + 1);
-    if (gid.x >= tileSide - feather) wx = min(wx, float(tileSide - gid.x) / float(feather + 1));
-    if (gid.y < feather) wy = float(gid.y + 1) / float(feather + 1);
-    if (gid.y >= tileSide - feather) wy = min(wy, float(tileSide - gid.y) / float(feather + 1));
+    if (gid.x < blendMargins.x) {
+      wx = raised_cosine(float(gid.x) + 0.5f, blendMargins.x);
+    }
+    if (gid.x >= tileSide - blendMargins.y) {
+      wx = min(
+        wx,
+        raised_cosine(float(tileSide - gid.x) - 0.5f, blendMargins.y)
+      );
+    }
+    if (gid.y < blendMargins.z) {
+      wy = raised_cosine(float(gid.y) + 0.5f, blendMargins.z);
+    }
+    if (gid.y >= tileSide - blendMargins.w) {
+      wy = min(
+        wy,
+        raised_cosine(float(tileSide - gid.y) - 0.5f, blendMargins.w)
+      );
+    }
     const float weight = wx * wy;
     const uint destination = (layout.y + gid.y) * layout.z + layout.x + gid.x;
-    const float3 rgb = float3(sr[tilePixel], sr[plane + tilePixel], sr[2 * plane + tilePixel]);
+    const float2 lowLocation = (float2(gid) + 0.5f) * 0.25f - 0.5f;
+    float3 rgb = float3(sr[tilePixel], sr[plane + tilePixel], sr[2 * plane + tilePixel]);
+    const float3 modelLow = float3(
+      sample_planar_128(srLow, 0, lowLocation),
+      sample_planar_128(srLow, 1, lowLocation),
+      sample_planar_128(srLow, 2, lowLocation)
+    );
+    const float3 sourceLow = float3(
+      sample_planar_128(lr, 0, lowLocation),
+      sample_planar_128(lr, 1, lowLocation),
+      sample_planar_128(lr, 2, lowLocation)
+    );
+    rgb += lowFrequencyAnchorStrength * (sourceLow - modelLow);
     canvas[destination] += float4(rgb * weight, weight);
   }
   """#
@@ -733,6 +829,7 @@ private final class AdcSRMetalCompositor {
   let device: MTLDevice
   let imageContext: CIContext
   private let queue: MTLCommandQueue
+  private let downsample: MTLComputePipelineState
   private let accumulation: MTLComputePipelineState
 
   init() throws {
@@ -741,44 +838,78 @@ private final class AdcSRMetalCompositor {
       throw AdcSRVideoError.media("Metalを利用できません")
     }
     let library = try device.makeLibrary(source: Self.source, options: nil)
-    guard let function = library.makeFunction(name: "accumulate_adcsr") else {
+    guard let downsampleFunction = library.makeFunction(name: "downsample_adcsr"),
+          let accumulationFunction = library.makeFunction(name: "accumulate_adcsr") else {
       throw AdcSRVideoError.media("AdcSR Metal合成関数がありません")
     }
     self.device = device
     self.queue = queue
-    accumulation = try device.makeComputePipelineState(function: function)
+    downsample = try device.makeComputePipelineState(function: downsampleFunction)
+    accumulation = try device.makeComputePipelineState(function: accumulationFunction)
     imageContext = CIContext(mtlDevice: device, options: [
       .cacheIntermediates: false,
       .highQualityDownsample: true,
     ])
   }
 
-  func add(output: NDArray, tile: AdcSRTile, canvas: AdcSRMappedCanvas) throws {
+  func add(
+    output: NDArray, input: [Float], tile: AdcSRTile, canvas: AdcSRMappedCanvas
+  ) throws {
     guard output.shape == [1, 3, 512, 512], output.scalarType == .float32 else {
       throw AdcSRVideoError.tensor("AdcSRタイル出力の形状または型が不正です")
     }
+    guard input.count == 3 * 128 * 128 else {
+      throw AdcSRVideoError.tensor("AdcSRタイル入力の形状が不正です")
+    }
     let outputBytes = 3 * 512 * 512 * MemoryLayout<Float>.stride
+    let lowBytes = 3 * 128 * 128 * MemoryLayout<Float>.stride
     let view = output.view(as: Float.self)
     try view.withUnsafePointer { pointer, _, _ in
       guard let outputBuffer = device.makeBuffer(
         bytes: pointer, length: outputBytes, options: .storageModeShared
+      ), let inputBuffer = device.makeBuffer(
+        bytes: input, length: lowBytes, options: .storageModeShared
+      ), let lowBuffer = device.makeBuffer(
+        length: lowBytes, options: .storageModePrivate
       ), let command = queue.makeCommandBuffer(),
-        let encoder = command.makeComputeCommandEncoder() else {
+        let lowEncoder = command.makeComputeCommandEncoder() else {
         throw AdcSRVideoError.media("AdcSR Metal合成バッファを作成できません")
+      }
+      lowEncoder.setComputePipelineState(downsample)
+      lowEncoder.setBuffer(outputBuffer, offset: 0, index: 0)
+      lowEncoder.setBuffer(lowBuffer, offset: 0, index: 1)
+      lowEncoder.dispatchThreads(
+        MTLSize(width: 128, height: 128, depth: 1),
+        threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1)
+      )
+      lowEncoder.endEncoding()
+      guard let encoder = command.makeComputeCommandEncoder() else {
+        throw AdcSRVideoError.media("AdcSR Metal合成エンコーダーを作成できません")
       }
       encoder.setComputePipelineState(accumulation)
       encoder.setBuffer(outputBuffer, offset: 0, index: 0)
-      encoder.setBuffer(canvas.buffer(), offset: 0, index: 1)
+      encoder.setBuffer(lowBuffer, offset: 0, index: 1)
+      encoder.setBuffer(inputBuffer, offset: 0, index: 2)
+      encoder.setBuffer(canvas.buffer(), offset: 0, index: 3)
       var layout = SIMD4<UInt32>(
         UInt32(tile.x * 4), UInt32(tile.y * 4), UInt32(canvas.width), UInt32(canvas.height)
       )
       var validSize = SIMD2<UInt32>(
         UInt32(tile.validWidth * 4), UInt32(tile.validHeight * 4)
       )
-      var feather = UInt32(adcSRTileOverlap * 4)
-      encoder.setBytes(&layout, length: MemoryLayout.size(ofValue: layout), index: 2)
-      encoder.setBytes(&validSize, length: MemoryLayout.size(ofValue: validSize), index: 3)
-      encoder.setBytes(&feather, length: MemoryLayout.size(ofValue: feather), index: 4)
+      var blendMargins = SIMD4<UInt32>(
+        UInt32(tile.blendLeft * 4), UInt32(tile.blendRight * 4),
+        UInt32(tile.blendTop * 4), UInt32(tile.blendBottom * 4)
+      )
+      var anchorStrength = adcSRLowFrequencyAnchorStrength
+      encoder.setBytes(&layout, length: MemoryLayout.size(ofValue: layout), index: 4)
+      encoder.setBytes(&validSize, length: MemoryLayout.size(ofValue: validSize), index: 5)
+      encoder.setBytes(
+        &blendMargins, length: MemoryLayout.size(ofValue: blendMargins), index: 6
+      )
+      encoder.setBytes(
+        &anchorStrength, length: MemoryLayout.size(ofValue: anchorStrength), index: 7
+      )
       encoder.dispatchThreads(
         MTLSize(width: Int(validSize.x), height: Int(validSize.y), depth: 1),
         threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1)
@@ -786,7 +917,7 @@ private final class AdcSRMetalCompositor {
       encoder.endEncoding()
       command.commit()
       command.waitUntilCompleted()
-      withExtendedLifetime(outputBuffer) {}
+      withExtendedLifetime((outputBuffer, inputBuffer, lowBuffer)) {}
       if command.status == .error {
         throw AdcSRVideoError.media(
           command.error?.localizedDescription ?? "AdcSR Metal合成に失敗しました"
@@ -1102,7 +1233,7 @@ private struct AdcSRNativeVideoRunner {
           print("TILE \(tileIndex + 1)/\(tiles.count)")
           let input = try preparer.tile(source, at: tile)
           let output = try await pipeline.upscale(tile: input)
-          try metal.add(output: output, tile: tile, canvas: canvas)
+          try metal.add(output: output, input: input, tile: tile, canvas: canvas)
           let local = 0.02 + 0.90 * Double(tileIndex + 1) / Double(tiles.count)
           progress.emit(
             100 * (Double(frameIndex) + local) / Double(metadata.frameCount)

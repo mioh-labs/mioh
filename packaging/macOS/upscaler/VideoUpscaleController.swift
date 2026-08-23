@@ -225,9 +225,7 @@ final class VideoUpscaleController: ObservableObject {
     let step = side - overlap
     func count(_ length: Int) -> Int {
       guard length > side else { return 1 }
-      let regular = (length - side) / step + 1
-      let lastRegular = (regular - 1) * step
-      return lastRegular == length - side ? regular : regular + 1
+      return Int(ceil(Double(length - side) / Double(step))) + 1
     }
     return "\(count(sourceInfo.width) * count(sourceInfo.height))"
   }
