@@ -22,8 +22,14 @@ H3_RUNNER = UPSCALER / "MiniMaxH3NativeRunner.swift"
 H3_MEDIA = UPSCALER / "MiniMaxH3NativeMedia.swift"
 H3_MODELS = UPSCALER / "MiniMaxH3NativeModels.swift"
 H3_DENOISER = UPSCALER / "TenErosMaxH3DenoiserComposite.swift"
+VENDORED_FLASHVSR_RUNNER = (
+    UPSCALER / "vendor" / "flashvsr" / "deployment" / "coreai"
+    / "FlashVSRNativeVideoRunner.swift"
+)
 FLASHVSR_RUNNER = (
-    ROOT.parent / "FlashVSR_plus" / "deployment" / "coreai"
+    VENDORED_FLASHVSR_RUNNER
+    if VENDORED_FLASHVSR_RUNNER.exists()
+    else ROOT.parent / "FlashVSR_plus" / "deployment" / "coreai"
     / "FlashVSRNativeVideoRunner.swift"
 )
 
@@ -128,6 +134,41 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
             controller,
         )
         self.assertNotIn('resources.appendingPathComponent("models/', controller)
+
+    def test_adcsr_tiles_use_low_frequency_anchored_cosine_blending(self):
+        runner = ADCSR_RUNNER.read_text()
+        controller = CONTROLLER.read_text()
+        view = UPSCALER_APP.read_text()
+
+        for contract in (
+            "private let adcSRTileOverlap = 16",
+            "private let adcSRLowFrequencyAnchorStrength: Float = 1",
+            "intervalCount = max(1, Int(ceil(",
+            "blendLeft:",
+            "blendRight:",
+            "blendTop:",
+            "blendBottom:",
+            "kernel void downsample_adcsr",
+            "inline float raised_cosine",
+            "lowFrequencyAnchorStrength * (sourceLow - modelLow)",
+            "try metal.add(output: output, input: input, tile: tile, canvas: canvas)",
+        ):
+            self.assertIn(contract, runner)
+        self.assertIn(
+            "let overlap = selectedUpscaler == .adcSR ? 16",
+            controller,
+        )
+        self.assertIn("低周波を入力へ固定したcosine blend", view)
+
+    def test_flashvsr_tiles_are_evenly_spaced_and_cosine_blended(self):
+        runner = FLASHVSR_RUNNER.read_text()
+        for contract in (
+            "intervalCount = max(1, Int(ceil(",
+            "inline float raised_cosine",
+            "raised_cosine(float(gid.x) + 0.5f, overlapLeft)",
+            "raised_cosine(float(gid.y) + 0.5f, overlapTop)",
+        ):
+            self.assertIn(contract, runner)
 
     def test_video_generation_owns_minimax_workflow_and_external_models(self):
         view = H3_VIEW.read_text()

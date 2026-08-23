@@ -205,10 +205,11 @@ private func nativeTiles(width: Int, height: Int, scale: Int) -> [NativeTile] {
     func positions(_ length: Int) -> [Int] {
         guard length > side else { return [0] }
         let step = side - overlap
-        var result = Array(Swift.stride(from: 0, through: max(0, length - side), by: step))
-        let last = length - side
-        if result.last != last { result.append(last) }
-        return result
+        let span = length - side
+        let intervalCount = max(1, Int(ceil(Double(span) / Double(step))))
+        return (0...intervalCount).map { index in
+            Int((Double(index) * Double(span) / Double(intervalCount)).rounded())
+        }
     }
     return positions(height).flatMap { y in
         positions(width).map { x in
@@ -723,6 +724,12 @@ private final class NativeMetalCompositor {
     #include <metal_stdlib>
     using namespace metal;
 
+    inline float raised_cosine(float position, uint extent) {
+      if (extent == 0) return 1.0f;
+      const float phase = clamp(position / float(extent), 0.0f, 1.0f);
+      return 0.5f - 0.5f * cos(3.14159265358979323846f * phase);
+    }
+
     kernel void correct_horizontal(
         device const half *content [[buffer(0)]],
         device const half *style [[buffer(1)]],
@@ -754,7 +761,7 @@ private final class NativeMetalCompositor {
       const uint destination = gid.y * width + originX + gid.x;
       float alpha = 1.0f;
       if (originX > 0 && gid.x < overlapLeft) {
-        alpha = float(gid.x + 1) / float(overlapLeft + 1);
+        alpha = raised_cosine(float(gid.x) + 0.5f, overlapLeft);
       }
       const float4 blended = mix(float4(row[destination]), generated, alpha);
       row[destination] = uchar4(clamp(blended + 0.5f, 0.0f, 255.0f));
@@ -775,7 +782,7 @@ private final class NativeMetalCompositor {
       const uint destination = (originY + gid.y) * width + gid.x;
       float alpha = 1.0f;
       if (originY > 0 && gid.y < overlapTop) {
-        alpha = float(gid.y + 1) / float(overlapTop + 1);
+        alpha = raised_cosine(float(gid.y) + 0.5f, overlapTop);
       }
       const float4 blended = mix(float4(canvas[destination]), float4(row[source]), alpha);
       canvas[destination] = uchar4(clamp(blended + 0.5f, 0.0f, 255.0f));

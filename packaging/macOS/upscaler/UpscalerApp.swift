@@ -311,7 +311,7 @@ private struct UpscalerContentView: View {
           value: $upscaler.adcSRRootPath,
           action: upscaler.chooseAdcSRRoot
         )
-        Text("128px・16px重複タイルを4倍化してmmapへfeather blendし、前フレームの高周波残差だけをoptical flowで混合します。")
+        Text("128pxタイルを16px以上重複させて均等配置し、低周波を入力へ固定したcosine blendで合成します。前フレームからは高周波残差だけをoptical flowで混合します。")
           .font(.caption).foregroundStyle(.secondary)
       } else {
         UpscalerPathSettingRow(
