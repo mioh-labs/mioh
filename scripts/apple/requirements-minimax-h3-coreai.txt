@@ -1,0 +1,6 @@
+coreai-torch==0.4.1
+coremltools==9.0
+huggingface-hub==1.25.1
+numpy==2.2.6
+safetensors==0.8.0
+torch==2.11.0
