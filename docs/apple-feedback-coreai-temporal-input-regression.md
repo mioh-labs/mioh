@@ -1,10 +1,9 @@
 # Core AI numerical regression with separately named temporal inputs
 
-> Submission status: **hold**. The reduced July 23 canary described below is
-> numerically clean for both contracts on the current runtime. It is useful as
-> a beta canary, but it is not by itself a valid reproducer for Apple. Do not
-> submit this report until the missing full-pipeline trigger is reduced into
-> the script and `apple_feedback_reproduction_ready` becomes true.
+> Submission status: **do not submit on the current toolchain**. The original
+> regression was real, but a reconstructed full-pipeline T18 canary is now
+> numerically clean on macOS 27 Developer Beta 7, Xcode 27 Beta 6, and Core AI
+> Torch 0.4.2. There is no current reproducer for Apple.
 
 ## Summary
 
@@ -13,9 +12,9 @@ incorrect output with a many-input unrolled contract. The production graph
 retained parity after repeated values were packed into contiguous
 `[K,C,H,W]` temporal tensors. A fixed T18 graph rebuilt with the current
 toolchain remained bit-compatible, excluding a general inability to unroll
-propagation. The current reduced graph does not reproduce the full failure, so
-the exact interaction responsible has not yet been isolated tightly enough for
-an Apple submission.
+propagation. The exact historical trigger was never reduced. The current full
+T18 reconstruction also does not reproduce the failure, so there is no active
+Apple-submission case on the tested Beta 7 toolchain.
 
 ## Environment
 
@@ -60,11 +59,50 @@ source asset and the M5 Pro `h17s` specialization matched the packed graph:
 | packed, h17s | 74.66 dB | 69.68 dB |
 | separate, h17s | 74.66 dB | 69.68 dB |
 
-Therefore input count alone is not a sufficient reproducer. The missing
-trigger is in the complete four-sweep pipeline, its boundary layout, or their
-interaction. The reduced canary remains valuable because a future beta must
-not make this clean control regress, but this report must not claim that it
-currently reproduces the original failure.
+Therefore input count alone was not a sufficient reproducer. At that time the
+remaining suspect was the complete four-sweep pipeline, its boundary layout,
+or their interaction. The later full-pipeline result below is also clean. Both
+canaries remain useful future-beta controls, but neither currently reproduces
+the original failure.
+
+## Full-pipeline revalidation on August 25
+
+The old many-input contract was reconstructed around the current production
+weights. The full canary executes the spatial encoder, bidirectional flow, all
+four BasicVSR++ propagation sweeps, two continuation chunks per sweep, and the
+reconstruction head. Its T18 input consists of decoded frames from the actual
+MIDV-670 ten-second source clip. The only A/B difference is propagation I/O:
+
+- packed: `contexts` and `flows` contiguous temporal tensors;
+- separate: every frame/component pair and every flow is a separately named
+  input. The `forward_2_start6` specialization has 29 inputs rather than two.
+
+Both arms were freshly exported and specialized with the current toolchain.
+They produced bit-identical FP16 output:
+
+| Comparison | Result |
+|---|---:|
+| packed vs separate maximum error | `0.0` |
+| packed vs separate mean error | `0.0` |
+| packed vs separate PSNR | infinite |
+| packed vs PyTorch reference | `81.3772 dB` |
+| separate vs PyTorch reference | `81.3772 dB` |
+
+This is stronger than the earlier reduced single-branch result and includes
+the complete four-sweep topology and recurrent boundary layout. The original
+approximately 23 dB regression is not present on the current runtime.
+
+Reproduction:
+
+```zsh
+.venv-coreai/bin/python \
+  scripts/apple/canary_basicvsrpp_full_temporal_io.py
+```
+
+The report is
+`/tmp/mioh-basicvsrpp-full-temporal-io/report.json`. Production may retain the
+packed contract because it has fewer inputs and is already deployed, but it is
+no longer justified as a correctness workaround on this tested toolchain.
 
 ## Reproduction
 
@@ -92,21 +130,26 @@ should have comparable agreement with their PyTorch reference.
 
 The end-to-end variable BasicVSR++ implementation packs the temporal axis into
 one contiguous tensor and has passed the complete T18/T90 quality and speed
-validation. Mioh therefore uses contiguous temporal I/O for every
-frame-repeated Core AI graph even though the reduced control above is clean.
+validation. Mioh continues using contiguous temporal I/O because it has fewer
+inputs and is already deployed, not because Beta 7 still requires it for
+correctness.
 
 ## Related state-I/O issue
 
-The same toolchain also lowered an attempted Core AI mutable state buffer to
-regular function I/O rather than exposing native state. This is a separate
-issue, but the canary accepts `--state-asset` so each beta can record whether
-state fields have reappeared:
+Core AI Torch 0.4.2 now lowers an optimized mutable buffer to native Core AI
+state. On macOS 27 Developer Beta 7 with Xcode 27 Beta 6, the repository's
+state canary passed source execution, h17s ahead-of-time compilation, and
+compiled Swift execution. Two calls produced 2 then 3 while the persistent
+state ended at 2:
 
 ```zsh
-.venv-coreai/bin/python \
-  scripts/apple/canary_basicvsrpp_coreai_temporal_io.py \
-  --state-asset /path/to/stateful.aimodel
+.venv-coreai/bin/python scripts/apple/canary_coreai_native_state.py
 ```
 
-Until native state lowering is verified, production uses the already validated
-contiguous boundary tensors.
+The report is `/tmp/mioh-coreai-native-state-canary/report.json`. A subsequent
+full BasicVSR++ A/B on the actual 300-frame MIDV-670 mosaic clip measured a
+13.6% restoration-time reduction and passed visual acceptance. Production
+therefore adopted native state for the three recurrent boundary values in all
+four continuation assets on 2026-08-25. Context and flow sequences remain
+packed contiguous tensors, so this does not remove the separate-temporal-input
+workaround documented above.

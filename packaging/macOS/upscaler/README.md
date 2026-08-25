@@ -9,8 +9,9 @@ Supported backends:
 - FlashVSR Tiny/Compact, with the shared 85-frame streaming decoder.
 - AdcSR x4 FP32 Core AI, with 128px tiles, 16px overlap, Metal feather
   composition, and optional optical-flow high-frequency stabilization.
-- MiniMax H3 native Swift generation, with video or up to ten
-  identity-reference images. Its converted graph, tokenizer and manifest stay
+- MiniMax H3 native Swift generation. Ref2VA accepts a video or up to ten
+  identity-reference images; the separate FL2VA profile generates video and
+  audio from a prompt alone. Converted graphs, tokenizer and manifests stay
   external and are selected from the **動画生成** tab.
 
 Build the signed-local app and unsigned distribution image with:
@@ -35,6 +36,7 @@ Model weights are never bundled. The default external locations are:
 - `model_weights/FlashVSR-v1.1-coreai-grid16`
 - `model_weights/adcsr_x4_float32.aimodel`
 - `model_weights/minimax-h3-native/manifest.json`
+- `model_weights/minimax-h3-native/manifest-fl2va.json`
 
 The first two can also be selected from the **アップスケール** tab and the
 MiniMax H3 manifest from the **動画生成** tab.

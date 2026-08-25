@@ -1,6 +1,6 @@
 import Foundation
 
-/// Swift-side ref2va graph for the 10Eros-Max H3 TURBO checkpoint.
+/// Swift-side ref2va / fl2va graph for the 10Eros-Max H3 checkpoints.
 ///
 /// Core AI executes the learned projections, 50 DiT blocks and final heads;
 /// this type performs the model's deterministic token packing, position/RoPE
@@ -174,6 +174,175 @@ final class TenErosMaxH3DenoiserComposite: @unchecked Sendable {
     )
   }
 
+  func prepareImages(
+    context: H3Tensor,
+    tokenTags: H3Tensor,
+    referenceImageLatents: [H3Tensor],
+    targetVideoShape: [Int],
+    targetAudioShape: [Int],
+    seed: UInt64,
+    visualConditionNoiseAug: Float
+  ) async throws -> Prepared {
+    try Self.validateVideoShape(targetVideoShape, semantic: "target video")
+    try Self.validateAudioShape(targetAudioShape, semantic: "target audio")
+    guard !referenceImageLatents.isEmpty else {
+      throw H3NativeError.invalidTensor("Ref2VA needs at least one image latent")
+    }
+    for (index, latent) in referenceImageLatents.enumerated() {
+      try Self.validateVideoShape(latent.shape, semantic: "reference image \(index + 1)")
+      guard latent.shape[2] == 1 else {
+        throw H3NativeError.invalidTensor(
+          "reference image \(index + 1) must contain one latent frame"
+        )
+      }
+    }
+    guard context.shape.last == 5120 else {
+      throw H3NativeError.invalidTensor(
+        "Qwen context must end in 5120, got \(context.shape)"
+      )
+    }
+    let textRows = context.elementCount / 5120
+    let tags = try Self.tokenTagValues(tokenTags)
+    guard tags.count == textRows, tags.allSatisfy({ $0 == 0 || $0 == 1 }) else {
+      throw H3NativeError.invalidTensor(
+        "Qwen token tags must contain one vision/text tag per context row"
+      )
+    }
+    let flatContext = try H3Tensor(
+      float32: context.floatValues(), shape: [textRows, 5120]
+    ).converted(to: .bfloat16)
+    guard let refined = try await predictOnce(
+      name: "10erosTextRefiner",
+      stage: manifest.textRefiner,
+      inputs: ["context": flatContext]
+    )["textHidden"] else {
+      throw H3NativeError.missingTensor("10Eros textHidden")
+    }
+
+    var referenceRows: [Float] = []
+    for latent in referenceImageLatents {
+      var rows = try Self.patchifyVideo(latent)
+      if visualConditionNoiseAug < 1 {
+        // MiniMax restarts the same condition RNG for every reference item.
+        var random = H3SplitMix64(seed: seed)
+        let noise = random.normal(count: rows.count)
+        let keep = max(0, visualConditionNoiseAug)
+        for index in rows.indices {
+          rows[index] = keep * rows[index] + (1 - keep) * noise[index]
+        }
+      }
+      referenceRows.append(contentsOf: rows)
+    }
+    let refVideoRowCount = referenceRows.count / 96
+    let projectedReferenceVideo = try await projectVideo(
+      referenceRows, rows: refVideoRowCount
+    )
+    let emptyHidden = try H3Tensor(
+      bfloat16Raw: [], shape: [0, 5376]
+    )
+    let targetVideoRows = Self.videoRowCount(targetVideoShape)
+    let targetAudioRows = Self.audioRowCount(targetAudioShape)
+    let totalRows = textRows + refVideoRowCount + targetAudioRows
+      + targetVideoRows
+    guard totalRows <= manifest.dynamicMaximumTokens else {
+      throw H3NativeError.invalidTensor(
+        "10Eros packed sequence \(totalRows) exceeds \(manifest.dynamicMaximumTokens)"
+      )
+    }
+    let positions = Self.packedImagePositions(
+      textRows: textRows,
+      referenceImageShapes: referenceImageLatents.map(\.shape),
+      targetVideoShape: targetVideoShape,
+      targetAudioShape: targetAudioShape
+    )
+    guard positions.count == totalRows * 3 else {
+      throw H3NativeError.invalidTensor("10Eros image-position length mismatch")
+    }
+    let rope = try makeRoPE(positions: positions, rows: totalRows)
+    return Prepared(
+      textHidden: refined,
+      referenceAudioHidden: emptyHidden,
+      referenceVideoHidden: projectedReferenceVideo,
+      tokenTags: tags,
+      ropeCosine: rope.cosine,
+      ropeSine: rope.sine,
+      textRows: textRows,
+      referenceAudioRows: 0,
+      referenceVideoRows: refVideoRowCount,
+      targetAudioRows: targetAudioRows,
+      targetVideoRows: targetVideoRows,
+      targetVideoShape: targetVideoShape,
+      targetAudioShape: targetAudioShape
+    )
+  }
+
+  func prepareTextToVideo(
+    context: H3Tensor,
+    tokenTags: H3Tensor,
+    targetVideoShape: [Int],
+    targetAudioShape: [Int]
+  ) async throws -> Prepared {
+    try Self.validateVideoShape(targetVideoShape, semantic: "target video")
+    try Self.validateAudioShape(targetAudioShape, semantic: "target audio")
+    guard context.shape.last == 5120 else {
+      throw H3NativeError.invalidTensor(
+        "Qwen context must end in 5120, got \(context.shape)"
+      )
+    }
+    let textRows = context.elementCount / 5120
+    let tags = try Self.tokenTagValues(tokenTags)
+    guard tags.count == textRows, tags.allSatisfy({ $0 == 1 }) else {
+      throw H3NativeError.invalidTensor(
+        "T2VA Qwen token tags must contain one text tag per context row"
+      )
+    }
+    let flatContext = try H3Tensor(
+      float32: context.floatValues(), shape: [textRows, 5120]
+    ).converted(to: .bfloat16)
+    guard let refined = try await predictOnce(
+      name: "10erosTextRefiner",
+      stage: manifest.textRefiner,
+      inputs: ["context": flatContext]
+    )["textHidden"] else {
+      throw H3NativeError.missingTensor("10Eros textHidden")
+    }
+    let targetVideoRows = Self.videoRowCount(targetVideoShape)
+    let targetAudioRows = Self.audioRowCount(targetAudioShape)
+    let totalRows = textRows + targetAudioRows + targetVideoRows
+    guard totalRows <= manifest.dynamicMaximumTokens else {
+      throw H3NativeError.invalidTensor(
+        "10Eros packed sequence \(totalRows) exceeds \(manifest.dynamicMaximumTokens)"
+      )
+    }
+    let positions = Self.packedTargetPositions(
+      textRows: textRows,
+      targetVideoShape: targetVideoShape,
+      targetAudioShape: targetAudioShape
+    )
+    guard positions.count == totalRows * 3 else {
+      throw H3NativeError.invalidTensor("10Eros T2VA position length mismatch")
+    }
+    let rope = try makeRoPE(positions: positions, rows: totalRows)
+    let emptyHidden = try H3Tensor(
+      bfloat16Raw: [], shape: [0, 5376]
+    )
+    return Prepared(
+      textHidden: refined,
+      referenceAudioHidden: emptyHidden,
+      referenceVideoHidden: emptyHidden,
+      tokenTags: tags,
+      ropeCosine: rope.cosine,
+      ropeSine: rope.sine,
+      textRows: textRows,
+      referenceAudioRows: 0,
+      referenceVideoRows: 0,
+      targetAudioRows: targetAudioRows,
+      targetVideoRows: targetVideoRows,
+      targetVideoShape: targetVideoShape,
+      targetAudioShape: targetAudioShape
+    )
+  }
+
   /// Returns x0 in the sampler's packed video-sigma coordinate system.
   func denoise(
     _ latent: H3AVLatent,
@@ -301,7 +470,10 @@ final class TenErosMaxH3DenoiserComposite: @unchecked Sendable {
     let ta = 1 - sigmaA
     let referenceVideoT = max(tv, 0.999)
     let referenceAudioT = max(ta, 1.0)
-    var unique = Array(Set([tv, ta, referenceVideoT, referenceAudioT])).sorted()
+    var timestepValues = [tv, ta]
+    if prepared.referenceVideoRows > 0 { timestepValues.append(referenceVideoT) }
+    if prepared.referenceAudioRows > 0 { timestepValues.append(referenceAudioT) }
+    var unique = Array(Set(timestepValues)).sorted()
     guard unique.count <= 4 else {
       throw H3NativeError.invalidTensor("10Eros produced more than four timestep rows")
     }
@@ -491,6 +663,73 @@ final class TenErosMaxH3DenoiserComposite: @unchecked Sendable {
     appendVideoGrid(to: &result, cursor: cursor, time: refT, frame: refFrame.rows)
     cursor += max(Float(refAudioT), videoSpan(refT))
 
+    let targetFrame = frameGrid(height: targetH, width: targetW)
+    appendAudioGrid(
+      to: &result, cursor: cursor, time: targetAudioT,
+      lowW: targetFrame.w.first ?? 0, highW: targetFrame.w.last ?? 0
+    )
+    appendVideoGrid(
+      to: &result, cursor: cursor, time: targetT, frame: targetFrame.rows
+    )
+    return result
+  }
+
+  private static func packedTargetPositions(
+    textRows: Int,
+    targetVideoShape: [Int],
+    targetAudioShape: [Int]
+  ) -> [Float] {
+    let targetT = targetVideoShape[2]
+    let targetH = targetVideoShape[3]
+    let targetW = targetVideoShape[4]
+    let targetAudioT = targetAudioShape[3]
+    var result: [Float] = []
+    result.reserveCapacity(
+      (textRows + videoRowCount(targetVideoShape)
+        + audioRowCount(targetAudioShape)) * 3
+    )
+    for row in 0..<textRows {
+      result.append(Float(row)); result.append(0); result.append(0)
+    }
+    let cursor = Float(textRows)
+    let targetFrame = frameGrid(height: targetH, width: targetW)
+    appendAudioGrid(
+      to: &result, cursor: cursor, time: targetAudioT,
+      lowW: targetFrame.w.first ?? 0, highW: targetFrame.w.last ?? 0
+    )
+    appendVideoGrid(
+      to: &result, cursor: cursor, time: targetT, frame: targetFrame.rows
+    )
+    return result
+  }
+
+  private static func packedImagePositions(
+    textRows: Int,
+    referenceImageShapes: [[Int]],
+    targetVideoShape: [Int],
+    targetAudioShape: [Int]
+  ) -> [Float] {
+    let targetT = targetVideoShape[2]
+    let targetH = targetVideoShape[3]
+    let targetW = targetVideoShape[4]
+    let targetAudioT = targetAudioShape[3]
+    let referenceRows = referenceImageShapes.reduce(0) {
+      $0 + videoRowCount($1)
+    }
+    var result: [Float] = []
+    result.reserveCapacity(
+      (textRows + referenceRows + videoRowCount(targetVideoShape)
+        + audioRowCount(targetAudioShape)) * 3
+    )
+    for row in 0..<textRows {
+      result.append(Float(row)); result.append(0); result.append(0)
+    }
+    var cursor = Float(textRows)
+    for shape in referenceImageShapes {
+      let frame = frameGrid(height: shape[3], width: shape[4])
+      appendVideoGrid(to: &result, cursor: cursor, time: 1, frame: frame.rows)
+      cursor += 1
+    }
     let targetFrame = frameGrid(height: targetH, width: targetW)
     appendAudioGrid(
       to: &result, cursor: cursor, time: targetAudioT,

@@ -381,6 +381,21 @@ VARIABLE_COREAI_ASSETS=(
   forward_2_start6 forward_2_continue6
   reconstruction6
 )
+variable_continuations_use_native_state() {
+  local source_root="$1"
+  local name source_asset inspection state_name
+  for name in \
+    backward_1_continue6 forward_1_continue6 \
+    backward_2_continue6 forward_2_continue6; do
+    source_asset="$source_root/basicvsrpp-variable-$name.aimodel"
+    [[ -d "$source_asset" ]] || return 1
+    inspection="$(xcrun coreai-build inspect "$source_asset" --json 2>/dev/null)" \
+      || return 1
+    for state_name in state_n1 state_n2 flow_previous; do
+      [[ "$inspection" == *"$state_name"* ]] || return 1
+    done
+  done
+}
 VARIABLE_COREAI_STEP1_SOURCE_MODELS="${VARIABLE_COREAI_STEP1_SOURCE_MODELS:-$BUILD_DIR/variable-basicvsrpp-step1-source}"
 VARIABLE_COREAI_STEP1_ASSETS=(
   spatial flow
@@ -401,12 +416,17 @@ for name in "${VARIABLE_COREAI_ASSETS[@]}"; do
     break
   fi
 done
+if (( ! needs_variable_export )) \
+  && ! variable_continuations_use_native_state "$VARIABLE_COREAI_SOURCE_MODELS"; then
+  needs_variable_export=1
+fi
 if (( needs_variable_export )); then
   mkdir -p "$VARIABLE_COREAI_SOURCE_MODELS"
   PYTHONPATH="$ROOT" "$LADA_STANDALONE_PYTHON_ENV/bin/python" \
     "$ROOT/scripts/apple/export_basicvsrpp_variable_chunk6.py" \
     --checkpoint "$VARIABLE_COREAI_CHECKPOINT" \
     --output-dir "$VARIABLE_COREAI_SOURCE_MODELS" \
+    --native-state-continuations \
     --overwrite
 fi
 if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
@@ -645,6 +665,10 @@ for name in "${CANONICAL_VARIABLE_ASSETS[@]}"; do
     break
   fi
 done
+if (( ! needs_canonical_variable_export )) \
+  && ! variable_continuations_use_native_state "$VARIABLE_COREAI_SOURCE_MODELS"; then
+  needs_canonical_variable_export=1
+fi
 if (( needs_canonical_variable_export )); then
   if [[ ! -f "$VARIABLE_COREAI_CHECKPOINT" ]]; then
     print -u2 "Missing checkpoint required for cluster identity manifest: $VARIABLE_COREAI_CHECKPOINT"
@@ -655,6 +679,7 @@ if (( needs_canonical_variable_export )); then
     "$ROOT/scripts/apple/export_basicvsrpp_variable_chunk6.py" \
     --checkpoint "$VARIABLE_COREAI_CHECKPOINT" \
     --output-dir "$VARIABLE_COREAI_SOURCE_MODELS" \
+    --native-state-continuations \
     --overwrite
 fi
 

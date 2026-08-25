@@ -6,13 +6,13 @@ and output frame counts are T18, T36, and T90 at 256 by 256.
 
 ## Environment
 
-Core AI Torch 0.4.1 requires PyTorch 2.11 or older, while Lada's normal Apple
+Core AI Torch 0.4.2 requires PyTorch 2.11 or older, while Lada's normal Apple
 extra pins PyTorch 2.12. Keep the conversion dependencies isolated:
 
 ```bash
 uv venv .venv-coreai --python 3.12
 uv pip install --python .venv-coreai/bin/python \
-  -e . coreai-torch 'torch==2.11.0' 'torchvision==0.26.0'
+  -e . 'coreai-torch==0.4.2' 'torch==2.11.0' 'torchvision==0.26.0'
 ```
 
 The probe also requires Xcode 27 and its Metal toolchain:
@@ -22,6 +22,46 @@ xcodebuild -version
 xcrun --find metal
 xcrun --find coreai-build
 ```
+
+After changing macOS, Xcode, Core AI Torch, or Core AI Core, verify native
+mutable-state lowering and both source/compiled Swift execution:
+
+```bash
+.venv-coreai/bin/python scripts/apple/canary_coreai_native_state.py
+```
+
+The report is written to
+`/tmp/mioh-coreai-native-state-canary/report.json`. This canary does not alter
+the shipping BasicVSR++ assets by itself. Production adoption is decided by
+the end-to-end MIDV-670 benchmark below.
+
+### Native recurrent-state A/B
+
+`scripts/apple/benchmark_basicvsrpp_native_state.py` compares the shipping
+forward_2 continuation asset, a freshly exported explicit-I/O control, and a
+native-state candidate at the production `[6, 256, 64, 64]` context shape. It
+uses asynchronous Metal buffers for all three paths:
+
+```bash
+.venv-coreai/bin/python scripts/apple/benchmark_basicvsrpp_native_state.py
+```
+
+On the M5 Pro, six isolated-process A-B-B-A pairs with Core AI Torch 0.4.2
+measured 8.139 ms for explicit boundary I/O and 8.191 ms for native state, a
+0.994x change. That single-block microbenchmark did not predict the complete
+pipeline result. On the actual 300-frame MIDV-670 mosaic clip, median
+restoration time fell from 5.223 s to 4.512 s (13.6%) and median wall time fell
+from 7.330 s to 6.646 s (9.3%). After visual acceptance, production adopted
+native state for all four continuation assets on 2026-08-25. The start, flow,
+spatial, and reconstruction assets remain unchanged.
+
+The durable end-to-end report is
+`output/evaluations/basicvsrpp-native-state-midv670-20260825/report.json`.
+
+The freshly converted explicit control differed from the previous shipping
+compiled asset by as much as 0.008789. The adopted decision therefore used a
+matched rebuild and an end-to-end video comparison rather than attributing the
+entire difference to state alone.
 
 ## Export
 

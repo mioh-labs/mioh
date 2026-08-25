@@ -33,11 +33,16 @@ final class H3QwenCompositeEncoder: @unchecked Sendable {
     let visualPositions = tokenIDs.indices.filter {
       tokenIDs[$0] == H3QwenPresentation.imagePad
     }
-    let expectedVisualTokens =
-      manifest.visionBlockBatch * manifest.visualTokensPerBlock
-    guard visualPositions.count == expectedVisualTokens else {
+    let hasVision = !visualPositions.isEmpty
+    let actualVisionBlocks = hasVision
+      ? visualPositions.count / manifest.visualTokensPerBlock : 0
+    guard !hasVision
+      || (visualPositions.count % manifest.visualTokensPerBlock == 0
+        && actualVisionBlocks > 0
+        && actualVisionBlocks <= manifest.visionBlockBatch)
+    else {
       throw H3NativeError.invalidTensor(
-        "Qwen presentation has \(visualPositions.count) visual tokens, expected \(expectedVisualTokens)"
+        "Qwen presentation has \(visualPositions.count) visual tokens; expected 1...\(manifest.visionBlockBatch) complete blocks"
       )
     }
 
@@ -51,78 +56,84 @@ final class H3QwenCompositeEncoder: @unchecked Sendable {
       throw H3NativeError.missingTensor("qwen.tokenEmbeddings")
     }
 
-    let patchShape = [
-      manifest.visionBlockBatch,
-      manifest.visionPatchesPerBlock,
-      1536,
-    ]
-    let patches = try presentation.pixelValues
-      .converted(to: .float16)
-      .reshaped(patchShape)
-    onProgress(0.04, "Qwen vision patch embedding")
-    let patchOutput = try await predictVisionBatchStage(
-      name: "qwen.visionPatch",
-      stage: manifest.visionPatch,
-      inputSemantic: "pixelPatches",
-      outputSemantic: "visionHidden",
-      input: patches
-    )
-    guard var visionHidden = patchOutput["visionHidden"] else {
-      throw H3NativeError.missingTensor("qwen.visionHidden")
-    }
-
     var deepstack: [H3Tensor] = []
-    for (index, stage) in manifest.visionBlocks.enumerated() {
-      onProgress(
-        0.05 + Double(index + 1) / Double(manifest.visionBlocks.count) * 0.23,
-        "Qwen vision layer \(index + 1)/\(manifest.visionBlocks.count)"
+    if hasVision {
+      let patchShape = [
+        manifest.visionBlockBatch,
+        manifest.visionPatchesPerBlock,
+        1536,
+      ]
+      let patches = try paddedVisionPatches(
+        presentation.pixelValues,
+        actualBlocks: actualVisionBlocks,
+        shape: patchShape
       )
-      let output = try await predictVisionBatchStage(
-        name: "qwen.visionBlock\(index)",
-        stage: stage,
-        inputSemantic: "visionHidden",
-        outputSemantic: "visionHiddenOut",
-        input: visionHidden
+      onProgress(0.04, "Qwen vision patch embedding")
+      let patchOutput = try await predictVisionBatchStage(
+        name: "qwen.visionPatch",
+        stage: manifest.visionPatch,
+        inputSemantic: "pixelPatches",
+        outputSemantic: "visionHidden",
+        input: patches
       )
-      guard let next = output["visionHiddenOut"] else {
-        throw H3NativeError.missingTensor("qwen.visionBlock\(index).output")
+      guard var visionHidden = patchOutput["visionHidden"] else {
+        throw H3NativeError.missingTensor("qwen.visionHidden")
       }
-      visionHidden = next
-      if let deepstackIndex = manifest.deepstackVisionBlockIndices.firstIndex(
-        of: index
-      ) {
-        let merged = try await predictVisionBatchStage(
-          name: "qwen.deepstack\(deepstackIndex)",
-          stage: manifest.visionDeepstackMergers[deepstackIndex],
+
+      for (index, stage) in manifest.visionBlocks.enumerated() {
+        onProgress(
+          0.05 + Double(index + 1) / Double(manifest.visionBlocks.count) * 0.23,
+          "Qwen vision layer \(index + 1)/\(manifest.visionBlocks.count)"
+        )
+        let output = try await predictVisionBatchStage(
+          name: "qwen.visionBlock\(index)",
+          stage: stage,
           inputSemantic: "visionHidden",
-          outputSemantic: "deepstack",
+          outputSemantic: "visionHiddenOut",
           input: visionHidden
         )
-        guard let tensor = merged["deepstack"] else {
-          throw H3NativeError.missingTensor("qwen.deepstack\(deepstackIndex)")
+        guard let next = output["visionHiddenOut"] else {
+          throw H3NativeError.missingTensor("qwen.visionBlock\(index).output")
         }
-        deepstack.append(tensor)
+        visionHidden = next
+        if let deepstackIndex = manifest.deepstackVisionBlockIndices.firstIndex(
+          of: index
+        ) {
+          let merged = try await predictVisionBatchStage(
+            name: "qwen.deepstack\(deepstackIndex)",
+            stage: manifest.visionDeepstackMergers[deepstackIndex],
+            inputSemantic: "visionHidden",
+            outputSemantic: "deepstack",
+            input: visionHidden
+          )
+          guard let tensor = merged["deepstack"] else {
+            throw H3NativeError.missingTensor("qwen.deepstack\(deepstackIndex)")
+          }
+          deepstack.append(
+            try prefixVisualRows(tensor, count: visualPositions.count)
+          )
+        }
       }
-    }
-    guard deepstack.count == 3 else {
-      throw H3NativeError.missingTensor("Qwen DeepStack outputs")
-    }
+      guard deepstack.count == 3 else {
+        throw H3NativeError.missingTensor("Qwen DeepStack outputs")
+      }
 
-    let visionOutput = try await predictVisionBatchStage(
-      name: "qwen.visionFinalMerger",
-      stage: manifest.visionFinalMerger,
-      inputSemantic: "visionHidden",
-      outputSemantic: "visionMerged",
-      input: visionHidden
-    )
-    guard let mergedVision = visionOutput["visionMerged"] else {
-      throw H3NativeError.missingTensor("qwen.visionMerged")
+      let visionOutput = try await predictVisionBatchStage(
+        name: "qwen.visionFinalMerger",
+        stage: manifest.visionFinalMerger,
+        inputSemantic: "visionHidden",
+        outputSemantic: "visionMerged",
+        input: visionHidden
+      )
+      guard let mergedVision = visionOutput["visionMerged"] else {
+        throw H3NativeError.missingTensor("qwen.visionMerged")
+      }
+      hiddenStates = try replacingVisualTokens(
+        in: hiddenStates,
+        with: prefixVisualRows(mergedVision, count: visualPositions.count),
+        at: visualPositions
+      )
     }
-    hiddenStates = try replacingVisualTokens(
-      in: hiddenStates,
-      with: mergedVision,
-      at: visualPositions
-    )
 
     let rope = try makeLanguageRoPE(positionIDs: presentation.positionIDs)
     for (index, stage) in manifest.languageLayers.enumerated() {
@@ -143,7 +154,8 @@ final class H3QwenCompositeEncoder: @unchecked Sendable {
         throw H3NativeError.missingTensor("qwen.languageLayer\(index).output")
       }
       hiddenStates = next
-      if let deepstackIndex = manifest.deepstackLanguageLayerIndices.firstIndex(
+      if hasVision,
+        let deepstackIndex = manifest.deepstackLanguageLayerIndices.firstIndex(
         of: index
       ) {
         hiddenStates = try addingVisualTokens(
@@ -187,6 +199,54 @@ final class H3QwenCompositeEncoder: @unchecked Sendable {
       baseDirectory: baseDirectory
     )
     return try await runner.predict(inputs)
+  }
+
+  private func paddedVisionPatches(
+    _ input: H3Tensor,
+    actualBlocks: Int,
+    shape: [Int]
+  ) throws -> H3Tensor {
+    let converted = try input.converted(to: .float16)
+    let expectedRows = actualBlocks * manifest.visionPatchesPerBlock
+    guard converted.shape == [expectedRows, 1536] else {
+      throw H3NativeError.invalidTensor(
+        "Qwen vision patches are \(converted.shape), expected [\(expectedRows),1536]"
+      )
+    }
+    let targetElements = shape.reduce(1, *)
+    guard converted.elementCount <= targetElements else {
+      throw H3NativeError.invalidTensor("Qwen vision patch batch exceeds its model")
+    }
+    var bytes = converted.bytes
+    bytes.append(
+      Data(
+        count: (targetElements - converted.elementCount)
+          * H3ScalarType.float16.byteCount
+      )
+    )
+    return try H3Tensor(
+      shape: shape,
+      scalarType: .float16,
+      bytes: bytes
+    )
+  }
+
+  private func prefixVisualRows(_ input: H3Tensor, count: Int) throws
+    -> H3Tensor
+  {
+    guard count > 0,
+      input.elementCount >= count * Self.hiddenSize
+    else {
+      throw H3NativeError.invalidTensor(
+        "Qwen vision output cannot provide \(count) rows"
+      )
+    }
+    let byteCount = count * Self.hiddenSize * input.scalarType.byteCount
+    return try H3Tensor(
+      shape: [count, Self.hiddenSize],
+      scalarType: input.scalarType,
+      bytes: Data(input.bytes.prefix(byteCount))
+    )
   }
 
   private func predictVisionBatchStage(

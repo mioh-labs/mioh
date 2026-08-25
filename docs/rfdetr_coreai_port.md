@@ -30,7 +30,7 @@ uv pip install --python .venv-coreai/bin/python 'rfdetr==1.8.3'
 ```
 
 The tested environment uses Python 3.12, PyTorch 2.11, torchvision 0.26,
-Core AI Torch 0.4.1, and macOS 27 beta.
+Core AI Torch 0.4.2, and macOS 27 beta.
 
 ## Export
 

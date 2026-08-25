@@ -93,7 +93,7 @@ private final class CoreMLFunctionAdapter: NativeInferenceFunction {
             throw NativePipelineError.invalidShape("Core ML output")
         }
         var result = NDArray(shape: shape, scalarType: .float16)
-        var destination = result.mutableView(as: Float16.self)
+        let destination = result.mutableView(as: Float16.self)
         try destination.withUnsafeMutablePointer { target, _, _ in
             try array.withUnsafeBufferPointer(ofType: Float16.self) { source in
                 guard let sourceBase = source.baseAddress else {
@@ -150,8 +150,8 @@ private final class CoreMLFunctionAdapter: NativeInferenceFunction {
                 shape: value.shape, dataType: .float16, strides: strides
             )
             let source = value.view(as: Float16.self)
-            try array.withUnsafeMutableBufferPointer(ofType: Float16.self) { target, _ in
-                try source.withUnsafePointer { pointer, _, _ in
+            array.withUnsafeMutableBufferPointer(ofType: Float16.self) { target, _ in
+                source.withUnsafePointer { pointer, _, _ in
                     target.baseAddress?.update(from: pointer, count: target.count)
                 }
             }
@@ -546,7 +546,7 @@ public final class FlashVSRNativePipeline {
         }
         let count = arrays.reduce(0) { $0 + $1.shape[1] }
         var destination = NDArray(shape: [1, count, 1536], scalarType: .float16)
-        var destinationView = destination.mutableView(as: Float16.self)
+        let destinationView = destination.mutableView(as: Float16.self)
         try destinationView.withUnsafeMutablePointer { target, _, _ in
             var scalarOffset = 0
             for array in arrays {
@@ -555,7 +555,7 @@ public final class FlashVSRNativePipeline {
                 guard sourceView.isContiguous else {
                     throw NativePipelineError.invalidShape("non-contiguous LQ output")
                 }
-                try sourceView.withUnsafePointer { source, _, _ in
+                sourceView.withUnsafePointer { source, _, _ in
                     target.advanced(by: scalarOffset).update(from: source, count: scalars)
                     scalarOffset += scalars
                 }
@@ -569,13 +569,13 @@ public final class FlashVSRNativePipeline {
             throw NativePipelineError.invalidShape("latent subtraction")
         }
         var result = NDArray(shape: lhs.shape, scalarType: .float16)
-        var outputView = result.mutableView(as: Float16.self)
+        let outputView = result.mutableView(as: Float16.self)
         let leftView = lhs.view(as: Float16.self)
         let rightView = rhs.view(as: Float16.self)
         let scalarCount = lhs.shape.reduce(1, *)
-        try outputView.withUnsafeMutablePointer { output, _, _ in
-            try leftView.withUnsafePointer { left, _, _ in
-                try rightView.withUnsafePointer { right, _, _ in
+        outputView.withUnsafeMutablePointer { output, _, _ in
+            leftView.withUnsafePointer { left, _, _ in
+                rightView.withUnsafePointer { right, _, _ in
                     for index in 0..<scalarCount {
                         output[index] = left[index] - right[index]
                     }
@@ -633,9 +633,9 @@ public final class FlashVSRNativePipeline {
         }
         var result = NDArray(shape: [1, 16, 32, 32], scalarType: .float16)
         let sourceView = latent.view(as: Float16.self)
-        var targetView = result.mutableView(as: Float16.self)
-        try targetView.withUnsafeMutablePointer { target, _, _ in
-            try sourceView.withUnsafePointer { source, _, _ in
+        let targetView = result.mutableView(as: Float16.self)
+        targetView.withUnsafeMutablePointer { target, _, _ in
+            sourceView.withUnsafePointer { source, _, _ in
                 for channel in 0..<16 {
                     let sourceOffset = (channel * frames + index) * 32 * 32
                     let targetOffset = channel * 32 * 32
@@ -667,13 +667,13 @@ public final class FlashVSRNativePipeline {
             shape: [1, totalFrames - droppingFirst, 3, 256, 256],
             scalarType: .float16
         )
-        var targetView = result.mutableView(as: Float16.self)
-        try targetView.withUnsafeMutablePointer { target, _, _ in
+        let targetView = result.mutableView(as: Float16.self)
+        targetView.withUnsafeMutablePointer { target, _, _ in
             var destinationFrame = 0
             var globalFrame = 0
             for group in groups {
                 let sourceView = group.view(as: Float16.self)
-                try sourceView.withUnsafePointer { source, _, _ in
+                sourceView.withUnsafePointer { source, _, _ in
                     for localFrame in 0..<group.shape[1] {
                         defer { globalFrame += 1 }
                         guard globalFrame >= droppingFirst else { continue }
