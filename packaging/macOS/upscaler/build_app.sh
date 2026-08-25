@@ -51,11 +51,13 @@ iconutil -c icns "$ICONSET" -o "$RESOURCES/AppIcon.icns"
 xcrun swiftc \
   -O -parse-as-library -target arm64-apple-macosx27.0 \
   -framework AppKit -framework AVFoundation -framework AVKit -framework CoreMedia \
-  -framework SwiftUI -framework UniformTypeIdentifiers \
+  -framework CoreImage -framework ImageIO -framework SwiftUI \
+  -framework UniformTypeIdentifiers -framework Vision \
   "$UPSCALER_DIR/UpscalerMediaProbe.swift" \
   "$UPSCALER_DIR/VideoUpscaleController.swift" \
   "$UPSCALER_DIR/UpscalerVideoPreview.swift" \
   "$UPSCALER_DIR/UpscalerModelSetup.swift" \
+  "$UPSCALER_DIR/MiniMaxH3FaceReferences.swift" \
   "$UPSCALER_DIR/MiniMaxH3VideoGenerationView.swift" \
   "$UPSCALER_DIR/UpscalerApp.swift" \
   -o "$CONTENTS/MacOS/mioh-upscaler"
@@ -85,6 +87,7 @@ xcrun swiftc \
   -framework CoreMedia -framework CoreML -framework CoreVideo \
   "$UPSCALER_DIR/MiniMaxH3NativeCore.swift" \
   "$UPSCALER_DIR/MiniMaxH3NativeModels.swift" \
+  "$UPSCALER_DIR/MiniMaxH3SpatialTileBlender.swift" \
   "$UPSCALER_DIR/MiniMaxH3NativeVideoVAE.swift" \
   "$UPSCALER_DIR/MiniMaxH3NativeQwen.swift" \
   "$UPSCALER_DIR/MiniMaxH3NativeQwenComposite.swift" \
@@ -141,7 +144,7 @@ rm -rf "$DMG_ROOT"
 mkdir -p "$DMG_ROOT"
 ditto "$APP" "$DMG_ROOT/${APP:t}"
 ln -s /Applications "$DMG_ROOT/Applications"
-hdiutil create -volname "mioh upscaler" -srcfolder "$DMG_ROOT" \
-  -ov -format UDZO "$DMG"
+diskutil image create from --volumeName "mioh upscaler" --format UDZO \
+  "$DMG_ROOT" "$DMG"
 print "App: $APP"
 print "DMG: $DMG"

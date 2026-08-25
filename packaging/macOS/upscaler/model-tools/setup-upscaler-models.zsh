@@ -198,7 +198,7 @@ install_flashvsr() {
   local venv="$WORK/coreai-venv"
   "$uv_root/uv" venv --clear --python 3.12 "$venv"
   "$uv_root/uv" pip install --python "$venv/bin/python" \
-    'torch==2.11.0' 'coreai-torch==0.4.1' 'coreai-opt==0.2.1' \
+    'torch==2.11.0' 'coreai-torch==0.4.2' 'coreai-opt==0.2.1' \
     'coremltools==9.0' 'safetensors==0.8.0' 'einops==0.8.2' \
     'tqdm==4.68.4' 'numpy==2.2.6'
 

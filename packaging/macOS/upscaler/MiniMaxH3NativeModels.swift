@@ -2,6 +2,19 @@ import CoreAI
 import CoreML
 import Foundation
 
+// macOS 27 beta 6 exports this Core AI initializer but omits it from the
+// generated Swift interface. `preferredComputeUnitKind: .gpu` still leaves
+// ANE in Core AI's allowed set, so use the full initializer to constrain the
+// outer Core AI specialization to CPU/GPU. The MPSGraph delegate can still
+// perform its own ANE placement probe; there is no public switch for that.
+@available(macOS 27.0, *)
+@_silgen_name("$s15CoreAIDelegates21SpecializationOptionsV23allowedComputeUnitKinds09preferredfG4KindACShyAA0fgJ0OG_AGSgtcfC")
+private func h3SpecializationOptions(
+  _ allowedComputeUnitKinds: __owned Set<ComputeUnitKind>,
+  _ preferredComputeUnitKind: ComputeUnitKind?,
+  _ type: SpecializationOptions.Type
+) -> SpecializationOptions
+
 protocol H3InferenceStage: AnyObject, Sendable {
   func predict(_ inputs: [String: H3Tensor]) async throws -> [String: H3Tensor]
 }
@@ -240,8 +253,8 @@ final class H3CoreAIStage: H3InferenceStage, @unchecked Sendable {
 /// This is required on macOS 27 beta 6 because weight-distinct assets with the
 /// same program hash can alias. Compiled h17s assets load directly. Exact-shape
 /// BF16 source assets cannot be compiled by coreai-build on macOS 27 beta 6.
-/// Loading their fixed graph directly avoids dynamic reshaping and the repeated
-/// unsupported ANE compilation attempt without adding an ineffective cache.
+/// The fixed graph avoids dynamic reshaping; MPSGraph's internal ANE placement
+/// probe remains outside this loader's control and falls back to the GPU.
 @available(macOS 27.0, *)
 private enum H3CoreAIModelLoader {
   static func load(
@@ -249,7 +262,16 @@ private enum H3CoreAIModelLoader {
     preferredCompute: String?
   ) async throws -> AIModel {
     let options = try specializationOptions(preferredCompute)
-    return try await AIModel(contentsOf: assetURL, options: options)
+    // Reuse Core AI's outer CPU/GPU specialization across block unloads, but
+    // leave it purgeable under storage pressure. `.persistent` disables all
+    // purge conditions and allowed the H3 cache to grow to tens of GiB.
+    // This does not cache or suppress MPSGraph's separate internal ANE probe.
+    return try await AIModel.specialize(
+      contentsOf: assetURL,
+      options: options,
+      cache: .default,
+      cachePolicy: .default
+    )
   }
 
   private static func specializationOptions(
@@ -259,7 +281,23 @@ private enum H3CoreAIModelLoader {
     case nil, "", "default", "all":
       return .default
     case "gpu":
-      return SpecializationOptions(preferredComputeUnitKind: .gpu)
+      let allowed = ComputeUnitKind.availableKinds.intersection([.cpu, .gpu])
+      guard allowed.contains(.gpu) else {
+        throw H3NativeError.inference("Core AI GPU is unavailable")
+      }
+      let options = h3SpecializationOptions(
+        allowed,
+        .gpu,
+        SpecializationOptions.self
+      )
+      guard options.allowedComputeUnitKinds == allowed,
+        options.preferredComputeUnitKind == .gpu
+      else {
+        throw H3NativeError.inference(
+          "Core AI failed to restrict MiniMax H3 to CPU and GPU"
+        )
+      }
+      return options
     case "ane", "neuralengine", "neural_engine":
       return SpecializationOptions(preferredComputeUnitKind: .neuralEngine)
     case "cpu":
@@ -293,6 +331,7 @@ final class H3CoreAIBlockSequence: @unchecked Sendable {
     let outputName: String
     let logicalLayerCount: Int
     let preferredCompute: String
+    let graphSalt: NDArray?
   }
 
   private let entries: [Entry]
@@ -320,6 +359,27 @@ final class H3CoreAIBlockSequence: @unchecked Sendable {
       guard FileManager.default.fileExists(atPath: assetURL.path) else {
         throw H3NativeError.missingAsset(assetURL.path)
       }
+      let graphSalt: NDArray?
+      if manifest.inputs["graphSalt"] != nil {
+        guard let constraint = manifest.inputConstraints?["graphSalt"],
+          let shape = constraint.shape,
+          !shape.isEmpty,
+          shape.allSatisfy({ $0 > 0 })
+        else {
+          throw H3NativeError.invalidManifest(
+            "10Eros graphSalt requires a fixed positive shape"
+          )
+        }
+        let count = shape.reduce(1, *)
+        let tensor = try H3Tensor(
+          shape: shape,
+          scalarType: constraint.scalarType,
+          bytes: Data(count: count * constraint.scalarType.byteCount)
+        )
+        graphSalt = try H3CoreAIStage.makeNDArray(tensor)
+      } else {
+        graphSalt = nil
+      }
       validated.append(
         Entry(
           assetURL: assetURL,
@@ -327,7 +387,8 @@ final class H3CoreAIBlockSequence: @unchecked Sendable {
           inputNames: manifest.inputs,
           outputName: outputName,
           logicalLayerCount: max(1, manifest.logicalLayerCount ?? 1),
-          preferredCompute: manifest.computeUnits ?? "gpu"
+          preferredCompute: manifest.computeUnits ?? "gpu",
+          graphSalt: graphSalt
         )
       )
       _ = index
@@ -398,6 +459,8 @@ final class H3CoreAIBlockSequence: @unchecked Sendable {
     for (semantic, modelName) in entry.inputNames {
       if semantic == "hiddenStates" {
         inputs[modelName] = hidden
+      } else if semantic == "graphSalt", let graphSalt = entry.graphSalt {
+        inputs[modelName] = graphSalt
       } else if let value = shared[semantic] {
         inputs[modelName] = value
       } else {
@@ -406,15 +469,10 @@ final class H3CoreAIBlockSequence: @unchecked Sendable {
     }
     var outputViews = InferenceFunction.MutableViews()
     outputViews.insert(&output, for: entry.outputName)
-    let outputs = try await function.run(
+    _ = try await function.run(
       inputs: inputs,
       outputViews: outputViews
     )
-    guard outputs.names.contains(entry.outputName) else {
-      throw H3NativeError.missingTensor(
-        "10Eros block output \(entry.outputName)"
-      )
-    }
   }
 }
 

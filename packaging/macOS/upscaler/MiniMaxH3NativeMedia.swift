@@ -75,19 +75,29 @@ enum H3NativeMedia {
     )
   }
 
+  static func decodeReferenceImage(
+    url: URL,
+    width: Int,
+    height: Int
+  ) throws -> H3Tensor {
+    try decodeImageFrames(
+      urls: [url],
+      imageIndices: [0],
+      width: width,
+      height: height
+    )
+  }
+
   static func decodeIdentityReferenceImages(
     urls: [URL],
     width: Int,
     height: Int
   ) throws -> H3Tensor {
     _ = try probeImages(urls)
-    let indices = (0..<H3Geometry.identityVisionBlocks).flatMap { slot in
-      let index = H3Geometry.identityImageIndex(
-        slot: slot,
-        imageCount: urls.count
-      )
-      return [index, index]
-    }
+    // Qwen consumes one two-frame vision block per still image. The second
+    // frame is an identical temporal-patch mate, not a request to turn the
+    // image into a ten-second reference video.
+    let indices = urls.indices.flatMap { [$0, $0] }
     return try decodeImageFrames(
       urls: urls,
       imageIndices: indices,
@@ -181,14 +191,12 @@ enum H3NativeMedia {
           Int(kCVPixelFormatType_32BGRA)
       ]
     )
-    output.alwaysCopiesSampleData = false
-    guard reader.canAdd(output) else {
-      throw H3NativeError.media("AVAssetReader rejected the video output")
-    }
-    reader.add(output)
-    guard reader.startReading() else {
+    let provider = reader.outputProvider(for: output)
+    do {
+      try reader.start()
+    } catch {
       throw H3NativeError.media(
-        "AVAssetReader did not start: \(reader.error?.localizedDescription ?? "unknown")"
+        "AVAssetReader did not start: \(error.localizedDescription)"
       )
     }
     let pool = try makePixelBufferPool(width: width, height: height)
@@ -197,34 +205,29 @@ enum H3NativeMedia {
     var values = [Float16](repeating: 0, count: frameElements * frameCount)
     var firstTimestamp: Double?
     var selected = 0
-    while selected < frameCount, let sample = output.copyNextSampleBuffer() {
-      autoreleasepool {
-        let timestamp = CMSampleBufferGetPresentationTimeStamp(sample).seconds
-        if firstTimestamp == nil { firstTimestamp = timestamp }
-        let relative = timestamp - (firstTimestamp ?? timestamp)
-        let wanted = Double(selected) / Double(H3Geometry.framesPerSecond)
-        guard relative + 1e-7 >= wanted,
-          let source = CMSampleBufferGetImageBuffer(sample)
-        else { return }
-        do {
-          let rendered = try render(
-            source,
-            transform: transform,
-            width: width,
-            height: height,
-            pool: pool
-          )
-          try appendNCTHW(
-            rendered,
-            frame: selected,
-            frameCount: frameCount,
-            destination: &values
-          )
-          selected += 1
-        } catch {
-          reader.cancelReading()
-        }
-      }
+    while selected < frameCount, let sample = try await provider.next() {
+      let timestamp = sample.presentationTimeStamp.seconds
+      if firstTimestamp == nil { firstTimestamp = timestamp }
+      let relative = timestamp - (firstTimestamp ?? timestamp)
+      let wanted = Double(selected) / Double(H3Geometry.framesPerSecond)
+      guard relative + 1e-7 >= wanted,
+        let pixelSample = CMReadySampleBuffer<CVReadOnlyPixelBuffer>(sample)
+      else { continue }
+      let source = pixelSample.content.withUnsafeBuffer { $0 }
+      let rendered = try render(
+        source,
+        transform: transform,
+        width: width,
+        height: height,
+        pool: pool
+      )
+      try appendNCTHW(
+        rendered,
+        frame: selected,
+        frameCount: frameCount,
+        destination: &values
+      )
+      selected += 1
     }
     guard selected == frameCount, reader.status != .failed else {
       throw H3NativeError.media(
@@ -263,39 +266,43 @@ enum H3NativeMedia {
         AVLinearPCMIsNonInterleaved: false,
       ]
     )
-    output.alwaysCopiesSampleData = false
-    guard reader.canAdd(output) else {
-      throw H3NativeError.media("AVAssetReader rejected the audio output")
-    }
-    reader.add(output)
-    guard reader.startReading() else {
+    let provider = reader.outputProvider(for: output)
+    do {
+      try reader.start()
+    } catch {
       throw H3NativeError.media(
-        "audio reader did not start: \(reader.error?.localizedDescription ?? "unknown")"
+        "audio reader did not start: \(error.localizedDescription)"
       )
     }
     let maximumFrames = max(1, Int((durationSeconds * Double(sampleRate)).rounded()))
     var interleaved: [Float] = []
     interleaved.reserveCapacity(maximumFrames * 2)
     while interleaved.count < maximumFrames * 2,
-      let sample = output.copyNextSampleBuffer()
+      let sample = try await provider.next()
     {
-      guard let block = CMSampleBufferGetDataBuffer(sample) else { continue }
-      let byteCount = CMBlockBufferGetDataLength(block)
-      guard byteCount > 0, byteCount % MemoryLayout<Float>.stride == 0 else {
-        continue
+      let payload: Data? = try sample.withUnsafeSampleBuffer { sampleBuffer in
+        guard let block = CMSampleBufferGetDataBuffer(sampleBuffer) else {
+          return nil
+        }
+        let byteCount = CMBlockBufferGetDataLength(block)
+        guard byteCount > 0,
+          byteCount % MemoryLayout<Float>.stride == 0
+        else { return nil }
+        var data = Data(count: byteCount)
+        let status = data.withUnsafeMutableBytes { raw in
+          CMBlockBufferCopyDataBytes(
+            block,
+            atOffset: 0,
+            dataLength: byteCount,
+            destination: raw.baseAddress!
+          )
+        }
+        guard status == noErr else {
+          throw H3NativeError.media("audio block copy returned \(status)")
+        }
+        return data
       }
-      var data = Data(count: byteCount)
-      let status = data.withUnsafeMutableBytes { raw in
-        CMBlockBufferCopyDataBytes(
-          block,
-          atOffset: 0,
-          dataLength: byteCount,
-          destination: raw.baseAddress!
-        )
-      }
-      guard status == noErr else {
-        throw H3NativeError.media("audio block copy returned \(status)")
-      }
+      guard let data = payload else { continue }
       data.withUnsafeBytes { raw in
         interleaved.append(contentsOf: raw.bindMemory(to: Float.self))
       }
@@ -508,24 +515,47 @@ enum H3NativeMedia {
     height: Int,
     output: CVPixelBuffer
   ) throws -> CVPixelBuffer {
-    var image = source
-    let extent = image.extent
+    var normalized = source
+    let extent = normalized.extent
     guard extent.width > 0, extent.height > 0 else {
       throw H3NativeError.media("input image extent is empty")
     }
-    image = image.transformed(
+    normalized = normalized.transformed(
       by: CGAffineTransform(translationX: -extent.minX, y: -extent.minY)
     )
-    image = image.transformed(
+    // Reference media is conditioning material, not the output canvas. Use a
+    // single scale factor so portrait-to-landscape and landscape-to-portrait
+    // generation never stretches the subject in either direction.
+    let uniformScale = min(
+      CGFloat(width) / extent.width,
+      CGFloat(height) / extent.height
+    )
+    var foreground = normalized.transformed(
+      by: CGAffineTransform(scaleX: uniformScale, y: uniformScale)
+    )
+    let fittedExtent = foreground.extent
+    foreground = foreground.transformed(
       by: CGAffineTransform(
-        scaleX: CGFloat(width) / extent.width,
-        y: CGFloat(height) / extent.height
+        translationX: (CGFloat(width) - fittedExtent.width) / 2
+          - fittedExtent.minX,
+        y: (CGFloat(height) - fittedExtent.height) / 2
+          - fittedExtent.minY
       )
     )
+    let targetBounds = CGRect(x: 0, y: 0, width: width, height: height)
+    // Black letterbox pillars become a spatial conditioning mask in Ref2VA:
+    // portrait subjects are generated inside a darker vertical slab while the
+    // expanded sides follow a different exposure. Preserve aspect ratio, then
+    // extend the fitted image's boundary pixels to the canvas edge. The value
+    // at the join is exactly continuous, unlike a black or aspect-fill
+    // backdrop, so the reference cannot stamp a rectangular exposure mask into
+    // the generated latent.
+    let background = foreground.clampedToExtent().cropped(to: targetBounds)
+    let image = foreground.composited(over: background).cropped(to: targetBounds)
     imageContext.render(
       image,
       to: output,
-      bounds: CGRect(x: 0, y: 0, width: width, height: height),
+      bounds: targetBounds,
       colorSpace: CGColorSpace(name: CGColorSpace.sRGB)
     )
     return output

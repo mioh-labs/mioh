@@ -83,7 +83,10 @@ private struct H3ExecutionPlan: Codable {
 
 @available(macOS 27.0, *)
 private final class H3NativePipeline {
+  private static let referenceMediaPreprocessingVersion =
+    "native-image-reference-v4-continuous-edge-extend"
   private let manifest: H3PipelineManifest
+  private let conditioningMode: H3ConditioningMode
   private let stages: [String: H3StageManifest]
   private let manifestDirectory: URL
   private let job: H3NativeJob
@@ -99,15 +102,34 @@ private final class H3NativePipeline {
     manifestDirectory = manifestURL.deletingLastPathComponent()
     let decodedManifest = try decodeH3PipelineManifest(manifestURL)
     manifest = decodedManifest
+    conditioningMode = decodedManifest.resolvedConditioningMode
     try decodedManifest.validate(relativeTo: manifestDirectory)
-    try job.validate()
+    try job.validate(conditioningMode: conditioningMode)
     if decodedManifest.qwenComposite != nil {
-      guard job.width == 864, job.height == 480,
-        abs(job.durationSeconds - 10) < 0.001
-      else {
+      guard abs(job.durationSeconds - 10) < 0.001 else {
         throw H3NativeError.invalidJob(
-          "native MiniMax H3 is compiled for 864x480 and 10.0 seconds"
+          "native MiniMax H3 uses a fixed 10.0-second, 24fps profile"
         )
+      }
+      let variableResolution = decodedManifest.denoiserComposite?.blocks
+        .allSatisfy { stage in
+          stage.inputConstraints?["hiddenStates"]?.shape?.first == -1
+        } == true
+      if variableResolution {
+        let latentPatchCells = (job.width / 32) * (job.height / 32)
+        guard job.width >= 256, job.height >= 256, latentPatchCells <= 576 else {
+          throw H3NativeError.invalidJob(
+            "native MiniMax H3 resolution must be at least 256x256 and no larger "
+              + "than the tested 1024x576-equivalent area"
+          )
+        }
+      } else {
+        guard job.width == 864, job.height == 480 else {
+          throw H3NativeError.invalidJob(
+            "the selected MiniMax H3 manifest is fixed to 864x480; select the "
+              + "variable-resolution manifest"
+          )
+        }
       }
     }
     stages = try decodedManifest.resolvedStages(backend: job.backend)
@@ -141,7 +163,7 @@ private final class H3NativePipeline {
     let source: (duration: Double, width: Int, height: Int, hasAudio: Bool)
     if let sourceURL {
       source = try await H3NativeMedia.probe(sourceURL)
-    } else {
+    } else if !sourceImageURLs.isEmpty {
       let imageSource = try H3NativeMedia.probeImages(sourceImageURLs)
       source = (
         job.durationSeconds,
@@ -149,21 +171,36 @@ private final class H3NativePipeline {
         imageSource.height,
         false
       )
+    } else {
+      source = (job.durationSeconds, job.width, job.height, false)
     }
     let generationFrames = H3Geometry.alignedGenerationFrameCount(
       durationSeconds: job.durationSeconds
     )
-    let available = max(
-      5,
-      Int((min(source.duration, job.durationSeconds) * 24).rounded(.down))
-    )
-    let referenceFrames = try H3Geometry.referenceFrameCount(
-      available: available,
-      output: generationFrames
-    )
-    let qwenSampleCount = H3Geometry.qwenVideoSampleIndices(
-      frameCount: referenceFrames
-    ).count
+    let referenceFrames: Int
+    let qwenFrames: Int
+    if conditioningMode == .fl2va, sourceURL == nil, sourceImageURLs.isEmpty {
+      referenceFrames = 0
+      qwenFrames = 0
+    } else if !sourceImageURLs.isEmpty {
+      // A still image is a one-frame DiT reference and one paired Qwen vision
+      // block. It must not inherit the ten-second video-reference geometry.
+      referenceFrames = 1
+      qwenFrames = sourceImageURLs.count * 2
+    } else {
+      let available = max(
+        5,
+        Int((min(source.duration, job.durationSeconds) * 24).rounded(.down))
+      )
+      referenceFrames = try H3Geometry.referenceFrameCount(
+        available: available,
+        output: generationFrames
+      )
+      let qwenSampleCount = H3Geometry.qwenVideoSampleIndices(
+        frameCount: referenceFrames
+      ).count
+      qwenFrames = qwenSampleCount + qwenSampleCount % 2
+    }
     return H3ExecutionPlan(
       input: sourceURL?.path ?? sourceImageURLs.first?.path ?? "",
       inputImages: sourceImageURLs.isEmpty ? nil : sourceImageURLs.map(\.path),
@@ -185,7 +222,7 @@ private final class H3NativePipeline {
       audioLatentShape: [
         1, 32, 2, H3Geometry.audioLatentFrames(pixelFrames: generationFrames),
       ],
-      qwenFrames: qwenSampleCount + qwenSampleCount % 2,
+      qwenFrames: qwenFrames,
       sigmas: manifest.sigmas,
       cacheDirectory: cache.directory.path
     )
@@ -194,53 +231,117 @@ private final class H3NativePipeline {
   func run() async throws {
     let plan = try await plan()
     reporter.emit("prepare", "started", 0.01, "Swift H3 pipeline started")
-    let media = try await decodedMedia(plan: plan)
-    guard let referenceVideo = media["video"], let referenceAudio = media["audio"] else {
-      throw H3NativeError.missingTensor("decoded reference media")
+    let denoised: H3AVLatent
+    switch conditioningMode {
+    case .ref2va:
+      let media = try await decodedMedia(plan: plan)
+      let text = try await textCondition(
+        referenceVideo: media["visionVideo"] ?? media["video"],
+        identityReferenceCount: sourceImageURLs.isEmpty
+          ? nil : sourceImageURLs.count,
+        sourceKey: sourceDigest,
+        progress: 0.43
+      )
+      guard let context = text["context"], let tokenTags = text["tokenTags"] else {
+        throw H3NativeError.missingTensor("textEncoder context/tokenTags")
+      }
+      if sourceImageURLs.isEmpty {
+        guard let referenceVideo = media["video"],
+          let referenceAudio = media["audio"]
+        else {
+          throw H3NativeError.missingTensor("decoded reference video/audio")
+        }
+        let videoKey = try stageKey(
+          "videoEncoder",
+          upstream: [
+            sourceDigest,
+            Data(Self.referenceMediaPreprocessingVersion.utf8),
+            Data("\(plan.referenceFrames)x\(job.width)x\(job.height)".utf8),
+          ]
+        )
+        let referenceVideoLatent = try await encodeReferenceVideo(
+          referenceVideo,
+          key: videoKey
+        )
+        let audioKey = try stageKey(
+          "audioEncoder",
+          upstream: [sourceDigest, Data("\(job.durationSeconds)@32000".utf8)]
+        )
+        let audioCondition = try await cachedStage(
+          "audioEncoder",
+          key: audioKey,
+          inputs: ["audio": referenceAudio],
+          progress: 0.34
+        )
+        guard let referenceAudioLatent = audioCondition["referenceAudioLatent"] else {
+          throw H3NativeError.missingTensor("audioEncoder.referenceAudioLatent")
+        }
+        denoised = try await denoise(
+          plan: plan,
+          context: context,
+          tokenTags: tokenTags,
+          referenceVideoLatent: referenceVideoLatent,
+          referenceAudioLatent: referenceAudioLatent,
+          referenceImageLatents: nil,
+          upstreamKeys: [videoKey, audioKey]
+        )
+      } else {
+        var imageLatents: [H3Tensor] = []
+        var imageKeys: [String] = []
+        imageLatents.reserveCapacity(sourceImageURLs.count)
+        imageKeys.reserveCapacity(sourceImageURLs.count)
+        for index in sourceImageURLs.indices {
+          guard let image = media["image\(index)"] else {
+            throw H3NativeError.missingTensor("decoded reference image \(index + 1)")
+          }
+          let imageKey = try stageKey(
+            "videoEncoder",
+            upstream: [
+              sourceDigest,
+              Data(Self.referenceMediaPreprocessingVersion.utf8),
+              Data("still-image:\(index):\(job.width)x\(job.height)".utf8),
+            ]
+          )
+          imageLatents.append(
+            try await encodeReferenceImage(
+              image,
+              key: imageKey,
+              index: index,
+              total: sourceImageURLs.count
+            )
+          )
+          imageKeys.append(imageKey)
+        }
+        denoised = try await denoise(
+          plan: plan,
+          context: context,
+          tokenTags: tokenTags,
+          referenceVideoLatent: nil,
+          referenceAudioLatent: nil,
+          referenceImageLatents: imageLatents,
+          upstreamKeys: imageKeys
+        )
+      }
+    case .fl2va:
+      let text = try await textCondition(
+        referenceVideo: nil,
+        identityReferenceCount: nil,
+        sourceKey: sourceDigest,
+        progress: 0.43
+      )
+      guard let context = text["context"], let tokenTags = text["tokenTags"] else {
+        throw H3NativeError.missingTensor("textEncoder context/tokenTags")
+      }
+      denoised = try await denoise(
+        plan: plan,
+        context: context,
+        tokenTags: tokenTags,
+        referenceVideoLatent: nil,
+        referenceAudioLatent: nil,
+        referenceImageLatents: nil,
+        upstreamKeys: []
+      )
     }
-
-    let videoKey = try stageKey(
-      "videoEncoder",
-      upstream: [sourceDigest, Data("\(plan.referenceFrames)x\(job.width)x\(job.height)".utf8)]
-    )
-    let referenceVideoLatent = try await encodeReferenceVideo(
-      referenceVideo,
-      key: videoKey
-    )
-
-    let audioKey = try stageKey(
-      "audioEncoder",
-      upstream: [sourceDigest, Data("\(job.durationSeconds)@32000".utf8)]
-    )
-    let audioCondition = try await cachedStage(
-      "audioEncoder",
-      key: audioKey,
-      inputs: ["audio": referenceAudio],
-      progress: 0.34
-    )
-    guard let referenceAudioLatent = audioCondition["referenceAudioLatent"] else {
-      throw H3NativeError.missingTensor("audioEncoder.referenceAudioLatent")
-    }
-
-    let text = try await textCondition(
-      referenceVideo: media["visionVideo"] ?? referenceVideo,
-      identityReferenceCount: sourceImageURLs.isEmpty
-        ? nil : sourceImageURLs.count,
-      sourceKey: sourceDigest,
-      progress: 0.43
-    )
-    guard let context = text["context"], let tokenTags = text["tokenTags"] else {
-      throw H3NativeError.missingTensor("textEncoder context/tokenTags")
-    }
-
-    let denoised = try await denoise(
-      plan: plan,
-      context: context,
-      tokenTags: tokenTags,
-      referenceVideoLatent: referenceVideoLatent,
-      referenceAudioLatent: referenceAudioLatent,
-      upstreamKeys: [videoKey, audioKey]
-    )
 
     let decodedVideo = try await decodeVideo(denoised.video, shape: denoised.videoShape)
     let decodedAudio = try await decodeAudio(denoised.audio, shape: denoised.audioShape)
@@ -258,7 +359,10 @@ private final class H3NativePipeline {
   {
     let key = H3StageCache.key(parts: [
       sourceDigest,
-      Data("media-v2:\(plan.referenceFrames):\(job.width):\(job.height):\(job.durationSeconds)".utf8),
+      Data(
+        "media-v7-continuous-edge-extend:\(plan.referenceFrames):\(job.width):\(job.height):\(job.durationSeconds)"
+          .utf8
+      ),
     ])
     if let hit = try cache.load(stage: "media", key: key) {
       reporter.emit("media", "cached", 0.12, "Reused decoded 24fps video/audio")
@@ -273,24 +377,14 @@ private final class H3NativePipeline {
         height: job.height,
         frameCount: plan.referenceFrames
       )
-      async let audio = H3NativeMedia.decodeReferenceAudio(
+      async let visionVideo = H3NativeMedia.decodeReferenceVideo(
         url: sourceURL,
-        durationSeconds: job.durationSeconds
-      )
-      result = try await ["video": video, "audio": audio]
-    } else {
-      async let video = H3NativeMedia.decodeReferenceImages(
-        urls: sourceImageURLs,
-        width: job.width,
-        height: job.height,
+        width: H3Geometry.qwenVisionWidth,
+        height: H3Geometry.qwenVisionHeight,
         frameCount: plan.referenceFrames
       )
-      async let visionVideo = H3NativeMedia.decodeIdentityReferenceImages(
-        urls: sourceImageURLs,
-        width: job.width,
-        height: job.height
-      )
-      async let audio = H3NativeMedia.silentAudio(
+      async let audio = H3NativeMedia.decodeReferenceAudio(
+        url: sourceURL,
         durationSeconds: job.durationSeconds
       )
       result = try await [
@@ -298,6 +392,21 @@ private final class H3NativePipeline {
         "visionVideo": visionVideo,
         "audio": audio,
       ]
+    } else {
+      async let visionVideo = H3NativeMedia.decodeIdentityReferenceImages(
+        urls: sourceImageURLs,
+        width: H3Geometry.qwenVisionWidth,
+        height: H3Geometry.qwenVisionHeight
+      )
+      var images: [String: H3Tensor] = ["visionVideo": try await visionVideo]
+      for index in sourceImageURLs.indices {
+        images["image\(index)"] = try H3NativeMedia.decodeReferenceImage(
+          url: sourceImageURLs[index],
+          width: job.width,
+          height: job.height
+        )
+      }
+      result = images
     }
     try cache.store(stage: "media", key: key, tensors: result)
     reporter.emit("media", "completed", 0.16, "Prepared native reference tensors")
@@ -305,7 +414,7 @@ private final class H3NativePipeline {
   }
 
   private func textCondition(
-    referenceVideo: H3Tensor,
+    referenceVideo: H3Tensor?,
     identityReferenceCount: Int?,
     sourceKey: Data,
     progress: Double
@@ -322,7 +431,7 @@ private final class H3NativePipeline {
       sourceKey,
       Data(effectivePrompt.utf8),
       tokenizerFingerprint,
-      Data("qwen-presentation-v2-fixed-context".utf8),
+      Data("qwen-presentation-v7-continuous-edge-extend".utf8),
     ]
     let key: String
     if let composite = manifest.qwenComposite {
@@ -341,16 +450,27 @@ private final class H3NativePipeline {
       "textEncoder",
       "started",
       progress - 0.05,
-      "Tokenizing prompt and packing 2fps vision blocks in Swift"
+      referenceVideo == nil
+        ? "Tokenizing text-only prompt in Swift"
+        : "Tokenizing prompt and packing 2fps vision blocks in Swift"
     )
     let tokenizer = try H3QwenBPETokenizer(directory: tokenizerURL)
-    let presentation = try H3QwenPresentation.makeReferenceVideo(
-      prompt: effectivePrompt,
-      video: referenceVideo,
-      tokenizer: tokenizer,
-      fixedSequenceLength: manifest.qwenComposite?.sequenceLength,
-      identityReferenceCount: identityReferenceCount
-    )
+    let presentation: H3QwenPresentation
+    if let referenceVideo {
+      presentation = try H3QwenPresentation.makeReferenceVideo(
+        prompt: effectivePrompt,
+        video: referenceVideo,
+        tokenizer: tokenizer,
+        fixedSequenceLength: manifest.qwenComposite?.sequenceLength,
+        identityReferenceCount: identityReferenceCount
+      )
+    } else {
+      presentation = try H3QwenPresentation.makeTextOnly(
+        prompt: effectivePrompt,
+        tokenizer: tokenizer,
+        fixedSequenceLength: manifest.qwenComposite?.sequenceLength
+      )
+    }
     if presentation.promptTokenCount > presentation.usedPromptTokenCount {
       reporter.emit(
         "textEncoder",
@@ -422,15 +542,80 @@ private final class H3NativePipeline {
     return latent
   }
 
+  private func encodeReferenceImage(
+    _ image: H3Tensor,
+    key: String,
+    index: Int,
+    total: Int
+  ) async throws -> H3Tensor {
+    if let hit = try cache.load(stage: "videoEncoder", key: key),
+      let latent = hit["referenceImageLatent"]
+    {
+      reporter.emit(
+        "videoEncoder", "cached", 0.25,
+        "Reused image reference latent \(index + 1)/\(total)"
+      )
+      return latent
+    }
+    reporter.emit(
+      "videoEncoder", "running", 0.17,
+      "Encoding image reference \(index + 1)/\(total)"
+    )
+    let runner = try await makeRunner("videoEncoder")
+    let encoded = try await H3VideoVAEEncoder.encode(video: image, runner: runner)
+    let latent = try Self.firstVideoLatentFrame(encoded)
+    try cache.store(
+      stage: "videoEncoder",
+      key: key,
+      tensors: ["referenceImageLatent": latent]
+    )
+    reporter.emit(
+      "videoEncoder", "running",
+      0.17 + 0.08 * Double(index + 1) / Double(max(1, total)),
+      "Image reference \(index + 1)/\(total) completed"
+    )
+    return latent
+  }
+
+  private static func firstVideoLatentFrame(_ latent: H3Tensor) throws
+    -> H3Tensor
+  {
+    guard latent.shape.count == 5, latent.shape[0] == 1,
+      latent.shape[1] == 24, latent.shape[2] > 0
+    else {
+      throw H3NativeError.invalidTensor(
+        "image reference latent must be [1,24,T,H,W], got \(latent.shape)"
+      )
+    }
+    let source = try latent.float16Values()
+    let time = latent.shape[2]
+    let plane = latent.shape[3] * latent.shape[4]
+    var output = [Float16](repeating: 0, count: 24 * plane)
+    for channel in 0..<24 {
+      let sourceStart = channel * time * plane
+      let destinationStart = channel * plane
+      output.replaceSubrange(
+        destinationStart..<(destinationStart + plane),
+        with: source[sourceStart..<(sourceStart + plane)]
+      )
+    }
+    return try H3Tensor(
+      float16: output,
+      shape: [1, 24, 1, latent.shape[3], latent.shape[4]]
+    )
+  }
+
   private func denoise(
     plan: H3ExecutionPlan,
     context: H3Tensor,
     tokenTags: H3Tensor,
-    referenceVideoLatent: H3Tensor,
-    referenceAudioLatent: H3Tensor,
+    referenceVideoLatent: H3Tensor?,
+    referenceAudioLatent: H3Tensor?,
+    referenceImageLatents: [H3Tensor]?,
     upstreamKeys: [String]
   ) async throws -> H3AVLatent {
     let keyParts = upstreamKeys.map { Data($0.utf8) } + [
+        Data(conditioningMode.rawValue.utf8),
         Data(effectivePrompt.utf8),
         context.bytes,
         tokenTags.bytes,
@@ -483,17 +668,43 @@ private final class H3NativePipeline {
           )
         }
       )
-      let prepared = try await composite.prepare(
-        context: context,
-        tokenTags: tokenTags,
-        referenceVideoLatent: referenceVideoLatent,
-        referenceAudioLatent: referenceAudioLatent,
-        targetVideoShape: plan.videoLatentShape,
-        targetAudioShape: plan.audioLatentShape,
-        seed: job.seed,
-        visualConditionNoiseAug: manifest.visualConditionNoiseAug ?? 0.999,
-        audioConditionNoiseAug: manifest.audioConditionNoiseAug ?? 1.0
-      )
+      let prepared: TenErosMaxH3DenoiserComposite.Prepared
+      switch conditioningMode {
+      case .ref2va:
+        if let referenceImageLatents, !referenceImageLatents.isEmpty {
+          prepared = try await composite.prepareImages(
+            context: context,
+            tokenTags: tokenTags,
+            referenceImageLatents: referenceImageLatents,
+            targetVideoShape: plan.videoLatentShape,
+            targetAudioShape: plan.audioLatentShape,
+            seed: job.seed,
+            visualConditionNoiseAug: manifest.visualConditionNoiseAug ?? 0.999
+          )
+        } else {
+          guard let referenceVideoLatent, let referenceAudioLatent else {
+            throw H3NativeError.missingTensor("Ref2VA reference latents")
+          }
+          prepared = try await composite.prepare(
+            context: context,
+            tokenTags: tokenTags,
+            referenceVideoLatent: referenceVideoLatent,
+            referenceAudioLatent: referenceAudioLatent,
+            targetVideoShape: plan.videoLatentShape,
+            targetAudioShape: plan.audioLatentShape,
+            seed: job.seed,
+            visualConditionNoiseAug: manifest.visualConditionNoiseAug ?? 0.999,
+            audioConditionNoiseAug: manifest.audioConditionNoiseAug ?? 1.0
+          )
+        }
+      case .fl2va:
+        prepared = try await composite.prepareTextToVideo(
+          context: context,
+          tokenTags: tokenTags,
+          targetVideoShape: plan.videoLatentShape,
+          targetAudioShape: plan.audioLatentShape
+        )
+      }
       denoise = { latent, sigma, _ in
         try await composite.denoise(
           latent,
@@ -504,6 +715,13 @@ private final class H3NativePipeline {
         )
       }
     } else {
+      guard referenceImageLatents?.isEmpty != false,
+        let referenceVideoLatent, let referenceAudioLatent
+      else {
+        throw H3NativeError.unsupported(
+          "still-image Ref2VA and prompt-only FL2VA require the native denoiser composite"
+        )
+      }
       let runner = try await makeRunner("denoiser")
       let uncoercedStaticInputs: [String: H3Tensor] = [
         "context": context,
@@ -612,7 +830,11 @@ private final class H3NativePipeline {
     let input = try H3Tensor(float16: values.map(Float16.init), shape: shape)
     let key = try stageKey(
       "videoDecoder",
-      upstream: [input.bytes, Data(shape.description.utf8)]
+      upstream: [
+        input.bytes,
+        Data(shape.description.utf8),
+        Data("spatial-half-tile-affine-cosine-blend-v3".utf8),
+      ]
     )
     if let hit = try cache.load(stage: "videoDecoder", key: key),
       let video = hit["video"]
@@ -648,9 +870,10 @@ private final class H3NativePipeline {
   private func decodeAudio(_ values: [Float], shape: [Int]) async throws
     -> H3Tensor
   {
-    let audioScale = manifest.videoShift / manifest.audioShift
-    let unscaled = values.map { $0 / audioScale }
-    let input = try H3Tensor(float32: unscaled, shape: shape)
+    // Native-composite sampling already performs ModelSamplingAV's single
+    // process_latent_out rescale before caching. Applying the shift ratio here
+    // again attenuated generated audio by another 4x (about 12 dB).
+    let input = try H3Tensor(float32: values, shape: shape)
     let key = try stageKey(
       "audioDecoder",
       upstream: [input.bytes, Data(shape.description.utf8)]
@@ -815,7 +1038,8 @@ struct MiniMaxH3NativeRunner {
       "usage: mioh-minimax-h3-native <validate|plan|run> --manifest <manifest.json> "
         + "[--job <job.json> | (--input <video> | --input-images-json <json>) "
         + "--output <mp4> --prompt <text> "
-        + "--cache <dir> --backend <coreai|coreml> --width 864 --height 480 "
+        + "--cache <dir> --backend <coreai|coreml> "
+        + "--width <multiple-of-32> --height <multiple-of-32> "
         + "--duration 10 --seed N]"
     )
   }

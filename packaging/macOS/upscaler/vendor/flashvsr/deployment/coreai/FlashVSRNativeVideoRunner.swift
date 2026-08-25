@@ -129,7 +129,7 @@ private struct NativeVideoMetadata {
         let oriented = natural.applying(transform)
         let nominal = max(1, Double(try await track.load(.nominalFrameRate)))
         let duration = try await asset.load(.duration)
-        let frameTimes = try readFrameTimes(asset: asset, track: track)
+        let frameTimes = try await readFrameTimes(asset: asset, track: track)
         guard !frameTimes.isEmpty else {
             throw NativeVideoError.media("The input has no decodable frames")
         }
@@ -155,7 +155,7 @@ private struct NativeVideoMetadata {
 
     private static func readFrameTimes(
         asset: AVAsset, track: AVAssetTrack
-    ) throws -> [CMTime] {
+    ) async throws -> [CMTime] {
         let reader = try AVAssetReader(asset: asset)
         // Count decoded images rather than compressed samples. On macOS 27 an
         // H.264 access unit may be vended as several compressed sample buffers,
@@ -166,15 +166,15 @@ private struct NativeVideoMetadata {
                 kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)
             ]
         )
-        output.alwaysCopiesSampleData = false
-        guard reader.canAdd(output) else { throw NativeVideoError.media("Cannot count input frames") }
-        reader.add(output)
-        guard reader.startReading() else {
-            throw NativeVideoError.media(reader.error?.localizedDescription ?? "Cannot read input")
+        let provider = reader.outputProvider(for: output)
+        do {
+            try reader.start()
+        } catch {
+            throw NativeVideoError.media("Cannot read input: \(error.localizedDescription)")
         }
         var times: [CMTime] = []
-        while let sample = output.copyNextSampleBuffer() {
-            times.append(CMSampleBufferGetPresentationTimeStamp(sample))
+        while let sample = try await provider.next() {
+            times.append(sample.presentationTimeStamp)
         }
         guard reader.status == .completed else {
             throw NativeVideoError.media(reader.error?.localizedDescription ?? "Frame count failed")
@@ -256,7 +256,7 @@ private final class NativeDecodedSegment {
         startFrame: Int,
         processingFrameCount: Int,
         reportFrames: (Int, Int) -> Void
-    ) throws {
+    ) async throws {
         let requested = min(
             max(0, metadata.frameCount - startFrame),
             processingFrameCount + nativeTemporalLookaheadFrames
@@ -284,22 +284,21 @@ private final class NativeDecodedSegment {
                 kCVPixelBufferMetalCompatibilityKey as String: true,
             ]
         )
-        output.alwaysCopiesSampleData = false
-        guard reader.canAdd(output) else {
-            throw NativeVideoError.media("Cannot create the shared segment decoder")
-        }
-        reader.add(output)
-        guard reader.startReading() else {
+        let provider = reader.outputProvider(for: output)
+        do {
+            try reader.start()
+        } catch {
             throw NativeVideoError.media(
-                reader.error?.localizedDescription ?? "Cannot start the shared segment decoder"
+                "Cannot start the shared segment decoder: \(error.localizedDescription)"
             )
         }
         var decoded: [CVPixelBuffer] = []
         decoded.reserveCapacity(requested)
         while decoded.count < requested,
-              let sample = output.copyNextSampleBuffer(),
-              let buffer = CMSampleBufferGetImageBuffer(sample) {
-            decoded.append(buffer)
+              let sample = try await provider.next() {
+            guard let pixelSample = CMReadySampleBuffer<CVReadOnlyPixelBuffer>(sample)
+            else { continue }
+            decoded.append(pixelSample.content.withUnsafeBuffer { $0 })
             reportFrames(decoded.count, requested)
         }
         guard !decoded.isEmpty else {
@@ -494,8 +493,7 @@ private struct NativeCoordinateNormalGenerator {
 @available(macOS 27.0, *)
 private final class NativeVideoWriter {
     private let writer: AVAssetWriter
-    private let input: AVAssetWriterInput
-    private let adaptor: AVAssetWriterInputPixelBufferAdaptor
+    private let receiver: AVAssetWriterInput.PixelBufferReceiver
     private let fpsNumerator: Int
     private let fpsDenominator: Int
     private(set) var frameCount = 0
@@ -547,52 +545,40 @@ private final class NativeVideoWriter {
                 AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
             ],
         ]
-        input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
-        input.expectsMediaDataInRealTime = false
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
         // Keep enough precision for CFR and VFR sources. 120000 is divisible
         // by the common 24000/30000/60000 video time scales, unlike a nominal
         // integer frame rate such as 23 or 29.
         writer.movieTimeScale = 120_000
         input.mediaTimeScale = 120_000
-        adaptor = AVAssetWriterInputPixelBufferAdaptor(
-            assetWriterInput: input,
-            sourcePixelBufferAttributes: [
-                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
-                kCVPixelBufferWidthKey as String: width,
-                kCVPixelBufferHeightKey as String: height,
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
-            ]
+        var attributes = CVPixelBufferCreationAttributes(
+            pixelFormatType: CVPixelFormatType(rawValue: kCVPixelFormatType_32BGRA),
+            size: CVImageSize(width: width, height: height)
         )
-        guard writer.canAdd(input) else { throw NativeVideoError.writer("Cannot add H.264 writer input") }
-        writer.add(input)
-        guard writer.startWriting() else {
-            throw NativeVideoError.writer(writer.error?.localizedDescription ?? "Cannot start video writer")
+        attributes.backing = .ioSurface
+        receiver = writer.inputPixelBufferReceiver(
+            for: input,
+            pixelBufferAttributes: attributes
+        )
+        do {
+            try writer.start()
+        } catch {
+            throw NativeVideoError.writer("Cannot start video writer: \(error.localizedDescription)")
         }
         writer.startSession(atSourceTime: .zero)
     }
 
     func makePixelBuffer() throws -> CVPixelBuffer {
-        guard let pool = adaptor.pixelBufferPool else {
+        guard let pool = receiver.pixelBufferPool else {
             throw NativeVideoError.writer("The video writer has no pixel-buffer pool")
         }
-        var value: CVPixelBuffer?
-        let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &value)
-        guard status == kCVReturnSuccess, let value else {
-            throw NativeVideoError.writer("Pixel-buffer allocation failed: \(status)")
-        }
-        return value
+        return try pool.makeMutablePixelBuffer().withUnsafeBuffer { $0 }
     }
 
     func append(
         _ pixelBuffer: CVPixelBuffer,
         presentationTime requestedTime: CMTime? = nil
     ) async throws {
-        while !input.isReadyForMoreMediaData {
-            if writer.status == .failed || writer.status == .cancelled {
-                throw NativeVideoError.writer(writer.error?.localizedDescription ?? "Video writer stopped")
-            }
-            try await Task.sleep(nanoseconds: 250_000)
-        }
         var time = requestedTime ?? CMTime(
             value: Int64(frameCount * fpsDenominator), timescale: Int32(fpsNumerator)
         )
@@ -601,18 +587,21 @@ private final class NativeVideoWriter {
                 value: Int64(fpsDenominator), timescale: Int32(fpsNumerator)
             )
         }
-        guard adaptor.append(pixelBuffer, withPresentationTime: time) else {
-            throw NativeVideoError.writer(writer.error?.localizedDescription ?? "Cannot append video frame")
+        do {
+            try await receiver.append(
+                CVReadOnlyPixelBuffer(unsafeBuffer: pixelBuffer),
+                with: time
+            )
+        } catch {
+            throw NativeVideoError.writer("Cannot append video frame: \(error.localizedDescription)")
         }
         lastPresentationTime = time
         frameCount += 1
     }
 
     func finish() async throws {
-        input.markAsFinished()
-        await withCheckedContinuation { continuation in
-            writer.finishWriting { continuation.resume() }
-        }
+        receiver.finish()
+        await writer.finishWriting()
         guard writer.status == .completed else {
             throw NativeVideoError.writer(writer.error?.localizedDescription ?? "Cannot finish video writer")
         }
@@ -1338,7 +1327,7 @@ private struct FlashVSRNativeVideoRunner {
                         "STAGE セグメント \(segmentIndex + 1)/\(segmentCount)を共有デコード中"
                     )
                     fflush(stdout)
-                    let decoded = try NativeDecodedSegment(
+                    let decoded = try await NativeDecodedSegment(
                         metadata: metadata,
                         startFrame: processingStart,
                         processingFrameCount: processingFrameCount

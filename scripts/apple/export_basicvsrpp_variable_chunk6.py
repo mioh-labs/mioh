@@ -145,6 +145,49 @@ class PropagationContinue6(torch.nn.Module):
         return torch.cat(outputs, dim=0)
 
 
+class StatefulPropagationContinue6(torch.nn.Module):
+    """Continuation chunk whose recurrent boundary is Core AI native state."""
+
+    def __init__(self, generator: torch.nn.Module, branch: str):
+        super().__init__()
+        self.later = PropagationLater(generator, branch)
+        self.register_buffer(
+            "state_n1",
+            torch.zeros(1, MID_CHANNELS, FEATURE_SIZE, FEATURE_SIZE),
+        )
+        self.register_buffer(
+            "state_n2",
+            torch.zeros(1, MID_CHANNELS, FEATURE_SIZE, FEATURE_SIZE),
+        )
+        self.register_buffer(
+            "flow_previous",
+            torch.zeros(1, 2, FEATURE_SIZE, FEATURE_SIZE),
+        )
+
+    def forward(
+        self, contexts: torch.Tensor, flows: torch.Tensor
+    ) -> torch.Tensor:
+        outputs = []
+        previous = self.state_n1
+        older = self.state_n2
+        previous_flow = self.flow_previous
+        for index in range(CHUNK_SIZE):
+            flow = flows[index : index + 1]
+            result = self.later(
+                contexts[index : index + 1],
+                previous,
+                older,
+                flow,
+                previous_flow,
+            )
+            outputs.append(result)
+            older, previous, previous_flow = previous, result, flow
+        self.state_n1.copy_(previous)
+        self.state_n2.copy_(older)
+        self.flow_previous.copy_(previous_flow)
+        return torch.cat(outputs, dim=0)
+
+
 @dataclass(frozen=True)
 class ChunkAssetSpec:
     name: str
@@ -245,6 +288,8 @@ def export_assets(
     *,
     overwrite: bool,
     fuse_flow_warp: bool = False,
+    optimize: bool = False,
+    native_state_continuations: bool = False,
 ) -> None:
     _coreai, coreai_torch = import_coreai()
     generator = load_generator(checkpoint).generator
@@ -261,7 +306,18 @@ def export_assets(
             if not overwrite:
                 continue
             shutil.rmtree(destination)
-        module = spec.module.half().eval()
+        native_state = native_state_continuations and spec.name.endswith(
+            "_continue6"
+        )
+        if native_state:
+            branch = spec.name.removesuffix("_continue6")
+            module = StatefulPropagationContinue6(generator, branch).half().eval()
+            examples = (spec.examples[0], spec.examples[3])
+            input_names = ["contexts", "flows"]
+        else:
+            module = spec.module.half().eval()
+            examples = spec.examples
+            input_names = list(spec.input_names)
         started = time.perf_counter()
         with torch.no_grad(), ExitStack() as stack:
             stack.enter_context(
@@ -270,16 +326,27 @@ def export_assets(
                 else use_grid_sample_metal_kernel(sampling_kernel)
             )
             stack.enter_context(use_deform_conv_metal_kernel(deform_kernel))
-            exported = torch.export.export(module, spec.examples)
+            exported = torch.export.export(module, examples)
             exported = exported.run_decompositions(coreai_torch.get_decomp_table())
         converter = coreai_torch.TorchConverter()
         converter.register_custom_kernels([sampling_kernel, deform_kernel])
-        converter.add_exported_program(
-            exported,
-            input_names=list(spec.input_names),
-            output_names=list(spec.output_names),
-        )
-        save_program_asset(converter.to_coreai(), destination)
+        if native_state:
+            converter.add_exported_program(
+                exported,
+                state_names=["state_n1", "state_n2", "flow_previous"],
+                input_names=input_names,
+                output_names=list(spec.output_names),
+            )
+        else:
+            converter.add_exported_program(
+                exported,
+                input_names=input_names,
+                output_names=list(spec.output_names),
+            )
+        program = converter.to_coreai()
+        if optimize or native_state:
+            program.optimize()
+        save_program_asset(program, destination)
         print(
             f"exported {spec.name}: {time.perf_counter() - started:.2f}s -> "
             f"{destination}",
@@ -305,6 +372,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "currently rejects this path; do not use for production exports."
         ),
     )
+    parser.add_argument(
+        "--native-state-continuations",
+        action="store_true",
+        help=(
+            "Export the four continuation chunks with Core AI mutable state. "
+            "The Swift runner remains compatible with explicit-I/O assets."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -315,6 +390,7 @@ def main() -> int:
         args.output_dir,
         overwrite=args.overwrite,
         fuse_flow_warp=args.fuse_flow_warp,
+        native_state_continuations=args.native_state_continuations,
     )
     return 0
 

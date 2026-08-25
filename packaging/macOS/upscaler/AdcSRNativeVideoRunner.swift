@@ -135,7 +135,7 @@ private struct AdcSRVideoMetadata {
     let transform = try await track.load(.preferredTransform)
     let oriented = natural.applying(transform)
     let frameRate = max(1, Double(try await track.load(.nominalFrameRate)))
-    let frameTimes = try readFrameTimes(asset: asset, track: track)
+    let frameTimes = try await readFrameTimes(asset: asset, track: track)
     guard !frameTimes.isEmpty else {
       throw AdcSRVideoError.media("デコードできるフレームがありません")
     }
@@ -159,7 +159,7 @@ private struct AdcSRVideoMetadata {
 
   private static func readFrameTimes(
     asset: AVAsset, track: AVAssetTrack
-  ) throws -> [CMTime] {
+  ) async throws -> [CMTime] {
     let reader = try AVAssetReader(asset: asset)
     let output = AVAssetReaderTrackOutput(
       track: track,
@@ -167,19 +167,17 @@ private struct AdcSRVideoMetadata {
         kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)
       ]
     )
-    output.alwaysCopiesSampleData = false
-    guard reader.canAdd(output) else {
-      throw AdcSRVideoError.media("フレーム数を取得できません")
-    }
-    reader.add(output)
-    guard reader.startReading() else {
+    let provider = reader.outputProvider(for: output)
+    do {
+      try reader.start()
+    } catch {
       throw AdcSRVideoError.media(
-        reader.error?.localizedDescription ?? "入力を読み込めません"
+        "入力を読み込めません: \(error.localizedDescription)"
       )
     }
     var times: [CMTime] = []
-    while let sample = output.copyNextSampleBuffer() {
-      times.append(CMSampleBufferGetPresentationTimeStamp(sample))
+    while let sample = try await provider.next() {
+      times.append(sample.presentationTimeStamp)
     }
     guard reader.status == .completed else {
       throw AdcSRVideoError.media(
@@ -236,12 +234,15 @@ private func adcSRTiles(width: Int, height: Int) -> [AdcSRTile] {
 
 @available(macOS 27.0, *)
 private final class AdcSRFrameReader {
+  private typealias DynamicSample =
+    CMReadySampleBuffer<CMSampleBuffer.DynamicContent>
+
   private let reader: AVAssetReader
-  private let output: AVAssetReaderTrackOutput
+  private let provider: AVAssetReaderOutput.Provider<DynamicSample>
 
   init(metadata: AdcSRVideoMetadata) throws {
     reader = try AVAssetReader(asset: metadata.asset)
-    output = AVAssetReaderTrackOutput(
+    let output = AVAssetReaderTrackOutput(
       track: metadata.track,
       outputSettings: [
         kCVPixelBufferPixelFormatTypeKey as String:
@@ -249,20 +250,18 @@ private final class AdcSRFrameReader {
         kCVPixelBufferMetalCompatibilityKey as String: true,
       ]
     )
-    output.alwaysCopiesSampleData = false
-    guard reader.canAdd(output) else {
-      throw AdcSRVideoError.media("共有フレームデコーダーを作成できません")
-    }
-    reader.add(output)
-    guard reader.startReading() else {
+    provider = reader.outputProvider(for: output)
+    do {
+      try reader.start()
+    } catch {
       throw AdcSRVideoError.media(
-        reader.error?.localizedDescription ?? "共有デコードを開始できません"
+        "共有デコードを開始できません: \(error.localizedDescription)"
       )
     }
   }
 
-  func next() throws -> CVPixelBuffer? {
-    guard let sample = output.copyNextSampleBuffer() else {
+  func next() async throws -> CVPixelBuffer? {
+    guard let sample = try await provider.next() else {
       if reader.status == .failed {
         throw AdcSRVideoError.media(
           reader.error?.localizedDescription ?? "共有デコードに失敗しました"
@@ -270,10 +269,11 @@ private final class AdcSRFrameReader {
       }
       return nil
     }
-    guard let buffer = CMSampleBufferGetImageBuffer(sample) else {
+    guard let pixelSample = CMReadySampleBuffer<CVReadOnlyPixelBuffer>(sample)
+    else {
       throw AdcSRVideoError.media("デコード済みフレームに画像がありません")
     }
-    return buffer
+    return pixelSample.content.withUnsafeBuffer { $0 }
   }
 
   func validateCompleted() throws {
@@ -930,8 +930,7 @@ private final class AdcSRMetalCompositor {
 @available(macOS 27.0, *)
 private final class AdcSRVideoWriter {
   private let writer: AVAssetWriter
-  private let input: AVAssetWriterInput
-  private let adaptor: AVAssetWriterInputPixelBufferAdaptor
+  private let receiver: AVAssetWriterInput.PixelBufferReceiver
   private let imageContext: CIContext
   private let fpsNumerator: Int
   private let fpsDenominator: Int
@@ -973,26 +972,23 @@ private final class AdcSRVideoWriter {
         AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
       ],
     ]
-    input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
-    input.expectsMediaDataInRealTime = false
+    let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
     input.mediaTimeScale = 120_000
     writer.movieTimeScale = 120_000
-    adaptor = AVAssetWriterInputPixelBufferAdaptor(
-      assetWriterInput: input,
-      sourcePixelBufferAttributes: [
-        kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
-        kCVPixelBufferWidthKey as String: width,
-        kCVPixelBufferHeightKey as String: height,
-        kCVPixelBufferIOSurfacePropertiesKey as String: [:],
-      ]
+    var attributes = CVPixelBufferCreationAttributes(
+      pixelFormatType: CVPixelFormatType(rawValue: kCVPixelFormatType_32BGRA),
+      size: CVImageSize(width: width, height: height)
     )
-    guard writer.canAdd(input) else {
-      throw AdcSRVideoError.writer("H.264書き出し入力を追加できません")
-    }
-    writer.add(input)
-    guard writer.startWriting() else {
+    attributes.backing = .ioSurface
+    receiver = writer.inputPixelBufferReceiver(
+      for: input,
+      pixelBufferAttributes: attributes
+    )
+    do {
+      try writer.start()
+    } catch {
       throw AdcSRVideoError.writer(
-        writer.error?.localizedDescription ?? "動画の書き出しを開始できません"
+        "動画の書き出しを開始できません: \(error.localizedDescription)"
       )
     }
     writer.startSession(atSourceTime: .zero)
@@ -1015,15 +1011,10 @@ private final class AdcSRVideoWriter {
   }
 
   private func makeOutputPixelBuffer() throws -> CVPixelBuffer {
-    guard let pool = adaptor.pixelBufferPool else {
+    guard let pool = receiver.pixelBufferPool else {
       throw AdcSRVideoError.writer("動画ライターのピクセルバッファプールがありません")
     }
-    var value: CVPixelBuffer?
-    let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &value)
-    guard status == kCVReturnSuccess, let value else {
-      throw AdcSRVideoError.writer("出力フレームを確保できません: \(status)")
-    }
-    return value
+    return try pool.makeMutablePixelBuffer().withUnsafeBuffer { $0 }
   }
 
   func append(native: CVPixelBuffer, presentationTime requested: CMTime) async throws {
@@ -1070,23 +1061,20 @@ private final class AdcSRVideoWriter {
       )
     }
 
-    while !input.isReadyForMoreMediaData {
-      if writer.status == .failed || writer.status == .cancelled {
-        throw AdcSRVideoError.writer(
-          writer.error?.localizedDescription ?? "動画ライターが停止しました"
-        )
-      }
-      try await Task.sleep(nanoseconds: 250_000)
-    }
     var time = requested
     if let lastPresentationTime, time <= lastPresentationTime {
       time = lastPresentationTime + CMTime(
         value: Int64(fpsDenominator), timescale: Int32(fpsNumerator)
       )
     }
-    guard adaptor.append(destination, withPresentationTime: time) else {
+    do {
+      try await receiver.append(
+        CVReadOnlyPixelBuffer(unsafeBuffer: destination),
+        with: time
+      )
+    } catch {
       throw AdcSRVideoError.writer(
-        writer.error?.localizedDescription ?? "動画フレームを書き出せません"
+        "動画フレームを書き出せません: \(error.localizedDescription)"
       )
     }
     lastPresentationTime = time
@@ -1094,10 +1082,8 @@ private final class AdcSRVideoWriter {
   }
 
   func finish() async throws {
-    input.markAsFinished()
-    await withCheckedContinuation { continuation in
-      writer.finishWriting { continuation.resume() }
-    }
+    receiver.finish()
+    await writer.finishWriting()
     guard writer.status == .completed else {
       throw AdcSRVideoError.writer(
         writer.error?.localizedDescription ?? "動画の書き出しを完了できません"
@@ -1181,7 +1167,7 @@ private struct AdcSRNativeVideoRunner {
       var previousSource: CVPixelBuffer?
       var previousOutput: CVPixelBuffer?
       var frameIndex = 0
-      while let decoded = try reader.next() {
+      while let decoded = try await reader.next() {
         guard frameIndex < metadata.frameCount else {
           throw AdcSRVideoError.media(
             "実デコード数が事前確認したフレーム数を上回りました"

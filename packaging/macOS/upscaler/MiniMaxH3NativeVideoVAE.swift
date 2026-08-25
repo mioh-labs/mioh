@@ -14,7 +14,10 @@ enum H3VideoVAETiling {
     let overlaps: [Int]
   }
 
-  static func axisPlan(length: Int) throws -> AxisPlan {
+  static func axisPlan(
+    length: Int,
+    minimumOverlap requestedMinimumOverlap: Int = minimumOverlap
+  ) throws -> AxisPlan {
     guard length >= tileSize else {
       throw H3NativeError.unsupported(
         "MiniMax H3 native video VAE currently needs both canvas edges >= \(tileSize)"
@@ -23,11 +26,19 @@ enum H3VideoVAETiling {
     if length == tileSize {
       return AxisPlan(starts: [0], lengths: [tileSize], overlaps: [])
     }
+    guard requestedMinimumOverlap >= 0,
+      requestedMinimumOverlap < tileSize,
+      requestedMinimumOverlap % spatialRatio == 0
+    else {
+      throw H3NativeError.invalidTensor(
+        "video VAE overlap must be a multiple of \(spatialRatio) below \(tileSize)"
+      )
+    }
     var count = Int(ceil(Double(length) / Double(tileSize)))
     var overlaps: [Int] = []
     var remaining = 0
     while true {
-      overlaps = Array(repeating: minimumOverlap, count: count - 1)
+      overlaps = Array(repeating: requestedMinimumOverlap, count: count - 1)
       remaining = tileSize * count - overlaps.reduce(0, +) - length
       if remaining < 0 {
         count += 1
@@ -311,6 +322,12 @@ enum H3VideoVAEDecoder {
   private static let frameOverlap = 5
   private static let framesPerToken = 4
   private static let chunkFrames = 20
+  /// With less than half-tile overlap, a strip in the middle of every interval
+  /// is represented by only one independently decoded VAE tile. The decoder's
+  /// low-frequency edge bias then becomes a visible vertical or horizontal
+  /// band. Half-tile overlap guarantees at least two contributors everywhere
+  /// except the outer canvas edges.
+  private static let spatialDecodeOverlap = 128
   private static let pixelMean: [Float] = [0.485, 0.456, 0.406]
   private static let pixelStandardDeviation: [Float] = [0.229, 0.224, 0.225]
 
@@ -335,8 +352,14 @@ enum H3VideoVAEDecoder {
     let latentWidth = latent.shape[4]
     let height = latentHeight * H3VideoVAETiling.spatialRatio
     let width = latentWidth * H3VideoVAETiling.spatialRatio
-    let vertical = try H3VideoVAETiling.axisPlan(length: height)
-    let horizontal = try H3VideoVAETiling.axisPlan(length: width)
+    let vertical = try H3VideoVAETiling.axisPlan(
+      length: height,
+      minimumOverlap: spatialDecodeOverlap
+    )
+    let horizontal = try H3VideoVAETiling.axisPlan(
+      length: width,
+      minimumOverlap: spatialDecodeOverlap
+    )
     let temporal = temporalPlan(tokens: sourceFrames)
     let tilesPerChunk = vertical.starts.count * horizontal.starts.count
     let totalTiles = temporal.chunks * tilesPerChunk
@@ -476,18 +499,16 @@ enum H3VideoVAEDecoder {
     runner: H3StageRunner,
     progress: ((Int) -> Void)?
   ) async throws -> [Float] {
-    var canvas = [Float](
-      repeating: 0,
-      count: channels * decodedFramesPerTile * height * width
+    var blender = H3SpatialTileBlender(
+      channels: channels,
+      frames: decodedFramesPerTile,
+      height: height,
+      width: width,
+      tileSize: H3VideoVAETiling.tileSize
     )
-    var rowTails = [[Float]]()
-    var outputY = 0
     var completed = 0
     for rowIndex in vertical.starts.indices {
       let y = vertical.starts[rowIndex]
-      var newTails = [[Float]]()
-      var leftTail: [Float]?
-      var outputX = 0
       for columnIndex in horizontal.starts.indices {
         let x = horizontal.starts[columnIndex]
         let tileValues = extractLatentTile(
@@ -520,68 +541,28 @@ enum H3VideoVAEDecoder {
             "video raw tile is \(tensor.shape), expected [1,3,28,256,256]"
           )
         }
-        var tile = try tensor.floatValues()
+        let tile = try tensor.floatValues()
         guard tile.allSatisfy(\.isFinite) else {
           throw H3NativeError.inference(
             "video decoder produced NaN or infinity; refusing a corrupted frame"
           )
         }
-        if rowIndex < vertical.starts.count - 1 {
-          newTails.append(
-            extractSpatialTail(
-              source: tile,
-              extent: vertical.overlaps[rowIndex],
-              axis: 0
-            )
-          )
-        }
-        let nextLeftTail = columnIndex < horizontal.starts.count - 1
-          ? extractSpatialTail(
-            source: tile,
-            extent: horizontal.overlaps[columnIndex],
-            axis: 1
-          ) : nil
-        if rowIndex > 0 {
-          blendSpatialTail(
-            previous: rowTails[columnIndex],
-            current: &tile,
-            extent: vertical.overlaps[rowIndex - 1],
-            axis: 0
-          )
-        }
-        if columnIndex > 0, let leftTail {
-          blendSpatialTail(
-            previous: leftTail,
-            current: &tile,
-            extent: horizontal.overlaps[columnIndex - 1],
-            axis: 1
-          )
-        }
-        leftTail = nextLeftTail
-        let keptHeight = H3VideoVAETiling.tileSize
-          - (rowIndex < vertical.starts.count - 1 ? vertical.overlaps[rowIndex] : 0)
-        let keptWidth = H3VideoVAETiling.tileSize
-          - (columnIndex < horizontal.starts.count - 1
-            ? horizontal.overlaps[columnIndex] : 0)
-        copySpatialTile(
-          source: tile,
-          keptHeight: keptHeight,
-          keptWidth: keptWidth,
-          destination: &canvas,
-          destinationHeight: height,
-          destinationWidth: width,
-          destinationY: outputY,
-          destinationX: outputX
+        blender.add(
+          tile: tile,
+          originY: y,
+          originX: x,
+          topOverlap: rowIndex > 0 ? vertical.overlaps[rowIndex - 1] : 0,
+          bottomOverlap: rowIndex < vertical.starts.count - 1
+            ? vertical.overlaps[rowIndex] : 0,
+          leftOverlap: columnIndex > 0 ? horizontal.overlaps[columnIndex - 1] : 0,
+          rightOverlap: columnIndex < horizontal.starts.count - 1
+            ? horizontal.overlaps[columnIndex] : 0
         )
-        outputX += keptWidth
         completed += 1
         progress?(completed)
       }
-      rowTails = newTails
-      outputY += H3VideoVAETiling.tileSize
-        - (rowIndex < vertical.starts.count - 1 ? vertical.overlaps[rowIndex] : 0)
     }
-    return canvas
+    return blender.finalized()
   }
 
   private static func extractLatentTile(
@@ -612,110 +593,6 @@ enum H3VideoVAEDecoder {
       }
     }
     return tile
-  }
-
-  private static func extractSpatialTail(
-    source: [Float],
-    extent: Int,
-    axis: Int
-  ) -> [Float] {
-    if axis == 0 {
-      var result = [Float](
-        repeating: 0,
-        count: channels * decodedFramesPerTile * extent * H3VideoVAETiling.tileSize
-      )
-      for channel in 0..<channels {
-        for frame in 0..<decodedFramesPerTile {
-          for y in 0..<extent {
-            let sourceStart = (((channel * decodedFramesPerTile + frame)
-              * H3VideoVAETiling.tileSize
-              + H3VideoVAETiling.tileSize - extent + y)
-              * H3VideoVAETiling.tileSize)
-            let destinationStart = ((channel * decodedFramesPerTile + frame) * extent + y)
-              * H3VideoVAETiling.tileSize
-            result.replaceSubrange(
-              destinationStart..<(destinationStart + H3VideoVAETiling.tileSize),
-              with: source[sourceStart..<(sourceStart + H3VideoVAETiling.tileSize)]
-            )
-          }
-        }
-      }
-      return result
-    }
-    var result = [Float](
-      repeating: 0,
-      count: channels * decodedFramesPerTile * H3VideoVAETiling.tileSize * extent
-    )
-    for channel in 0..<channels {
-      for frame in 0..<decodedFramesPerTile {
-        for y in 0..<H3VideoVAETiling.tileSize {
-          for x in 0..<extent {
-            let sourceIndex = (((channel * decodedFramesPerTile + frame)
-              * H3VideoVAETiling.tileSize + y) * H3VideoVAETiling.tileSize
-              + H3VideoVAETiling.tileSize - extent + x)
-            let destinationIndex = (((channel * decodedFramesPerTile + frame)
-              * H3VideoVAETiling.tileSize + y) * extent + x)
-            result[destinationIndex] = source[sourceIndex]
-          }
-        }
-      }
-    }
-    return result
-  }
-
-  private static func blendSpatialTail(
-    previous: [Float],
-    current: inout [Float],
-    extent: Int,
-    axis: Int
-  ) {
-    guard extent > 0 else { return }
-    for channel in 0..<channels {
-      for frame in 0..<decodedFramesPerTile {
-        for y in 0..<H3VideoVAETiling.tileSize {
-          for x in 0..<H3VideoVAETiling.tileSize {
-            let position = axis == 0 ? y : x
-            guard position < extent else { continue }
-            let previousIndex = axis == 0
-              ? (((channel * decodedFramesPerTile + frame) * extent + y)
-                * H3VideoVAETiling.tileSize + x)
-              : (((channel * decodedFramesPerTile + frame)
-                * H3VideoVAETiling.tileSize + y) * extent + x)
-            let currentIndex = (((channel * decodedFramesPerTile + frame)
-              * H3VideoVAETiling.tileSize + y) * H3VideoVAETiling.tileSize + x)
-            let currentWeight = Float(position) / Float(extent)
-            current[currentIndex] = previous[previousIndex] * (1 - currentWeight)
-              + current[currentIndex] * currentWeight
-          }
-        }
-      }
-    }
-  }
-
-  private static func copySpatialTile(
-    source: [Float],
-    keptHeight: Int,
-    keptWidth: Int,
-    destination: inout [Float],
-    destinationHeight: Int,
-    destinationWidth: Int,
-    destinationY: Int,
-    destinationX: Int
-  ) {
-    for channel in 0..<channels {
-      for frame in 0..<decodedFramesPerTile {
-        for y in 0..<keptHeight {
-          for x in 0..<keptWidth {
-            let sourceIndex = (((channel * decodedFramesPerTile + frame)
-              * H3VideoVAETiling.tileSize + y) * H3VideoVAETiling.tileSize + x)
-            let destinationIndex = (((channel * decodedFramesPerTile + frame)
-              * destinationHeight + destinationY + y) * destinationWidth
-              + destinationX + x)
-            destination[destinationIndex] = source[sourceIndex]
-          }
-        }
-      }
-    }
   }
 
   private static func blendTemporal(

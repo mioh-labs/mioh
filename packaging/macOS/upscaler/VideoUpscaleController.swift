@@ -89,6 +89,11 @@ final class VideoUpscaleController: ObservableObject {
   private var outputIsAutomatic = true
   private var sourceProbeGeneration = UUID()
   private var upscaleStartedAt: Date?
+  private var runInputURL: URL?
+  private var runStartSeconds = 0.0
+  private var runDurationSeconds = 0.0
+  private var runPreservesAudio = false
+  private var upscaledVideoURL: URL?
 
   init() {
     flashVSRRootPath = UserDefaults.standard.string(
@@ -400,6 +405,11 @@ final class VideoUpscaleController: ObservableObject {
       resultsDirectory = results
       finalOutputURL = outputURL
       activeInstallation = installation
+      runInputURL = inputURL
+      runStartSeconds = start
+      runDurationSeconds = end - start
+      runPreservesAudio = preserveAudio
+      upscaledVideoURL = nil
       progress = 0
       status = "選択範囲を準備中"
       log = ""
@@ -426,21 +436,18 @@ final class VideoUpscaleController: ObservableObject {
       task.executableURL = ffmpeg
       var arguments = [
         "-hide_banner", "-loglevel", "warning", "-nostdin", "-n",
-        "-i", inputURL.path,
+        // Input seeking remains frame-exact while avoiding a decode from the
+        // beginning of long sources to a late selected range.
         "-ss", Self.number(start),
+        "-i", inputURL.path,
         "-t", Self.number(end - start),
         "-map", "0:v:0",
         "-vf", "setpts=PTS-STARTPTS",
         "-c:v", "prores_ks", "-profile:v", "3", "-pix_fmt", "yuv444p10le",
+        // Audio is not needed by either upscaler. Preserve it packet-for-packet
+        // from the original input only when the final MP4 is assembled.
+        "-an",
       ]
-      if preserveAudio {
-        arguments += [
-          "-map", "0:a:0?", "-af", "asetpts=PTS-STARTPTS",
-          "-c:a", "aac", "-b:a", "192k",
-        ]
-      } else {
-        arguments.append("-an")
-      }
       arguments.append(trimmed.path)
       task.arguments = arguments
       try launch(task, phase: .trim)
@@ -465,7 +472,13 @@ final class VideoUpscaleController: ObservableObject {
   private enum ProcessPhase {
     case trim
     case upscale
-    case mux
+    case muxPrimary
+    case muxAudioFallback
+  }
+
+  private enum FinalAudioMode {
+    case copy
+    case encodeAAC
   }
 
   private struct Installation {
@@ -651,7 +664,25 @@ final class VideoUpscaleController: ObservableObject {
       switch phase {
       case .trim: fail("選択範囲の切り出しに失敗しました")
       case .upscale: fail("\(modelTitle)アップスケールに失敗しました")
-      case .mux: fail("音声と映像の結合に失敗しました")
+      case .muxPrimary:
+        guard runPreservesAudio, let upscaledVideoURL else {
+          fail("音声と映像の結合に失敗しました")
+          cleanupTemporaryFiles()
+          return
+        }
+        appendLog("元音声を直接格納できないためAACへ変換します。\n")
+        if let resizedOutputURL {
+          try? FileManager.default.removeItem(at: resizedOutputURL)
+        }
+        do {
+          try startFinalMux(from: upscaledVideoURL, audioMode: .encodeAAC)
+        } catch {
+          fail(error.localizedDescription)
+          cleanupTemporaryFiles()
+        }
+        return
+      case .muxAudioFallback:
+        fail("音声と映像の結合に失敗しました")
       }
       cleanupTemporaryFiles()
       return
@@ -669,7 +700,7 @@ final class VideoUpscaleController: ObservableObject {
         fail(error.localizedDescription)
         cleanupTemporaryFiles()
       }
-    case .mux:
+    case .muxPrimary, .muxAudioFallback:
       guard let resizedOutputURL else {
         fail("指定解像度の出力が見つかりません")
         cleanupTemporaryFiles()
@@ -720,12 +751,16 @@ final class VideoUpscaleController: ObservableObject {
     guard FileManager.default.fileExists(atPath: expected.path) else {
       throw UpscaleControllerError.missingUpscalerOutput
     }
-    try startFinalMux(from: expected)
+    upscaledVideoURL = expected
+    try startFinalMux(from: expected, audioMode: .copy)
   }
 
-  private func startFinalMux(from source: URL) throws {
+  private func startFinalMux(
+    from source: URL,
+    audioMode: FinalAudioMode
+  ) throws {
     guard let installation = activeInstallation,
-      let temporaryDirectory, let trimmedInputURL
+      let temporaryDirectory
     else { throw UpscaleControllerError.incompleteState }
     let ffmpeg = installation.resources.appendingPathComponent("bin/ffmpeg")
     guard FileManager.default.isExecutableFile(atPath: ffmpeg.path) else {
@@ -741,13 +776,37 @@ final class VideoUpscaleController: ObservableObject {
     var arguments = [
       "-hide_banner", "-loglevel", "warning", "-nostdin", "-n",
       "-i", source.path,
-      "-i", trimmedInputURL.path,
-      "-map", "0:v:0", "-map", "1:a:0?",
+    ]
+    if runPreservesAudio {
+      guard let runInputURL, runDurationSeconds > 0 else {
+        throw UpscaleControllerError.incompleteState
+      }
+      arguments += [
+        "-ss", Self.number(runStartSeconds),
+        "-t", Self.number(runDurationSeconds),
+        "-i", runInputURL.path,
+        "-map", "0:v:0", "-map", "1:a:0?",
+      ]
+    } else {
+      arguments += ["-map", "0:v:0", "-an"]
+    }
+    arguments += [
       "-c:v", "copy",
     ]
-    arguments += ["-c:a", "copy", "-movflags", "+faststart", resized.path]
+    if runPreservesAudio {
+      switch audioMode {
+      case .copy:
+        arguments += ["-c:a", "copy"]
+      case .encodeAAC:
+        arguments += ["-c:a", "aac", "-b:a", "192k"]
+      }
+    }
+    arguments += ["-movflags", "+faststart", resized.path]
     task.arguments = arguments
-    try launch(task, phase: .mux)
+    try launch(
+      task,
+      phase: audioMode == .copy ? .muxPrimary : .muxAudioFallback
+    )
   }
 
   private func finishOutput(from source: URL) {
@@ -911,6 +970,11 @@ final class VideoUpscaleController: ObservableObject {
     finalOutputURL = nil
     resizedOutputURL = nil
     activeInstallation = nil
+    runInputURL = nil
+    runStartSeconds = 0
+    runDurationSeconds = 0
+    runPreservesAudio = false
+    upscaledVideoURL = nil
   }
 
   static func timecode(_ seconds: Double) -> String {

@@ -18,6 +18,7 @@ CONTROLLER = UPSCALER / "VideoUpscaleController.swift"
 ADCSR_PIPELINE = UPSCALER / "AdcSRNativePipeline.swift"
 ADCSR_RUNNER = UPSCALER / "AdcSRNativeVideoRunner.swift"
 H3_VIEW = UPSCALER / "MiniMaxH3VideoGenerationView.swift"
+H3_FACE_REFERENCES = UPSCALER / "MiniMaxH3FaceReferences.swift"
 H3_RUNNER = UPSCALER / "MiniMaxH3NativeRunner.swift"
 H3_MEDIA = UPSCALER / "MiniMaxH3NativeMedia.swift"
 H3_MODELS = UPSCALER / "MiniMaxH3NativeModels.swift"
@@ -96,10 +97,12 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
             "UpscalerModelSetup.swift",
             "UpscalerApp.swift",
             "MiniMaxH3VideoGenerationView.swift",
+            "MiniMaxH3FaceReferences.swift",
             "MiniMaxH3NativeCore.swift",
             "MiniMaxH3NativeRunner.swift",
             '"$RESOURCES/bin/mioh-minimax-h3-native"',
             "-framework AVKit",
+            "-framework Vision",
             "FlashVSRNativePipeline.swift",
             "FlashVSRNativeVideoRunner.swift",
             '"$RESOURCES/bin/flashvsr-coreai-video"',
@@ -110,7 +113,7 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
             'ln -s /Applications "$DMG_ROOT/Applications"',
             'iconutil -c icns "$ICONSET" -o "$RESOURCES/AppIcon.icns"',
             "codesign --force --deep",
-            "hdiutil create",
+            "diskutil image create from",
         ):
             self.assertIn(contract, source)
         for bundled_model_contract in (
@@ -134,6 +137,22 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
             controller,
         )
         self.assertNotIn('resources.appendingPathComponent("models/', controller)
+
+    def test_native_upscaler_runners_use_macos_27_streaming_io(self):
+        for path in (ADCSR_RUNNER, FLASHVSR_RUNNER, H3_MEDIA):
+            source = path.read_text()
+            self.assertIn("outputProvider(for:", source, path)
+            self.assertIn("try reader.start()", source, path)
+            self.assertNotIn("copyNextSampleBuffer()", source, path)
+            self.assertNotIn("startReading()", source, path)
+            self.assertNotIn("alwaysCopiesSampleData", source, path)
+
+        for path in (ADCSR_RUNNER, FLASHVSR_RUNNER):
+            source = path.read_text()
+            self.assertIn("inputPixelBufferReceiver(", source, path)
+            self.assertIn("try await receiver.append(", source, path)
+            self.assertNotIn("AVAssetWriterInputPixelBufferAdaptor", source, path)
+            self.assertNotIn("isReadyForMoreMediaData", source, path)
 
     def test_adcsr_tiles_use_low_frequency_anchored_cosine_blending(self):
         runner = ADCSR_RUNNER.read_text()
@@ -160,6 +179,32 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
         )
         self.assertIn("低周波を入力へ固定したcosine blend", view)
 
+    def test_upscaler_preserves_original_audio_without_intermediate_reencode(self):
+        controller = CONTROLLER.read_text()
+        trim = controller.split("let task = Process()", 1)[1].split(
+            "try launch(task, phase: .trim)", 1
+        )[0]
+        self.assertIn('"-ss", Self.number(start)', trim)
+        self.assertLess(
+            trim.index('"-ss", Self.number(start)'),
+            trim.index('"-i", inputURL.path'),
+        )
+        self.assertIn('"-an"', trim)
+        self.assertNotIn('"asetpts=PTS-STARTPTS"', trim)
+
+        final_mux = controller.split("private func startFinalMux(", 1)[1]
+        final_mux = final_mux.split("private func finishOutput(", 1)[0]
+        for contract in (
+            '"-ss", Self.number(runStartSeconds)',
+            '"-t", Self.number(runDurationSeconds)',
+            '"-i", runInputURL.path',
+            'arguments += ["-c:a", "copy"]',
+            'arguments += ["-c:a", "aac", "-b:a", "192k"]',
+            'case muxAudioFallback',
+        ):
+            self.assertIn(contract, controller)
+        self.assertIn('"-movflags", "+faststart"', final_mux)
+
     def test_flashvsr_tiles_are_evenly_spaced_and_cosine_blended(self):
         runner = FLASHVSR_RUNNER.read_text()
         for contract in (
@@ -172,6 +217,7 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
 
     def test_video_generation_owns_minimax_workflow_and_external_models(self):
         view = H3_VIEW.read_text()
+        face_references = H3_FACE_REFERENCES.read_text()
         runner = H3_RUNNER.read_text()
         media = H3_MEDIA.read_text()
         build = UPSCALER_BUILD.read_text()
@@ -181,23 +227,101 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
             "panel.allowedContentTypes = [.movie, .image]",
             "panel.allowsMultipleSelection = true",
             '"--input-images-json"',
-            "追加画像は同一人物の外見参照として使います",
+            "参照素材は縦横比を保って中央に収め",
+            'Text("プロンプトのみ").tag(true)',
+            '"manifest-fl2va.json"',
+            'return mode == "fl2va"',
             '"bin/mioh-minimax-h3-native"',
             "com.okatti.mioh.upscaler.10erosMaxH3ManifestPath",
             "外部のMiniMax H3 manifest.json",
             "resolvePipelineManifestPath",
             '.appendingPathComponent("manifest.json")',
+            "selectImageReferenceScope",
+            "groupSelectedFacesAsOneSubject",
+            "faceReferencePrompt",
+            "selectedFaceReferences.map(\\.cropURL)",
         ):
             self.assertIn(contract, view)
+        for contract in (
+            "VNDetectFaceRectanglesRequest",
+            "expandedFaceCrop",
+            "face.width * 1.75",
+            "face.height * 1.95",
+            "UTType.png.identifier",
+            "maximumReferences = 8",
+            'case .faceOnly: "顔のみ"',
+        ):
+            self.assertIn(contract, face_references)
         self.assertIn('options["input-images-json"]', runner)
-        self.assertIn("qwen-presentation-v2-fixed-context", runner)
+        self.assertIn("qwen-presentation-v7-continuous-edge-extend", runner)
+        self.assertIn("width: H3Geometry.qwenVisionWidth", runner)
+        self.assertIn("height: H3Geometry.qwenVisionHeight", runner)
+        self.assertIn("case .fl2va:", runner)
+        self.assertIn("referenceVideo: nil", runner)
+        self.assertIn("prepareTextToVideo", H3_DENOISER.read_text())
+        self.assertIn("prepareImages", H3_DENOISER.read_text())
         self.assertIn("decodeReferenceImages", media)
+        self.assertIn("decodeReferenceImage", media)
         self.assertIn("decodeIdentityReferenceImages", media)
-        self.assertIn("silentAudio", media)
+        self.assertIn("referenceImageLatents", runner)
+        self.assertIn("firstVideoLatentFrame", runner)
+        self.assertNotIn("H3NativeMedia.silentAudio", runner)
+        self.assertEqual(
+            runner.count("sampled.audio = sampled.audio.map { $0 / scale }"),
+            1,
+        )
+        self.assertNotIn("let unscaled = values.map { $0 / audioScale }", runner)
+        self.assertIn('resolutionProfileID = "864x480"', view)
+        self.assertIn('Text("24fps固定")', view)
+        self.assertIn("1024, height: 576", view)
+        self.assertIn("768, height: 768", view)
+        self.assertIn("latentPatchCells <= 576", runner)
+        self.assertIn("variable-resolution manifest", runner)
         self.assertNotIn("10秒へ等間隔配置", view)
         self.assertNotIn("H3_NATIVE_ASSETS", build)
         self.assertNotIn("H3_BUNDLE_ASSETS", build)
         self.assertNotIn('models/10eros-max-h3/manifest.json', view)
+
+    def test_minimax_h3_preserves_reference_aspect_ratio(self):
+        media = H3_MEDIA.read_text()
+        runner = H3_RUNNER.read_text()
+        self.assertIn("let uniformScale = min(", media)
+        self.assertIn("scaleX: uniformScale, y: uniformScale", media)
+        self.assertIn("foreground.clampedToExtent().cropped", media)
+        self.assertIn("foreground.composited(over: background)", media)
+        self.assertIn('"native-image-reference-v4-continuous-edge-extend"', runner)
+        self.assertIn('"media-v7-continuous-edge-extend:', runner)
+        self.assertIn('"qwen-presentation-v7-continuous-edge-extend"', runner)
+        self.assertIn("Data(Self.referenceMediaPreprocessingVersion.utf8)", runner)
+        self.assertNotIn(
+            "scaleX: CGFloat(width) / extent.width,\n"
+            "        y: CGFloat(height) / extent.height",
+            media,
+        )
+
+    def test_minimax_h3_decoder_matches_tile_exposure_and_cosine_blends(self):
+        decoder = (UPSCALER / "MiniMaxH3NativeVideoVAE.swift").read_text()
+        blender = (UPSCALER / "MiniMaxH3SpatialTileBlender.swift").read_text()
+        runner = H3_RUNNER.read_text()
+        build = UPSCALER_BUILD.read_text()
+
+        self.assertIn("H3SpatialTileBlender", decoder)
+        self.assertNotIn("blendSpatialTail", decoder)
+        self.assertIn("private static let spatialDecodeOverlap = 128", decoder)
+        self.assertIn("minimumOverlap: spatialDecodeOverlap", decoder)
+        for contract in (
+            "estimateCorrection(",
+            "maximumGainDelta",
+            "maximumOffset",
+            "sin(.pi * 0.5",
+            "cos(.pi * 0.5",
+            "sums[destinationIndex] /= weight",
+        ):
+            self.assertIn(contract, blender)
+        self.assertIn(
+            'Data("spatial-half-tile-affine-cosine-blend-v3".utf8)', runner
+        )
+        self.assertIn('"$UPSCALER_DIR/MiniMaxH3SpatialTileBlender.swift"', build)
 
     def test_first_launch_model_setup_downloads_converts_and_configures(self):
         setup = MODEL_SETUP.read_text()
@@ -218,7 +342,7 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
         for contract in (
             "JunhaoZhuang/FlashVSR-v1.1/resolve/main",
             "mlboydaisuke/AdcSR-CoreAI/resolve/main",
-            "coreai-torch==0.4.1",
+            "coreai-torch==0.4.2",
             "deployment.coreai.export_native",
             'DESTINATION/.mioh-upscaler-setup',
             "--dry-run",
@@ -240,12 +364,22 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
 
         for contract in (
             "static let maximumResidentModels = 1",
+            "h3SpecializationOptions(",
+            "allowedComputeUnitKinds",
+            "intersection([.cpu, .gpu])",
+            '"Core AI failed to restrict MiniMax H3 to CPU and GPU"',
+            "cachePolicy: .default",
+            'manifest.inputs["graphSalt"]',
+            'semantic == "graphSalt"',
             "var scratch = NDArray(",
             "outputViews.insert(&output, for: entry.outputName)",
+            "_ = try await function.run(",
             "swap(&hidden, &scratch)",
             "await Task.yield()",
         ):
             self.assertIn(contract, models)
+        self.assertNotIn("cachePolicy: .persistent", models)
+        self.assertNotIn("outputs.names.contains(entry.outputName)", models)
         self.assertIn("maximumResidentAuxiliaryModels = 1", denoiser)
         self.assertIn("private func predictOnce(", denoiser)
         self.assertIn("private static func runAuxiliaryStage(", denoiser)
@@ -254,6 +388,22 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
         self.assertNotIn("private let finalVideo: H3StageRunner", denoiser)
         self.assertNotIn("kCVPixelBufferIOSurfacePropertiesKey", media)
         self.assertNotIn("kCVPixelBufferMetalCompatibilityKey", media)
+
+        view = H3_VIEW.read_text()
+        for contract in (
+            "maximumVisibleLogCharacters = 24_000",
+            "consumeStandardError(data)",
+            "isInternalCoreAIWarning",
+            "guard !isInternalCoreAIWarning(line) else { continue }",
+            '"#aicode."',
+            '"aicode.serialization"',
+            '"full compile with ane as preferred device failed"',
+            '"mioh-minimax-h3-native["',
+            'normalized == "error:"',
+            "diagnosticPunctuation",
+            '"…以前のログを省略…\\n"',
+        ):
+            self.assertIn(contract, view)
 
     def test_independent_app_has_a_distinct_green_icon(self):
         self.assertTrue(UPSCALER_ICON.is_file())

@@ -68,6 +68,11 @@ private final class Workspace {
   let flowChunkBuffer: MTLBuffer
   let featureChunkBuffer: MTLBuffer
   let restoredChunkBuffer: MTLBuffer
+  // Native-state continuation assets are supported for controlled A/B tests.
+  // Shipping explicit-I/O assets leave these buffers unused.
+  let nativeStateN1Buffer: MTLBuffer
+  let nativeStateN2Buffer: MTLBuffer
+  let nativePreviousFlowBuffer: MTLBuffer
   let spatialStream = ComputeStream()
   let flowStream = ComputeStream()
   let propagationStream = ComputeStream()
@@ -99,6 +104,9 @@ private final class Workspace {
     flowChunkBuffer = try buffer(chunkSize * flowBytes)
     featureChunkBuffer = try buffer(chunkSize * featureElements * half)
     restoredChunkBuffer = try buffer(chunkSize * frameBytes)
+    nativeStateN1Buffer = try buffer(featureElements * half)
+    nativeStateN2Buffer = try buffer(featureElements * half)
+    nativePreviousFlowBuffer = try buffer(flowElements * half)
   }
 }
 
@@ -332,7 +340,70 @@ struct Chunk6Runner {
           scalarType: .float16, shape: [chunkSize, featureChannels, featureSize, featureSize])
         var outputs = InferenceFunction.AsyncMutableViews()
         outputs.insert(&destination, for: "features")
-        _ = try function.encode(inputs: inputs, outputViews: outputs, to: workspace.propagationStream)
+        let nativeStateNames = Set(function.descriptor.stateNames)
+        if nativeStateNames.isEmpty {
+          _ = try function.encode(
+            inputs: inputs,
+            outputViews: outputs,
+            to: workspace.propagationStream)
+        } else {
+          let expectedStateNames = Set([
+            "state_n1", "state_n2", "flow_previous",
+          ])
+          guard chunkStart > 0, nativeStateNames == expectedStateNames,
+            let flows = inputs["flows"]
+          else {
+            throw RunnerError.invalidDescriptor(
+              "unsupported native state contract for \(functionName): \(nativeStateNames.sorted())")
+          }
+          // Seed each branch once from the preceding start chunk. Later
+          // continuation chunks reuse the state mutated by Core AI directly.
+          if chunkStart == chunkSize {
+            let previousFrame = indices[chunkStart - 1]
+            let olderFrame = indices[chunkStart - 2]
+            let previousFlowIndex = branch.backward ? previousFrame : previousFrame - 1
+            memcpy(
+              workspace.nativeStateN1Buffer.contents(),
+              workspace.featureBuffer.contents().advanced(
+                by: previousFrame * perFrameFeatureBytes
+                  + outputChannel * featurePlaneElements * half),
+              featureBytes)
+            memcpy(
+              workspace.nativeStateN2Buffer.contents(),
+              workspace.featureBuffer.contents().advanced(
+                by: olderFrame * perFrameFeatureBytes
+                  + outputChannel * featurePlaneElements * half),
+              featureBytes)
+            memcpy(
+              workspace.nativePreviousFlowBuffer.contents(),
+              directional.contents().advanced(by: previousFlowIndex * flowBytes),
+              flowBytes)
+          }
+          var stateN1 = InferenceFunction.AsyncMutableValue(
+            unsafeBuffer: workspace.nativeStateN1Buffer,
+            byteOffset: 0,
+            scalarType: .float16,
+            shape: [1, featureChannels, featureSize, featureSize])
+          var stateN2 = InferenceFunction.AsyncMutableValue(
+            unsafeBuffer: workspace.nativeStateN2Buffer,
+            byteOffset: 0,
+            scalarType: .float16,
+            shape: [1, featureChannels, featureSize, featureSize])
+          var previousFlow = InferenceFunction.AsyncMutableValue(
+            unsafeBuffer: workspace.nativePreviousFlowBuffer,
+            byteOffset: 0,
+            scalarType: .float16,
+            shape: [1, 2, featureSize, featureSize])
+          var states = InferenceFunction.AsyncMutableViews()
+          states.insert(&stateN1, for: "state_n1")
+          states.insert(&stateN2, for: "state_n2")
+          states.insert(&previousFlow, for: "flow_previous")
+          _ = try function.encode(
+            inputs: ["contexts": context, "flows": flows],
+            states: states,
+            outputViews: outputs,
+            to: workspace.propagationStream)
+        }
         await workspace.propagationStream.currentWorkCompleted()
         for offset in 0..<valid {
           memcpy(

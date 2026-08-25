@@ -167,6 +167,60 @@ struct H3QwenPresentation: Sendable {
     let gridWidth: Int
   }
 
+  static func makeTextOnly(
+    prompt: String,
+    tokenizer: H3QwenBPETokenizer,
+    fixedSequenceLength: Int? = nil
+  ) throws -> H3QwenPresentation {
+    let promptTokens = try tokenizer.encode(prompt)
+    let usedPromptTokens: [Int32]
+    if let fixedSequenceLength {
+      guard fixedSequenceLength > 0 else {
+        throw H3NativeError.invalidTensor(
+          "Qwen fixed sequence length must be positive"
+        )
+      }
+      usedPromptTokens = Array(promptTokens.prefix(fixedSequenceLength))
+    } else {
+      usedPromptTokens = promptTokens
+    }
+    var tokenIDs = usedPromptTokens.isEmpty ? [textPad] : usedPromptTokens
+    let contentSequenceLength = tokenIDs.count
+    if let fixedSequenceLength, tokenIDs.count < fixedSequenceLength {
+      tokenIDs.append(
+        contentsOf: repeatElement(
+          textPad,
+          count: fixedSequenceLength - tokenIDs.count
+        )
+      )
+    }
+    let positions = makePositionIDs(sequenceLength: tokenIDs.count, spans: [])
+    return H3QwenPresentation(
+      inputIDs: try H3Tensor(int32: tokenIDs, shape: [1, tokenIDs.count]),
+      attentionMask: try H3Tensor(
+        int32: (0..<tokenIDs.count).map {
+          $0 < contentSequenceLength ? 1 : 0
+        },
+        shape: [1, tokenIDs.count]
+      ),
+      pixelValues: try H3Tensor(float32: [], shape: [0, 1536]),
+      imageGridTHW: try H3Tensor(int32: [], shape: [0, 3]),
+      positionIDs: try H3Tensor(
+        int32: positions,
+        shape: [3, tokenIDs.count]
+      ),
+      tokenTags: try H3Tensor(
+        int32: [Int32](repeating: 1, count: tokenIDs.count),
+        shape: [1, tokenIDs.count]
+      ),
+      // The Core AI Qwen graph is padded to its compiled sequence length, but
+      // native T2VA sends only real prompt rows into the DiT/text refiner.
+      effectiveSequenceLength: contentSequenceLength,
+      promptTokenCount: promptTokens.count,
+      usedPromptTokenCount: usedPromptTokens.count
+    )
+  }
+
   static func makeReferenceVideo(
     prompt: String,
     video: H3Tensor,
@@ -191,10 +245,11 @@ struct H3QwenPresentation: Sendable {
     var sampleIndices: [Int]
     if let identityReferenceCount {
       guard identityReferenceCount > 0,
-        frameCount == H3Geometry.identityVisionBlocks * 2
+        identityReferenceCount <= H3Geometry.identityVisionBlocks,
+        frameCount == identityReferenceCount * 2
       else {
         throw H3NativeError.invalidTensor(
-          "identity references need ten paired visual blocks"
+          "identity references need one paired visual block per image"
         )
       }
       sampleIndices = Array(0..<frameCount)
@@ -210,16 +265,13 @@ struct H3QwenPresentation: Sendable {
     var grids: [Int32] = []
     var spans: [VisionSpan] = []
 
-    tokenIDs += try tokenizer.encode(
-      identityReferenceCount == nil ? "<Video 1>: " : "<Image references>: "
-    )
+    if identityReferenceCount == nil {
+      tokenIDs += try tokenizer.encode("<Video 1>: ")
+    }
     for block in stride(from: 0, to: sampleIndices.count, by: 2) {
       if let identityReferenceCount {
-        let imageIndex = H3Geometry.identityImageIndex(
-          slot: block / 2,
-          imageCount: identityReferenceCount
-        )
-        tokenIDs += try tokenizer.encode("<Image \(imageIndex + 1)>")
+        let imageIndex = min(identityReferenceCount - 1, block / 2)
+        tokenIDs += try tokenizer.encode("<Picture \(imageIndex + 1)>: ")
       } else {
         let timestamp0 = Double(block) / 2.0
         let timestamp1 = Double(block + 1) / 2.0
@@ -274,10 +326,10 @@ struct H3QwenPresentation: Sendable {
         )
       )
     }
-    // The exported MiniMax DiT blocks have a fixed packed-row contract. Keep
-    // all Qwen rows, including text padding, in the denoiser context while the
-    // attention mask continues to describe only real visual/prompt content.
-    let effectiveSequenceLength = fixedSequenceLength ?? contentSequenceLength
+    // Qwen itself is compiled at a fixed sequence length, but the dynamic DiT
+    // must receive only real image/text rows. Passing padded rows changes the
+    // conditioning and previously left just 16 usable prompt tokens.
+    let effectiveSequenceLength = contentSequenceLength
 
     var tags = [Int32](repeating: 1, count: tokenIDs.count)
     for span in spans {

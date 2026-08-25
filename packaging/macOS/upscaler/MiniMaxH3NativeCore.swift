@@ -431,9 +431,15 @@ struct H3DenoiserCompositeManifest: Codable, Sendable {
   }
 }
 
+enum H3ConditioningMode: String, Codable, Sendable {
+  case ref2va
+  case fl2va
+}
+
 struct H3PipelineManifest: Codable, Sendable {
   let schemaVersion: Int
   let modelIdentifier: String
+  let conditioningMode: H3ConditioningMode?
   let fixedPrompt: String?
   let tokenizerDirectory: String?
   let qwenComposite: H3QwenCompositeManifest?
@@ -448,6 +454,11 @@ struct H3PipelineManifest: Codable, Sendable {
   let audioShift: Float
   let visualConditionNoiseAug: Float?
   let audioConditionNoiseAug: Float?
+
+  var resolvedConditioningMode: H3ConditioningMode {
+    if let conditioningMode { return conditioningMode }
+    return modelIdentifier.lowercased().contains("fl2va") ? .fl2va : .ref2va
+  }
 
   static let baseRequiredStages = [
     "videoEncoder", "audioEncoder", "videoDecoder", "audioDecoder",
@@ -582,30 +593,39 @@ struct H3NativeJob: Codable, Sendable {
   let backend: H3BackendKind?
   let preserveSourceAudioWhenDecoderIsUnavailable: Bool?
 
-  func validate() throws {
+  func validate(conditioningMode: H3ConditioningMode = .ref2va) throws {
     let video = input?.trimmingCharacters(in: .whitespacesAndNewlines)
     let images = inputImages?.filter {
       !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     } ?? []
-    guard (video?.isEmpty == false) != !images.isEmpty else {
-      throw H3NativeError.invalidJob(
-        "select exactly one input video or one or more input images"
-      )
-    }
-    if let video, !video.isEmpty {
-      guard FileManager.default.fileExists(atPath: video) else {
-        throw H3NativeError.missingAsset(video)
-      }
-    } else {
-      guard images.count <= H3Geometry.identityVisionBlocks else {
+    switch conditioningMode {
+    case .ref2va:
+      guard (video?.isEmpty == false) != !images.isEmpty else {
         throw H3NativeError.invalidJob(
-          "at most \(H3Geometry.identityVisionBlocks) identity images are supported"
+          "select exactly one input video or one or more input images"
         )
       }
-      for image in images {
-        guard FileManager.default.fileExists(atPath: image) else {
-          throw H3NativeError.missingAsset(image)
+      if let video, !video.isEmpty {
+        guard FileManager.default.fileExists(atPath: video) else {
+          throw H3NativeError.missingAsset(video)
         }
+      } else {
+        guard images.count <= H3Geometry.identityVisionBlocks else {
+          throw H3NativeError.invalidJob(
+            "at most \(H3Geometry.identityVisionBlocks) identity images are supported"
+          )
+        }
+        for image in images {
+          guard FileManager.default.fileExists(atPath: image) else {
+            throw H3NativeError.missingAsset(image)
+          }
+        }
+      }
+    case .fl2va:
+      guard video?.isEmpty != false, images.isEmpty else {
+        throw H3NativeError.invalidJob(
+          "the native FL2VA profile currently accepts prompt-only generation"
+        )
       }
     }
     guard !output.isEmpty, !cacheDirectory.isEmpty else {
@@ -628,7 +648,14 @@ struct H3NativeJob: Codable, Sendable {
 enum H3Geometry {
   static let framesPerSecond = 24
   static let audioLatentFramesPerSecond = 40
-  static let identityVisionBlocks = 10
+  // Keep two of the compiled ten Qwen vision slots available for prompt text.
+  // Eight 405-token image blocks still leave roughly 800 tokens for motion,
+  // soundscape and music instructions; ten blocks leave only 16.
+  static let identityVisionBlocks = 8
+  // The exported Qwen vision tower has a fixed 10 x 864x480 visual contract,
+  // independently of the variable-resolution DiT/VAE output canvas.
+  static let qwenVisionWidth = 864
+  static let qwenVisionHeight = 480
 
   static func identityImageIndex(
     slot: Int,
