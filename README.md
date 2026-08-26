@@ -10,7 +10,7 @@ This repository is the public source/distribution repository for the macOS build
 
 The universal build should be published as a GitHub Release asset:
 
-- `mioh-universal-0.14.3-unsigned.dmg`
+- `mioh-universal-0.14.3-011-unsigned.dmg`
 
 Large DMG files are not stored directly in git. See [releases/README.md](releases/README.md).
 
