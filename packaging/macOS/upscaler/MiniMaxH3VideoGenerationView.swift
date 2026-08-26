@@ -125,11 +125,11 @@ final class MiniMaxH3Controller: ObservableObject {
     if inputURLs.isEmpty { return "未指定" }
     if isImageSequence {
       if imageReferenceScope == .faceOnly {
-        if isDetectingFaces { return "人物の顔を検出中" }
+        if isDetectingFaces { return "Subject候補の顔を検出中" }
         return "顔参照 \(selectedFaceReferences.count)件（検出\(faceReferences.count)件）"
       }
       if inputURLs.count == 1 { return inputURLs[0].path }
-      return "人物参照画像 \(inputURLs.count)枚（先頭画像が基準）"
+      return "Subject参照画像 \(inputURLs.count)枚（先頭画像が基準）"
     }
     return inputURLs[0].path
   }
@@ -183,7 +183,7 @@ final class MiniMaxH3Controller: ObservableObject {
       return
     }
     if allImages, urls.count > Self.maximumIdentityImages {
-      status = "人物参照画像は最大\(Self.maximumIdentityImages)枚です"
+      status = "Subject参照画像は最大\(Self.maximumIdentityImages)枚です"
       return
     }
     if allImages {
@@ -320,7 +320,7 @@ final class MiniMaxH3Controller: ObservableObject {
     for index in faceReferences.indices where faceReferences[index].isSelected {
       faceReferences[index].subjectIndex = 1
     }
-    status = "選択した顔を人物1へまとめました"
+    status = "選択した顔を<Subject 1>へまとめました"
   }
 
   private func resetFaceReferences() {
@@ -777,7 +777,7 @@ struct MiniMaxH3GenerationView: View {
                   Button("再検出", action: controller.detectFaces)
                     .disabled(controller.isRunning)
                   Button(
-                    "選択顔を人物1へまとめる",
+                    "選択顔を<Subject 1>へまとめる",
                     action: controller.groupSelectedFacesAsOneSubject
                   )
                     .disabled(
@@ -789,7 +789,7 @@ struct MiniMaxH3GenerationView: View {
             }
             if !controller.faceReferences.isEmpty {
               DisclosureGroup(
-                "検出した顔（使用する顔と人物番号を指定）"
+                "検出した顔（使用する顔とSubject番号を指定）"
               ) {
                 VStack(alignment: .leading, spacing: 8) {
                   ForEach(controller.faceReferences) { reference in
@@ -806,7 +806,7 @@ struct MiniMaxH3GenerationView: View {
               }
             }
             Text(
-              "同一人物の別画像には同じ人物番号を指定してください。H3には選択した顔クロップだけを渡し、服装・姿勢・背景・構図はプロンプトから生成します。"
+              "同一人物の別画像には同じSubject番号を指定してください。プロンプトでは<Subject 1>の形式で指定します。H3には選択した顔クロップだけを渡し、服装・姿勢・背景・構図はプロンプトから生成します。"
             )
               .font(.caption)
               .foregroundStyle(.secondary)
@@ -958,7 +958,7 @@ private struct MiniMaxH3FaceReferenceRow: View {
       }
       Spacer()
       Picker(
-        "人物",
+        "Subject",
         selection: Binding(
           get: { reference.subjectIndex },
           set: {
@@ -970,10 +970,15 @@ private struct MiniMaxH3FaceReferenceRow: View {
         )
       ) {
         ForEach(1...8, id: \.self) { index in
-          Text("人物\(index)").tag(index)
+          Text("<Subject \(index)>").tag(index)
         }
       }
-        .frame(width: 100)
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: 140, alignment: .trailing)
+        .layoutPriority(1)
+        .accessibilityLabel("Subject")
+        .accessibilityValue("<Subject \(reference.subjectIndex)>")
         .disabled(controller.isRunning || !reference.isSelected)
     }
   }
