@@ -62,26 +62,36 @@ enum MiniMaxH3FaceReferenceProcessor {
       pictureLabelsBySubject[face.subjectIndex, default: []]
         .append("<Picture \(index + 1)>")
     }
-    let definitions = pictureLabelsBySubject.keys.sorted().map { subject in
+    let subjectNumbers = pictureLabelsBySubject.keys.sorted()
+    let definitions = subjectNumbers.map { subject in
       let pictures = pictureLabelsBySubject[subject, default: []]
         .joined(separator: ", ")
       return "<Subject \(subject)> is the person whose facial identity comes from \(pictures)."
     }.joined(separator: "\n")
-    let retention = pictureLabelsBySubject.keys.sorted().map { subject in
+    let retention = subjectNumbers.map { subject in
       "<Subject \(subject)>: partially_preserved - preserve facial identity only."
     }.joined(separator: "\n")
+    let subjects = subjectNumbers.map { "<Subject \($0)>" }
+      .joined(separator: ", ")
     return """
       subject_definitions:
       \(definitions)
 
       summary:
-      [reference generation] Use only each subject's facial structure, eyes, nose, mouth, hairline, and recognizable identity from the reference pictures. Regenerate clothing, body pose, background, framing, lighting, and camera angle from the user request.
+      [reference generation] Generate the requested video with \(subjects) as visible facial-identity references. Use only each subject's facial structure, eyes, nose, mouth, hairline, and recognizable identity from the reference pictures. Regenerate clothing, body pose, background, framing, lighting, and camera angle from the requested scene.
 
       retention_analysis:
       \(retention)
 
-      user_request:
-      \(originalPrompt)
+      detailed_description:
+      [Shot 1] Follow this user direction: \(originalPrompt)
+      Use \(subjects) only as visible facial-identity references. Reference labels such as <Subject 1> and <Picture 1> are silent control metadata. Never speak, narrate, sing, subtitle, or render a reference label as visible text.
+
+      overall_soundscape:
+      Generate only sounds explicitly requested in detailed_description. Do not add narration, voice-over, dialogue, singing, or spoken reference labels unless the user explicitly requests speech.
+
+      non_diegetic_music:
+      N/A unless explicitly requested in detailed_description.
       """
   }
 

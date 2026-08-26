@@ -312,7 +312,7 @@ private enum H3CoreAIModelLoader {
 
 /// Keeps the 62000x5376 BF16 hidden state inside Core AI between DiT blocks.
 /// A tensor round-trip through Swift Data at every block would copy hundreds
-/// of MB per block and dominate the seven-step sampler.
+/// of MB per block and dominate the multi-step sampler.
 ///
 /// The learned functions are deliberately loaded one at a time. Two caller-
 /// owned NDArrays are alternated as input/output buffers, which prevents each

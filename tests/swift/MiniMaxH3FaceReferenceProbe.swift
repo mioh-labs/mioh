@@ -57,7 +57,13 @@ struct MiniMaxH3FaceReferenceProbe {
       ),
         !prompt.contains("<Subject 2> is the person"),
         prompt.contains("Regenerate clothing, body pose, background"),
-        prompt.hasSuffix("Two people walk through a new environment.")
+        prompt.contains("detailed_description:"),
+        prompt.contains("overall_soundscape:"),
+        prompt.contains("non_diegetic_music:"),
+        prompt.contains("Reference labels such as <Subject 1> and <Picture 1> are silent control metadata."),
+        prompt.contains("Do not add narration, voice-over, dialogue, singing, or spoken reference labels unless the user explicitly requests speech."),
+        !prompt.contains("user_request:"),
+        prompt.contains("Two people walk through a new environment.")
       else {
         throw NSError(
           domain: "MiniMaxH3FaceReferenceProbe",

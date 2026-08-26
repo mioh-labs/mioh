@@ -360,33 +360,12 @@ final class TenErosMaxH3DenoiserComposite: @unchecked Sendable {
     let sigmaA = Self.timeShiftSigma(
       sigmaV, from: videoShift, to: audioShift
     )
-    let carry = sigmaA / sigmaV
-    let carriedAudio = latent.audio.map { $0 * carry }
-    let targetVideoRows = try Self.patchifyVideo(
-      values: latent.video, shape: latent.videoShape
+    let blockInput = try await makeBlockInput(
+      latent: latent, sigmaV: sigmaV, sigmaA: sigmaA, prepared: prepared
     )
-    let targetAudioRows = try Self.packAudio(
-      values: carriedAudio, shape: latent.audioShape
-    )
-    let projectedTargetAudio = try await projectAudio(
-      targetAudioRows, rows: prepared.targetAudioRows
-    )
-    let projectedTargetVideo = try await projectVideo(
-      targetVideoRows, rows: prepared.targetVideoRows
-    )
-    var hidden = try Self.concatenateRows([
-      prepared.textHidden,
-      prepared.referenceAudioHidden,
-      prepared.referenceVideoHidden,
-      projectedTargetAudio,
-      projectedTargetVideo,
-    ], width: 5376)
-
-    let time = try makeTimeInputs(
-      sigmaV: sigmaV,
-      sigmaA: sigmaA,
-      prepared: prepared
-    )
+    var hidden = blockInput.hidden
+    let time = blockInput.time
+    let carriedAudio = blockInput.carriedAudio
     hidden = try await blocks.predict(
       hiddenStates: hidden,
       timestepCoordinates: time.coordinates,
@@ -460,6 +439,75 @@ final class TenErosMaxH3DenoiserComposite: @unchecked Sendable {
     let videoCoordinate: H3Tensor
     let audioCoordinate: H3Tensor
   }
+
+  private struct BlockInput {
+    let hidden: H3Tensor
+    let time: TimeInputs
+    let carriedAudio: [Float]
+  }
+
+  private func makeBlockInput(
+    latent: H3AVLatent,
+    sigmaV: Float,
+    sigmaA: Float,
+    prepared: Prepared
+  ) async throws -> BlockInput {
+    let carry = sigmaA / sigmaV
+    let carriedAudio = latent.audio.map { $0 * carry }
+    let targetVideoRows = try Self.patchifyVideo(
+      values: latent.video, shape: latent.videoShape
+    )
+    let targetAudioRows = try Self.packAudio(
+      values: carriedAudio, shape: latent.audioShape
+    )
+    let projectedTargetAudio = try await projectAudio(
+      targetAudioRows, rows: prepared.targetAudioRows
+    )
+    let projectedTargetVideo = try await projectVideo(
+      targetVideoRows, rows: prepared.targetVideoRows
+    )
+    let hidden = try Self.concatenateRows([
+      prepared.textHidden,
+      prepared.referenceAudioHidden,
+      prepared.referenceVideoHidden,
+      projectedTargetAudio,
+      projectedTargetVideo,
+    ], width: 5376)
+    let time = try makeTimeInputs(
+      sigmaV: sigmaV, sigmaA: sigmaA, prepared: prepared
+    )
+    return BlockInput(
+      hidden: hidden, time: time, carriedAudio: carriedAudio
+    )
+  }
+
+  #if DEBUG
+  func debugBlockInput(
+    _ latent: H3AVLatent,
+    sigma videoSigma: Float,
+    prepared: Prepared,
+    videoShift: Float,
+    audioShift: Float
+  ) async throws -> (
+    hidden: H3Tensor,
+    timestepCoordinates: H3Tensor,
+    modulationWeights: H3Tensor,
+    ropeCosine: H3Tensor,
+    ropeSine: H3Tensor
+  ) {
+    let sigmaV = max(videoSigma, 1e-6)
+    let sigmaA = Self.timeShiftSigma(
+      sigmaV, from: videoShift, to: audioShift
+    )
+    let input = try await makeBlockInput(
+      latent: latent, sigmaV: sigmaV, sigmaA: sigmaA, prepared: prepared
+    )
+    return (
+      input.hidden, input.time.coordinates, input.time.weights,
+      prepared.ropeCosine, prepared.ropeSine
+    )
+  }
+  #endif
 
   private func makeTimeInputs(
     sigmaV: Float,

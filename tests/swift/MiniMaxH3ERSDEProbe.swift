@@ -11,7 +11,9 @@ struct MiniMaxH3ERSDEProbe {
     )
     let result = try await H3ERSDE.sample(
       initial: initial,
-      sigmas: [1, 0.94, 0.83, 0.72, 0.55, 0.30, 0.10, 0],
+      sigmas: [
+        1, 0.9836839, 0.96005756, 0.9230769, 0.8575097, 0.70638, 0,
+      ],
       flowShift: 12,
       seed: 123,
       sNoise: 0,

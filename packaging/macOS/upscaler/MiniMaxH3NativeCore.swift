@@ -883,8 +883,7 @@ enum H3ResMultistep {
 }
 
 /// Swift implementation of ComfyUI's VP ER-SDE-Solver-3 for H3's CONST flow
-/// schedule. The model author's preferred 10Eros-Max TURBO recipe uses this
-/// solver with a hand-tuned seven-step sigma schedule.
+/// schedule. Sigma selection is supplied by the external model manifest.
 enum H3ERSDE {
   typealias Denoiser = H3ResMultistep.Denoiser
 
@@ -920,6 +919,10 @@ enum H3ERSDE {
     var current = initial
     var oldDenoised: H3AVLatent?
     var oldDerivative: H3AVLatent?
+    // ComfyUI uses the same numeric seed for a fresh device-side generator,
+    // while prepare_noise is generated on CPU. Those are independent random
+    // streams. SplitMix64 is used for both paths here, so domain-separate the
+    // sampler stream instead of accidentally replaying the initial noise.
     var random = H3SplitMix64(seed: seed &+ 1)
 
     for index in 0..<(sigmas.count - 1) {
