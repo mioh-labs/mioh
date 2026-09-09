@@ -22,6 +22,7 @@ def register_all_modules():
     from .pixelwise_loss import CharbonnierLoss
     from .roi_loss import (
         KnownGridMosaicConsistencyLoss,
+        ROIHighFrequencyProjectionLoss,
         ROIHighFrequencyLoss,
         ROIPixelLoss,
         ROITemporalDifferenceLoss,

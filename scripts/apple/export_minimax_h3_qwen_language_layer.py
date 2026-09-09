@@ -22,6 +22,10 @@ from pilot_minimax_h3_qwen_nvfp4 import (
     ExactNVFP4PalettizedLinear,
     load_exact_palettized_mapping,
 )
+from pilot_10eros_max_h3_int8_convrot import (
+    ExactINT8ConvRotLinear,
+    load_mapping as load_int8_convrot_mapping,
+)
 
 
 HIDDEN_SIZE = 5120
@@ -73,9 +77,23 @@ class QwenLanguageLayer(torch.nn.Module):
         super().__init__()
         prefix = f"model.layers.{layer}"
 
-        def linear(name: str) -> ExactNVFP4PalettizedLinear:
+        def linear(name: str) -> torch.nn.Module:
+            tensor_prefix = f"{prefix}.{name}"
+            with safe_open(str(checkpoint), framework="pt", device="cpu") as handle:
+                keys = set(handle.keys())
+                quant_key = f"{tensor_prefix}.comfy_quant"
+                quant_config = None
+                if quant_key in keys:
+                    quant_config = json.loads(bytes(handle.get_tensor(quant_key).tolist()))
+            if quant_config is not None and quant_config.get(
+                "format"
+            ) == "int8_tensorwise" and quant_config.get("convrot"):
+                weight, scale, bias, group_size = load_int8_convrot_mapping(
+                    checkpoint, tensor_prefix
+                )
+                return ExactINT8ConvRotLinear(weight, scale, bias, group_size)
             weight, scale, pre_quant, bias = load_exact_palettized_mapping(
-                checkpoint, f"{prefix}.{name}"
+                checkpoint, tensor_prefix
             )
             return ExactNVFP4PalettizedLinear(weight, scale, pre_quant, bias)
 

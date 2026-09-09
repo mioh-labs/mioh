@@ -34,15 +34,32 @@ from lada.models.basicvsrpp.mmagic.roi_laplacian_error import (
     roi_laplacian_error,
 )
 from lada.models.basicvsrpp.mmagic.roi_psnr import roi_psnr
+from lada.models.mioh_restorer.losses_v5 import (
+    high_frequency,
+    masked_correlation,
+    masked_local_correlation,
+    masked_mean,
+    masked_projection_statistics,
+)
 
 
-def parse_checkpoint(value: str) -> tuple[str, Path]:
+def parse_checkpoint(value: str) -> tuple[str, tuple[Path, str]]:
     label, separator, path = value.partition("=")
     if not separator or not label.strip() or not path.strip():
         raise argparse.ArgumentTypeError(
-            "checkpoint must be LABEL=/absolute/path/to/checkpoint.pth"
+            "checkpoint must be LABEL=/absolute/path/to/checkpoint.pth "
+            "or LABEL@raw=... / LABEL@ema=..."
         )
-    return label.strip(), Path(path).expanduser().resolve()
+    label = label.strip()
+    state_preference = "auto"
+    for suffix, preference in (("@raw", "raw"), ("@ema", "ema")):
+        if label.endswith(suffix):
+            label = label[: -len(suffix)].strip()
+            state_preference = preference
+            break
+    if not label:
+        raise argparse.ArgumentTypeError("checkpoint label must not be empty")
+    return label, (Path(path).expanduser().resolve(), state_preference)
 
 
 def resolve_device(requested: str) -> torch.device:
@@ -53,7 +70,13 @@ def resolve_device(requested: str) -> torch.device:
     return torch.device(requested)
 
 
-def load_generator(config: Config, checkpoint: Path, device: torch.device):
+def load_generator(
+    config: Config,
+    checkpoint: Path,
+    device: torch.device,
+    *,
+    state_preference: str = "auto",
+):
     if not checkpoint.is_file():
         raise FileNotFoundError(f"checkpoint does not exist: {checkpoint}")
     payload = torch.load(
@@ -65,7 +88,14 @@ def load_generator(config: Config, checkpoint: Path, device: torch.device):
     if not isinstance(state_dict, dict):
         raise TypeError(f"checkpoint has no state_dict mapping: {checkpoint}")
 
-    prefixes = ("generator_ema.", "generator.")
+    if state_preference == "raw":
+        prefixes = ("generator.",)
+    elif state_preference == "ema":
+        prefixes = ("generator_ema.",)
+    elif state_preference == "auto":
+        prefixes = ("generator_ema.", "generator.")
+    else:
+        raise ValueError(f"unknown checkpoint state preference: {state_preference}")
     selected = None
     selected_prefix = None
     for prefix in prefixes:
@@ -80,7 +110,8 @@ def load_generator(config: Config, checkpoint: Path, device: torch.device):
             break
     if selected is None:
         raise ValueError(
-            f"checkpoint has neither generator_ema nor generator weights: {checkpoint}"
+            f"checkpoint has no requested {state_preference} generator weights: "
+            f"{checkpoint}"
         )
 
     generator = MODELS.build(config.model.generator)
@@ -127,6 +158,38 @@ def sequence_metrics(
             float(np.mean(temporal_values)) if temporal_values else 0.0
         ),
     }
+    prediction_hf = high_frequency(prediction.float())
+    target_hf = high_frequency(target.float())
+    prediction_amplitude = torch.sqrt(
+        masked_mean(prediction_hf.square(), mask).clamp_min(1e-12)
+    )
+    target_amplitude = torch.sqrt(
+        masked_mean(target_hf.square(), mask).clamp_min(1e-12)
+    )
+    projection, orthogonal_rms, orthogonal_energy = (
+        masked_projection_statistics(prediction_hf, target_hf, mask)
+    )
+    metrics.update(
+        {
+            "hf_amplitude_ratio": float(
+                prediction_amplitude / target_amplitude.clamp_min(1e-6)
+            ),
+            "hf_correlation": float(
+                masked_correlation(prediction_hf, target_hf, mask)
+            ),
+            "hf_local_correlation": float(
+                masked_local_correlation(
+                    prediction_hf.unsqueeze(0),
+                    target_hf.unsqueeze(0),
+                    mask.unsqueeze(0),
+                    patch_size=32,
+                )
+            ),
+            "hf_projection_gain": float(projection),
+            "hf_orthogonal_rms_ratio": float(orthogonal_rms),
+            "hf_orthogonal_energy_ratio": float(orthogonal_energy),
+        }
+    )
     if (
         observation is not None
         and mosaic_phase is not None
@@ -339,11 +402,19 @@ def main() -> int:
         action="append",
         required=True,
         type=parse_checkpoint,
-        help="repeatable LABEL=/absolute/checkpoint.pth",
+        help=(
+            "repeatable LABEL=/absolute/checkpoint.pth; suffix LABEL with "
+            "@raw or @ema to choose the state explicitly"
+        ),
     )
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--device", choices=("auto", "mps", "cpu"), default="auto")
     parser.add_argument("--fps", type=int, default=6)
+    parser.add_argument(
+        "--skip-videos",
+        action="store_true",
+        help="write metrics/CSV without rendering comparison panels",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--trust-checkpoint", action="store_true")
     args = parser.parse_args()
@@ -411,8 +482,13 @@ def main() -> int:
         "sample_count": len(samples),
         "checkpoints": {},
     }
-    for label, checkpoint in checkpoints.items():
-        generator, prefix = load_generator(config, checkpoint, device)
+    for label, (checkpoint, state_preference) in checkpoints.items():
+        generator, prefix = load_generator(
+            config,
+            checkpoint,
+            device,
+            state_preference=state_preference,
+        )
         per_sample = []
         rendered = []
         for sample in samples:
@@ -445,10 +521,17 @@ def main() -> int:
                 "roi_laplacian_error",
                 "roi_temporal_error",
                 "roi_mosaic_consistency_error",
+                "hf_amplitude_ratio",
+                "hf_correlation",
+                "hf_local_correlation",
+                "hf_projection_gain",
+                "hf_orthogonal_rms_ratio",
+                "hf_orthogonal_energy_ratio",
             )
         }
         report["checkpoints"][label] = {
             "path": str(checkpoint),
+            "state_preference": state_preference,
             "state_prefix": prefix,
             "aggregate": aggregate,
             "samples": per_sample,
@@ -478,9 +561,36 @@ def main() -> int:
                     candidate["roi_mosaic_consistency_error"]
                     - baseline["roi_mosaic_consistency_error"]
                 ),
+                "hf_amplitude_ratio": (
+                    candidate["hf_amplitude_ratio"]
+                    - baseline["hf_amplitude_ratio"]
+                ),
+                "hf_correlation": (
+                    candidate["hf_correlation"] - baseline["hf_correlation"]
+                ),
+                "hf_local_correlation": (
+                    candidate["hf_local_correlation"]
+                    - baseline["hf_local_correlation"]
+                ),
+                "hf_projection_gain": (
+                    candidate["hf_projection_gain"]
+                    - baseline["hf_projection_gain"]
+                ),
+                "hf_orthogonal_rms_ratio": (
+                    candidate["hf_orthogonal_rms_ratio"]
+                    - baseline["hf_orthogonal_rms_ratio"]
+                ),
+                "hf_orthogonal_energy_ratio": (
+                    candidate["hf_orthogonal_energy_ratio"]
+                    - baseline["hf_orthogonal_energy_ratio"]
+                ),
             }
 
-    videos = render_panels(samples, predictions, output_dir, fps=args.fps)
+    videos = (
+        {}
+        if args.skip_videos
+        else render_panels(samples, predictions, output_dir, fps=args.fps)
+    )
     report["videos"] = videos
     metrics_path = output_dir / "metrics.json"
     metrics_path.write_text(
@@ -501,6 +611,12 @@ def main() -> int:
                 "roi_laplacian_error",
                 "roi_temporal_error",
                 "roi_mosaic_consistency_error",
+                "hf_amplitude_ratio",
+                "hf_correlation",
+                "hf_local_correlation",
+                "hf_projection_gain",
+                "hf_orthogonal_rms_ratio",
+                "hf_orthogonal_energy_ratio",
             )
         )
         for label, checkpoint_report in report["checkpoints"].items():
@@ -515,14 +631,21 @@ def main() -> int:
                         sample["roi_laplacian_error"],
                         sample["roi_temporal_error"],
                         sample["roi_mosaic_consistency_error"],
+                        sample["hf_amplitude_ratio"],
+                        sample["hf_correlation"],
+                        sample["hf_local_correlation"],
+                        sample["hf_projection_gain"],
+                        sample["hf_orthogonal_rms_ratio"],
+                        sample["hf_orthogonal_energy_ratio"],
                     )
                 )
 
     print(json.dumps(report, indent=2, ensure_ascii=False))
     print(f"metrics: {metrics_path}")
     print(f"per-sample CSV: {csv_path}")
-    print(f"full comparison: {videos['full']}")
-    print(f"ROI comparison: {videos['roi']}")
+    if videos:
+        print(f"full comparison: {videos['full']}")
+        print(f"ROI comparison: {videos['roi']}")
     return 0
 
 

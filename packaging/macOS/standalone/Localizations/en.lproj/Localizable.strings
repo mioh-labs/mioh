@@ -76,6 +76,8 @@
 "検出モデル" = "Detection Model";
 "無検出時の判定間隔" = "No-Detection Probe Interval";
 "空検出先読み" = "Empty Detection Lookahead";
+"検出後のマスク再利用" = "Reuse Detection Mask";
+"検出後スキップ" = "Post-Detection Skip";
 "顔モザイクを検出" = "Detect Face Mosaics";
 
 "エンコーダー" = "Encoder";
@@ -169,19 +171,37 @@
 "この動画をAVFoundation互換形式に変換できません" = "This video could not be converted to an AVFoundation-compatible format";
 "AVFoundation互換MP4へremux中" = "Remuxing to an AVFoundation-compatible MP4";
 "非対応コーデックをVideoToolboxで互換変換中" = "Converting an unsupported codec with VideoToolbox";
+"独立ウインドウで表示" = "Show in Separate Window";
+"独立ウインドウを前面に" = "Bring Separate Window Forward";
+"再生タブに戻す" = "Return to Playback Tab";
+"動画は独立ウインドウに表示中です" = "The video is displayed in a separate window";
+"最大30fps" = "Max 30 fps";
+"再生を最大29.97/30fpsにする" = "Limit Playback to 29.97/30 fps";
+"59.94fpsは29.97fps、60fpsは30fpsへ復元前に間引きます" = "Before restoration, reduce 59.94 fps to 29.97 fps and 60 fps to 30 fps";
+"59.94fpsは29.97fps、60fpsは30fpsへ復元前に間引きます。30fps以下は変更しません" = "Before restoration, reduce 59.94 fps to 29.97 fps and 60 fps to 30 fps. Sources at 30 fps or below are unchanged";
 
 "mioh ユーザーマニュアル.pdf" = "mioh User Manual.pdf";
 
 "ローカルネットワーク操作" = "Local Network Control";
 "Webリモコンを有効にする" = "Enable Web Remote";
+"同じLANからmiohを操作する" = "Control mioh from the same LAN";
 "ポート" = "Port";
 "状態" = "Status";
 "同じLANから接続できるアドレスを確認中です。" = "Checking addresses available on the same LAN.";
+"接続" = "Connect";
+"Webリモコンを開く" = "Open Web Remote";
+"接続情報をコピー" = "Copy Connection Info";
 "接続URL" = "Connection URL";
 "アクセスコード" = "Access Code";
+"初回アクセスコード" = "First-Time Access Code";
 "コピー" = "Copy";
 "開く" = "Open";
 "再生成" = "Regenerate";
+"詳細設定" = "Advanced Settings";
+"アクセスコードを再生成" = "Regenerate Access Code";
+"mioh Remoteでは表示されたMacをタップし、このコードを初回だけ入力します。次回からは自動接続します。" = "In mioh Remote, tap the Mac shown and enter this code once. Future connections are automatic.";
+"信頼できる家庭・社内LAN専用です。インターネットには公開しないでください。" = "Use only on a trusted home or office LAN. Do not expose it to the internet.";
+"一度有効にすると、このMacでは次回起動時から自動で待ち受けます。" = "After enabling it once, this Mac will listen automatically on future launches.";
 "接続先のブラウザで12文字のアクセスコードを入力してください。大文字小文字・ハイフンの有無は問いません。信頼できる家庭・社内LAN専用です。" = "Enter the 12-character access code in the connecting browser. Letter case and hyphens are optional. Use only on a trusted home or office LAN.";
 "無効" = "Off";
 "待受中" = "Listening";

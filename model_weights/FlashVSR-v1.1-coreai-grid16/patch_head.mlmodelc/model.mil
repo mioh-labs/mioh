@@ -1,0 +1,92 @@
+program(1.3)
+[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3600.16.1"}, {"coremlc-version", "3600.25.1"}})]
+{
+    func head_first<ios18>(tensor<fp16, [1, 1536, 1536]> x) {
+            tensor<int32, [1]> layer_norm_axes_0 = const()[name = string("layer_norm_axes_0"), val = tensor<int32, [1]>([-1])];
+            fp16 const_1_to_fp16 = const()[name = string("const_1_to_fp16"), val = fp16(0x1.1p-20)];
+            tensor<fp16, [1, 1536, 1536]> layer_norm_cast_fp16 = layer_norm(axes = layer_norm_axes_0, epsilon = const_1_to_fp16, x = x)[name = string("layer_norm_cast_fp16")];
+            tensor<fp16, [1, 1, 1536]> add_to_fp16 = const()[name = string("add_to_fp16"), val = tensor<fp16, [1, 1, 1536]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(199872)))];
+            tensor<fp16, [1, 1536, 1536]> mul_cast_fp16 = mul(x = layer_norm_cast_fp16, y = add_to_fp16)[name = string("mul_cast_fp16")];
+            tensor<fp16, [1, 1, 1536]> b_shift_to_fp16 = const()[name = string("b_shift_to_fp16"), val = tensor<fp16, [1, 1, 1536]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(203008)))];
+            tensor<fp16, [1, 1536, 1536]> add_1_cast_fp16 = add(x = mul_cast_fp16, y = b_shift_to_fp16)[name = string("add_1_cast_fp16")];
+            tensor<fp16, [64, 1536]> p_linear_weight_to_fp16 = const()[name = string("p_linear_weight_to_fp16"), val = tensor<fp16, [64, 1536]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(206144)))];
+            tensor<fp16, [64]> p_linear_bias_to_fp16 = const()[name = string("p_linear_bias_to_fp16"), val = tensor<fp16, [64]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(402816)))];
+            tensor<fp16, [1, 1536, 64]> linear_0_cast_fp16 = linear(bias = p_linear_bias_to_fp16, weight = p_linear_weight_to_fp16, x = add_1_cast_fp16)[name = string("linear_0_cast_fp16")];
+            tensor<int32, [5]> const_4 = const()[name = string("const_4"), val = tensor<int32, [5]>([1, 6, 16, 16, 64])];
+            tensor<fp16, [1, 6, 16, 16, 64]> view_cast_fp16 = reshape(shape = const_4, x = linear_0_cast_fp16)[name = string("view_cast_fp16")];
+            tensor<int32, [5]> const_5 = const()[name = string("const_5"), val = tensor<int32, [5]>([0, 1, 4, 2, 3])];
+            tensor<int32, [4]> const_6 = const()[name = string("const_6"), val = tensor<int32, [4]>([6, 64, 16, 16])];
+            tensor<fp16, [1, 6, 64, 16, 16]> permute_cast_fp16 = transpose(perm = const_5, x = view_cast_fp16)[name = string("transpose_1")];
+            tensor<fp16, [6, 64, 16, 16]> view_1_cast_fp16 = reshape(shape = const_6, x = permute_cast_fp16)[name = string("view_1_cast_fp16")];
+            string conv_transpose2d_pad_type_0 = const()[name = string("conv_transpose2d_pad_type_0"), val = string("valid")];
+            tensor<int32, [2]> conv_transpose2d_strides_0 = const()[name = string("conv_transpose2d_strides_0"), val = tensor<int32, [2]>([2, 2])];
+            tensor<int32, [4]> conv_transpose2d_pad_0 = const()[name = string("conv_transpose2d_pad_0"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+            tensor<int32, [2]> conv_transpose2d_dilations_0 = const()[name = string("conv_transpose2d_dilations_0"), val = tensor<int32, [2]>([1, 1])];
+            int32 conv_transpose2d_groups_0 = const()[name = string("conv_transpose2d_groups_0"), val = int32(1)];
+            tensor<int32, [4]> conv_transpose2d_has_output_shape_output_shape_0 = const()[name = string("conv_transpose2d_has_output_shape_output_shape_0"), val = tensor<int32, [4]>([6, 16, 32, 32])];
+            tensor<fp16, [64, 16, 2, 2]> b_pixel_shuffle_weight_to_fp16 = const()[name = string("b_pixel_shuffle_weight_to_fp16"), val = tensor<fp16, [64, 16, 2, 2]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(403008)))];
+            tensor<fp16, [6, 16, 32, 32]> conv_transpose2d_has_output_shape_cast_fp16 = conv_transpose(dilations = conv_transpose2d_dilations_0, groups = conv_transpose2d_groups_0, output_shape = conv_transpose2d_has_output_shape_output_shape_0, pad = conv_transpose2d_pad_0, pad_type = conv_transpose2d_pad_type_0, strides = conv_transpose2d_strides_0, weight = b_pixel_shuffle_weight_to_fp16, x = view_1_cast_fp16)[name = string("conv_transpose2d_has_output_shape_cast_fp16")];
+            tensor<int32, [5]> const_8 = const()[name = string("const_8"), val = tensor<int32, [5]>([1, 6, 16, 32, 32])];
+            tensor<fp16, [1, 6, 16, 32, 32]> view_2_cast_fp16 = reshape(shape = const_8, x = conv_transpose2d_has_output_shape_cast_fp16)[name = string("view_2_cast_fp16")];
+            tensor<int32, [5]> const_9 = const()[name = string("const_9"), val = tensor<int32, [5]>([0, 2, 1, 3, 4])];
+            tensor<fp16, [1, 16, 6, 32, 32]> latent = transpose(perm = const_9, x = view_2_cast_fp16)[name = string("transpose_0")];
+        } -> (latent);
+    func head_next<ios18>(tensor<fp16, [1, 512, 1536]> x) {
+            tensor<int32, [1]> layer_norm_axes_0 = const()[name = string("layer_norm_axes_0"), val = tensor<int32, [1]>([-1])];
+            fp16 const_1_to_fp16 = const()[name = string("const_1_to_fp16"), val = fp16(0x1.1p-20)];
+            tensor<fp16, [1, 512, 1536]> layer_norm_cast_fp16 = layer_norm(axes = layer_norm_axes_0, epsilon = const_1_to_fp16, x = x)[name = string("layer_norm_cast_fp16")];
+            tensor<fp16, [1, 1, 1536]> add_to_fp16 = const()[name = string("add_to_fp16"), val = tensor<fp16, [1, 1, 1536]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(199872)))];
+            tensor<fp16, [1, 512, 1536]> mul_cast_fp16 = mul(x = layer_norm_cast_fp16, y = add_to_fp16)[name = string("mul_cast_fp16")];
+            tensor<fp16, [1, 1, 1536]> b_shift_to_fp16 = const()[name = string("b_shift_to_fp16"), val = tensor<fp16, [1, 1, 1536]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(203008)))];
+            tensor<fp16, [1, 512, 1536]> add_1_cast_fp16 = add(x = mul_cast_fp16, y = b_shift_to_fp16)[name = string("add_1_cast_fp16")];
+            tensor<fp16, [64, 1536]> p_linear_weight_to_fp16 = const()[name = string("p_linear_weight_to_fp16"), val = tensor<fp16, [64, 1536]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(206144)))];
+            tensor<fp16, [64]> p_linear_bias_to_fp16 = const()[name = string("p_linear_bias_to_fp16"), val = tensor<fp16, [64]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(402816)))];
+            tensor<fp16, [1, 512, 64]> linear_0_cast_fp16 = linear(bias = p_linear_bias_to_fp16, weight = p_linear_weight_to_fp16, x = add_1_cast_fp16)[name = string("linear_0_cast_fp16")];
+            tensor<int32, [5]> const_4 = const()[name = string("const_4"), val = tensor<int32, [5]>([1, 2, 16, 16, 64])];
+            tensor<fp16, [1, 2, 16, 16, 64]> view_cast_fp16 = reshape(shape = const_4, x = linear_0_cast_fp16)[name = string("view_cast_fp16")];
+            tensor<int32, [5]> const_5 = const()[name = string("const_5"), val = tensor<int32, [5]>([0, 1, 4, 2, 3])];
+            tensor<int32, [4]> const_6 = const()[name = string("const_6"), val = tensor<int32, [4]>([2, 64, 16, 16])];
+            tensor<fp16, [1, 2, 64, 16, 16]> permute_cast_fp16 = transpose(perm = const_5, x = view_cast_fp16)[name = string("transpose_1")];
+            tensor<fp16, [2, 64, 16, 16]> view_1_cast_fp16 = reshape(shape = const_6, x = permute_cast_fp16)[name = string("view_1_cast_fp16")];
+            string conv_transpose2d_pad_type_0 = const()[name = string("conv_transpose2d_pad_type_0"), val = string("valid")];
+            tensor<int32, [2]> conv_transpose2d_strides_0 = const()[name = string("conv_transpose2d_strides_0"), val = tensor<int32, [2]>([2, 2])];
+            tensor<int32, [4]> conv_transpose2d_pad_0 = const()[name = string("conv_transpose2d_pad_0"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+            tensor<int32, [2]> conv_transpose2d_dilations_0 = const()[name = string("conv_transpose2d_dilations_0"), val = tensor<int32, [2]>([1, 1])];
+            int32 conv_transpose2d_groups_0 = const()[name = string("conv_transpose2d_groups_0"), val = int32(1)];
+            tensor<int32, [4]> conv_transpose2d_has_output_shape_output_shape_0 = const()[name = string("conv_transpose2d_has_output_shape_output_shape_0"), val = tensor<int32, [4]>([2, 16, 32, 32])];
+            tensor<fp16, [64, 16, 2, 2]> b_pixel_shuffle_weight_to_fp16 = const()[name = string("b_pixel_shuffle_weight_to_fp16"), val = tensor<fp16, [64, 16, 2, 2]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(403008)))];
+            tensor<fp16, [2, 16, 32, 32]> conv_transpose2d_has_output_shape_cast_fp16 = conv_transpose(dilations = conv_transpose2d_dilations_0, groups = conv_transpose2d_groups_0, output_shape = conv_transpose2d_has_output_shape_output_shape_0, pad = conv_transpose2d_pad_0, pad_type = conv_transpose2d_pad_type_0, strides = conv_transpose2d_strides_0, weight = b_pixel_shuffle_weight_to_fp16, x = view_1_cast_fp16)[name = string("conv_transpose2d_has_output_shape_cast_fp16")];
+            tensor<int32, [5]> const_8 = const()[name = string("const_8"), val = tensor<int32, [5]>([1, 2, 16, 32, 32])];
+            tensor<fp16, [1, 2, 16, 32, 32]> view_2_cast_fp16 = reshape(shape = const_8, x = conv_transpose2d_has_output_shape_cast_fp16)[name = string("view_2_cast_fp16")];
+            tensor<int32, [5]> const_9 = const()[name = string("const_9"), val = tensor<int32, [5]>([0, 2, 1, 3, 4])];
+            tensor<fp16, [1, 16, 2, 32, 32]> latent = transpose(perm = const_9, x = view_2_cast_fp16)[name = string("transpose_0")];
+        } -> (latent);
+    func patch_first<ios18>(tensor<fp16, [1, 16, 6, 32, 32]> latent) {
+            string conv3d_pad_type_0 = const()[name = string("conv3d_pad_type_0"), val = string("valid")];
+            tensor<int32, [3]> conv3d_strides_0 = const()[name = string("conv3d_strides_0"), val = tensor<int32, [3]>([1, 2, 2])];
+            tensor<int32, [6]> conv3d_pad_0 = const()[name = string("conv3d_pad_0"), val = tensor<int32, [6]>([0, 0, 0, 0, 0, 0])];
+            tensor<int32, [3]> conv3d_dilations_0 = const()[name = string("conv3d_dilations_0"), val = tensor<int32, [3]>([1, 1, 1])];
+            int32 conv3d_groups_0 = const()[name = string("conv3d_groups_0"), val = int32(1)];
+            tensor<fp16, [1536, 16, 1, 2, 2]> p_projection_weight_to_fp16 = const()[name = string("p_projection_weight_to_fp16"), val = tensor<fp16, [1536, 16, 1, 2, 2]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(64)))];
+            tensor<fp16, [1536]> p_projection_bias_to_fp16 = const()[name = string("p_projection_bias_to_fp16"), val = tensor<fp16, [1536]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(196736)))];
+            tensor<fp16, [1, 1536, 6, 16, 16]> conv3d_cast_fp16 = conv(bias = p_projection_bias_to_fp16, dilations = conv3d_dilations_0, groups = conv3d_groups_0, pad = conv3d_pad_0, pad_type = conv3d_pad_type_0, strides = conv3d_strides_0, weight = p_projection_weight_to_fp16, x = latent)[name = string("conv3d_cast_fp16")];
+            tensor<int32, [5]> const_1 = const()[name = string("const_1"), val = tensor<int32, [5]>([0, 2, 3, 4, 1])];
+            tensor<int32, [3]> const_2 = const()[name = string("const_2"), val = tensor<int32, [3]>([1, 1536, 1536])];
+            tensor<fp16, [1, 6, 16, 16, 1536]> permute_cast_fp16 = transpose(perm = const_1, x = conv3d_cast_fp16)[name = string("transpose_0")];
+            tensor<fp16, [1, 1536, 1536]> x = reshape(shape = const_2, x = permute_cast_fp16)[name = string("view_cast_fp16")];
+        } -> (x);
+    func patch_next<ios18>(tensor<fp16, [1, 16, 2, 32, 32]> latent) {
+            string conv3d_pad_type_0 = const()[name = string("conv3d_pad_type_0"), val = string("valid")];
+            tensor<int32, [3]> conv3d_strides_0 = const()[name = string("conv3d_strides_0"), val = tensor<int32, [3]>([1, 2, 2])];
+            tensor<int32, [6]> conv3d_pad_0 = const()[name = string("conv3d_pad_0"), val = tensor<int32, [6]>([0, 0, 0, 0, 0, 0])];
+            tensor<int32, [3]> conv3d_dilations_0 = const()[name = string("conv3d_dilations_0"), val = tensor<int32, [3]>([1, 1, 1])];
+            int32 conv3d_groups_0 = const()[name = string("conv3d_groups_0"), val = int32(1)];
+            tensor<fp16, [1536, 16, 1, 2, 2]> p_projection_weight_to_fp16 = const()[name = string("p_projection_weight_to_fp16"), val = tensor<fp16, [1536, 16, 1, 2, 2]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(64)))];
+            tensor<fp16, [1536]> p_projection_bias_to_fp16 = const()[name = string("p_projection_bias_to_fp16"), val = tensor<fp16, [1536]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(196736)))];
+            tensor<fp16, [1, 1536, 2, 16, 16]> conv3d_cast_fp16 = conv(bias = p_projection_bias_to_fp16, dilations = conv3d_dilations_0, groups = conv3d_groups_0, pad = conv3d_pad_0, pad_type = conv3d_pad_type_0, strides = conv3d_strides_0, weight = p_projection_weight_to_fp16, x = latent)[name = string("conv3d_cast_fp16")];
+            tensor<int32, [5]> const_1 = const()[name = string("const_1"), val = tensor<int32, [5]>([0, 2, 3, 4, 1])];
+            tensor<int32, [3]> const_2 = const()[name = string("const_2"), val = tensor<int32, [3]>([1, 512, 1536])];
+            tensor<fp16, [1, 2, 16, 16, 1536]> permute_cast_fp16 = transpose(perm = const_1, x = conv3d_cast_fp16)[name = string("transpose_0")];
+            tensor<fp16, [1, 512, 1536]> x = reshape(shape = const_2, x = permute_cast_fp16)[name = string("view_cast_fp16")];
+        } -> (x);
+}

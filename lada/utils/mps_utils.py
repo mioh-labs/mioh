@@ -260,6 +260,20 @@ def safe_mps_grid_sample(input, grid, mode='bilinear', padding_mode='zeros',
     device = input.device
     
     if device.type == 'mps':
+        # PyTorch 2.12 has an MPS forward kernel but no
+        # aten::grid_sampler_2d_backward MPS dispatch.  Load Lada's one-kernel
+        # implementation only for autograd workloads; inference stays on the
+        # built-in forward path without extension startup overhead.
+        needs_backward = (
+            getattr(input, "requires_grad", False) is True
+            or getattr(grid, "requires_grad", False) is True
+        )
+        if torch.is_grad_enabled() and needs_backward:
+            from lada.utils.mps_grid_sample_backward import (
+                enable_native_mps_grid_sample_backward,
+            )
+
+            enable_native_mps_grid_sample_backward(raise_on_error=True)
         try:
             output = F.grid_sample(
                 input, grid,

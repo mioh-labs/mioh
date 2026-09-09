@@ -19,10 +19,15 @@ ADCSR_PIPELINE = UPSCALER / "AdcSRNativePipeline.swift"
 ADCSR_RUNNER = UPSCALER / "AdcSRNativeVideoRunner.swift"
 H3_VIEW = UPSCALER / "MiniMaxH3VideoGenerationView.swift"
 H3_FACE_REFERENCES = UPSCALER / "MiniMaxH3FaceReferences.swift"
+H3_CORE = UPSCALER / "MiniMaxH3NativeCore.swift"
 H3_RUNNER = UPSCALER / "MiniMaxH3NativeRunner.swift"
 H3_MEDIA = UPSCALER / "MiniMaxH3NativeMedia.swift"
+H3_QWEN_COMPOSITE = UPSCALER / "MiniMaxH3NativeQwenComposite.swift"
 H3_MODELS = UPSCALER / "MiniMaxH3NativeModels.swift"
 H3_DENOISER = UPSCALER / "TenErosMaxH3DenoiserComposite.swift"
+MCP_SERVER = UPSCALER / "MiohUpscalerMCPServer.swift"
+H3_DIT_EXPORT = ROOT / "scripts" / "apple" / "export_10eros_max_h3_dit_block.py"
+H3_DIT_DRIVER = ROOT / "scripts" / "apple" / "export_10eros_max_h3_dit_coreai.py"
 VENDORED_FLASHVSR_RUNNER = (
     UPSCALER / "vendor" / "flashvsr" / "deployment" / "coreai"
     / "FlashVSRNativeVideoRunner.swift"
@@ -101,6 +106,8 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
             "MiniMaxH3NativeCore.swift",
             "MiniMaxH3NativeRunner.swift",
             '"$RESOURCES/bin/mioh-minimax-h3-native"',
+            "MiohUpscalerMCPServer.swift",
+            '"$RESOURCES/bin/mioh-upscaler-mcp"',
             "-framework AVKit",
             "-framework Vision",
             "FlashVSRNativePipeline.swift",
@@ -114,6 +121,11 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
             'iconutil -c icns "$ICONSET" -o "$RESOURCES/AppIcon.icns"',
             "codesign --force --deep",
             "diskutil image create from",
+            'FFMPEG_VERSION="8.1.2"',
+            'FFMPEG_SHA256="c57c509ffc3c5456fb9a37101ec25468f4bfe20d2f68394b9f307066422642d0"',
+            "TAS-FFMPEG/releases/download",
+            "ditto \"$FFMPEG_PACKAGE/lib\" \"$RESOURCES/lib\"",
+            "ditto \"$FFMPEG_PACKAGE/licenses\"",
         ):
             self.assertIn(contract, source)
         for bundled_model_contract in (
@@ -126,6 +138,31 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
             "Bundled AdcSR",
         ):
             self.assertNotIn(bundled_model_contract, source)
+
+        runner = H3_RUNNER.read_text()
+        self.assertNotIn('"-frames:v", String(count), "-vsync", "0"', runner)
+        for contract in (
+            '"Reading source duration and the selected audio range"',
+            '"Decoded \\(analysisAudio.shape[2]) analysis samples',
+            '"Interval %d/%d · %.3f–%.3fs',
+        ):
+            self.assertIn(contract, runner)
+
+        h3_view = H3_VIEW.read_text()
+        self.assertIn('@Published private(set) var musicAnalysisSummary', h3_view)
+        self.assertIn('LabeledContent("音源解析")', h3_view)
+        self.assertIn('[musicAnalysis] queued:', h3_view)
+
+        mcp = MCP_SERVER.read_text()
+        for contract in (
+            'case "mioh_start_video_generation"',
+            'case "mioh_start_upscale"',
+            'case "mioh_get_job_status"',
+            'case "mioh_stop_job"',
+            '"--prompt", runtimePrompt',
+            '"prompt_passthrough": "exact"',
+        ):
+            self.assertIn(contract, mcp)
 
         controller = CONTROLLER.read_text()
         self.assertIn(
@@ -250,21 +287,117 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
             "UTType.png.identifier",
             "maximumReferences = 8",
             'case .faceOnly: "顔のみ"',
+            "isStructuredH3Prompt(originalPrompt)",
+            "augmentStructuredH3Prompt(",
+            "facial identity comes from",
         ):
             self.assertIn(contract, face_references)
         self.assertIn('options["input-images-json"]', runner)
-        self.assertIn("qwen-presentation-v7-continuous-edge-extend", runner)
+        self.assertIn("qwen-presentation-v8-variable-duration", runner)
         self.assertIn("width: H3Geometry.qwenVisionWidth", runner)
         self.assertIn("height: H3Geometry.qwenVisionHeight", runner)
         self.assertIn("case .fl2va:", runner)
-        self.assertIn("referenceVideo: nil", runner)
+        self.assertIn("composite.prepareKeyframes(", runner)
         self.assertIn("prepareTextToVideo", H3_DENOISER.read_text())
         self.assertIn("prepareImages", H3_DENOISER.read_text())
+        self.assertIn("prepareKeyframes", H3_DENOISER.read_text())
+        self.assertIn("packedKeyframePositions", H3_DENOISER.read_text())
+        self.assertNotIn(
+            "continuationVideoLatent: H3Tensor?", H3_DENOISER.read_text()
+        )
+        self.assertIn("time: shape[2]", H3_DENOISER.read_text())
+        denoiser = H3_DENOISER.read_text()
+        self.assertIn("cursor += 1", denoiser)
+        self.assertNotIn("cursor += videoSpan(shape[2])", denoiser)
         self.assertIn("decodeReferenceImages", media)
         self.assertIn("decodeReferenceImage", media)
         self.assertIn("decodeIdentityReferenceImages", media)
+        self.assertIn("decodeReferenceImageSequence", media)
         self.assertIn("referenceImageLatents", runner)
-        self.assertIn("firstVideoLatentFrame", runner)
+        self.assertIn("denoiserImageReferenceCount", runner)
+        self.assertIn("denoiserIdentityReferenceCount", runner)
+        self.assertIn("usesDirectCutIdentity", runner)
+        self.assertIn("denoiserImageReferenceCountOverride", runner)
+        self.assertIn(
+            "planned.denoiserIdentityReferenceCount", runner
+        )
+        self.assertIn("referenceImageLatents != nil", runner)
+        self.assertIn("distillsVisionContext: true", runner)
+        self.assertIn("distillsVisionContext: Bool = false", H3_DENOISER.read_text())
+        self.assertIn(
+            "Using semantic identity context without temporal image references",
+            runner,
+        )
+        self.assertIn(
+            "music-video-flat-v15-continuum-extend-hybrid-cut-qwen-storyboard-face-ref2va-layout-v3",
+            runner,
+        )
+        self.assertIn(
+            "cutImages.count - (storyboardFrame == nil ? 0 : 1)",
+            runner,
+        )
+        self.assertIn(
+            "ref2va-image-rope-v2-single-integer-slot",
+            runner,
+        )
+        self.assertIn(
+            "ref2va-semantic-identity-without-vision-rows-v1",
+            runner,
+        )
+        mcp = MCP_SERVER.read_text()
+        self.assertIn('reference_scope must be whole_image or face_only', mcp)
+        self.assertIn('prepareAutomationReferences', mcp)
+        self.assertIn('"face_only"', mcp)
+        faces = H3_FACE_REFERENCES.read_text()
+        self.assertIn("VNGeneratePersonSegmentationRequest", faces)
+        self.assertIn("backgroundSoftenedIdentityImage", faces)
+        self.assertIn('"CIBlendWithMask"', faces)
+        self.assertIn("paddedSquareCrop", faces)
+        self.assertIn("sqrt(width * height * 0.5)", faces)
+        self.assertIn("kCIInputSaturationKey: 0.04", faces)
+        self.assertIn('"CIMorphologyMaximum"', faces)
+        self.assertIn('"CIMorphologyMinimum"', faces)
+        self.assertIn("featherRadius * 2", faces)
+        self.assertIn('"CIDissolveTransition"', faces)
+        self.assertIn('"inputTime": 0.7', faces)
+        self.assertIn("width - proposed.width", faces)
+        self.assertIn(".clampedToExtent()", faces)
+        self.assertIn("H3MusicVideoBoundary.cutPreRollFrames", runner)
+        self.assertIn("H3MusicVideoBoundary.blendFrames", runner)
+        self.assertIn("payloads = [first, entryFrames - first]", runner)
+        self.assertIn("intervalPromptEntryIndices?[interval.index]", runner)
+        self.assertIn("xfade=transition=fade", runner)
+        self.assertIn('"-c:v", "hevc_videotoolbox"', runner)
+        self.assertIn("sourceImageDigests[index]", runner)
+        self.assertIn("H3QwenVisionFeatureMemoryCache()", runner)
+        self.assertIn(
+            "reusableVisionBlockCount: cutImageURLs.count", runner
+        )
+        self.assertIn("musicVideoStoryboardDirectory", runner)
+        self.assertIn('String(format: "entry-%04d", entryIndex)', runner)
+        self.assertIn("? cutImages.count", runner)
+        self.assertIn('"storyboard_directory"', mcp)
+        self.assertIn("continuationState", runner)
+        self.assertIn("prepareHybridContinuation", H3_DENOISER.read_text())
+        self.assertIn("packedHybridContinuationPositions", H3_DENOISER.read_text())
+        self.assertNotIn("extractContinuationFrames(", runner)
+        self.assertIn(
+            "music-video-flat-v15-continuum-extend-hybrid",
+            runner,
+        )
+        self.assertIn("conditioningModeOverride: conditioningMode", runner)
+        self.assertIn("inputImages: [previousFrameURL]", runner)
+        self.assertIn("inputImages: [previousFrameURL, lastFrameURL]", runner)
+        self.assertIn("inputImages: [previousFrameURL, draftLastURL]", runner)
+        self.assertIn("case .firstAndProvidedLast:", runner)
+        self.assertIn("case .firstAndGeneratedLast:", runner)
+        self.assertIn("continuationFrameOutputPath:", runner)
+        self.assertIn("H3NativeMedia.writeReferenceImage(", runner)
+        self.assertIn("H3FlatTimelinePrompt.parse(", runner)
+        self.assertIn("flatPromptPlan.compiledPrompt(", runner)
+        self.assertIn('format: "interval-%04d.mp4"', runner)
+        self.assertNotIn('format: "shot-%04d-part-%02d.mp4"', runner)
+        self.assertNotIn("continuationAnchor", runner)
         self.assertNotIn("H3NativeMedia.silentAudio", runner)
         self.assertEqual(
             runner.count("sampled.audio = sampled.audio.map { $0 / scale }"),
@@ -273,14 +406,112 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
         self.assertNotIn("let unscaled = values.map { $0 / audioScale }", runner)
         self.assertIn('resolutionProfileID = "864x480"', view)
         self.assertIn('Text("24fps固定")', view)
+        self.assertIn("in: 2...controller.maximumShotDuration", view)
+        self.assertIn("durationSeconds: job.durationSeconds", runner)
+        self.assertIn("maximumVisionBlocks:", runner)
         self.assertIn("1024, height: 576", view)
+        self.assertIn("1344, height: 768", view)
+        self.assertIn("width: 1920", view)
+        self.assertIn("height: 1088", view)
+        self.assertIn("outputHeight: 1080", view)
+        self.assertIn("fixedDuration: 6", view)
+        self.assertIn('"--output-width", String(outputWidth)', view)
+        self.assertIn('"--output-height", String(outputHeight)', view)
+        self.assertIn("768, height: 1344", view)
         self.assertIn("768, height: 768", view)
-        self.assertIn("latentPatchCells <= 576", runner)
+        self.assertIn("isOfficial1080pProfile", runner)
+        self.assertIn("isOfficial1080pProfile ? 2_040 : 1_008", runner)
+        self.assertIn("official 1920x1080 / 6-second profile", runner)
+        self.assertIn("outputWidth: job.resolvedOutputWidth", runner)
+        self.assertIn("outputHeight: job.resolvedOutputHeight", runner)
+        self.assertIn("let cropY = (sourceHeight - outputHeight) / 2", media)
+        for audio_contract in (
+            'LabeledContent("リップシンク音源")',
+            '"--audio-input", audioInputURL.path',
+            '"--music-video-cuts-json"',
+            'musicVideoMode ? "music-video" : "run"',
+            'Toggle("長尺Music Videoとして音源の最後まで連続生成"',
+            'GroupBox("構図変更ポイント")',
+            'MiniMaxH3MusicCutTimeline(',
+            "元音源を音声latentとして生成中も固定",
+        ):
+            self.assertIn(audio_contract, view)
+        for audio_contract in (
+            'command == "music-video"',
+            "H3AudioConditioning.samplerState(",
+            "targetAudioLatent: targetAudioLatent",
+            'appendingPathExtension("mioh-h3-work")',
+            '"-c:v", "copy", "-c:a", "aac"',
+            "musicVideoIntervalDirective(",
+            "H3MusicVideoAnalyzer.timeline(",
+            "cutPoints: manualCutPoints",
+            "H3MusicVideoAnalyzer.generationIntervals(",
+            "Show exactly one visible instance",
+            "Never superimpose, overlap, ghost, double-expose",
+            '"music-video-flat-v15-continuum-extend-hybrid"',
+            "H3MusicVideoSeed.value(",
+            "CONTINUE FORWARD.",
+            "HARD CUT.",
+            "Generate only what physically follows",
+            "composite.prepareKeyframes(",
+            "exact preceding physical state",
+            'appendingPathExtension("signature")',
+            'appendingPathExtension("latent-prefix.plist")',
+            "continuationLatentPath: continuationLatentURL?.path",
+            "temporalLatentOutputPath: temporalLatentOutputURL?.path",
+            "continuationStateOverride: continuationLatent",
+        ):
+            self.assertIn(audio_contract, runner)
+        for continuation_contract in (
+            'case hybridAV = "hybrid-av"',
+            'case latentPrefix = "latent-prefix"',
+            'case firstFrame = "first"',
+            'case firstAndProvidedLast = "first-last-provided"',
+            'case firstAndGeneratedLast = "first-last-generated"',
+        ):
+            self.assertIn(continuation_contract, H3_CORE.read_text())
+        for continuation_contract in (
+            'Text("Hybrid AV（推奨）")',
+            'Text("latent-prefix（従来方式）")',
+            'Text("Firstのみ（高速）")',
+            'Text("First＋Codex指定Last（1パス）")',
+            'Text("First＋mioh生成Last（全自動）")',
+            '"--music-video-continuation", musicVideoContinuationMode.rawValue',
+            '"--music-video-last-frame-directory", musicVideoLastFrameDirectory',
+        ):
+            self.assertIn(continuation_contract, view)
+        mcp = MCP_SERVER.read_text()
+        for continuation_contract in (
+            '"hybrid-av"',
+            '"latent-prefix"',
+            '"first-last-provided"',
+            '"first-last-generated"',
+            '"music_video_continuation_modes"',
+            '"--music-video-continuation", continuationMode',
+            '"--music-video-last-frame-directory"',
+        ):
+            self.assertIn(continuation_contract, mcp)
+        self.assertNotIn("not additional identity subjects", runner)
+        self.assertNotIn("final four frames", runner)
+        self.assertIn("static func fitAudioLatent(", media)
         self.assertIn("variable-resolution manifest", runner)
         self.assertNotIn("10秒へ等間隔配置", view)
         self.assertNotIn("H3_NATIVE_ASSETS", build)
         self.assertNotIn("H3_BUNDLE_ASSETS", build)
         self.assertNotIn('models/10eros-max-h3/manifest.json', view)
+        self.assertIn(
+            '"$UPSCALER_DIR/MiniMaxH3MusicAnalysis.swift"', build
+        )
+
+        qwen = H3_QWEN_COMPOSITE.read_text()
+        for contract in (
+            "logicalBatch <= manifest.visionBlockBatch",
+            "Qwen vision patch embedding (\\(missing.count)/\\(layout.blockCount) blocks)",
+            "Reused all Qwen image-reference features",
+            "selectingBatchBlocks(activePatches, indices: missing)",
+        ):
+            self.assertIn(contract, qwen)
+        self.assertNotIn("paddedVisionPatches", qwen)
 
     def test_minimax_h3_preserves_reference_aspect_ratio(self):
         media = H3_MEDIA.read_text()
@@ -290,8 +521,8 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
         self.assertIn("foreground.clampedToExtent().cropped", media)
         self.assertIn("foreground.composited(over: background)", media)
         self.assertIn('"native-image-reference-v4-continuous-edge-extend"', runner)
-        self.assertIn('"media-v7-continuous-edge-extend:', runner)
-        self.assertIn('"qwen-presentation-v7-continuous-edge-extend"', runner)
+        self.assertIn('"media-v12-av-continuation:', runner)
+        self.assertIn('"qwen-presentation-v8-variable-duration"', runner)
         self.assertIn("Data(Self.referenceMediaPreprocessingVersion.utf8)", runner)
         self.assertNotIn(
             "scaleX: CGFloat(width) / extent.width,\n"
@@ -380,6 +611,68 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
             self.assertIn(contract, models)
         self.assertNotIn("cachePolicy: .persistent", models)
         self.assertNotIn("outputs.names.contains(entry.outputName)", models)
+        runner = H3_RUNNER.read_text()
+        runner_main = runner.split("static func main() async {", 1)[1].split(
+            "private static func execute", 1
+        )[0]
+        self.assertIn("MPSGRAPH_DISABLE_ANEC_MODULE_VALIDATION", runner_main)
+        self.assertIn('== "prepare-part"', runner_main)
+        self.assertLess(runner_main.index("setenv("), runner_main.index("do {"))
+        self.assertLess(runner_main.index("unsetenv("), runner_main.index("do {"))
+        self.assertEqual(
+            runner.count(
+                'setenv("MPSGRAPH_DISABLE_ANEC_MODULE_VALIDATION", "1", 1)'
+            ),
+            1,
+        )
+        self.assertEqual(
+            runner.count('unsetenv("MPSGRAPH_DISABLE_ANEC_MODULE_VALIDATION")'),
+            1,
+        )
+        self.assertIn(
+            'environment["MPSGRAPH_DISABLE_ANEC_MODULE_VALIDATION"] = "1"',
+            runner,
+        )
+        run_interval = runner.split("func runInterval(", 1)[1].split(
+            "func continuationLatentURL", 1
+        )[0]
+        self.assertIn("let conditioningPipeline = try await H3NativePipeline(", run_interval)
+        self.assertIn("conditioningModeOverride: conditioningMode", run_interval)
+        self.assertIn("continuationStateOverride: continuationLatent", run_interval)
+        self.assertIn("conditioningOnly: true", run_interval)
+        self.assertLess(
+            run_interval.index("try await conditioningPipeline.run()"),
+            run_interval.index("let prepareWorker = H3DenoisePrepareWorker("),
+        )
+        self.assertIn('"prepare-part", "--manifest"', runner)
+        self.assertIn("H3DenoisePrepareWorker(", runner)
+        self.assertIn("H3PrepareWorkerDiagnosticFilter", runner)
+        self.assertIn('"incompatible element type for ane"', runner)
+        self.assertIn('"#aicode."', runner)
+        self.assertEqual(runner.count('"-nostdin"'), 2)
+        self.assertIn('"mpsgraph_disable_anec_module_validation"', runner)
+        self.assertIn("process.standardOutput = diagnosticPipe", runner)
+        self.assertIn("process.standardError = diagnosticPipe", runner)
+        self.assertIn("conditioningOnly: true", runner)
+        self.assertIn("H3PipelineControl.conditioningPrepared", runner)
+        self.assertIn("pipeline.run(decodeOutput: false)", runner)
+        self.assertIn("guard decodeOutput else", runner)
+        self.assertNotIn("configureMPSGraph", runner)
+        exporter = H3_DIT_EXPORT.read_text()
+        driver = H3_DIT_DRIVER.read_text()
+        for contract in (
+            '"--graph-identity"',
+            "hidden_states = hidden_states + graph_identity_salt.sum()",
+            "entrypoint_name=entrypoint_name",
+            'f"w{checkpoint_sha256(args.checkpoint)[:16]}_"',
+        ):
+            self.assertIn(contract, exporter)
+        for contract in (
+            "checkpointSHA256",
+            'f"main_{graph_identity}"',
+            '"graphSalt": graph_salt_name',
+        ):
+            self.assertIn(contract, driver)
         self.assertIn("maximumResidentAuxiliaryModels = 1", denoiser)
         self.assertIn("private func predictOnce(", denoiser)
         self.assertIn("private static func runAuxiliaryStage(", denoiser)

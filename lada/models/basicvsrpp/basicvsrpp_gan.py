@@ -159,6 +159,7 @@ class BasicVSRPlusPlusSharpGan(BasicVSRPlusPlusGan):
         roi_pixel_loss=None,
         perceptual_loss=None,
         high_frequency_loss=None,
+        high_frequency_projection_loss=None,
         temporal_loss=None,
         mosaic_forward_consistency_loss=None,
         roi_dilation=4,
@@ -174,6 +175,11 @@ class BasicVSRPlusPlusSharpGan(BasicVSRPlusPlusGan):
         )
         self.high_frequency_loss = (
             MODELS.build(high_frequency_loss) if high_frequency_loss else None
+        )
+        self.high_frequency_projection_loss = (
+            MODELS.build(high_frequency_projection_loss)
+            if high_frequency_projection_loss
+            else None
         )
         self.roi_pixel_loss = (
             MODELS.build(roi_pixel_loss) if roi_pixel_loss else None
@@ -258,6 +264,12 @@ class BasicVSRPlusPlusSharpGan(BasicVSRPlusPlusGan):
         if self.high_frequency_loss:
             losses['loss_high_frequency_roi'] = self.high_frequency_loss(
                 fake_output, gt_pixel, mask
+            )
+        if self.high_frequency_projection_loss:
+            losses['loss_high_frequency_projection_roi'] = (
+                self.high_frequency_projection_loss(
+                    fake_output, gt_pixel, mask
+                )
             )
         if self.temporal_loss:
             losses['loss_temporal_roi'] = self.temporal_loss(

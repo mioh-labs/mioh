@@ -1,5 +1,9 @@
 import unittest
 import plistlib
+import shutil
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 
@@ -7,6 +11,17 @@ ROOT = Path(__file__).resolve().parents[1]
 APP_SOURCE = ROOT / "packaging" / "macOS" / "standalone" / "MiohApp.swift"
 PLAYER_SOURCE = ROOT / "packaging" / "macOS" / "standalone" / "RealtimePlayer.swift"
 BUILD_SCRIPT = ROOT / "packaging" / "macOS" / "standalone" / "build_app.sh"
+BATCH_SOURCE = (
+    ROOT / "packaging" / "macOS" / "standalone" / "MacNativeExportBatch.swift"
+)
+INPUT_PANEL_CACHE_SOURCE = (
+    ROOT
+    / "packaging"
+    / "macOS"
+    / "standalone"
+    / "InputPanelThumbnailCache.swift"
+)
+BATCH_HARNESS = ROOT / "tests" / "swift" / "MacNativeExportBatchHarness.swift"
 UNIVERSAL_BUILD_SCRIPT = (
     ROOT / "packaging" / "macOS" / "standalone" / "build_universal_app.sh"
 )
@@ -40,6 +55,7 @@ EXPECTED_COREAI_SOURCES = (
 class StandaloneAppOptionTests(unittest.TestCase):
     def test_native_swift_pipeline_supports_complete_file_export(self):
         app = APP_SOURCE.read_text()
+        batch = BATCH_SOURCE.read_text()
         pipeline = NATIVE_PIPELINE_SOURCE.read_text()
         encoder = PREVIEW_ENCODER_SOURCE.read_text()
 
@@ -47,7 +63,6 @@ class StandaloneAppOptionTests(unittest.TestCase):
             'let mode = "export"',
             "makeNativeExportTask(",
             "resolvedOutputFile(",
-            'appendingPathComponent("\\(stem)-UC")',
             "mioh-swift-export-",
             "restorationFrameCount:",
             '"lada-coreai-runner"',
@@ -61,12 +76,15 @@ class StandaloneAppOptionTests(unittest.TestCase):
             'nativeEnvironment["TMPDIR"]',
         ]:
             self.assertIn(contract, app)
+        self.assertIn('appendingPathComponent("\\(stem)-UC")', batch)
         for contract in [
             "var isExport: Bool",
             "struct DetectedBatch",
             "temporalOverlap",
             "prepareInput(",
             "finishExport(",
+            'arguments(audio: ["-c:a", "copy"])',
+            'audio: ["-c:a", "aac", "-b:a", "192k"]',
             '"export_progress"',
             '"duration_seconds"',
             '"eta_seconds"',
@@ -93,9 +111,106 @@ class StandaloneAppOptionTests(unittest.TestCase):
             app,
         )
         self.assertIn(
-            ".disabled(!runner.useFPS || (runner.usesPythonEngine && runner.noSplit))",
+            ".disabled(!runner.useFPS)",
             app,
         )
+
+    def test_native_directory_batch_keeps_single_file_and_skips_completed_outputs(self):
+        app = APP_SOURCE.read_text()
+        batch = BATCH_SOURCE.read_text()
+        build = BUILD_SCRIPT.read_text()
+        input_panel_cache = INPUT_PANEL_CACHE_SOURCE.read_text()
+        for contract in [
+            "MacNativeExportBatchPlanner.plan(",
+            "launchNativeExportPlan(",
+            "launchNextNativeExportBatchItem()",
+            "finishNativeExportBatchItem(",
+            "private func chooseInput()",
+            'panel.title = "入力ファイルまたはフォルダを選択"',
+            "panel.canChooseFiles = true",
+            "panel.canChooseDirectories = true",
+            "panel.allowedContentTypes = []",
+            "thumbnailCache.pause()",
+            "thumbnailCache.prepare(initialURL: url)",
+            'actionLabel: "入力を選択…"',
+            "runner.inputURL = url.standardizedFileURL",
+            'sourceBatchSummary = "バッチ入力: 直下の対応動画 \\(count)本"',
+            "nativeExportBatchPending.removeFirst()",
+            "未処理の動画はありません。",
+            "スキップ（出力済み）",
+        ]:
+            self.assertIn(contract, app)
+        for contract in [
+            "final class InputPanelThumbnailCache",
+            "static let shared = InputPanelThumbnailCache()",
+            "func pause()",
+            "QuickLookThumbnailing",
+            ".lowQualityThumbnail, .thumbnail",
+            "Task.detached(priority: .utility)",
+            "includingPropertiesForKeys: nil",
+        ]:
+            self.assertIn(contract, input_panel_cache)
+        self.assertNotIn("panelSelectionDidChange", input_panel_cache)
+        self.assertNotIn("panel.delegate = thumbnailCache", app)
+        self.assertIn("-framework QuickLookThumbnailing", build)
+        self.assertIn('"$PACKAGE_DIR/InputPanelThumbnailCache.swift"', build)
+        for contract in [
+            "inputValues.isRegularFile == true",
+            "inputValues.isDirectory == true",
+            ".skipsHiddenFiles",
+            "values.isSymbolicLink != true",
+            "videoExtensions.contains(candidate.pathExtension.lowercased())",
+            "fileManager.fileExists(atPath: output.path)",
+            "resolvedOutputFile(input: input, selectedOutput: selectedOutput)",
+        ]:
+            self.assertIn(contract, batch)
+        self.assertIn("MacNativeExportBatch.swift", build)
+
+    def test_native_directory_batch_planner_runtime(self):
+        if sys.platform != "darwin":
+            self.skipTest("Swift batch planner requires macOS")
+        swiftc = shutil.which("swiftc")
+        if not swiftc:
+            self.skipTest("Swift compiler is required")
+        with tempfile.TemporaryDirectory(
+            prefix="mioh-native-export-batch-"
+        ) as directory:
+            root = Path(directory)
+            executable = root / "batch-planner"
+            compiled = subprocess.run(
+                [
+                    swiftc,
+                    "-module-cache-path",
+                    str(root / "module-cache"),
+                    "-parse-as-library",
+                    str(BATCH_SOURCE),
+                    str(BATCH_HARNESS),
+                    "-o",
+                    str(executable),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(
+                compiled.returncode,
+                0,
+                f"Batch planner did not compile:\n"
+                f"{compiled.stdout}{compiled.stderr}",
+            )
+            completed = subprocess.run(
+                [str(executable)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"Batch planner failed:\n"
+                f"{completed.stdout}{completed.stderr}",
+            )
+        self.assertIn("Mac native export batch harness passed", completed.stdout)
 
     def test_coreai_runner_is_descriptor_driven(self):
         source = COREAI_RUNNER_SOURCE.read_text()
@@ -148,6 +263,76 @@ class StandaloneAppOptionTests(unittest.TestCase):
             self.assertIn(contract, player)
         self.assertIn('RealtimePlayerView(controller: player, runner: runner)', app)
         self.assertIn('.tabItem { Label("再生", systemImage: "play.rectangle") }', app)
+
+    def test_realtime_video_can_move_to_one_synchronized_independent_window(self):
+        player = PLAYER_SOURCE.read_text()
+
+        for contract in [
+            "private struct RealtimeVideoSurface: View",
+            "final class RealtimeDetachedVideoWindowController",
+            "NSWindowDelegate",
+            "@Published private(set) var isPresented = false",
+            "NSHostingView(rootView: detachedVideo)",
+            "styleMask: [.titled, .closable, .miniaturizable, .resizable]",
+            "window.collectionBehavior.insert(.fullScreenPrimary)",
+            "func windowWillClose(_ notification: Notification)",
+            "@StateObject private var detachedVideoWindow",
+            'Label("独立ウインドウで表示", systemImage: "macwindow.on.rectangle")',
+            'Text("動画は独立ウインドウに表示中です")',
+            "detachedVideoWindow.bringToFront()",
+            "detachedVideoWindow.dismiss()",
+        ]:
+            self.assertIn(contract, player)
+
+        surface = player.split(
+            "private struct RealtimeVideoSurface: View", 1
+        )[1].split(
+            "@MainActor\nprivate final class RealtimeDetachedVideoWindowController", 1
+        )[0]
+        self.assertIn("VideoPlayer(player: controller.sourcePlayer)", surface)
+        self.assertIn("VideoPlayer(player: controller.restoredPlayer)", surface)
+        self.assertIn("VRPreviewSceneView(", surface)
+        self.assertIn("view.controlsStyle = .none", player)
+        self.assertIn("showsSystemControls: false", player)
+
+        detached = player.split(
+            "private struct RealtimeDetachedVideoView: View", 1
+        )[1].split(
+            "@MainActor\nprivate final class RealtimeDetachedVideoWindowController", 1
+        )[0]
+        for control in [
+            "@State private var controlsVisible = true",
+            "@State private var hideControlsTask: Task<Void, Never>?",
+            "controller.seek(to: target)",
+            "controller.togglePlayback()",
+            "controller.setMuted(!controller.muted)",
+            "Binding(get: { controller.volume }, set: controller.setVolume)",
+            'Toggle(\n              "処理前"',
+            ".onContinuousHover { phase in",
+            "Task.sleep(nanoseconds: 2_500_000_000)",
+        ]:
+            self.assertIn(control, detached)
+
+        embedded = player.split("struct RealtimePlayerView: View", 1)[1]
+        self.assertIn("if detachedVideoWindow.isPresented", embedded)
+        self.assertIn(
+            "RealtimeVideoSurface(controller: controller, runner: runner)", embedded
+        )
+
+        for localization in ["en.lproj", "zh-Hant.lproj"]:
+            strings = (
+                ROOT
+                / "packaging/macOS/standalone/Localizations"
+                / localization
+                / "Localizable.strings"
+            ).read_text()
+            for label in [
+                "独立ウインドウで表示",
+                "独立ウインドウを前面に",
+                "再生タブに戻す",
+                "動画は独立ウインドウに表示中です",
+            ]:
+                self.assertIn(f'"{label}" = ', strings)
 
     def test_player_starts_each_generation_once_and_resumes_without_seeking(self):
         player = PLAYER_SOURCE.read_text()
@@ -331,7 +516,8 @@ class StandaloneAppOptionTests(unittest.TestCase):
 
         self.assertIn("func nativePreviewInvocation(", app)
         for contract in [
-            "let previewModel = previewRestorationModel",
+            "let selectedPreviewModel = previewRestorationModel",
+            "let previewModel = selectedPreviewModel",
             "let selectedPreviewDetectionModel = previewDetectionModel",
             "restorationModels: restoration.url.path",
             "detectionModel: detection.url.path",
@@ -354,6 +540,53 @@ class StandaloneAppOptionTests(unittest.TestCase):
             source,
         )
 
+    def test_realtime_preview_can_cap_high_frame_rate_before_restoration(self):
+        app = APP_SOURCE.read_text()
+        player = PLAYER_SOURCE.read_text()
+        pipeline = NATIVE_PIPELINE_SOURCE.read_text()
+
+        for contract in [
+            "var previewLimitHighFrameRate: Bool?",
+            "@Published var previewLimitHighFrameRate = false",
+            "previewLimitHighFrameRate: previewLimitHighFrameRate",
+            "previewLimitHighFrameRate = snapshot.previewLimitHighFrameRate ?? false",
+            "maximumFPS: previewLimitHighFrameRate ? 30 : nil",
+            "preFPSConversion: true",
+        ]:
+            self.assertIn(contract, app)
+
+        for contract in [
+            "let maximumFPS: Int?",
+            "let maximumTargetRate: (numerator: Int, denominator: Int)?",
+            "config.maximumFPS.flatMap { maximum in",
+            "sourceFPS > maximumValue + 0.01 ? rate : nil",
+            "maximumTargetRate ?? config.targetFPS.map",
+        ]:
+            self.assertIn(contract, pipeline)
+
+        for contract in [
+            "func setPreviewHighFrameRateLimit(",
+            '"limitHighFrameRate=\\(runner.previewLimitHighFrameRate)"',
+            '"最大30fps"',
+            "controller.setPreviewHighFrameRateLimit($0, runner: runner)",
+            ".disabled(controller.isVRVideo)",
+        ]:
+            self.assertIn(contract, player)
+
+        # The switch is present in both the playback tab and detached window.
+        self.assertEqual(
+            player.count("controller.setPreviewHighFrameRateLimit($0, runner: runner)"),
+            2,
+        )
+        self.assertNotIn(
+            'Text("59.94fpsは29.97fps、60fpsは30fpsへ復元前に間引きます。30fps以下は変更しません")',
+            player,
+        )
+        self.assertNotIn(
+            'Text("復元は維持し、再生中は合成エフェクトとROIエンハンサーをバイパスします")',
+            player,
+        )
+
     def test_app_has_user_default_settings_panel(self):
         source = APP_SOURCE.read_text()
 
@@ -374,11 +607,12 @@ class StandaloneAppOptionTests(unittest.TestCase):
             'Label("現在の設定をデフォルトに保存", systemImage: "square.and.arrow.down")',
             'Label("保存済みデフォルトを読み込み", systemImage: "arrow.clockwise")',
             'Label("初期値に戻す", systemImage: "trash")',
-            "入力/出力、一時フォルダ、分割、復元、検出、出力、メモリ、再生バッファ、HLS通信方式まで保存します",
+            "入力/出力、一時フォルダ、分割、復元、検出、出力、メモリ、再生バッファ、HLS通信方式・画質まで保存します",
         ]:
             self.assertIn(contract, source)
 
         self.assertIn("var previewBufferLimit: Double", source)
+        self.assertIn("var previewHLSQuality: String?", source)
         self.assertIn("var previewProjectionMode: String?", source)
         self.assertIn("var previewVideoLayout: String?", source)
         self.assertIn("var previewEye: String?", source)
@@ -417,7 +651,8 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "uv.maxX - uv.width * u",
             "struct VRPreviewSceneView: NSViewRepresentable",
             "final class Coordinator: NSObject",
-            "AVPlayerItemVideoOutput(pixelBufferAttributes: attributes)",
+            "pixelBufferAttributes: CVPixelBufferAttributes(",
+            "videoOutput.pixelBufferAndDisplayTime(forItemTime: itemTime)",
             "CVMetalTextureCacheCreateTextureFromImage",
             "CVMetalTextureGetTexture(videoTexture)",
             "videoNode.geometry?.firstMaterial?.diffuse.contents = metalTexture",
@@ -551,11 +786,15 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn("var previewRestorationModel: String?", source)
         self.assertIn("@Published var previewRealtimeOptimization = true", source)
         self.assertIn(
-            'supportsCoreAI ? "basicvsrpp-v1.2-coreai-variable" : "basicvsrpp-v1.2"',
+            '"basicvsrpp-v1.2-coreai-variable"',
             source,
         )
         self.assertIn(
-            "let previewModel = previewRestorationModel",
+            "let selectedPreviewModel = previewRestorationModel",
+            source,
+        )
+        self.assertIn(
+            "let previewModel = selectedPreviewModel",
             source,
         )
         self.assertIn(
@@ -568,11 +807,12 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn('previewDetectionModel != "カスタム"', source)
         self.assertIn("@Published var previewRestorationModel: String", source)
         self.assertIn("@Published var previewDetectionModel: String", source)
+        self.assertIn('Picker("復元モデル"', player)
         self.assertIn(
-            'if runner.usesPythonEngine {\n            HStack(spacing: 12) {\n'
-            '              Picker("復元モデル"',
+            "ForEach(runner.previewRestorationModels, id: \\.self)",
             player,
         )
+        self.assertNotIn("usesPythonEngine", player)
         self.assertIn('Picker("再生用検出モデル"', player)
         self.assertIn(
             'Toggle("リアルタイム最適化", isOn: $runner.previewRealtimeOptimization)',
@@ -586,22 +826,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "      && !preservesRealtimeCompositeParameters",
             source,
         )
-        for contract in [
-            'add(&args, "--sharpen-strength", skipsCompositeParameters ? 0 : sharpenStrength)',
-            'add(&args, "--detail-boost", skipsCompositeParameters ? 0 : detailBoost)',
-            'add(&args, "--blend-feather", blendFeather)',
-            'add(&args, "--texture-mix", skipsCompositeParameters ? 0 : textureMix)',
-            'add(&args, "--smooth-strength", skipsCompositeParameters ? 0 : smoothStrength)',
-        ]:
-            self.assertIn(contract, source)
-        self.assertIn(
-            'add(&args, "--roi-enhancer", skipsCompositeParameters ? "none" : roiEnhancer)',
-            source,
-        )
-        self.assertIn(
-            'add(&args, "--effect-upscale", skipsCompositeParameters ? 1 : effectUpscale)',
-            source,
-        )
+        self.assertNotIn("previewArguments(", source)
         self.assertIn(
             "let effectiveUpscale = skipsCompositeParameters ? 1 : effectUpscale",
             source,
@@ -641,12 +866,14 @@ class StandaloneAppOptionTests(unittest.TestCase):
             player,
         )
         self.assertIn('if !controller.isVRVideo', player)
+        for contract in [
+            "let usesVariableTemporalModel = restoration.fixedFrameCount == nil",
+            "let temporalLimit = usesVariableTemporalModel",
+            "? 48",
+        ]:
+            self.assertIn(contract, source)
         self.assertIn(
-            "let temporalLimit = detection.computeUnits == nil ? 30 : 36",
-            source,
-        )
-        self.assertIn(
-            'supportsCoreAI ? "basicvsrpp-v1.2-coreai-t90" : "basicvsrpp-v1.2"',
+            '"basicvsrpp-v1.2-coreai-t90"',
             source,
         )
 
@@ -668,11 +895,11 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn("struct PlatformCapabilities", source)
         self.assertIn("operatingSystemVersion.majorVersion >= 27", source)
         self.assertIn(
-            'supportsCoreAI ? "basicvsrpp-v1.2-coreai-t90" : "basicvsrpp-v1.2"',
+            '"basicvsrpp-v1.2-coreai-t90"',
             source,
         )
         self.assertIn(
-            'supportsCoreAI ? coreAIRestorationModels + baseRestorationModels : baseRestorationModels',
+            "var restorationModels: [String] {\n    coreAIRestorationModels",
             source,
         )
         for name in (
@@ -694,7 +921,31 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertNotIn('"vr-v2-accurate"', base_models)
         self.assertIn("normalizeModelSelections()", source)
 
-    def test_rfdetr_is_dedicated_only_and_does_not_change_shared_memory_policy(self):
+    def test_start612_and_large_roi_runtime_are_excluded(self):
+        source = APP_SOURCE.read_text()
+        pipeline = NATIVE_PIPELINE_SOURCE.read_text()
+        excluded_model = "basicvsrpp-v1.2-start612-coreai-variable"
+        excluded_hq_model = "basicvsrpp-v1.2-coreai-variable-hq"
+
+        self.assertNotIn(excluded_model, source)
+        self.assertNotIn(excluded_hq_model, source)
+        self.assertNotIn("nativeLargeROITiles", source + pipeline)
+        self.assertNotIn("restoreNativeTiles", pipeline)
+        self.assertNotIn("NativeTile", pipeline)
+        self.assertNotIn("大ROI最適化", source)
+
+        english = (
+            ROOT
+            / "packaging/macOS/standalone/Localizations/en.lproj/Localizable.strings"
+        ).read_text()
+        traditional_chinese = (
+            ROOT
+            / "packaging/macOS/standalone/Localizations/zh-Hant.lproj/Localizable.strings"
+        ).read_text()
+        self.assertNotIn("START-612", english)
+        self.assertNotIn("START-612", traditional_chinese)
+
+    def test_rfdetr_coreai_stays_dedicated_while_coreml_is_portable(self):
         source = APP_SOURCE.read_text()
         build_script = BUILD_SCRIPT.read_text()
         restorer = (
@@ -705,7 +956,11 @@ class StandaloneAppOptionTests(unittest.TestCase):
         ).read_text()
 
         self.assertIn(
-            '#if !MIOH_PORTABLE_COREAI\n    models.append("jasna-v6-coreai")',
+            '#if !MIOH_PORTABLE_COREAI\n'
+            '    models.append("jasna-v6-coreml")\n'
+            '    models.append("jasna-v6-large-coreml")\n'
+            '    models.append("jasna-v6-coreai")\n'
+            '    models.append("jasna-v6-large-coreai")',
             source,
         )
         self.assertIn(
@@ -714,45 +969,42 @@ class StandaloneAppOptionTests(unittest.TestCase):
         )
         self.assertIn("rfdetr-v6-576-fp32.aimodel", build_script)
         self.assertIn("rfdetr-v6-large-768-fp32.aimodel", build_script)
+        self.assertIn("rfdetr-v6-576-fp32.mlpackage", build_script)
+        self.assertIn("rfdetr-v6-large-768-fp32.mlpackage", build_script)
+        self.assertIn(
+            'if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then\n'
+            '  COREML_DETECTION_ASSETS+=(',
+            build_script,
+        )
         self.assertIn("-iname '*rfdetr*' -delete", build_script)
-        # The bundled runtime inherits the build venv, so RF-DETR has to be
-        # stripped back out of it rather than merely never copied.
-        self.assertIn(
-            '"$RESOURCES/runtime/lib/python3.12/site-packages/rfdetr" \\',
-            build_script,
-        )
-        self.assertIn(
-            '"$RESOURCES/runtime/lib/python3.12/site-packages/lada/models/rfdetr"',
-            build_script,
-        )
+        self.assertNotIn("$RESOURCES/runtime", build_script)
         self.assertNotIn("calculate_frame_detection_queue_size", restorer)
         self.assertNotIn("pipeline_queue_depth", detector)
         self.assertIn("maxsize=8", detector)
 
-    def test_dedicated_rfdetr_uses_native_swift_detection_contract(self):
+    def test_rfdetr_uses_native_swift_coreai_and_coreml_contract(self):
         app = APP_SOURCE.read_text()
         pipeline = NATIVE_PIPELINE_SOURCE.read_text()
 
-        # Dedicated export resolves each Jasna choice directly to the matching
-        # fixed-shape Core AI asset. Universal and realtime preview continue to
-        # exclude RF-DETR by policy.
+        # Both backends resolve to the same fixed-shape RF-DETR contract. The
+        # Core ML medium model is also available to Universal and preview.
         self.assertIn('if base == "jasna-v6" || base == "jasna-v6-large"', app)
         self.assertIn('"rfdetr-v6-576-fp32"', app)
         self.assertIn('"rfdetr-v6-large-768-fp32"', app)
         self.assertIn('large ? 768 : 576', app)
         self.assertIn('large ? 0.40 : 0.35', app)
-        self.assertIn(
-            'detectionModels.filter { !$0.hasPrefix("jasna-v6") }', app
-        )
+        self.assertIn('$0.hasSuffix("-coreml")', app)
+        self.assertIn('"cpuAndGPU"', app)
 
         # RF-DETR has different preprocessing and output semantics from YOLO:
         # direct square resize, ImageNet-normalized FP32 NCHW input, per-query
         # logits/masks, and direct mask projection without letterboxing.
         self.assertIn(
-            'private final class RFDETRCoreAIDetector: NativeDetecting',
+            'private final class RFDETRDetector: NativeDetecting',
             pipeline,
         )
         self.assertIn('config.detectionBackend == "rfdetr"', pipeline)
+        self.assertIn('MLFeatureValue(multiArray: input)', pipeline)
         self.assertIn('shape: [1, 3, resolution, resolution]', pipeline)
         self.assertIn('scalarType: .float32', pipeline)
         self.assertIn('expectedShape: [1, queries, 4]', pipeline)
@@ -769,33 +1021,19 @@ class StandaloneAppOptionTests(unittest.TestCase):
         source = APP_SOURCE.read_text()
 
         self.assertIn("guard capabilities.supportsCoreAI else", source)
-        # The Python engine environment only advertises the Core AI helpers on
-        # a machine that can actually load them, and strips them otherwise.
-        self.assertIn("if capabilities.supportsCoreAI {", source)
-        self.assertIn(
-            'result.removeValue(forKey: "LADA_COREAI_PYTHON")',
-            source,
-        )
-        self.assertIn(
-            'result.removeValue(forKey: "LADA_COREAI_SWIFT_RUNNER")',
-            source,
-        )
         self.assertIn('"bin/mioh-native-coreai-preview"', source)
-        self.assertIn("try rejectUnsupportedCoreAIModel(previewModel)", source)
+        self.assertIn(
+            "try rejectUnsupportedCoreAIModel(selectedPreviewModel)", source
+        )
+        self.assertNotIn("PYTHONHOME", source)
+        self.assertNotIn("runtime/bin/python", source)
 
     def test_app_exports_m5_pro_coreai_architecture(self):
         script = BUILD_SCRIPT.read_text()
 
         self.assertIn('COREAI_ARCHITECTURE="${COREAI_ARCHITECTURE:-h17s}"', script)
-        # The app only names the architecture inside the Python engine's
-        # environment, and the portable build strips it there.
         source = APP_SOURCE.read_text()
-        self.assertIn(
-            '#if MIOH_PORTABLE_COREAI\n      result.removeValue('
-            'forKey: "LADA_COREAI_ARCHITECTURE")\n#else\n'
-            '      result["LADA_COREAI_ARCHITECTURE"] = "h17s"',
-            source,
-        )
+        self.assertNotIn("LADA_COREAI_ARCHITECTURE", source)
         self.assertNotIn(
             'nativeEnvironment["LADA_COREAI_ARCHITECTURE"]', source
         )
@@ -806,24 +1044,28 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn(
             'COREAI_ARCHITECTURE="${COREAI_ARCHITECTURE:-h17s}"', script
         )
-        self.assertIn('--architecture "$COREAI_ARCHITECTURE"', script)
-        self.assertIn('! -name "*.$COREAI_ARCHITECTURE.aimodelc"', script)
-        self.assertNotIn('for model in "$COMPILED_MODELS"/*.aimodelc', script)
+        self.assertIn(
+            'DEDICATED_PREBUILT_MODELS="${DEDICATED_PREBUILT_MODELS:-'
+            '$ROOT/model_weights/mioh-dedicated-$COREAI_ARCHITECTURE}"',
+            script,
+        )
+        self.assertIn(
+            'basicvsrpp-v1.2-t90-fp16.$COREAI_ARCHITECTURE.aimodelc',
+            script,
+        )
         self.assertNotIn("basicvsrpp-v1.2-t36-b2-fp16.aimodel", script)
-        regular_assets = script.split("MODEL_ASSETS=(", 1)[1].split(")", 1)[0]
         for source in EXPECTED_COREAI_SOURCES:
             self.assertIn(source, script)
-            self.assertNotIn(source, regular_assets)
 
     def test_build_runs_all_coreai_smoke_tests_before_signing(self):
         script = BUILD_SCRIPT.read_text()
 
-        verifier = script.index('"$PACKAGE_DIR/verify_coreai_models.py"')
+        verifier = script.index('"$RESOURCES/bin/mioh-dedicated-model-verifier"')
         signing = script.index('codesign --force --deep --sign - "$APP"')
         self.assertLess(verifier, signing)
-        self.assertIn('LADA_COREAI_ARCHITECTURE="$COREAI_ARCHITECTURE"', script)
-        self.assertIn('LADA_MODEL_WEIGHTS_DIR="$RESOURCES/models"', script)
-        self.assertIn('LADA_COREAI_SWIFT_RUNNER="$RESOURCES/bin/lada-coreai-runner"', script)
+        self.assertIn('"$RESOURCES/models"', script)
+        self.assertIn('"$COREAI_ARCHITECTURE"', script)
+        self.assertIn('DedicatedModelVerifier.swift', script)
 
     def test_build_supports_dedicated_and_portable_coreai_distributions(self):
         script = BUILD_SCRIPT.read_text()
@@ -839,19 +1081,17 @@ class StandaloneAppOptionTests(unittest.TestCase):
         script = BUILD_SCRIPT.read_text()
 
         self.assertIn(
-            '$ROOT/model_weights/hf2500-plus-fc2-forward-consistency-w005-500-ema.pth',
+            '$ROOT/model_weights/mioh-dedicated-$COREAI_ARCHITECTURE',
             script,
         )
         self.assertIn(
             '$ROOT/model_weights/lada_mosaic_restoration_model_generic_v1.2.pth',
             script,
         )
-        self.assertIn(
-            'VARIABLE_COREAI_CHECKPOINT="${VARIABLE_COREAI_CHECKPOINT:-$default_variable_checkpoint}"',
+        self.assertIn('Missing portable variable restoration checkpoint:', script)
+        self.assertNotIn(
+            'basicvsrpp-v1.2-large-roi-native-tiles-27000-ema.pth',
             script,
-        )
-        self.assertIn(
-            'Missing variable restoration checkpoint:', script
         )
 
     def test_build_records_variable_restoration_checkpoint_provenance(self):
@@ -860,49 +1100,70 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn(
             'basicvsrpp-v1.2-variable-coreai.provenance.json', script
         )
-        self.assertIn('"checkpoint_sha256": digest.hexdigest()', script)
-        self.assertIn('"checkpoint_filename": checkpoint.name', script)
-        self.assertIn('"chunk_asset_count": 11', script)
         self.assertIn(
-            '"hq_asset_count": 15 if distribution == "dedicated" else 0',
+            'source_metadata="$DEDICATED_PREBUILT_MODELS/'
+            'basicvsrpp-v1.2-standard-variable-coreai.provenance.json"',
+            script,
+        )
+        self.assertIn(
+            '"$RESOURCES/models/basicvsrpp-v1.2-variable-coreai.provenance.json"',
             script,
         )
 
-    def test_only_the_portable_build_bundles_a_python_runtime(self):
+    def test_build_packages_pre_large_roi_standard_baseline_only_for_dedicated_coreai(self):
         script = BUILD_SCRIPT.read_text()
-
-        # The dedicated package is Core AI only; the portable/universal one
-        # still ships the interpreter that drives the Python fallback.
         self.assertIn(
-            'if [[ "$COREAI_DISTRIBUTION" == "portable" ]]; then\n'
-            '  MIOH_BUNDLE_PYTHON_RUNTIME="${MIOH_BUNDLE_PYTHON_RUNTIME:-1}"\n'
-            "else\n"
-            '  MIOH_BUNDLE_PYTHON_RUNTIME="${MIOH_BUNDLE_PYTHON_RUNTIME:-0}"',
+            "basicvsrpp-v1.2-standard-variable-coreai.$COREAI_ARCHITECTURE.aimodelc",
             script,
         )
-        for guarded in [
-            'ditto "$PYTHON_SOURCE" "$RESOURCES/runtime"',
-            'cp "$ROOT/process_video_parallel.py" \\',
-            'cp "$PACKAGE_DIR/mioh_preview_worker.py" \\',
-            'chmod +x "$RESOURCES/runtime/bin/python3.12"',
-        ]:
-            self.assertIn(guarded, script)
-        # Every runtime block must sit behind the bundling flag.
-        for block in script.split('if [[ "$MIOH_BUNDLE_PYTHON_RUNTIME" == 1 ]]; then')[
-            :1
-        ]:
-            self.assertNotIn('ditto "$PYTHON_SOURCE"', block)
+        self.assertIn(
+            "basicvsrpp-v1.2-standard-variable-coreai.provenance.json",
+            script,
+        )
+        self.assertIn(
+            'ditto "$source_standard_variable" '
+            '"$RESOURCES/models/$active_variable_asset"',
+            script,
+        )
+        self.assertNotIn("MIOH_DEDICATED_LARGE_ROI", script)
+        self.assertNotIn("start612", script.lower())
+        self.assertNotIn("variable-hq", script.lower())
+        self.assertNotIn("VariableBasicVSRPPRunner.swift", script)
 
-    def test_build_time_python_is_required_for_models_or_bundling(self):
+    def test_no_distribution_bundles_a_python_runtime(self):
+        script = BUILD_SCRIPT.read_text()
+
+        self.assertNotIn("MIOH_BUNDLE_PYTHON_RUNTIME", script)
+        self.assertNotIn("$RESOURCES/runtime", script)
+        self.assertNotIn("process_video_parallel.py", script)
+        self.assertNotIn("mioh_preview_worker.py", script)
+
+    def test_build_time_python_is_required_only_for_universal_models(self):
         script = BUILD_SCRIPT.read_text()
 
         self.assertIn(
-            'if [[ "$MIOH_BUNDLE_PYTHON_RUNTIME" == 1 '
-            '|| "$MIOH_MODELESS_DISTRIBUTION" != 1 ]]',
+            'if [[ "$COREAI_DISTRIBUTION" == "portable"',
             script,
         )
         self.assertIn("Missing build-time Python:", script)
-        self.assertIn("Missing interpreter to bundle:", script)
+        self.assertNotIn("Missing interpreter to bundle:", script)
+
+    def test_dedicated_build_uses_only_prebuilt_native_models_and_swift_verification(self):
+        script = BUILD_SCRIPT.read_text()
+
+        self.assertIn("DEDICATED_PREBUILT_MODELS", script)
+        self.assertIn("DEDICATED_COREAI_ASSETS=(", script)
+        self.assertIn("DedicatedModelVerifier.swift", script)
+        self.assertIn("mioh-dedicated-model-verifier", script)
+        self.assertIn("Dedicated app unexpectedly contains Python files:", script)
+        self.assertIn("Dedicated app unexpectedly contains Python checkpoints:", script)
+        dedicated_model_branch = script.split(
+            'if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then\n'
+            '  DEDICATED_COREAI_ASSETS=(',
+            1,
+        )[1].split("\nelse\n", 1)[0]
+        self.assertNotIn("python", dedicated_model_branch.lower())
+        self.assertNotIn(".pth", dedicated_model_branch)
 
     def test_mioh_keeps_only_one_mewzoom_coreml_asset(self):
         script = BUILD_SCRIPT.read_text()
@@ -916,7 +1177,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
 
         self.assertIn("LADA_STANDALONE_PYTHON_ENV", script)
         self.assertIn("$ROOT/.venv-coreai", script)
-        self.assertIn('if [[ "$MIOH_MODELESS_DISTRIBUTION" != 1 ]]', script)
+        self.assertIn('if [[ "$COREAI_DISTRIBUTION" == "portable"', script)
         self.assertNotIn('if [[ -d "$ROOT/.venv" ]]', script)
         self.assertNotIn('$ROOT/.venv/lib/python3.12/site-packages', script)
 
@@ -936,11 +1197,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
         script = BUILD_SCRIPT.read_text()
 
         self.assertIn("#if !MIOH_PORTABLE_COREAI", source)
-        self.assertIn(
-            '#if MIOH_PORTABLE_COREAI\n      result.removeValue('
-            'forKey: "LADA_COREAI_ARCHITECTURE")',
-            source,
-        )
+        self.assertNotIn("LADA_COREAI_ARCHITECTURE", source)
         self.assertIn("-D MIOH_PORTABLE_COREAI", script)
 
     def test_target_frame_rate_inherits_the_source_timebase(self):
@@ -996,6 +1253,22 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "?? video.fpsDenominator",
             pipeline,
         )
+        # Selecting the source's existing rational rate is a no-op. Sending
+        # jittered HLS timestamps through the down-conversion gate used to
+        # drop frames and compact the video ahead of its original audio.
+        self.assertIn("static func matches(", pipeline)
+        self.assertIn("let requestedTargetRate:", pipeline)
+        self.assertIn(
+            "SourceFrameRate.matches(requested, sourceRate) ? nil : requested",
+            pipeline,
+        )
+
+        # Full exports must not be reported as successful when muxing exposes
+        # a new video/audio duration skew.
+        self.assertIn("validateExportSynchronization(", pipeline)
+        self.assertIn("let addedDrift = abs(outputDifference - sourceDifference)", pipeline)
+        self.assertIn("guard addedDrift <= 0.5", pipeline)
+        self.assertIn("音声同期の検証に失敗しました", pipeline)
 
         # VideoToolbox must retain that exact rational in the encoded track.
         # Its default 19,200 time scale quantizes 29.97fps into periodic
@@ -1051,8 +1324,12 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn("SourceInfoRow(", source)
         # Shown right under the input path it describes.
         self.assertIn(
-            'PathRow(title: "入力", icon: "film", url: runner.inputURL, '
-            "action: runner.chooseInput)\n        if runner.inputURL != nil {",
+            'PathRow(\n          title: "入力",\n'
+            '          icon: "film",\n'
+            "          url: runner.inputURL,\n"
+            "          action: chooseInput,\n"
+            '          actionLabel: "入力を選択…"\n'
+            "        )\n        if runner.inputURL != nil {",
             source,
         )
         for field in ["解像度", "フレームレート", "長さ", "コーデック", "ビットレート", "音声"]:
@@ -1091,61 +1368,164 @@ class StandaloneAppOptionTests(unittest.TestCase):
                 f"FrameRateOption(numerator: {whole}, denominator: 1)", source
             )
 
-        # The Python CLI only takes an integer --fps.
-        self.assertIn(
-            "var pythonTargetFPS: Int { max(1, Int(targetFPSValue.rounded())) }",
-            source,
-        )
-        self.assertIn('add(&args, "--fps", pythonTargetFPS)', source)
+        self.assertNotIn("pythonTargetFPS", source)
+        self.assertNotIn('add(&args, "--fps"', source)
 
     def test_native_export_uses_internal_stage_concurrency(self):
         source = APP_SOURCE.read_text()
+        pipeline = NATIVE_PIPELINE_SOURCE.read_text()
 
         self.assertNotIn("guard parallelWorkers == 1", source)
         self.assertIn('parallelWorkers = 1', source)
+        self.assertIn("@Published var nativeParallelWorkers = 1", source)
+        self.assertIn(
+            'Picker("ネイティブ並列数", selection: '
+            "$runner.nativeParallelWorkers)",
+            source,
+        )
+        for lane in [1, 2, 3]:
+            self.assertIn(f'.tag({lane})', source)
+        self.assertIn(
+            "nativeParallelWorkers: min(max(nativeParallelWorkers, 1), 3)",
+            source,
+        )
+        self.assertIn("nativeParallelWorkers: 1,", source)
         self.assertIn('executor = "process"', source)
         self.assertIn('mergeEncoder = "copy"', source)
-        self.assertIn("Swiftネイティブ（自動段階並列）", source)
-        self.assertIn("デコード・検出・復元・エンコードを1プロセス内で並行実行します", source)
+        self.assertIn("Swiftネイティブ（段階並列）", source)
+        self.assertIn("let nativeParallelWorkers: Int?", pipeline)
+        self.assertIn(
+            "config.isExport && !config.isWorker", pipeline
+        )
+        self.assertIn(
+            "min(max(config.nativeParallelWorkers ?? 1, 1), 3)",
+            pipeline,
+        )
+        self.assertIn(
+            "processors.reserveCapacity(nativeParallelWorkers)", pipeline
+        )
+        self.assertNotIn("nativeTileParallelism", pipeline)
+        self.assertNotIn("NativeTileRestoration", pipeline)
+        self.assertNotIn("空間タイル", source)
+        self.assertIn(
+            "value: nativeParallelWorkers", pipeline
+        )
+        self.assertIn("func launchProcessing(", pipeline)
+        self.assertIn("func drainNextProcessing() async throws", pipeline)
+        self.assertIn("func flushProcessing() async throws", pipeline)
+        self.assertIn(
+            "let pending = pendingProcessing.removeFirst()",
+            pipeline,
+        )
+        self.assertIn(
+            "try await encodeProcessedBatch(pending, result: result)",
+            pipeline,
+        )
+        self.assertIn(
+            "if pendingProcessing.count == nativeParallelWorkers {\n"
+            "            try await drainNextProcessing()",
+            pipeline,
+        )
+        self.assertIn(
+            "while !pendingProcessing.isEmpty {\n"
+            "          try await drainNextProcessing()",
+            pipeline,
+        )
+        self.assertNotIn(
+            "if pendingProcessing.count == nativeParallelWorkers {\n"
+            "            try await flushProcessing()",
+            pipeline,
+        )
+        self.assertIn(
+            '"native_parallel_workers": nativeParallelWorkers', pipeline
+        )
 
-    def test_native_engine_normalizes_python_only_options(self):
+    def test_native_large_roi_tile_compositor_is_removed(self):
+        pipeline = NATIVE_PIPELINE_SOURCE.read_text()
+
+        for forbidden in [
+            "restoreNativeTiles",
+            "NativeTile",
+            "nativeTile",
+            "restorationTileStride",
+            "native_large_roi_tiles",
+        ]:
+            self.assertNotIn(forbidden, pipeline)
+
+    def test_native_detection_mask_reuse_applies_to_export_and_realtime(self):
+        source = APP_SOURCE.read_text()
+        pipeline = NATIVE_PIPELINE_SOURCE.read_text()
+
+        for contract in [
+            "@Published var detectionMaskReuseSkipFrames = 0",
+            "var detectionMaskReuseSkipFrames: Int?",
+            'LabeledContent("検出後のマスク再利用")',
+            "value: $runner.detectionMaskReuseSkipFrames",
+            "in: 0...8",
+            "detectionMaskReuseSkipFrames: min(",
+            "max(detectionMaskReuseSkipFrames, 0)",
+            "detectionMaskReuseSkipFrames: detectionMaskReuseSkipFrames",
+            "snapshot.detectionMaskReuseSkipFrames ?? 0",
+            "検出後スキップ: \\(configuration.detectionMaskReuseSkipFrames)フレーム",
+        ]:
+            self.assertIn(contract, source)
+        self.assertGreaterEqual(
+            source.count("detectionMaskReuseSkipFrames: min("),
+            3,
+        )
+
+        for contract in [
+            "let detectionMaskReuseSkipFrames: Int?",
+            "max(config.detectionMaskReuseSkipFrames ?? 0, 0)",
+            "if detectionMaskReuseSkipFrames > 0",
+            "let lastDetections = try await inferDetections(",
+            "if firstDetections.isEmpty && lastDetections.isEmpty",
+            "let sampleStride = detectionMaskReuseSkipFrames + 1",
+            "0: firstDetections",
+            "lastIndex: lastDetections",
+            "detections: reusedDetections",
+        ]:
+            self.assertIn(contract, pipeline)
+        reuse_branch = pipeline.split(
+            "if detectionMaskReuseSkipFrames > 0", 1
+        )[1].split("if !firstDetections.isEmpty", 1)[0]
+        self.assertLess(
+            reuse_branch.index("lastDetections = try await inferDetections"),
+            reuse_branch.index(
+                "if firstDetections.isEmpty && lastDetections.isEmpty"
+            ),
+        )
+        self.assertNotIn(
+            ".disabled(runner.detectionMaskReuseSkipFrames > 0)",
+            source,
+        )
+
+    def test_native_engine_is_the_only_runtime_engine(self):
         source = APP_SOURCE.read_text()
 
-        # The device/precision controls exist again, but only the bundled
-        # Python engine may show them; the native engine pins its contract.
-        self.assertIn("if runner.usesPythonEngine {\n          Picker(\"デバイス\"", source)
-        self.assertIn('Toggle("FP16", isOn: $runner.fp16)', source)
-        self.assertIn('Toggle("自動最適化", isOn: $runner.autoOptimize)', source)
         self.assertIn('device = "mps"', source)
         self.assertIn("fp16 = true", source)
         self.assertIn("autoOptimize = true", source)
         self.assertIn("Swiftネイティブ / Core AI", source)
-        self.assertIn(
-            "var usesPythonEngine: Bool { supportsPythonEngine "
-            '&& restorationEngine == "python" }',
-            source,
-        )
+        self.assertIn('restorationEngine = "native"', source)
+        self.assertNotIn("usesPythonEngine", source)
+        self.assertNotIn("supportsPythonEngine", source)
 
-    def test_python_engine_is_portable_only(self):
+    def test_export_and_preview_have_no_python_runtime_path(self):
         source = APP_SOURCE.read_text()
         player = PLAYER_SOURCE.read_text()
 
-        self.assertIn("var bundlesPythonRuntime: Bool {\n#if MIOH_PORTABLE_COREAI", source)
-        self.assertIn(
-            "var supportsPythonEngine: Bool { capabilities.bundlesPythonRuntime }",
-            source,
-        )
-        # Both the export and the preview honour the same switch.
-        self.assertIn("if usesPythonEngine {\n        let pythonTask =", source)
-        self.assertIn("if runner.usesPythonEngine {", player)
-        self.assertIn(
-            '"runtime/lib/python3.12/site-packages/mioh_preview_worker.py"',
-            player,
-        )
-        self.assertIn(
-            '"runtime/lib/python3.12/site-packages/process_video_parallel.py"',
-            source,
-        )
+        for forbidden in [
+            "bundlesPythonRuntime",
+            "supportsPythonEngine",
+            "usesPythonEngine",
+            "runtime/bin/python",
+            "mioh_preview_worker.py",
+            "process_video_parallel.py",
+        ]:
+            self.assertNotIn(forbidden, source + player)
+        self.assertIn("runner.nativePreviewInvocation(", player)
+        self.assertIn("launchNativeExportPlan(", source)
 
     def test_product_is_named_mioh(self):
         self.assertTrue(APP_SOURCE.is_file(), "MiohApp.swift must be the app entry source")
@@ -1176,7 +1556,8 @@ class StandaloneAppOptionTests(unittest.TestCase):
         source = APP_SOURCE.read_text()
         expected_properties = {
             "inputURL", "outputURL", "tempDirectory", "ffmpegTempDirectory",
-            "ladaTempDirectory", "parallelWorkers", "executor",
+            "ladaTempDirectory", "parallelWorkers", "nativeParallelWorkers",
+            "executor",
             "segmentDuration", "segmentCount", "mergeEncoder",
             "deleteSegments", "keepTemp", "forceSplit", "noSplit", "device",
             "fp16", "encodingPreset", "encoder", "encoderOptions",
@@ -1187,7 +1568,8 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "detailBoost", "blendFeather", "textureMix", "smoothStrength",
             "effectUpscale", "roiEnhancer", "roiEnhancerModel",
             "roiEnhancerScale", "roiEnhancerStrength", "roiEnhancerTile",
-            "detectionModel", "detectionEmptyLookahead", "detectFaceMosaics",
+            "detectionModel", "detectionEmptyLookahead",
+            "detectionMaskReuseSkipFrames", "detectFaceMosaics",
             "memoryCleanupInterval", "cleanupTriggerGB", "mpsMemoryFraction",
             "logMPSMemory", "overwrite",
         }
@@ -1213,6 +1595,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "let temporalOverlap: Int",
             "let crossfade: Bool",
             "let previewOverlap = min(",
+            "usesVariableTemporalModel ? 6 : restoreTemporalOverlap",
             "temporalOverlap: previewOverlap",
         ]:
             self.assertIn(contract, source)
@@ -1295,7 +1678,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
     def test_restoration_effects_use_slider_number_rows(self):
         source = APP_SOURCE.read_text()
         expected_slider_rows = [
-            'doubleSliderField("シャープ", value: $runner.sharpenStrength, range: 0...2, step: 0.05)',
+            'doubleSliderField("シャープ", value: $runner.sharpenStrength, range: 0...5, step: 0.05)',
             'doubleSliderField("ディテール", value: $runner.detailBoost, range: 0...1, step: 0.05)',
             'doubleSliderField("境界フェザー", value: $runner.blendFeather, range: 0...3, step: 0.05)',
             'doubleSliderField("テクスチャ", value: $runner.textureMix, range: 0...1, step: 0.01)',
@@ -1363,6 +1746,11 @@ class StandaloneAppOptionTests(unittest.TestCase):
             pipeline,
         )
         self.assertIn("config.temporalBatchFrames * 3 + overlap * 2 + 16", pipeline)
+        self.assertNotIn(
+            "nativeParallelWorkers == 1\n      ? max(64, "
+            "config.temporalBatchFrames * 3",
+            pipeline,
+        )
         self.assertIn("private let miohMaximumClipFrames = 180", app)
         self.assertIn("in: 1...miohMaximumClipFrames", app)
         self.assertIn("private let maximumTemporalBatchFrames = 180", pipeline)
@@ -1383,6 +1771,22 @@ class StandaloneAppOptionTests(unittest.TestCase):
         )
         self.assertIn("try autoreleasepool {", pipeline)
         self.assertNotIn("vImagePremultipliedConstAlphaBlend_ARGB8888(", pipeline)
+
+    def test_native_roi_preparation_reuses_sampling_and_composite_plans(self):
+        pipeline = NATIVE_PIPELINE_SOURCE.read_text()
+
+        for contract in [
+            "private struct NativeSamplingAxis",
+            "private struct NativeCompositePlan",
+            "private var maskSamplingCache:",
+            "Self.makeModelInputAxes(",
+            "Self.writeModelInput(",
+            "Self.makeCompositeAxes(geometry: geometry)",
+            "plan: compositePlans[index]",
+            "let alpha = plan.blendMask[",
+        ]:
+            self.assertIn(contract, pipeline)
+        self.assertNotIn("private static func makeModelInput(\n", pipeline)
 
     def test_native_pipeline_supports_bounded_roi_enhancement(self):
         source = APP_SOURCE.read_text()
@@ -1439,7 +1843,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
         source = APP_SOURCE.read_text()
         script = BUILD_SCRIPT.read_text()
         verifier = (
-            ROOT / "packaging" / "macOS" / "standalone" / "verify_coreai_models.py"
+            ROOT / "packaging" / "macOS" / "standalone" / "DedicatedModelVerifier.swift"
         ).read_text()
 
         self.assertIn('let enhancerModels = ["none", "realesrgan", "mewzoom", "swinir", "spandrel"]', source)
@@ -1447,14 +1851,13 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn('"nomos-webphoto-realplksr-x4-coreml"', source)
         self.assertIn("4xNomosWebPhoto_RealPLKSR_256.mlpackage", script)
         self.assertIn("4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel", script)
-        self.assertIn('"nomos-webphoto-realplksr-x4-coreai"', verifier)
-        self.assertIn('"4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel"', verifier)
+        self.assertIn('"4xNomosWebPhoto_RealPLKSR-256-fp16"', verifier)
 
     def test_roi_enhancer_model_picker_is_filtered_by_method(self):
         source = APP_SOURCE.read_text()
         script = BUILD_SCRIPT.read_text()
         verifier = (
-            ROOT / "packaging" / "macOS" / "standalone" / "verify_coreai_models.py"
+            ROOT / "packaging" / "macOS" / "standalone" / "DedicatedModelVerifier.swift"
         ).read_text()
 
         self.assertIn("var roiEnhancerModelOptions: [ROIEnhancerModelOption]", source)
@@ -1463,7 +1866,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn("ForEach(runner.roiEnhancerModelOptions)", source)
         self.assertIn("runner.selectROIEnhancerModel($0)", source)
         self.assertIn("RealESRGAN_x2plus-256-fp16.aimodel", script)
-        self.assertIn('"realesrgan-x2-coreai"', verifier)
+        self.assertIn('"RealESRGAN_x2plus-256-fp16"', verifier)
 
 
 if __name__ == "__main__":

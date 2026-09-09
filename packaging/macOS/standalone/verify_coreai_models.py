@@ -29,7 +29,6 @@ EXPECTED_MODEL_ASSETS = {
     "realesr-general-x4v3-256-fp16.h17s.aimodelc",
     "4xNomosWebPhoto_RealPLKSR-256-fp16.h17s.aimodelc",
     "basicvsrpp-v1.2-variable-coreai.h17s.aimodelc",
-    "basicvsrpp-v1.2-variable-hq-coreai.h17s.aimodelc",
 }
 
 EXPECTED_SOURCE_MODEL_ASSETS = {
@@ -53,24 +52,6 @@ EXPECTED_DEDICATED_SOURCE_MODEL_ASSETS = {
     "rfdetr-v6-large-768-fp32.aimodel",
 }
 VARIABLE_MODEL_NAME = "basicvsrpp-v1.2-coreai-variable"
-VARIABLE_HQ_MODEL_NAME = "basicvsrpp-v1.2-coreai-variable-hq"
-VARIABLE_STEP1_ASSET_NAMES = {
-    "spatial",
-    "flow",
-    "backward_1_init",
-    "backward_1_first",
-    "backward_1_later",
-    "forward_1_init",
-    "forward_1_first",
-    "forward_1_later",
-    "backward_2_init",
-    "backward_2_first",
-    "backward_2_later",
-    "forward_2_init",
-    "forward_2_first",
-    "forward_2_later",
-    "reconstruction",
-}
 VARIABLE_CHUNK6_ASSET_NAMES = {
     "spatial6",
     "flow6",
@@ -169,9 +150,6 @@ def expected_model_assets(distribution: str, architecture: str) -> set[str]:
         }
         assets.update(EXPECTED_DEDICATED_SOURCE_MODEL_ASSETS)
         assets.add(f"basicvsrpp-v1.2-variable-coreai.{architecture}.aimodelc")
-        assets.add(
-            f"basicvsrpp-v1.2-variable-hq-coreai.{architecture}.aimodelc"
-        )
         return assets
     raise ValueError(f"unsupported Core AI distribution: {distribution}")
 
@@ -350,8 +328,6 @@ def verify_models(
     verify_asset_set(models_dir, distribution, architecture)
     all_smokes = set(MODEL_CONTRACTS)
     all_smokes.add(VARIABLE_MODEL_NAME)
-    if distribution == "dedicated":
-        all_smokes.add(VARIABLE_HQ_MODEL_NAME)
     selected_smokes = all_smokes if smoke_names is None else smoke_names
     unknown_smokes = selected_smokes - all_smokes
     if unknown_smokes:
@@ -393,19 +369,10 @@ def verify_models(
             None,
         )
     ]
-    if distribution == "dedicated":
-        variable_models.append(
-            (
-                VARIABLE_HQ_MODEL_NAME,
-                f"basicvsrpp-v1.2-variable-hq-coreai.{architecture}.aimodelc",
-                VARIABLE_STEP1_ASSET_NAMES,
-                resources / "bin" / "lada-basicvsrpp-variable-hq-runner",
-            )
-        )
     for name, asset, asset_names, runner in variable_models:
+        expected_path = models_dir / asset
         model = _resolve_model(name, "restoration")
         path = Path(model.path)
-        expected_path = models_dir / asset
         if path != expected_path:
             raise RuntimeError(f"{name} resolved to {path}, expected {expected_path}")
         if name in selected_smokes:
@@ -450,10 +417,6 @@ def configure_environment(
             "LADA_VARIABLE_COREAI_SWIFT_RUNNER",
             str(resources / "bin" / "lada-basicvsrpp-variable-runner"),
         )
-        os.environ.setdefault(
-            "LADA_VARIABLE_COREAI_HQ_SWIFT_RUNNER",
-            str(resources / "bin" / "lada-basicvsrpp-variable-hq-runner"),
-        )
     elif distribution == "portable":
         os.environ.pop("LADA_COREAI_ARCHITECTURE", None)
         os.environ.pop("LADA_COREAI_SWIFT_RUNNER", None)
@@ -478,7 +441,7 @@ def main() -> None:
         "--smoke-model",
         action="append",
         choices=tuple(MODEL_CONTRACTS)
-        + (VARIABLE_MODEL_NAME, VARIABLE_HQ_MODEL_NAME),
+        + (VARIABLE_MODEL_NAME,),
     )
     args = parser.parse_args()
     resources = args.resources.resolve()

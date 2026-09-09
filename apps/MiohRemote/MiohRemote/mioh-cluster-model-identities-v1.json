@@ -1,0 +1,38 @@
+{
+  "format_version": 1,
+  "digest_algorithm": "sha256-tree-v1",
+  "models": {
+    "basicvsrpp-v1.2-coreai": { "sha256": "66b2cc453f3d789e70c889ff4941f0fab4bced54c7ddcd0e92086ff7e2895586", "asset_type": "source-tree", "source_assets": ["basicvsrpp-v1.2-t18-fp16.aimodel"] },
+    "basicvsrpp-v1.2-coreai-t36": { "sha256": "45b61880e1cb8988a820dc536100a186c03221a958b2a3451dd806a8f2079276", "asset_type": "source-tree", "source_assets": ["basicvsrpp-v1.2-t36-fp16.aimodel"] },
+    "basicvsrpp-v1.2-coreai-t90": { "sha256": "e3d68e24d2e20911d48d64de76999c49ed42b21a41026f071cb8041c75579ff0", "asset_type": "source-tree", "source_assets": ["basicvsrpp-v1.2-t90-fp16.aimodel"] },
+    "basicvsrpp-v1.2-coreai-variable": {
+      "sha256": "91e23e86978cf14c4aa3edd2030c55cb70565c039c0dac928b851a093161e3f6",
+      "asset_type": "source-collection",
+      "source_assets": [
+        "basicvsrpp-variable-spatial6.aimodel",
+        "basicvsrpp-variable-flow6.aimodel",
+        "basicvsrpp-variable-backward_1_start6.aimodel",
+        "basicvsrpp-variable-backward_1_continue6.aimodel",
+        "basicvsrpp-variable-forward_1_start6.aimodel",
+        "basicvsrpp-variable-forward_1_continue6.aimodel",
+        "basicvsrpp-variable-backward_2_start6.aimodel",
+        "basicvsrpp-variable-backward_2_continue6.aimodel",
+        "basicvsrpp-variable-forward_2_start6.aimodel",
+        "basicvsrpp-variable-forward_2_continue6.aimodel",
+        "basicvsrpp-variable-reconstruction6.aimodel"
+      ]
+    },
+    "v2-coreai": { "sha256": "f1d8c1508f8d895647e1a7160e3fb9df7af4bc605d8c9bab982bee8ba2fde814", "asset_type": "source-tree", "source_assets": ["lada_mosaic_detection_model_v2-fp16.aimodel"] },
+    "v2-coreml": { "sha256": "19e363d441527aae835d4e85bd360e381304f5e1deaecdeffae914cc71db6b8d", "asset_type": "source-tree", "source_assets": ["lada_mosaic_detection_model_v2.mlpackage"] },
+    "v3.1-fast-coreai": { "sha256": "2fd8d61783ef0d64f6c96e8f5cbb56f8c486275a7db45b12ef0732234b039c65", "asset_type": "source-tree", "source_assets": ["lada_mosaic_detection_model_v3.1_fast-fp16.aimodel"] },
+    "v3.1-fast-coreml": { "sha256": "6ae065fb7c23018ffb8972b2e1c7d9433a4b1c7679d2040b8acdd60abc04fee6", "asset_type": "source-tree", "source_assets": ["lada_mosaic_detection_model_v3.1_fast.mlpackage"] },
+    "v3.1-accurate-coreai": { "sha256": "6527dab9b047e9dc7885684f5c5305a766fe48d454977d14e6e541a677ea56be", "asset_type": "source-tree", "source_assets": ["lada_mosaic_detection_model_v3.1_accurate-fp16.aimodel"] },
+    "v3.1-accurate-coreml": { "sha256": "aa16c90491e6cfa5be57b5634f6fa706e041536d2d01c317d33f2b98b9082f0d", "asset_type": "source-tree", "source_assets": ["lada_mosaic_detection_model_v3.1_accurate.mlpackage"] },
+    "v4-fast-coreai": { "sha256": "a14154e25d57ccbcc1fd08d5692b96c5106f6f017323e4e7ee8f811f87ac91a6", "asset_type": "source-tree", "source_assets": ["lada_mosaic_detection_model_v4_fast-fp16.aimodel"] },
+    "v4-fast-coreml": { "sha256": "a65dc0cd65f6d9fdf76c4cd9efef84723dbeceb7fbb6da218017345e590b83c4", "asset_type": "source-tree", "source_assets": ["lada_mosaic_detection_model_v4_fast.mlpackage"] },
+    "v4-accurate-coreai": { "sha256": "f2d8de954987d04f216a19d01b2fc80099fbbe9a02aea419df039be082a743f1", "asset_type": "source-tree", "source_assets": ["lada_mosaic_detection_model_v4_accurate-fp16.aimodel"] },
+    "v4-accurate-coreml": { "sha256": "6a9f1ff113940fe53ab500eda3dd8dc649aca850433cdc9d24d461d0b2cf3ac8", "asset_type": "source-tree", "source_assets": ["lada_mosaic_detection_model_v4_accurate.mlpackage"] },
+    "vr-v2-accurate-coreai": { "sha256": "fd6fe99672842dc17a4983a9e7f26b239063c7d3bbd3027f631135a4e2cc704c", "asset_type": "source-tree", "source_assets": ["lada_mosaic_detection_model_vr_v2_accurate-fp16.aimodel"] },
+    "vr-v2-accurate-coreml": { "sha256": "ece53554b15bd8f33b612bfc741b137b6542ebe7a03370c743b25786456a548e", "asset_type": "source-tree", "source_assets": ["lada_mosaic_detection_model_vr_v2_accurate.mlpackage"] }
+  }
+}

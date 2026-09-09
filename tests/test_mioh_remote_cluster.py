@@ -206,6 +206,25 @@ class MiohRemoteClusterFoundationTests(unittest.TestCase):
         ]:
             self.assertIn(contract, self.pipeline)
 
+    def test_cluster_workers_receive_detection_sampling_options(self):
+        for contract in [
+            "let detectionMaskReuseSkipFrames: Int?",
+            "(1...300).contains(detectionEmptyLookahead)",
+            "detectionMaskReuseSkipFrames.map { (0...8).contains($0) }",
+        ]:
+            self.assertIn(contract, self.source)
+        for contract in [
+            "detectionEmptyLookahead: min(max(detectionEmptyLookahead, 1), 300)",
+            "detectionMaskReuseSkipFrames: min(",
+            "request.options.detectionEmptyLookahead",
+            "request.options.detectionMaskReuseSkipFrames ?? 0",
+        ]:
+            self.assertIn(contract, self.runner)
+        self.assertNotIn(
+            "request.options.detectionEmptyLookahead == 1",
+            self.runner,
+        )
+
     def test_worker_capability_extensions_are_optional_and_preflighted(self):
         for contract in [
             "let maximumRestorationClipLength: Int?",
@@ -453,7 +472,9 @@ class MiohRemoteClusterFoundationTests(unittest.TestCase):
 
         # Halo frames must participate in restoration/crossfade first, and
         # only then be removed by the half-open core-range ownership filter.
-        crossfade = self.pipeline.index("pixelBuffer: try processor.crossfade(")
+        crossfade = self.pipeline.index(
+            "pixelBuffer: try pending.processor.crossfade("
+        )
         core_filter = self.pipeline.index(
             "let acceptedFrames = framesToEncode.filter", crossfade
         )
@@ -483,7 +504,10 @@ class MiohRemoteClusterFoundationTests(unittest.TestCase):
         )[0]
         self.assertIn('"-an", "-c:v", "copy"', worker_mux)
         self.assertIn('"-map", "0:v:0", "-map", "1:a:0?"', self.controller)
-        self.assertIn('"-c:v", "copy", "-c:a", "aac"', self.controller)
+        self.assertIn('arguments(audio: ["-c:a", "copy"])', self.controller)
+        self.assertIn(
+            'audio: ["-c:a", "aac", "-b:a", "192k"]', self.controller
+        )
         merge_body = self.controller.split("private func merge(", 1)[1].split(
             "private func verify(", 1
         )[0]

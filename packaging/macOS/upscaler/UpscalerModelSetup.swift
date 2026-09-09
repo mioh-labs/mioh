@@ -26,8 +26,11 @@ final class UpscalerModelSetupController: ObservableObject {
   }
   @Published var installFlashVSR = true
   @Published var installAdcSR = false
+  @Published var installMiniMaxH3 = false
   @Published private(set) var flashVSRInstalled = false
   @Published private(set) var adcSRInstalled = false
+  @Published private(set) var miniMaxH3Installed = false
+  @Published private(set) var miniMaxH3ManifestPath = ""
   @Published private(set) var isRunning = false
   @Published private(set) var progress = 0.0
   @Published private(set) var status = "未確認"
@@ -50,7 +53,7 @@ final class UpscalerModelSetupController: ObservableObject {
 
   var canStart: Bool {
     !isRunning
-      && (installFlashVSR || installAdcSR)
+      && (installFlashVSR || installAdcSR || installMiniMaxH3)
       && !destinationPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
   }
 
@@ -66,6 +69,60 @@ final class UpscalerModelSetupController: ObservableObject {
     }
     installFlashVSR = kind == .flashVSR
     installAdcSR = kind == .adcSR
+    installMiniMaxH3 = false
+    completedSuccessfully = false
+    refreshInstallationState()
+  }
+
+  func prepareInitial(
+    for kind: VideoUpscaleController.UpscalerKind,
+    preferredPath: String,
+    h3ManifestPath: String,
+    h3Ready: Bool
+  ) {
+    if !preferredPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      var preferred = URL(fileURLWithPath: preferredPath).standardizedFileURL
+      if preferred.lastPathComponent == VideoUpscaleController.nativeDirectoryName
+        || preferred.pathExtension == "aimodel"
+      {
+        preferred.deleteLastPathComponent()
+      }
+      destinationPath = preferred.path
+    } else if !h3ManifestPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      var preferred = URL(fileURLWithPath: h3ManifestPath).standardizedFileURL
+      if preferred.lastPathComponent.hasPrefix("manifest")
+        && preferred.pathExtension == "json"
+      {
+        preferred.deleteLastPathComponent()
+      }
+      if preferred.lastPathComponent == "minimax-h3-native" {
+        preferred.deleteLastPathComponent()
+      }
+      destinationPath = preferred.path
+    }
+    refreshInstallationState()
+    installFlashVSR = kind == .flashVSR && !flashVSRInstalled
+    installAdcSR = kind == .adcSR && !adcSRInstalled
+    installMiniMaxH3 = !h3Ready && !miniMaxH3Installed
+    completedSuccessfully = false
+  }
+
+  func prepareForMiniMaxH3(preferredManifestPath: String) {
+    if !preferredManifestPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      var preferred = URL(fileURLWithPath: preferredManifestPath).standardizedFileURL
+      if preferred.lastPathComponent.hasPrefix("manifest")
+        && preferred.pathExtension == "json"
+      {
+        preferred.deleteLastPathComponent()
+      }
+      if preferred.lastPathComponent == "minimax-h3-native" {
+        preferred.deleteLastPathComponent()
+      }
+      destinationPath = preferred.path
+    }
+    installFlashVSR = false
+    installAdcSR = false
+    installMiniMaxH3 = true
     completedSuccessfully = false
     refreshInstallationState()
   }
@@ -114,8 +171,16 @@ final class UpscalerModelSetupController: ObservableObject {
     ) && FileManager.default.fileExists(
       atPath: adcsr.appendingPathComponent("metadata.json").path
     )
+    if let h3Manifest = Self.findMiniMaxH3Manifest(under: root) {
+      miniMaxH3Installed = true
+      miniMaxH3ManifestPath = h3Manifest.path
+    } else {
+      miniMaxH3Installed = false
+      miniMaxH3ManifestPath = ""
+    }
     if !isRunning {
-      status = flashVSRInstalled || adcSRInstalled ? "配置状態を確認済み" : "モデルがありません"
+      status = flashVSRInstalled || adcSRInstalled || miniMaxH3Installed
+        ? "配置状態を確認済み" : "モデルがありません"
     }
   }
 
@@ -145,6 +210,7 @@ final class UpscalerModelSetupController: ObservableObject {
     var arguments = ["--destination", destination.path]
     if installFlashVSR { arguments.append("--flashvsr") }
     if installAdcSR { arguments.append("--adcsr") }
+    if installMiniMaxH3 { arguments.append("--minimax-h3") }
     task.arguments = arguments
     let pipe = Pipe()
     task.standardOutput = pipe
@@ -229,6 +295,42 @@ final class UpscalerModelSetupController: ObservableObject {
     completion = nil
     cancellationRequested = false
   }
+
+  private static func findMiniMaxH3Manifest(under root: URL) -> URL? {
+    let candidates = [
+      root.appendingPathComponent("minimax-h3-native/manifest-beta5-s16384.json"),
+      root.appendingPathComponent("minimax-h3-native/manifest-beta4-s16384.json"),
+      root.appendingPathComponent("minimax-h3-native/manifest-s16384.json"),
+      root.appendingPathComponent("minimax-h3-native/manifest-beta5.json"),
+      root.appendingPathComponent("minimax-h3-native/manifest-beta4.json"),
+      root.appendingPathComponent("minimax-h3-native/manifest.json"),
+      root.appendingPathComponent("manifest-beta5-s16384.json"),
+      root.appendingPathComponent("manifest-beta4-s16384.json"),
+      root.appendingPathComponent("manifest-s16384.json"),
+      root.appendingPathComponent("manifest-beta5.json"),
+      root.appendingPathComponent("manifest-beta4.json"),
+      root.appendingPathComponent("manifest.json"),
+      URL(fileURLWithPath: "/Volumes/Project_HD/model_weights/minimax-h3-native/manifest-beta5-s16384.json"),
+      URL(fileURLWithPath: "/Volumes/Project_HD/model_weights/minimax-h3-native/manifest-beta4-s16384.json"),
+      URL(fileURLWithPath: "/Volumes/Project_HD/model_weights/minimax-h3-native/manifest-s16384.json"),
+      URL(fileURLWithPath: "/Volumes/Project_HD/model_weights/minimax-h3-native/manifest-beta5.json"),
+      URL(fileURLWithPath: "/Volumes/Project_HD/model_weights/minimax-h3-native/manifest-beta4.json"),
+      URL(fileURLWithPath: "/Volumes/Project_HD/model_weights/minimax-h3-native/manifest.json"),
+    ].map(\.standardizedFileURL)
+    return candidates.first { isMiniMaxH3Manifest($0) }
+  }
+
+  private static func isMiniMaxH3Manifest(_ url: URL) -> Bool {
+    guard let data = try? Data(contentsOf: url),
+      let object = try? JSONSerialization.jsonObject(with: data),
+      let dictionary = object as? [String: Any]
+    else { return false }
+    let identifier = dictionary["modelIdentifier"] as? String ?? ""
+    return dictionary["schemaVersion"] != nil
+      && dictionary["stages"] != nil
+      && dictionary["sigmas"] != nil
+      && identifier.localizedCaseInsensitiveContains("h3")
+  }
 }
 
 struct UpscalerModelSetupView: View {
@@ -279,6 +381,27 @@ struct UpscalerModelSetupView: View {
           }
           Text(controller.adcSRInstalled ? "配置済み" : "未配置")
             .font(.caption).foregroundStyle(controller.adcSRInstalled ? .green : .orange)
+          Divider()
+          Toggle(isOn: $controller.installMiniMaxH3) {
+            VStack(alignment: .leading) {
+              Text("MiniMax H3 / 10Eros-Max H3")
+              Text("配置済みH3 manifestを検出します。未配置なら約数十GBのH3/Qwen/VAE重みを取得し、このMacでCore AIへ変換してmanifestを作成します。作業用に140 GB以上の空きが必要です。")
+                .font(.caption).foregroundStyle(.secondary)
+            }
+          }
+          VStack(alignment: .leading, spacing: 2) {
+            Text(controller.miniMaxH3Installed ? "配置済み" : "未配置")
+              .font(.caption)
+              .foregroundStyle(controller.miniMaxH3Installed ? .green : .orange)
+            if !controller.miniMaxH3ManifestPath.isEmpty {
+              Text(controller.miniMaxH3ManifestPath)
+                .font(.caption2.monospaced())
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+            }
+          }
         }
         .padding(8)
       }

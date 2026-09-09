@@ -103,12 +103,21 @@ class BaseSampleWiseMetric(BaseMetric):
                 mask = 1 - pred * 0
 
             if len(gt.shape) <= 3:
+                if self.mask_key is not None and not bool((mask != 0).any()):
+                    continue
                 result = self.process_image(gt, pred, mask)
             else:
                 result_sum = 0
+                valid_frame_count = 0
                 for i in range(gt.shape[0]):
+                    if self.mask_key is not None and not bool(
+                            (mask[i] != 0).any()):
+                        continue
                     result_sum += self.process_image(gt[i], pred[i], mask[i])
-                result = result_sum / gt.shape[0]
+                    valid_frame_count += 1
+                if valid_frame_count == 0:
+                    continue
+                result = result_sum / valid_frame_count
 
             self.results.append({self.metric: result})
 

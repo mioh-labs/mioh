@@ -76,6 +76,7 @@ final class VideoUpscaleController: ObservableObject {
   private static let rootDefaultsKey = "mioh.flashvsr.root"
   private static let adcSRRootDefaultsKey = "mioh.adcsr.root"
   private static let modelDefaultsKey = "mioh.upscaler.model"
+  private let resourceURLOverride: URL?
 
   private var process: Process?
   private var lineBuffer = ""
@@ -95,7 +96,8 @@ final class VideoUpscaleController: ObservableObject {
   private var runPreservesAudio = false
   private var upscaledVideoURL: URL?
 
-  init() {
+  init(resourceURL: URL? = nil) {
+    resourceURLOverride = resourceURL
     flashVSRRootPath = UserDefaults.standard.string(
       forKey: Self.rootDefaultsKey
     ) ?? ""
@@ -362,7 +364,8 @@ final class VideoUpscaleController: ObservableObject {
   }
 
   func start() {
-    guard let inputURL, let outputURL, let resources = Bundle.main.resourceURL
+    guard let inputURL, let outputURL,
+      let resources = resourceURLOverride ?? Bundle.main.resourceURL
     else { return }
     let start = normalizedStartSeconds
     let end = normalizedEndSeconds
@@ -490,7 +493,9 @@ final class VideoUpscaleController: ObservableObject {
 
   private var resolvedInstallation: Installation? {
     guard #available(macOS 27.0, *) else { return nil }
-    guard let resources = Bundle.main.resourceURL else { return nil }
+    guard let resources = resourceURLOverride ?? Bundle.main.resourceURL else {
+      return nil
+    }
     switch selectedUpscaler {
     case .flashVSR:
       return resolvedFlashVSRInstallation(resources: resources)

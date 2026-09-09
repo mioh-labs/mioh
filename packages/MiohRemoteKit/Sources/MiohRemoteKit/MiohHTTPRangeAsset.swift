@@ -229,6 +229,7 @@ public final class MiohHTTPRangeAsset: NSObject, AVAssetResourceLoaderDelegate,
         if error != nil {
           // Foundation errors can include the capability URL in userInfo.
           // Normalize them before they cross the worker/logging boundary.
+          self.requests.removeValue(forKey: identifier)
           loadingRequest.finishLoading(with: MiohHTTPRangeAssetError.invalidResponse)
           return
         }
@@ -242,6 +243,7 @@ public final class MiohHTTPRangeAsset: NSObject, AVAssetResourceLoaderDelegate,
           let data,
           data.count == Int(count)
         else {
+          self.requests.removeValue(forKey: identifier)
           loadingRequest.finishLoading(with: MiohHTTPRangeAssetError.invalidResponse)
           return
         }

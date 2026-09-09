@@ -867,11 +867,14 @@ struct VRPreviewSceneView: NSViewRepresentable {
         }
       }
       guard let item else { return }
-      let attributes: [String: Any] = [
-        kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
-        kCVPixelBufferMetalCompatibilityKey as String: true,
-      ]
-      let output = AVPlayerItemVideoOutput(pixelBufferAttributes: attributes)
+      let output = AVPlayerItemVideoOutput(
+        pixelBufferAttributes: CVPixelBufferAttributes(
+          pixelFormatTypes: [
+            CVPixelFormatType(rawValue: kCVPixelFormatType_32BGRA)
+          ],
+          compatibility: [.metalTexture]
+        )
+      )
       item.add(output)
       output.requestNotificationOfMediaDataChange(withAdvanceInterval: 1.0 / 60.0)
       textureLock.withLock {
@@ -884,14 +887,12 @@ struct VRPreviewSceneView: NSViewRepresentable {
       defer { textureLock.unlock() }
       guard let videoOutput, let textureCache else { return }
       let itemTime = videoOutput.itemTime(forHostTime: CACurrentMediaTime())
-      guard videoOutput.hasNewPixelBuffer(forItemTime: itemTime),
-        let pixelBuffer = videoOutput.copyPixelBuffer(
-          forItemTime: itemTime,
-          itemTimeForDisplay: nil
-        )
-      else {
+      guard videoOutput.hasNewPixelBuffer(forItemTime: itemTime) else {
         return
       }
+      let frame = videoOutput.pixelBufferAndDisplayTime(forItemTime: itemTime)
+      guard let readOnlyPixelBuffer = frame.pixelBuffer else { return }
+      let pixelBuffer: CVPixelBuffer = readOnlyPixelBuffer.withUnsafeBuffer { $0 }
 
       let width = CVPixelBufferGetWidth(pixelBuffer)
       let height = CVPixelBufferGetHeight(pixelBuffer)
@@ -945,7 +946,11 @@ final class RealtimePlayerController: ObservableObject {
   @Published var position = 0.0
   @Published var duration = 0.0
   @Published var bufferedSeconds = 0.0
-  @Published var showOriginal = false
+  @Published var showOriginal = false {
+    didSet {
+      if usesUnifiedHLSPlayback { updateUnifiedOriginalPreview() }
+    }
+  }
   @Published var volume = 1.0
   @Published var muted = false
   @Published var errorMessage = ""
@@ -968,6 +973,7 @@ final class RealtimePlayerController: ObservableObject {
   let hlsDriftResumeToleranceSeconds = 0.050
   let hlsDriftSeekToleranceSeconds = 0.100
   let hlsClockObservationIntervalSeconds = 0.080
+  let hlsHostSynchronizedStartLeadSeconds = 0.080
   let hlsOperationWatchdogSeconds = 2.0
   let hlsMaximumInitialSeekAttempts = 3
   let hlsMaximumSynchronizedStartAttempts = 3
@@ -1027,6 +1033,12 @@ final class RealtimePlayerController: ObservableObject {
   private var currentRestoredItemStartedAt = 0.0
   private var hlsRestoredHeldForSourceCatchup = false
   private var hlsDriftCorrectionInFlight = false
+  private var hlsHostSynchronizedStartPendingUntil = 0.0
+  private var hlsHostSynchronizedStartTask: Task<Void, Never>?
+  private var hlsPlaybackPreparer: (any MacHLSPlaybackPreparing)?
+  private var unifiedOriginalAsset: AVAsset?
+  private var unifiedOriginalSeekInFlight = false
+  private var usesUnifiedHLSPlayback: Bool { hlsPlaybackPreparer != nil }
   private var hlsInitialSeekAttempt = 0
   private var hlsInitialSeekWatchdogTask: Task<Void, Never>?
   private var hlsSynchronizedStartRevision = 0
@@ -1075,6 +1087,7 @@ final class RealtimePlayerController: ObservableObject {
     hlsProductionTask?.cancel()
     hlsInitialSeekWatchdogTask?.cancel()
     hlsSynchronizedStartWatchdogTask?.cancel()
+    hlsHostSynchronizedStartTask?.cancel()
     hlsProducer?.cancel()
     hlsMediaProxy?.stop()
     try? workerInput?.fileHandleForWriting.close()
@@ -1274,53 +1287,23 @@ final class RealtimePlayerController: ObservableObject {
         let outputPipe = Pipe()
         let errorPipe = Pipe()
         do {
-          if runner.usesPythonEngine {
-            // The bundled interpreter speaks the same stdout event protocol as
-            // the Swift pipeline, so only the launch differs.
-            let python = resources.appendingPathComponent(
-              "runtime/bin/python3.12"
-            )
-            let script = resources.appendingPathComponent(
-              "runtime/lib/python3.12/site-packages/mioh_preview_worker.py"
-            )
-            guard FileManager.default.isExecutableFile(atPath: python.path) else {
-              throw RunnerError.missingResource("Python runtime")
-            }
-            guard FileManager.default.fileExists(atPath: script.path) else {
-              throw RunnerError.missingResource("Realtime preview worker")
-            }
-            process.executableURL = python
-            process.arguments = [script.path] + (try runner.previewArguments(
-              resources: resources,
-              outputDirectory: session,
-              input: processingInput
-            )) + [
-              "--start-ns", String(Int64(startSeconds * 1_000_000_000)),
-              "--generation", String(startingGeneration),
-            ]
-            process.environment = runner.environment(
-              resources: resources,
-              python: python
-            )
-          } else {
-            let invocation = try runner.nativePreviewInvocation(
-              resources: resources,
-              outputDirectory: session,
-              input: processingInput,
-              startNanoseconds: Int64(startSeconds * 1_000_000_000),
-              generation: startingGeneration
-            )
-            let configurationURL = session.appendingPathComponent(
-              "native-preview-configuration.json"
-            )
-            try invocation.configuration.write(
-              to: configurationURL,
-              options: .atomic
-            )
-            process.executableURL = invocation.executable
-            process.arguments = [configurationURL.path]
-            process.environment = invocation.environment
-          }
+          let invocation = try runner.nativePreviewInvocation(
+            resources: resources,
+            outputDirectory: session,
+            input: processingInput,
+            startNanoseconds: Int64(startSeconds * 1_000_000_000),
+            generation: startingGeneration
+          )
+          let configurationURL = session.appendingPathComponent(
+            "native-preview-configuration.json"
+          )
+          try invocation.configuration.write(
+            to: configurationURL,
+            options: .atomic
+          )
+          process.executableURL = invocation.executable
+          process.arguments = [configurationURL.path]
+          process.environment = invocation.environment
         } catch {
           self.fail(error.localizedDescription)
           self.cleanupSession()
@@ -1676,6 +1659,20 @@ final class RealtimePlayerController: ObservableObject {
               "HLS再生方式を準備できませんでした"
             )
           }
+          if #available(macOS 27.0, *) {
+            let playback = MacHLSUnifiedPlayback(
+              item: sourceItem, start: target, duration: availableDuration, isLive: playlist.isLive
+            )
+            self.hlsPlaybackPreparer = playback
+            self.unifiedOriginalAsset = sourceItem.asset
+            self.restoredPlayer.isMuted = false
+            self.restoredPlayer.volume = self.muted ? 0 : Float(self.volume)
+            self.sourcePlayer.volume = 0
+            if playlist.isLive { try await playback.prepare() }
+            self.runner?.appendExternalLog(
+              "HLS再生: macOS 27 音声PCMを復元区間へ統合し、1つのプレーヤーで再生します\n"
+            )
+          }
           let createdProducer = MacHLSRealtimeProducer(
             source: source,
             runner: runner,
@@ -1686,6 +1683,7 @@ final class RealtimePlayerController: ObservableObject {
             resourceLoader: selectedResourceLoader,
             avFoundationCapture: activeAVFoundationCapture,
             allowsVariantFallback: requestedHLSQuality == .automatic,
+            playbackPreparer: self.hlsPlaybackPreparer,
             log: { text in
               Task { @MainActor in runner.appendExternalLog(text) }
             }
@@ -1711,7 +1709,7 @@ final class RealtimePlayerController: ObservableObject {
           // restoration downloader cannot race the same signed startup URL.
           // A live playlist must be attached eagerly or its sliding seekable
           // window can move past the restoration start while the worker warms.
-          if playlist.isLive {
+          if playlist.isLive, !self.usesUnifiedHLSPlayback {
             sourceItemInstalled = self.installPreparedHLSSourceItem(
               sourceItem,
               generation: startingGeneration
@@ -1729,8 +1727,8 @@ final class RealtimePlayerController: ObservableObject {
             guard let self, self.generation == startingGeneration,
               !Task.isCancelled
             else { return }
-            if !sourceItemInstalled,
-              case .segment = event
+            if !sourceItemInstalled, case .segment = event,
+              !self.usesUnifiedHLSPlayback
             {
               sourceItemInstalled = self.installPreparedHLSSourceItem(
                 sourceItem,
@@ -1904,6 +1902,11 @@ final class RealtimePlayerController: ObservableObject {
           : "連続HLS区間から復元バッファを準備中"
       }
       if shouldPlay { state = .buffering }
+    case .status(let detail):
+      guard !hlsRestoredClockFallbackActive,
+        state == .loading || state == .buffering || state == .seeking
+      else { break }
+      playbackDetail = detail
     case .discontinuity(let newPosition):
       // A live media playlist may slide past the sequence the producer was
       // waiting for. Old restored items and their synthetic clock can no
@@ -2084,6 +2087,7 @@ final class RealtimePlayerController: ObservableObject {
       "detection=\(runner.previewDetectionModel)",
       "customDetection=\(runner.previewCustomDetectionModel)",
       "realtimeOptimization=\(runner.previewRealtimeOptimization)",
+      "limitHighFrameRate=\(runner.previewLimitHighFrameRate)",
       "preserveComposite=\(runner.preservesRealtimeCompositeParameters)",
       "useMaxClip=\(runner.useMaxClipLength)",
       "maxClip=\(runner.maxClipLength)",
@@ -2336,11 +2340,26 @@ final class RealtimePlayerController: ObservableObject {
     }
   }
 
+  func setPreviewHighFrameRateLimit(
+    _ enabled: Bool,
+    runner: RestorationRunner
+  ) {
+    guard runner.previewLimitHighFrameRate != enabled else { return }
+    runner.previewLimitHighFrameRate = enabled
+    switch state {
+    case .loading, .buffering, .playing, .paused, .seeking:
+      restartWithCurrentSettings(runner: runner)
+    case .idle, .ended, .failed:
+      break
+    }
+  }
+
   func setVolume(_ value: Double) {
     volume = min(max(value, 0), 1)
-    sourcePlayer.volume = muted || hlsRestoredClockFallbackActive
+    sourcePlayer.volume = muted || hlsRestoredClockFallbackActive || usesUnifiedHLSPlayback
       ? 0
       : Float(volume)
+    if usesUnifiedHLSPlayback { restoredPlayer.volume = muted ? 0 : Float(volume) }
   }
 
   func setBufferLimit(_ seconds: Double) {
@@ -2394,9 +2413,10 @@ final class RealtimePlayerController: ObservableObject {
 
   func setMuted(_ value: Bool) {
     muted = value
-    sourcePlayer.volume = value || hlsRestoredClockFallbackActive
+    sourcePlayer.volume = value || hlsRestoredClockFallbackActive || usesUnifiedHLSPlayback
       ? 0
       : Float(volume)
+    if usesUnifiedHLSPlayback { restoredPlayer.volume = value ? 0 : Float(volume) }
   }
 
   func stop(
@@ -2404,6 +2424,11 @@ final class RealtimePlayerController: ObservableObject {
     preserveHLSSelection: Bool = true
   ) {
     let stoppedGeneration = generation
+    hlsPlaybackPreparer?.cancel()
+    hlsPlaybackPreparer = nil
+    unifiedOriginalAsset = nil
+    unifiedOriginalSeekInFlight = false
+    restoredPlayer.isMuted = true
     let retiringHLSProducer = hlsProducer
     let retiringHLSSession = hlsSource == nil ? nil : sessionDirectory
     let precedingHLSRetirement = hlsProducerRetirementTask
@@ -2474,6 +2499,8 @@ final class RealtimePlayerController: ObservableObject {
     }
     restoredPlayer.pause()
     let retiringWorker = worker
+    sourcePlayer.automaticallyWaitsToMinimizeStalling = true
+    restoredPlayer.automaticallyWaitsToMinimizeStalling = true
     if retiringWorker != nil {
       sendCommand(["command": "stop"])
     }
@@ -2813,7 +2840,7 @@ final class RealtimePlayerController: ObservableObject {
     queuedSegments.append(segment)
     restoredPlayer.insert(item, after: nil)
     let token = NotificationCenter.default.addObserver(
-      forName: .AVPlayerItemDidPlayToEndTime,
+      forName: AVPlayerItem.didPlayToEndTimeNotification,
       object: item,
       queue: .main
     ) { [weak self] _ in
@@ -2938,6 +2965,7 @@ final class RealtimePlayerController: ObservableObject {
     if hlsSource != nil {
       if shouldPreferRestoredHLSPlayback {
         restoredPlayer.play()
+        if usesUnifiedHLSPlayback { updateUnifiedOriginalPreview() }
         state = .playing
         if hlsRestoredClockFallbackActive, playbackDetail.isEmpty {
           playbackDetail = "元動画側の再生を継続できないため、復元映像のみ再生中（音声なし）"
@@ -2960,7 +2988,7 @@ final class RealtimePlayerController: ObservableObject {
   }
 
   private var hlsSourceClockIsReadyForSynchronizedPlayback: Bool {
-    hlsSourceReady && hlsSourceSeekCompleted
+    usesUnifiedHLSPlayback || (hlsSourceReady && hlsSourceSeekCompleted)
   }
 
   private var canStartHLSWithRestoredClockFallback: Bool {
@@ -2970,18 +2998,15 @@ final class RealtimePlayerController: ObservableObject {
   }
 
   private var shouldPreferRestoredHLSPlayback: Bool {
-    canStartHLSWithRestoredClockFallback
+    usesUnifiedHLSPlayback || canStartHLSWithRestoredClockFallback
       || (hlsSourceReachedEnd
         && restoredPlayer.currentItem != nil
         && !queuedSegments.isEmpty)
   }
 
-  /// Preroll both independent players before starting them in the same main
-  /// actor transaction. `sourcePlayer.play()` followed by a later KVO callback
-  /// used to let the audible HLS clock run ahead while Core AI kept the main
-  /// thread busy. AVPlayer cannot share a timebase across these two assets, but
-  /// adjacent starts after both prerolls keep the initial skew bounded and the
-  /// periodic one-way correction below handles the remaining few frames.
+  /// Prime both render pipelines, then map their item times to one host-clock
+  /// instant. Separate play() calls depend on callback scheduling under load.
+  /// The source audio remains the timeline authority for drift correction.
   private func beginSynchronizedHLSStart() {
     guard hlsSource != nil,
       hlsSourceClockIsReadyForSynchronizedPlayback,
@@ -2991,7 +3016,9 @@ final class RealtimePlayerController: ObservableObject {
       let sourceItem = sourcePlayer.currentItem,
       let restoredItem = restoredPlayer.currentItem
     else { return }
-    guard !hlsSynchronizedStartInFlight else { return }
+    guard !hlsSynchronizedStartInFlight, !hlsDriftCorrectionInFlight,
+      hlsHostSynchronizedStartPendingUntil == 0
+    else { return }
 
     hlsSynchronizedStartInFlight = true
     hlsSynchronizedStartRevision &+= 1
@@ -3047,18 +3074,63 @@ final class RealtimePlayerController: ObservableObject {
             self.hlsSynchronizedStartWatchdogTask?.cancel()
             self.hlsSynchronizedStartWatchdogTask = nil
             self.hlsSynchronizedStartInFlight = false
+            guard self.startHLSPlayersAtSharedHostTime() else {
+              self.finishSynchronizedHLSStartRetry(
+                generation: expectedGeneration,
+                revision: revision,
+                detail: "HLS音声と復元映像の時刻を準備中"
+              )
+              return
+            }
             self.hlsSynchronizedStartAttempt = 0
-            // Keep these calls adjacent. Waiting for source timeControlStatus
-            // before starting restored video reintroduced a main-thread-sized
-            // audio lead on every initial start and queue refill.
-            self.sourcePlayer.play()
-            self.restoredPlayer.play()
             self.state = .playing
             self.playbackDetail = ""
           }
         }
       }
     }
+  }
+
+  private func startHLSPlayersAtSharedHostTime() -> Bool {
+    // Required by AVPlayer: a scheduled start with automatic waiting enabled
+    // raises NSInvalidArgumentException. Our preroll/watchdog owns buffering.
+    sourcePlayer.automaticallyWaitsToMinimizeStalling = false
+    restoredPlayer.automaticallyWaitsToMinimizeStalling = false
+    let sourceTime = sourcePlayer.currentTime()
+    let restoredTime = restoredPlayer.currentTime()
+    let sourceSeconds = sourceTime.seconds
+    let restoredSeconds = restoredTime.seconds
+    guard sourceSeconds.isFinite, restoredSeconds.isFinite else {
+      return false
+    }
+    let lead = CMTime(
+      seconds: hlsHostSynchronizedStartLeadSeconds,
+      preferredTimescale: 600
+    )
+    let hostTime = CMTimeAdd(CMClockGetTime(CMClockGetHostTimeClock()), lead)
+    let now = ProcessInfo.processInfo.systemUptime
+    hlsHostSynchronizedStartPendingUntil =
+      now + hlsHostSynchronizedStartLeadSeconds + hlsClockObservationIntervalSeconds
+    sourcePlayer.setRate(1, time: sourceTime, atHostTime: hostTime)
+    restoredPlayer.setRate(1, time: restoredTime, atHostTime: hostTime)
+    let expectedGeneration = generation
+    let revision = hlsSynchronizedStartRevision
+    let delay = hlsHostSynchronizedStartLeadSeconds + hlsClockObservationIntervalSeconds
+    hlsHostSynchronizedStartTask?.cancel()
+    hlsHostSynchronizedStartTask = Task { @MainActor [weak self] in
+      do {
+        try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+      } catch { return }
+      guard let self, self.generation == expectedGeneration,
+        self.hlsSynchronizedStartRevision == revision
+      else { return }
+      self.hlsHostSynchronizedStartPendingUntil = 0
+      self.hlsHostSynchronizedStartTask = nil
+      if let item = self.sourcePlayer.currentItem {
+        self.updateHLSPlaybackState(item: item, generation: expectedGeneration)
+      }
+    }
+    return true
   }
 
   private func finishSynchronizedHLSStartRetry(
@@ -3137,6 +3209,9 @@ final class RealtimePlayerController: ObservableObject {
     hlsSynchronizedStartRevision &+= 1
     hlsSynchronizedStartInFlight = false
     hlsSynchronizedStartAttempt = 0
+    hlsHostSynchronizedStartPendingUntil = 0
+    hlsHostSynchronizedStartTask?.cancel()
+    hlsHostSynchronizedStartTask = nil
     hlsSynchronizedStartWatchdogTask?.cancel()
     hlsSynchronizedStartWatchdogTask = nil
     sourcePlayer.cancelPendingPrerolls()
@@ -3190,7 +3265,7 @@ final class RealtimePlayerController: ObservableObject {
     }
 
     let stalled = NotificationCenter.default.addObserver(
-      forName: .AVPlayerItemPlaybackStalled,
+      forName: AVPlayerItem.playbackStalledNotification,
       object: item,
       queue: .main
     ) { [weak self, weak item] _ in
@@ -3202,17 +3277,13 @@ final class RealtimePlayerController: ObservableObject {
           self.state != .failed,
           !self.hlsRestoredClockFallbackActive
         else { return }
-        self.restoredPlayer.pause()
-        if self.shouldPlay {
-          self.state = .buffering
-          self.playbackDetail = "HLS元動画を再バッファ中"
-        }
+        self.updateHLSPlaybackState(item: item, generation: generation)
       }
     }
     hlsNotificationTokens.append(stalled)
 
     let failedToEnd = NotificationCenter.default.addObserver(
-      forName: .AVPlayerItemFailedToPlayToEndTime,
+      forName: AVPlayerItem.failedToPlayToEndTimeNotification,
       object: item,
       queue: .main
     ) { [weak self, weak item] notification in
@@ -3235,7 +3306,7 @@ final class RealtimePlayerController: ObservableObject {
     hlsNotificationTokens.append(failedToEnd)
 
     let ended = NotificationCenter.default.addObserver(
-      forName: .AVPlayerItemDidPlayToEndTime,
+      forName: AVPlayerItem.didPlayToEndTimeNotification,
       object: item,
       queue: .main
     ) { [weak self, weak item] _ in
@@ -3371,12 +3442,15 @@ final class RealtimePlayerController: ObservableObject {
     // restored-video correction is in flight. Do not reinterpret that pause as
     // an AVFoundation decoder stall and restart the state machine underneath
     // the seek completion.
-    if hlsDriftCorrectionInFlight { return }
+    if hlsDriftCorrectionInFlight || hlsSynchronizedStartInFlight { return }
+    // KVO may report waiting/paused during the scheduled-start lead time.
+    // Reconcile once afterward even if neither player's clock has advanced.
+    if hlsHostSynchronizedStartPendingUntil != 0 { return }
 
     switch sourcePlayer.timeControlStatus {
     case .playing:
       if !hlsSourceReachedEnd {
-        if !hlsRestoredHeldForSourceCatchup {
+        if !hlsRestoredHeldForSourceCatchup, restoredPlayer.rate == 0 {
           restoredPlayer.play()
         }
         state = .playing
@@ -3385,14 +3459,17 @@ final class RealtimePlayerController: ObservableObject {
           : ""
       }
     case .waitingToPlayAtSpecifiedRate:
+      sourcePlayer.pause()
       restoredPlayer.pause()
       state = .buffering
       playbackDetail = hlsSourceWaitingDescription()
+      resumeIfBuffered()
     case .paused:
       if !hlsSourceReachedEnd {
         restoredPlayer.pause()
         state = .buffering
         playbackDetail = "HLS元動画のデコーダ開始待ち"
+        resumeIfBuffered()
       }
     @unknown default:
       restoredPlayer.pause()
@@ -3638,7 +3715,7 @@ final class RealtimePlayerController: ObservableObject {
     }
 
     let token = NotificationCenter.default.addObserver(
-      forName: .AVPlayerItemDidPlayToEndTime,
+      forName: AVPlayerItem.didPlayToEndTimeNotification,
       object: item,
       queue: .main
     ) { [weak self] _ in
@@ -3792,6 +3869,10 @@ final class RealtimePlayerController: ObservableObject {
     let restoredLocalSeconds = restoredPlayer.currentTime().seconds
     guard restoredLocalSeconds.isFinite else { return }
     if hlsSource != nil {
+      guard !hlsSynchronizedStartInFlight,
+        !hlsDriftCorrectionInFlight,
+        hlsHostSynchronizedStartPendingUntil == 0
+      else { return }
       let itemIdentifier = ObjectIdentifier(currentItem)
       let now = ProcessInfo.processInfo.systemUptime
       if itemIdentifier != currentRestoredItemIdentifier {
@@ -3913,13 +3994,7 @@ final class RealtimePlayerController: ObservableObject {
           }
           self.hlsRestoredHeldForSourceCatchup = false
           if self.shouldPlay {
-            // Keep these starts adjacent for the same reason as the initial
-            // preroll path: neither independent player may gain a main-thread
-            // scheduling turn over the other.
-            self.sourcePlayer.play()
-            self.restoredPlayer.play()
-            self.state = .playing
-            self.playbackDetail = ""
+            self.beginSynchronizedHLSStart()
           } else {
             self.state = .paused
             self.playbackDetail = ""
@@ -3937,7 +4012,7 @@ final class RealtimePlayerController: ObservableObject {
 
   private var hlsShouldUseRestoredClock: Bool {
     hlsSource != nil
-      && (hlsRestoredClockFallbackActive || hlsSourceReachedEnd)
+      && (usesUnifiedHLSPlayback || hlsRestoredClockFallbackActive || hlsSourceReachedEnd)
       && generationHasStarted
   }
 
@@ -3949,6 +4024,38 @@ final class RealtimePlayerController: ObservableObject {
     else { return }
     position = max(0, active.startSeconds + restoredLocalSeconds)
     updateBufferedDuration()
+    if usesUnifiedHLSPlayback {
+      updateUnifiedOriginalPreview()
+      if shouldPlay, restoredPlayer.timeControlStatus == .playing { state = .playing }
+    }
+  }
+
+  /// Optional before/after comparison is video-only. It never supplies the
+  /// audible clock or controls playback of the combined restoration item.
+  private func updateUnifiedOriginalPreview() {
+    guard usesUnifiedHLSPlayback else { return }
+    guard showOriginal, shouldPlay else { sourcePlayer.pause(); return }
+    guard !unifiedOriginalSeekInFlight, let asset = unifiedOriginalAsset else { return }
+    if sourcePlayer.currentItem == nil {
+      sourcePlayer.replaceCurrentItem(with: AVPlayerItem(asset: asset))
+    }
+    sourcePlayer.volume = 0
+    let target = position + (hlsPlaybackPreparer?.sourceTimeOffset ?? 0)
+    if abs(sourcePlayer.currentTime().seconds - target) < 0.15 {
+      if sourcePlayer.rate == 0 { sourcePlayer.play() }
+      return
+    }
+    unifiedOriginalSeekInFlight = true
+    let expectedGeneration = generation
+    sourcePlayer.seek(to: CMTime(seconds: target, preferredTimescale: 48_000),
+      toleranceBefore: .zero, toleranceAfter: .zero
+    ) { [weak self] finished in
+      Task { @MainActor in
+        guard let self, self.generation == expectedGeneration else { return }
+        self.unifiedOriginalSeekInFlight = false
+        if finished, self.showOriginal, self.shouldPlay { self.sourcePlayer.play() }
+      }
+    }
   }
 
   /// The original HLS AVPlayer is only the audio/source-clock companion for
@@ -4251,14 +4358,315 @@ final class RealtimePlayerController: ObservableObject {
   }
 }
 
-struct RealtimePlayerView: View {
+private struct RealtimePlayerLayerView: NSViewRepresentable {
+  let player: AVPlayer
+
+  func makeNSView(context: Context) -> AVPlayerView {
+    let view = AVPlayerView()
+    view.controlsStyle = .none
+    view.videoGravity = .resizeAspect
+    view.player = player
+    return view
+  }
+
+  func updateNSView(_ view: AVPlayerView, context: Context) {
+    if view.player !== player {
+      view.player = player
+    }
+  }
+}
+
+private struct RealtimeVideoSurface: View {
+  @ObservedObject var controller: RealtimePlayerController
+  @ObservedObject var runner: RestorationRunner
+  var showsSystemControls = true
+
+  var body: some View {
+    ZStack {
+      Color.black
+      if runner.previewProjectionMode == "通常" {
+        if controller.prefersSourceVideoLayer {
+          if showsSystemControls {
+            VideoPlayer(player: controller.sourcePlayer)
+          } else {
+            RealtimePlayerLayerView(player: controller.sourcePlayer)
+          }
+        } else {
+          if showsSystemControls {
+            VideoPlayer(player: controller.restoredPlayer)
+          } else {
+            RealtimePlayerLayerView(player: controller.restoredPlayer)
+          }
+        }
+      } else {
+        VRPreviewSceneView(
+          playerItem: controller.sourceOnlyPlayback || controller.showOriginal
+            ? controller.sourcePlayer.currentItem
+            : controller.restoredPlayer.currentItem,
+          projection: PreviewProjectionMode(rawValue: runner.previewProjectionMode) ?? .vr180,
+          layout: PreviewVideoLayout(rawValue: runner.previewVideoLayout) ?? .sbs,
+          eye: PreviewEye(rawValue: runner.previewEye) ?? .left,
+          cameraFOV: runner.previewCameraFOV
+        )
+      }
+      if controller.shouldShowProcessingOverlay {
+        VStack(spacing: 8) {
+          ProgressView()
+          Text(controller.processingOverlayLabel)
+        }
+        .padding(18)
+        .background(.black.opacity(0.65), in: RoundedRectangle(cornerRadius: 10))
+        .foregroundStyle(.white)
+      }
+    }
+  }
+}
+
+private struct RealtimeDetachedVideoView: View {
   @ObservedObject var controller: RealtimePlayerController
   @ObservedObject var runner: RestorationRunner
   @State private var seekPosition = 0.0
   @State private var isScrubbing = false
+  @State private var controlsVisible = true
+  @State private var hideControlsTask: Task<Void, Never>?
 
   var body: some View {
-    VStack(spacing: 12) {
+    ZStack(alignment: .bottom) {
+      RealtimeVideoSurface(
+        controller: controller,
+        runner: runner,
+        showsSystemControls: false
+      )
+
+      if controlsVisible {
+        VStack(spacing: 10) {
+          HStack(spacing: 10) {
+            Text(time(controller.position))
+              .font(.caption.monospacedDigit())
+              .frame(width: 58, alignment: .trailing)
+            Slider(
+              value: Binding(
+                get: { isScrubbing ? seekPosition : controller.position },
+                set: { seekPosition = $0 }
+              ),
+              in: 0...max(controller.duration, 0.01),
+              onEditingChanged: { editing in
+                if editing {
+                  hideControlsTask?.cancel()
+                  seekPosition = controller.position
+                  isScrubbing = true
+                } else {
+                  let target = seekPosition
+                  isScrubbing = false
+                  controller.seek(to: target)
+                  scheduleControlsHide()
+                }
+              }
+            )
+            .disabled(!controller.isSeekable)
+            .accessibilityLabel("シーク")
+            Text(time(controller.duration))
+              .font(.caption.monospacedDigit())
+              .frame(width: 58, alignment: .leading)
+          }
+
+          HStack(spacing: 12) {
+            Button(action: togglePlayback) {
+              Image(systemName: controller.state == .playing ? "pause.fill" : "play.fill")
+                .frame(width: 20)
+            }
+            .buttonStyle(.borderless)
+            .help(controller.state == .playing ? "一時停止" : "再生")
+            .disabled(controller.previewInputURL == nil || controller.isDetectingVR)
+
+            Button {
+              controller.setMuted(!controller.muted)
+              revealControls()
+            } label: {
+              Image(systemName: controller.muted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                .frame(width: 20)
+            }
+            .buttonStyle(.borderless)
+
+            Slider(
+              value: Binding(get: { controller.volume }, set: controller.setVolume),
+              in: 0...1
+            )
+            .frame(width: 110)
+            .accessibilityLabel("音量")
+
+            Toggle(
+              "処理前",
+              isOn: Binding(
+                get: { controller.showOriginal },
+                set: { controller.showOriginal = $0 && controller.canShowOriginal }
+              )
+            )
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            .disabled(!controller.canShowOriginal)
+
+            Toggle(
+              "最大30fps",
+              isOn: Binding(
+                get: { runner.previewLimitHighFrameRate },
+                set: {
+                  controller.setPreviewHighFrameRateLimit($0, runner: runner)
+                }
+              )
+            )
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            .disabled(controller.isVRVideo)
+            .help("59.94fpsは29.97fps、60fpsは30fpsへ復元前に間引きます")
+
+            Spacer(minLength: 0)
+          }
+        }
+        .padding(12)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .shadow(radius: 8)
+        .padding(16)
+        .transition(.opacity)
+        .environment(\.colorScheme, .dark)
+      }
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .contentShape(Rectangle())
+    .onContinuousHover { phase in
+      switch phase {
+      case .active:
+        revealControls()
+      case .ended:
+        scheduleControlsHide()
+      }
+    }
+    .onChange(of: controller.state) { _, state in
+      if state == .playing {
+        scheduleControlsHide()
+      } else {
+        hideControlsTask?.cancel()
+        withAnimation(.easeInOut(duration: 0.15)) {
+          controlsVisible = true
+        }
+      }
+    }
+    .onAppear {
+      scheduleControlsHide()
+    }
+    .onDisappear {
+      hideControlsTask?.cancel()
+    }
+  }
+
+  private func togglePlayback() {
+    if controller.state == .idle || controller.state == .ended || controller.state == .failed {
+      controller.startSelectedInput(runner: runner)
+    } else {
+      controller.togglePlayback()
+    }
+    revealControls()
+  }
+
+  private func revealControls() {
+    hideControlsTask?.cancel()
+    if !controlsVisible {
+      withAnimation(.easeInOut(duration: 0.15)) {
+        controlsVisible = true
+      }
+    }
+    scheduleControlsHide()
+  }
+
+  private func scheduleControlsHide() {
+    hideControlsTask?.cancel()
+    guard controller.state == .playing, !isScrubbing else { return }
+    hideControlsTask = Task { @MainActor in
+      try? await Task.sleep(nanoseconds: 2_500_000_000)
+      guard !Task.isCancelled,
+            controller.state == .playing,
+            !isScrubbing else { return }
+      withAnimation(.easeOut(duration: 0.2)) {
+        controlsVisible = false
+      }
+    }
+  }
+
+  private func time(_ seconds: Double) -> String {
+    guard seconds.isFinite else { return "00:00" }
+    let value = max(0, Int(seconds))
+    return String(format: "%02d:%02d", value / 60, value % 60)
+  }
+}
+
+@MainActor
+private final class RealtimeDetachedVideoWindowController: NSObject, ObservableObject, NSWindowDelegate {
+  @Published private(set) var isPresented = false
+
+  private var window: NSWindow?
+  private let frameAutosaveName = "MiohDetachedRealtimeVideoWindow"
+
+  func present(controller: RealtimePlayerController, runner: RestorationRunner) {
+    if let window {
+      NSApp.activate(ignoringOtherApps: true)
+      window.makeKeyAndOrderFront(nil)
+      return
+    }
+
+    let detachedVideo = RealtimeDetachedVideoView(controller: controller, runner: runner)
+      .frame(minWidth: 640, minHeight: 360)
+      .background(Color.black)
+    let hostingView = NSHostingView(rootView: detachedVideo)
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 960, height: 540),
+      styleMask: [.titled, .closable, .miniaturizable, .resizable],
+      backing: .buffered,
+      defer: false
+    )
+    window.title = L("再生動画")
+    window.contentView = hostingView
+    window.contentMinSize = NSSize(width: 640, height: 360)
+    window.collectionBehavior.insert(.fullScreenPrimary)
+    window.delegate = self
+    window.isReleasedWhenClosed = false
+    if !window.setFrameUsingName(frameAutosaveName) {
+      window.center()
+    }
+    window.setFrameAutosaveName(frameAutosaveName)
+
+    self.window = window
+    isPresented = true
+    NSApp.activate(ignoringOtherApps: true)
+    window.makeKeyAndOrderFront(nil)
+  }
+
+  func bringToFront() {
+    guard let window else { return }
+    NSApp.activate(ignoringOtherApps: true)
+    window.makeKeyAndOrderFront(nil)
+  }
+
+  func dismiss() {
+    window?.performClose(nil)
+  }
+
+  func windowWillClose(_ notification: Notification) {
+    guard let closingWindow = notification.object as? NSWindow,
+          closingWindow === window else { return }
+    window = nil
+    isPresented = false
+  }
+}
+
+struct RealtimePlayerView: View {
+  @ObservedObject var controller: RealtimePlayerController
+  @ObservedObject var runner: RestorationRunner
+  @StateObject private var detachedVideoWindow = RealtimeDetachedVideoWindowController()
+  @State private var seekPosition = 0.0
+  @State private var isScrubbing = false
+
+  var body: some View {
+    VStack(spacing: 6) {
       PathRow(
         title: "再生動画",
         icon: "film",
@@ -4266,94 +4674,84 @@ struct RealtimePlayerView: View {
         action: { controller.choosePreviewInput(runner: runner) }
       )
 
-      if !controller.isVRVideo {
-        VStack(alignment: .leading, spacing: 8) {
-          // The Swift native preview picks its own Core AI assets. Only the
-          // bundled Python worker takes these selections.
-          if runner.usesPythonEngine {
-            HStack(spacing: 12) {
-              Picker("復元モデル", selection: $runner.previewRestorationModel) {
-                ForEach(runner.restorationModels, id: \.self) { model in
-                  Text(L(model)).tag(model)
-                }
+      HStack(spacing: 8) {
+        if !controller.isVRVideo {
+          HStack(spacing: 4) {
+            Text("復元モデル")
+            Picker("復元モデル", selection: $runner.previewRestorationModel) {
+              ForEach(runner.previewRestorationModels, id: \.self) { model in
+                Text(restorationModelLabel(model)).tag(model)
               }
-              .frame(maxWidth: 430)
-              if runner.previewRestorationModel == "カスタム" {
-                TextField("モデル名またはパス", text: $runner.previewCustomRestorationModel)
-                  .textFieldStyle(.roundedBorder)
-                  .frame(maxWidth: 360)
-                Button {
-                  runner.choosePath(\.previewCustomRestorationModel)
-                } label: {
-                  Image(systemName: "folder")
-                }
-              }
-              Spacer()
             }
-            HStack(spacing: 12) {
-              Picker("再生用検出モデル", selection: $runner.previewDetectionModel) {
-                ForEach(runner.previewDetectionModels, id: \.self) { model in
-                  Text(L(model)).tag(model)
-                }
+            .labelsHidden()
+            .frame(width: 205)
+          }
+          HStack(spacing: 4) {
+            Text("再生用検出モデル")
+            Picker("再生用検出モデル", selection: $runner.previewDetectionModel) {
+              ForEach(runner.previewDetectionModels, id: \.self) { model in
+                Text(L(model)).tag(model)
               }
-              .frame(maxWidth: 430)
-              if runner.previewDetectionModel == "カスタム" {
-                TextField("モデル名またはパス", text: $runner.previewCustomDetectionModel)
-                  .textFieldStyle(.roundedBorder)
-                  .frame(maxWidth: 360)
-                Button {
-                  runner.choosePath(\.previewCustomDetectionModel)
-                } label: {
-                  Image(systemName: "folder")
-                }
-              }
-              Spacer()
             }
+            .labelsHidden()
+            .frame(width: 155)
           }
-          HStack(spacing: 12) {
-            Toggle("リアルタイム最適化", isOn: $runner.previewRealtimeOptimization)
-              .toggleStyle(.checkbox)
-            Spacer()
-          }
-          if runner.previewRealtimeOptimization {
-            Text("復元は維持し、再生中は合成エフェクトとROIエンハンサーをバイパスします")
-              .font(.caption)
-              .foregroundStyle(.secondary)
-          }
+          Toggle("リアルタイム最適化", isOn: $runner.previewRealtimeOptimization)
+            .toggleStyle(.checkbox)
+          Toggle(
+            "最大30fps",
+            isOn: Binding(
+              get: { runner.previewLimitHighFrameRate },
+              set: {
+                controller.setPreviewHighFrameRateLimit($0, runner: runner)
+              }
+            )
+          )
+          .toggleStyle(.checkbox)
+          .disabled(controller.isVRVideo)
         }
-      }
-
-      ZStack {
-        Color.black
-        if runner.previewProjectionMode == "通常" {
-          if controller.prefersSourceVideoLayer {
-            VideoPlayer(player: controller.sourcePlayer)
-          } else {
-            VideoPlayer(player: controller.restoredPlayer)
+        Spacer()
+        if detachedVideoWindow.isPresented {
+          Button {
+            detachedVideoWindow.bringToFront()
+          } label: {
+            Label("独立ウインドウを前面に", systemImage: "macwindow")
+          }
+          Button {
+            detachedVideoWindow.dismiss()
+          } label: {
+            Label("再生タブに戻す", systemImage: "rectangle.inset.filled.and.person.filled")
           }
         } else {
-          VRPreviewSceneView(
-            playerItem: controller.sourceOnlyPlayback || controller.showOriginal
-              ? controller.sourcePlayer.currentItem
-              : controller.restoredPlayer.currentItem,
-            projection: PreviewProjectionMode(rawValue: runner.previewProjectionMode) ?? .vr180,
-            layout: PreviewVideoLayout(rawValue: runner.previewVideoLayout) ?? .sbs,
-            eye: PreviewEye(rawValue: runner.previewEye) ?? .left,
-            cameraFOV: runner.previewCameraFOV
-          )
-        }
-        if controller.shouldShowProcessingOverlay {
-          VStack(spacing: 8) {
-            ProgressView()
-            Text(controller.processingOverlayLabel)
+          Button {
+            detachedVideoWindow.present(controller: controller, runner: runner)
+          } label: {
+            Label("独立ウインドウで表示", systemImage: "macwindow.on.rectangle")
           }
-          .padding(18)
-          .background(.black.opacity(0.65), in: RoundedRectangle(cornerRadius: 10))
-          .foregroundStyle(.white)
         }
       }
-      .aspectRatio(16 / 9, contentMode: .fit)
-      .clipShape(RoundedRectangle(cornerRadius: 8))
+      .controlSize(.small)
+
+      Group {
+        if detachedVideoWindow.isPresented {
+          ZStack {
+            Color.black
+            VStack(spacing: 12) {
+              Image(systemName: "macwindow")
+                .font(.system(size: 36))
+              Text("動画は独立ウインドウに表示中です")
+              Button("独立ウインドウを前面に") {
+                detachedVideoWindow.bringToFront()
+              }
+            }
+            .foregroundStyle(.white)
+          }
+        } else {
+          RealtimeVideoSurface(controller: controller, runner: runner)
+        }
+      }
+        .aspectRatio(16 / 9, contentMode: .fit)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
 
       HStack {
         Text(time(controller.position))

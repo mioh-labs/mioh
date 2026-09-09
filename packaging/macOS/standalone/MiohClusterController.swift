@@ -1144,22 +1144,42 @@ final class MiohClusterController: ObservableObject {
       .appendingPathExtension("part")
       .appendingPathExtension(outputExtension)
     try? FileManager.default.removeItem(at: part)
-    var arguments = [
-      "-hide_banner", "-loglevel", "error", "-y",
-      "-f", "concat", "-safe", "0", "-i", manifest.path,
-      "-i", source.path,
-      "-map", "0:v:0", "-map", "1:a:0?",
-      "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+    func arguments(audio: [String]) -> [String] {
+      var values = [
+        "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+        "-f", "concat", "-safe", "0", "-i", manifest.path,
+        "-i", source.path,
+        "-map", "0:v:0", "-map", "1:a:0?",
+        "-c:v", "copy",
+      ]
+      values.append(contentsOf: audio)
       // Workers emit video-only shards. Add the original audio exactly once.
       // Do not use -shortest: a source whose audio ends a fraction early must
       // not lose an otherwise valid final restored video frame.
-      "-map_metadata", "1",
-    ]
-    if fastStart && outputExtension.lowercased() == "mp4" {
-      arguments.append(contentsOf: ["-movflags", "+faststart"])
+      values.append(contentsOf: ["-map_metadata", "1"])
+      if fastStart && outputExtension.lowercased() == "mp4" {
+        values.append(contentsOf: ["-movflags", "+faststart"])
+      }
+      values.append(part.path)
+      return values
     }
-    arguments.append(part.path)
-    try await Self.runProcess(ffmpeg, arguments: arguments, workingDirectory: working)
+    do {
+      try await Self.runProcess(
+        ffmpeg,
+        arguments: arguments(audio: ["-c:a", "copy"]),
+        workingDirectory: working
+      )
+    } catch {
+      try Task.checkCancellation()
+      try? FileManager.default.removeItem(at: part)
+      try await Self.runProcess(
+        ffmpeg,
+        arguments: arguments(
+          audio: ["-c:a", "aac", "-b:a", "192k"]
+        ),
+        workingDirectory: working
+      )
+    }
     try? FileManager.default.removeItem(at: output)
     try FileManager.default.moveItem(at: part, to: output)
   }
@@ -1373,19 +1393,13 @@ final class MiohClusterController: ObservableObject {
       }
       let reader = try AVAssetReader(asset: asset)
       let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
-      output.alwaysCopiesSampleData = false
-      guard reader.canAdd(output) else {
-        throw MiohClusterControllerError.sourceMetadataUnavailable
-      }
-      reader.add(output)
-      guard reader.startReading() else {
-        throw reader.error ?? MiohClusterControllerError.sourceMetadataUnavailable
-      }
+      let provider = reader.outputProvider(for: output)
+      try reader.start()
       var timestamps: [Int64] = []
       timestamps.reserveCapacity(32_768)
-      while let sample = output.copyNextSampleBuffer() {
+      while let sample = try await provider.next() {
         try Task.checkCancellation()
-        let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+        let pts = sample.presentationTimeStamp
         guard pts.isValid, !pts.isIndefinite else { continue }
         let seconds = CMTimeGetSeconds(pts)
         if seconds.isFinite, seconds >= 0 {

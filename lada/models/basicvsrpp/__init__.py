@@ -10,6 +10,9 @@ def register_all_modules():
         BasicVSRPlusPlusSharpGan,
     )
     from lada.models.basicvsrpp.mosaic_video_dataset import MosaicVideoDataset
+    from lada.models.basicvsrpp.known_grid_video_dataset import (
+        KnownGridMosaicVideoDataset,
+    )
     from lada.models.basicvsrpp.recoverable_hf_dataset import (
         RecoverableHFMosaicVideoDataset,
     )

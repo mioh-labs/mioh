@@ -310,11 +310,16 @@ class RecoverableHFMosaicVideoDataset(Dataset):
                 )
             )
 
-        final_top, final_left = _shared_roi_crop_offset(
-            mask_512_frames,
-            rng=rng,
-            training=self.training,
-        )
+        if entry.forced_final_crop_offset is None:
+            final_top, final_left = _shared_roi_crop_offset(
+                mask_512_frames,
+                rng=rng,
+                training=self.training,
+            )
+            crop_selection = "roi-anchor"
+        else:
+            final_left, final_top = entry.forced_final_crop_offset
+            crop_selection = "forced-native-tile"
         targets: list[np.ndarray] = []
         inputs: list[np.ndarray] = []
         masks: list[np.ndarray] = []
@@ -407,6 +412,7 @@ class RecoverableHFMosaicVideoDataset(Dataset):
                 "native_source_crop_size": SOURCE_CROP_SIZE,
                 "native_final_crop_size": FINAL_CROP_SIZE,
                 "native_final_crop_offset": (final_left, final_top),
+                "native_crop_selection": crop_selection,
                 "time_reversed": reversed_time,
                 "hflip": hflip,
             }

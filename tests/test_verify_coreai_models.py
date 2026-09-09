@@ -31,7 +31,6 @@ EXPECTED_MODELS = {
     "realesr-general-x4v3-256-fp16.h17s.aimodelc",
     "4xNomosWebPhoto_RealPLKSR-256-fp16.h17s.aimodelc",
     "basicvsrpp-v1.2-variable-coreai.h17s.aimodelc",
-    "basicvsrpp-v1.2-variable-hq-coreai.h17s.aimodelc",
 }
 EXPECTED_DEDICATED_MODELS = EXPECTED_MODELS | {
     "rfdetr-v6-576-fp32.aimodel",
@@ -132,7 +131,7 @@ def test_distribution_manifest_rejects_unknown_mode():
 
 
 @pytest.mark.parametrize("distribution", ["dedicated", "portable"])
-def test_verifier_resolves_all_seven_models_for_distribution(
+def test_verifier_resolves_all_models_for_distribution(
     tmp_path, monkeypatch, distribution
 ):
     resources = tmp_path / "Resources"
@@ -150,13 +149,6 @@ def test_verifier_resolves_all_seven_models_for_distribution(
             )
             return SimpleNamespace(
                 path=str(models / variable_asset)
-            )
-        if name == verifier.VARIABLE_HQ_MODEL_NAME:
-            return SimpleNamespace(
-                path=str(
-                    models
-                    / "basicvsrpp-v1.2-variable-hq-coreai.h17s.aimodelc"
-                )
             )
         contract = verifier.MODEL_CONTRACTS[name]
         asset = verifier.model_asset_name(contract["asset"], distribution, "h17s")

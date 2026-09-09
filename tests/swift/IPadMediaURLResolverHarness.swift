@@ -90,6 +90,8 @@ private struct IPadMediaURLResolverHarness {
       try await verifyBodyBudget(relativeTo: baseURL)
     case "drm":
       try await verifyDRMRejection(relativeTo: baseURL)
+    case "aes128":
+      try await verifyAES128Compatibility(relativeTo: baseURL)
     case "invalid-playlists":
       try await verifyInvalidPlaylists(relativeTo: baseURL)
     case "request-budget":
@@ -466,19 +468,19 @@ private struct IPadMediaURLResolverHarness {
       IPadRestorationMediaLimits.accepts(
         width: 1_920,
         height: 1_080,
-        clipLength: 30,
+        clipLength: 48,
         pixelFrameBudget: IPadRestorationMediaLimits.maximumRealtimePixelFrames
       ),
-      "the realtime 1080p T30 budget was rejected"
+      "the realtime 1080p T48 budget was rejected"
     )
     try require(
       !IPadRestorationMediaLimits.accepts(
         width: 1_920,
         height: 1_080,
-        clipLength: 31,
+        clipLength: 49,
         pixelFrameBudget: IPadRestorationMediaLimits.maximumRealtimePixelFrames
       ),
-      "the realtime budget exceeded T30"
+      "the realtime budget exceeded T48"
     )
   }
 
@@ -1278,6 +1280,65 @@ private struct IPadMediaURLResolverHarness {
         endpoint("drm/encrypted.m3u8", relativeTo: baseURL).absoluteString
       )
       throw ResolverHarnessFailure.assertion("encrypted HLS was accepted")
+    } catch IPadMediaURLResolverError.encryptedPlaylist {
+      return
+    }
+  }
+
+  private static func verifyAES128Compatibility(relativeTo baseURL: URL) async throws {
+    let resolver = IPadMediaURLResolver(
+      requestTimeout: 3,
+      allowsAES128HLS: true
+    )
+    let source = try await resolver.resolve(
+      endpoint("drm/encrypted.m3u8", relativeTo: baseURL).absoluteString
+    )
+    try require(source.kind == .hls, "AES-128 HLS was not resolved")
+    guard let segment = source.hlsPlaylist?.segments.first else {
+      throw ResolverHarnessFailure.assertion("AES-128 HLS segment is missing")
+    }
+    try require(
+      segment.resource.url.path == "/drm/encrypted.ts",
+      "AES-128 HLS segment was not parsed"
+    )
+    try require(
+      segment.encryption?.keyResource.url.path == "/drm/key.bin",
+      "AES-128 key resource was not parsed"
+    )
+    try require(
+      segment.encryption?.resolvedInitializationVector(sequence: 0)
+        == [UInt8](repeating: 0, count: 16),
+      "AES-128 default media-sequence IV was not derived"
+    )
+
+    let outputDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "mioh-aes128-materialize-\(UUID().uuidString)",
+      isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: outputDirectory) }
+    let downloader = IPadHLSResourceDownloader(requestTimeout: 3)
+    let outputURL = try await downloader.materialize(
+      segment: segment,
+      in: outputDirectory
+    )
+    let decrypted = try Data(contentsOf: outputURL)
+    var expected = Data()
+    for packetIndex in 0..<5 {
+      expected.append(0x47)
+      expected.append(
+        Data(repeating: UInt8(0x10 + packetIndex), count: 187)
+      )
+    }
+    try require(
+      decrypted == expected,
+      "AES-128 HLS segment was not decrypted exactly"
+    )
+
+    do {
+      _ = try await resolver.resolve(
+        endpoint("drm/sample-aes.m3u8", relativeTo: baseURL).absoluteString
+      )
+      throw ResolverHarnessFailure.assertion("SAMPLE-AES HLS was accepted")
     } catch IPadMediaURLResolverError.encryptedPlaylist {
       return
     }

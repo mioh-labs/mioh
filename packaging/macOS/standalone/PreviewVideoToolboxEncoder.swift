@@ -85,8 +85,7 @@ final class SegmentWriter {
   private var lastPTS: Int64?
   private var framesInSegment = 0
   private var writer: AVAssetWriter?
-  private var writerInput: AVAssetWriterInput?
-  private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
+  private var pixelBufferReceiver: AVAssetWriterInput.PixelBufferReceiver?
   private var workingURL: URL?
   private var finalURL: URL?
 
@@ -197,32 +196,28 @@ final class SegmentWriter {
     let exactTimeScale = CMTimeScale(fpsNumerator)
     writer.movieTimeScale = exactTimeScale
     input.mediaTimeScale = exactTimeScale
-    input.expectsMediaDataInRealTime = realTime
-    let attributes: [String: Any] = [
-      kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
-      kCVPixelBufferWidthKey as String: width,
-      kCVPixelBufferHeightKey as String: height,
-      kCVPixelBufferMetalCompatibilityKey as String: true,
-      kCVPixelBufferIOSurfacePropertiesKey as String: [:],
-    ]
-    let adaptor = AVAssetWriterInputPixelBufferAdaptor(
-      assetWriterInput: input,
-      sourcePixelBufferAttributes: attributes
+    var attributes = CVPixelBufferCreationAttributes(
+      pixelFormatType: CVPixelFormatType(
+        rawValue: kCVPixelFormatType_32BGRA
+      ),
+      size: CVImageSize(width: width, height: height)
     )
-    guard writer.canAdd(input) else {
-      throw EncoderError.writer("cannot add \(codec.rawValue) input")
-    }
-    writer.add(input)
-    guard writer.startWriting() else {
+    attributes.backing = .ioSurface
+    let receiver = writer.inputPixelBufferReceiver(
+      for: input,
+      pixelBufferAttributes: attributes
+    )
+    do {
+      try writer.start()
+    } catch {
       throw EncoderError.writer(
-        writer.error?.localizedDescription ?? "startWriting failed"
+        "writer start failed: \(error.localizedDescription)"
       )
     }
     writer.startSession(atSourceTime: .zero)
 
     self.writer = writer
-    writerInput = input
-    self.adaptor = adaptor
+    pixelBufferReceiver = receiver
     workingURL = paths.working
     finalURL = paths.final
     segmentStartNanoseconds = startNanoseconds
@@ -230,79 +225,81 @@ final class SegmentWriter {
   }
 
   private func makePixelBuffer(fromBGR source: UnsafeMutableRawPointer) throws
-    -> CVPixelBuffer
+    -> CVReadOnlyPixelBuffer
   {
-    guard let pool = adaptor?.pixelBufferPool else {
+    guard let pool = pixelBufferReceiver?.pixelBufferPool else {
       throw EncoderError.pixelBuffer("AVAssetWriter did not create a pool")
     }
-    var optionalBuffer: CVPixelBuffer?
-    let result = CVPixelBufferPoolCreatePixelBuffer(
-      kCFAllocatorDefault,
-      pool,
-      &optionalBuffer
-    )
-    guard result == kCVReturnSuccess, let pixelBuffer = optionalBuffer else {
-      throw EncoderError.pixelBuffer("pool allocation returned \(result)")
-    }
-    CVPixelBufferLockBaseAddress(pixelBuffer, [])
-    defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
-    guard let destination = CVPixelBufferGetBaseAddress(pixelBuffer) else {
-      throw EncoderError.pixelBuffer("base address unavailable")
-    }
+    let pixelBuffer = try pool.makeMutablePixelBuffer()
+    try pixelBuffer.withUnsafeBuffer { unsafeBuffer in
+      CVPixelBufferLockBaseAddress(unsafeBuffer, [])
+      defer { CVPixelBufferUnlockBaseAddress(unsafeBuffer, []) }
+      guard let destination = CVPixelBufferGetBaseAddress(unsafeBuffer) else {
+        throw EncoderError.pixelBuffer("base address unavailable")
+      }
 
-    var sourceBuffer = vImage_Buffer(
-      data: source,
-      height: vImagePixelCount(height),
-      width: vImagePixelCount(width),
-      rowBytes: width * 3
-    )
-    var destinationBuffer = vImage_Buffer(
-      data: destination,
-      height: vImagePixelCount(height),
-      width: vImagePixelCount(width),
-      rowBytes: CVPixelBufferGetBytesPerRow(pixelBuffer)
-    )
-    // The three source bytes are B,G,R. The RGB->RGBA routine preserves
-    // channel order and appends alpha, producing the BGRA layout requested by
-    // the pixel-buffer pool without an intermediate ndarray or VideoFrame.
-    let conversion = vImageConvert_RGB888toRGBA8888(
-      &sourceBuffer,
-      nil,
-      255,
-      &destinationBuffer,
-      false,
-      vImage_Flags(kvImageNoFlags)
-    )
-    guard conversion == kvImageNoError else {
-      throw EncoderError.pixelBuffer("vImage conversion returned \(conversion)")
+      var sourceBuffer = vImage_Buffer(
+        data: source,
+        height: vImagePixelCount(height),
+        width: vImagePixelCount(width),
+        rowBytes: width * 3
+      )
+      var destinationBuffer = vImage_Buffer(
+        data: destination,
+        height: vImagePixelCount(height),
+        width: vImagePixelCount(width),
+        rowBytes: CVPixelBufferGetBytesPerRow(unsafeBuffer)
+      )
+      // The three source bytes are B,G,R. The RGB->RGBA routine preserves
+      // channel order and appends alpha, producing BGRA without an
+      // intermediate ndarray or VideoFrame.
+      let conversion = vImageConvert_RGB888toRGBA8888(
+        &sourceBuffer,
+        nil,
+        255,
+        &destinationBuffer,
+        false,
+        vImage_Flags(kvImageNoFlags)
+      )
+      guard conversion == kvImageNoError else {
+        throw EncoderError.pixelBuffer(
+          "vImage conversion returned \(conversion)"
+        )
+      }
+      CVBufferSetAttachment(
+        unsafeBuffer,
+        kCVImageBufferColorPrimariesKey,
+        kCVImageBufferColorPrimaries_ITU_R_709_2,
+        .shouldPropagate
+      )
+      CVBufferSetAttachment(
+        unsafeBuffer,
+        kCVImageBufferTransferFunctionKey,
+        kCVImageBufferTransferFunction_ITU_R_709_2,
+        .shouldPropagate
+      )
+      CVBufferSetAttachment(
+        unsafeBuffer,
+        kCVImageBufferYCbCrMatrixKey,
+        kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+        .shouldPropagate
+      )
     }
-    CVBufferSetAttachment(
-      pixelBuffer,
-      kCVImageBufferColorPrimariesKey,
-      kCVImageBufferColorPrimaries_ITU_R_709_2,
-      .shouldPropagate
-    )
-    CVBufferSetAttachment(
-      pixelBuffer,
-      kCVImageBufferTransferFunctionKey,
-      kCVImageBufferTransferFunction_ITU_R_709_2,
-      .shouldPropagate
-    )
-    CVBufferSetAttachment(
-      pixelBuffer,
-      kCVImageBufferYCbCrMatrixKey,
-      kCVImageBufferYCbCrMatrix_ITU_R_709_2,
-      .shouldPropagate
-    )
-    return pixelBuffer
+    return CVReadOnlyPixelBuffer(pixelBuffer)
   }
 
   func append(source: UnsafeMutableRawPointer, ptsNanoseconds: Int64) async throws
     -> SegmentEvent?
   {
-    let pixelBuffer = try makePixelBuffer(fromBGR: source)
+    // The BGR bridge needs the adaptor's pixel-buffer pool before it can
+    // convert the first frame. The native CVPixelBuffer entry point opens the
+    // segment later in append(pixelBuffer:), but that is too late here.
+    if writer == nil {
+      try openSegment(startNanoseconds: ptsNanoseconds)
+    }
+    let readOnlyPixelBuffer = try makePixelBuffer(fromBGR: source)
     return try await append(
-      pixelBuffer: pixelBuffer,
+      readOnlyPixelBuffer: readOnlyPixelBuffer,
       ptsNanoseconds: ptsNanoseconds
     )
   }
@@ -313,6 +310,18 @@ final class SegmentWriter {
   func append(pixelBuffer: CVPixelBuffer, ptsNanoseconds: Int64) async throws
     -> SegmentEvent?
   {
+    try await append(
+      readOnlyPixelBuffer: CVReadOnlyPixelBuffer(
+        unsafeBuffer: pixelBuffer
+      ),
+      ptsNanoseconds: ptsNanoseconds
+    )
+  }
+
+  private func append(
+    readOnlyPixelBuffer: CVReadOnlyPixelBuffer,
+    ptsNanoseconds: Int64
+  ) async throws -> SegmentEvent? {
     var completed: SegmentEvent?
     if let start = segmentStartNanoseconds,
       ptsNanoseconds >= start + segmentNanoseconds
@@ -322,24 +331,21 @@ final class SegmentWriter {
     if writer == nil {
       try openSegment(startNanoseconds: ptsNanoseconds)
     }
-    guard let writer, let input = writerInput, let adaptor else {
+    guard writer != nil, let receiver = pixelBufferReceiver else {
       throw EncoderError.writer("segment is not open")
-    }
-    while !input.isReadyForMoreMediaData {
-      if writer.status == .failed || writer.status == .cancelled {
-        throw EncoderError.writer(
-          writer.error?.localizedDescription ?? "writer stopped accepting frames"
-        )
-      }
-      try await Task.sleep(nanoseconds: 250_000)
     }
     let presentationTime = CMTime(
       value: Int64(framesInSegment * fpsDenominator),
       timescale: Int32(fpsNumerator)
     )
-    guard adaptor.append(pixelBuffer, withPresentationTime: presentationTime) else {
+    do {
+      try await receiver.append(
+        readOnlyPixelBuffer,
+        with: presentationTime
+      )
+    } catch {
       throw EncoderError.writer(
-        writer.error?.localizedDescription ?? "pixel-buffer append failed"
+        "pixel-buffer append failed: \(error.localizedDescription)"
       )
     }
     framesInSegment += 1
@@ -355,17 +361,14 @@ final class SegmentWriter {
   }
 
   private func closeSegment(endNanoseconds: Int64) async throws -> SegmentEvent {
-    guard let writer, let input = writerInput, let workingURL, let finalURL,
+    guard let writer, let receiver = pixelBufferReceiver, let workingURL,
+      let finalURL,
       let start = segmentStartNanoseconds
     else {
       throw EncoderError.writer("cannot close a segment that is not open")
     }
-    input.markAsFinished()
-    await withCheckedContinuation { continuation in
-      writer.finishWriting {
-        continuation.resume()
-      }
-    }
+    receiver.finish()
+    await writer.finishWriting()
     guard writer.status == .completed else {
       throw EncoderError.writer(
         writer.error?.localizedDescription ?? "finishWriting failed"
@@ -381,8 +384,7 @@ final class SegmentWriter {
     )
     sequence += 1
     self.writer = nil
-    writerInput = nil
-    adaptor = nil
+    pixelBufferReceiver = nil
     self.workingURL = nil
     self.finalURL = nil
     segmentStartNanoseconds = nil
@@ -396,8 +398,7 @@ final class SegmentWriter {
       try? FileManager.default.removeItem(at: workingURL)
     }
     writer = nil
-    writerInput = nil
-    adaptor = nil
+    pixelBufferReceiver = nil
     workingURL = nil
     finalURL = nil
     segmentStartNanoseconds = nil

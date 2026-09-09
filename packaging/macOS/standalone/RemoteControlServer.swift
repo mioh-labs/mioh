@@ -62,7 +62,12 @@ private enum RemoteControlConfigurationError: Error {
 @MainActor
 final class RemoteControlServer: ObservableObject {
   @Published private(set) var enabled = false
-  @Published var port = 8888
+  @Published var port: Int {
+    didSet {
+      guard (1...65_535).contains(port) else { return }
+      UserDefaults.standard.set(port, forKey: Self.portDefaultsKey)
+    }
+  }
   @Published private(set) var status = L("無効")
   @Published private(set) var token: String
   @Published private(set) var urls: [URL] = []
@@ -82,9 +87,16 @@ final class RemoteControlServer: ObservableObject {
   private var configurationRevision = 1
   private var configurationSnapshotData: Data?
   private var assetCatalog: [String: RemoteControlAsset] = [:]
+  private var resumeWhenAttached: Bool
   private static let maximumAssetCount = 65_536
+  private static let enabledDefaultsKey = "mioh.remote-control.enabled.v1"
+  private static let portDefaultsKey = "mioh.remote-control.port.v1"
 
   init() {
+    let defaults = UserDefaults.standard
+    let savedPort = defaults.integer(forKey: Self.portDefaultsKey)
+    port = (1...65_535).contains(savedPort) ? savedPort : 8888
+    resumeWhenAttached = defaults.bool(forKey: Self.enabledDefaultsKey)
     let loaded = RemoteControlTokenStore.loadOrCreate()
     token = loaded.token
     keychainWarning = loaded.warning
@@ -109,7 +121,16 @@ final class RemoteControlServer: ObservableObject {
     streaming.setServerEnabled(enabled)
   }
 
+  /// Restores the user's last explicit choice after all controlled objects are
+  /// attached. A one-time opt-in is therefore enough for normal daily use.
+  func activateIfRemembered() {
+    guard resumeWhenAttached, !enabled else { return }
+    start()
+  }
+
   func setEnabled(_ newValue: Bool) {
+    resumeWhenAttached = newValue
+    UserDefaults.standard.set(newValue, forKey: Self.enabledDefaultsKey)
     newValue ? start() : stop()
   }
 
@@ -182,6 +203,8 @@ final class RemoteControlServer: ObservableObject {
                 ? L("待受中")
                 : L("待受中（トークンをKeychainへ保存できませんでした）")
             case .failed(let message):
+              self.resumeWhenAttached = false
+              UserDefaults.standard.set(false, forKey: Self.enabledDefaultsKey)
               self.streaming?.setServerEnabled(false)
               self.engine = nil
               self.enabled = false
@@ -700,7 +723,7 @@ final class RemoteControlServer: ObservableObject {
   }
 
   private func configurationOptions(_ runner: RestorationRunner) -> [String: Any] {
-    let engines = runner.supportsPythonEngine ? ["native", "python"] : ["native"]
+    let engines = ["native"]
     func availabilityJSON(_ value: MiohModelAvailability) -> [String: Any] {
       var result: [String: Any] = ["available": value.available]
       if let reason = value.reason { result["reason"] = reason }
@@ -759,7 +782,7 @@ final class RemoteControlServer: ObservableObject {
     return [
       "restorationEngines": engines,
       "executors": ["process", "thread"],
-      "devices": runner.supportsPythonEngine ? ["mps", "cpu", "cuda:0"] : ["mps"],
+      "devices": ["mps"],
       "encodingModes": ["auto", "preset", "custom"],
       "encodingPresets": runner.encodingPresets,
       "restorationModels": restorationModels,
@@ -910,9 +933,9 @@ final class RemoteControlServer: ObservableObject {
       // roiEnhancerModel normally contains a built-in model identifier. Only
       // the opaque asset form is resolved as a filesystem selection.
       if key == "roiEnhancerModel", !string.hasPrefix("asset-") { continue }
-      // Python-compatible custom selectors may be a registered model name as
-      // well as a file. Absolute paths are never accepted from the browser;
-      // files still have to arrive as opaque asset capabilities.
+      // Legacy custom selectors may be a registered model name as well as a
+      // file. Absolute paths are never accepted from the browser; files still
+      // have to arrive as opaque asset capabilities.
       if Self.customModelSettingKeys.contains(key), !string.hasPrefix("asset-") {
         guard Self.validModelIdentifier(string) else {
           throw RemoteControlConfigurationError.invalidAsset(key)
@@ -946,17 +969,13 @@ final class RemoteControlServer: ObservableObject {
     runner: RestorationRunner
   ) -> Bool {
     let requestedEngine = value.restorationEngine ?? "native"
-    let allowedDevices = requestedEngine == "python"
-      ? Set(["mps", "cpu", "cuda:0"])
-      : Set(["mps"])
+    let allowedDevices = Set(["mps"])
     let allowedMergeEncoders = Set([
       "copy", "h264", "hevc", "h264_videotoolbox", "hevc_videotoolbox",
       "libx264", "libx265",
     ])
     guard (value.restorationEngine == nil
-        || (runner.supportsPythonEngine
-          ? ["native", "python"].contains(value.restorationEngine!)
-          : value.restorationEngine == "native")),
+        || value.restorationEngine == "native"),
       (1...16).contains(value.parallelWorkers),
       (1...3).contains(value.nativeParallelWorkers ?? 1),
       ["process", "thread"].contains(value.executor),
@@ -974,7 +993,7 @@ final class RemoteControlServer: ObservableObject {
       (1...180).contains(value.maxClipLength),
       (value.restoreMaxFrames == -1 || (1...180).contains(value.restoreMaxFrames)),
       (0...120).contains(value.restoreTemporalOverlap ?? 8),
-      value.sharpenStrength.isFinite, (0...2).contains(value.sharpenStrength),
+      value.sharpenStrength.isFinite, (0...5).contains(value.sharpenStrength),
       value.detailBoost.isFinite, (0...1).contains(value.detailBoost),
       value.blendFeather.isFinite, (0...3).contains(value.blendFeather),
       value.textureMix.isFinite, (0...1).contains(value.textureMix),
@@ -986,6 +1005,7 @@ final class RemoteControlServer: ObservableObject {
       (0...1_024).contains(value.roiEnhancerTile),
       runner.detectionModels.contains(value.detectionModel),
       (0...300).contains(value.detectionEmptyLookahead),
+      (0...8).contains(value.detectionMaskReuseSkipFrames ?? 0),
       value.previewBufferLimit.isFinite, (1...60).contains(value.previewBufferLimit),
       runner.restorationModels.contains(value.previewRestorationModel ?? ""),
       runner.previewDetectionModels.contains(value.previewDetectionModel ?? ""),
@@ -2448,16 +2468,16 @@ private enum RemoteControlHTML {
         ['実行',[['restorationEngine','実行エンジン','select','restorationEngines'],['device','デバイス','select','devices'],['fp16','FP16','bool'],['autoOptimize','自動最適化','bool'],['overwrite','既存結果を上書き','bool']]]
       ]],
       ['processing',[
-        ['並列処理',[['parallelWorkers','Python並列数','number',1,16,1],['nativeParallelWorkers','ネイティブ並列数','number',1,3,1],['executor','実行方式','select','executors']]],
+        ['並列処理',[['parallelWorkers','旧並列数','number',1,16,1],['nativeParallelWorkers','ネイティブ並列数','number',1,3,1],['executor','旧実行方式','select','executors']]],
         ['セグメント',[['noSplit','分割しない','bool'],['useSegmentCount','分割方法','boolSelect'],['segmentCount','分割数','number',1,128,1],['segmentDuration','長さ（秒）','number',10,3600,10],['mergeEncoder','結合エンコーダー','text'],['deleteSegments','処理済みセグメントを削除','bool'],['keepTemp','一時ファイルを保持','bool'],['forceSplit','強制的に再分割','bool']]]
       ]],
       ['restoration',[
         ['モデル',[['restorationModel','復元モデル','select','restorationModels'],['customRestorationModel','モデルパス','modelValue'],['useMaxClipLength','最大クリップ長を指定','bool'],['maxClipLength','最大クリップ長','number',1,180,1],['useRestoreMaxFrames','復元チャンク数を指定','bool'],['restoreMaxFrames','復元チャンク数','number',-1,180,1],['restoreTemporalOverlap','Temporal overlap','number',0,120,1],['restoreCrossfade','クロスフェードを有効化','bool']]],
-        ['合成',[['sharpenStrength','シャープ','range',0,2,0.05],['detailBoost','ディテール','range',0,1,0.05],['blendFeather','境界フェザー','range',0,3,0.05],['textureMix','テクスチャ','range',0,1,0.01],['smoothStrength','スムージング','range',0,1,0.05],['effectUpscale','エフェクト倍率','number',1,4,1]]],
+        ['合成',[['sharpenStrength','シャープ','range',0,5,0.05],['detailBoost','ディテール','range',0,1,0.05],['blendFeather','境界フェザー','range',0,3,0.05],['textureMix','テクスチャ','range',0,1,0.01],['smoothStrength','スムージング','range',0,1,0.05],['effectUpscale','エフェクト倍率','number',1,4,1]]],
         ['ROIエンハンサー',[['roiEnhancer','方式','select','roiEnhancers'],['roiEnhancerModel','モデル','roiModel'],['roiEnhancerScale','倍率','number',1,8,1],['roiEnhancerStrength','強度','range',0,1,0.05],['roiEnhancerTile','タイル','number',0,1024,32]]]
       ]],
       ['detection',[
-        ['検出モデル',[['detectionModel','モデル','select','detectionModels'],['customDetectionModel','モデルパス','modelValue'],['detectionEmptyLookahead','無検出時の判定間隔','number',0,300,1],['detectFaceMosaics','顔モザイクを検出','bool']]]
+        ['検出モデル',[['detectionModel','モデル','select','detectionModels'],['customDetectionModel','モデルパス','modelValue'],['detectionEmptyLookahead','無検出時の判定間隔','number',0,300,1],['detectionMaskReuseSkipFrames','検出後スキップ','number',0,8,1],['detectFaceMosaics','顔モザイクを検出','bool']]]
       ]],
       ['output',[
         ['エンコーダー',[['encodingMode','設定方法','select','encodingModes'],['encodingPreset','プリセット','select','encodingPresets'],['encoder','エンコーダー','text'],['bitrateMultiplier','ビットレート倍率','number',0.1,100,0.1],['mp4FastStart','MP4 Fast Start','bool']]],
@@ -2472,17 +2492,17 @@ private enum RemoteControlHTML {
         ['HLS再生',[['previewUseSafariCompatibleHLS','Safari互換通信','bool'],['previewHLSQuality','HLS画質','select','hlsQualities']]]
       ]],
       ['playback',[
-        ['再生設定',[['previewRestorationModel','復元モデル','select','previewRestorationModels'],['previewCustomRestorationModel','復元モデルパス','modelValue'],['previewDetectionModel','再生用検出モデル','select','previewDetectionModels'],['previewCustomDetectionModel','検出モデルパス','modelValue'],['previewRealtimeOptimization','リアルタイム最適化','bool'],['previewBufferLimit','バッファ上限（秒）','range',1,60,1]]],
+        ['再生設定',[['previewRestorationModel','復元モデル','select','previewRestorationModels'],['previewCustomRestorationModel','復元モデルパス','modelValue'],['previewDetectionModel','再生用検出モデル','select','previewDetectionModels'],['previewCustomDetectionModel','検出モデルパス','modelValue'],['previewRealtimeOptimization','リアルタイム最適化','bool'],['previewLimitHighFrameRate','高フレームレートを29.97fpsへ制限','bool'],['previewBufferLimit','バッファ上限（秒）','range',1,60,1]]],
         ['VR表示',[['previewProjectionMode','表示','select','projectionModes'],['previewVideoLayout','形式','select','videoLayouts'],['previewEye','目','select','eyes'],['previewCameraFOV','視野角','range',45,105,1]]]
       ]]
     ];
     function optionsFor(spec){const values=spec[2]==='roiModel'?(config.options.roiEnhancerModels[config.settings.roiEnhancer]||[]):(config.options[spec[3]]||[]),engine=config.settings.restorationEngine||'native';return values.map(x=>{if(typeof x==='string')return{value:x,label:x,available:true,reason:''};const state=x.availabilityByEngine?.[engine]||x;return{value:x.id||x.value,label:x.label||x.id,available:state.available!==false,reason:state.reason||''}})}
     function isCustom(value){return value==='カスタム'||value==='custom'}
-    function fieldVisible(key){const s=config.settings,python=s.restorationEngine==='python';switch(key){case'device':case'fp16':case'autoOptimize':case'parallelWorkers':case'executor':case'mergeEncoder':return python;case'nativeParallelWorkers':return !python;case'customRestorationModel':return isCustom(s.restorationModel);case'maxClipLength':return Boolean(s.useMaxClipLength);case'restoreMaxFrames':return Boolean(s.useRestoreMaxFrames);case'roiEnhancerModel':return s.roiEnhancer!=='none';case'customDetectionModel':return isCustom(s.detectionModel);case'encodingPreset':return s.encodingMode==='preset';case'encoder':return s.encodingMode==='custom';case'segmentCount':return Boolean(s.useSegmentCount);case'segmentDuration':return !s.useSegmentCount;case'mpsMemoryFraction':return Boolean(s.useMPSMemoryFraction);case'previewRestorationModel':case'previewDetectionModel':return python;case'previewCustomRestorationModel':return python&&isCustom(s.previewRestorationModel);case'previewCustomDetectionModel':return python&&isCustom(s.previewDetectionModel);default:return true}}
-    function fieldDisabled(key){const s=config.settings,python=s.restorationEngine==='python';if(['parallelWorkers','executor','useSegmentCount','segmentCount','segmentDuration','forceSplit'].includes(key)&&s.noSplit)return true;if(['roiEnhancerScale','roiEnhancerStrength','roiEnhancerTile'].includes(key)&&s.roiEnhancer==='none')return true;if(key==='quality'&&!s.useQuality)return true;if(key==='qmin'&&!s.useQMin)return true;if(key==='qmax'&&!s.useQMax)return true;if(['fps','fpsDenominator'].includes(key)&&!s.useFPS)return true;if(key==='preFPSConversion'&&(!s.useFPS||(python&&s.noSplit)))return true;return false}
-    const dependencyKeys=new Set(['restorationEngine','restorationModel','detectionModel','useMaxClipLength','useRestoreMaxFrames','roiEnhancer','encodingMode','useSegmentCount','noSplit','useQuality','useQMin','useQMax','useFPS','useMPSMemoryFraction','previewRestorationModel','previewDetectionModel','previewRealtimeOptimization']);
+    function fieldVisible(key){const s=config.settings;switch(key){case'restorationEngine':case'device':case'fp16':case'autoOptimize':case'parallelWorkers':case'executor':case'mergeEncoder':case'customRestorationModel':case'customDetectionModel':case'previewCustomRestorationModel':case'previewCustomDetectionModel':return false;case'nativeParallelWorkers':case'detectionMaskReuseSkipFrames':case'previewRestorationModel':case'previewDetectionModel':return true;case'maxClipLength':return Boolean(s.useMaxClipLength);case'restoreMaxFrames':return Boolean(s.useRestoreMaxFrames);case'roiEnhancerModel':return s.roiEnhancer!=='none';case'encodingPreset':return s.encodingMode==='preset';case'encoder':return s.encodingMode==='custom';case'segmentCount':return Boolean(s.useSegmentCount);case'segmentDuration':return !s.useSegmentCount;case'mpsMemoryFraction':return Boolean(s.useMPSMemoryFraction);default:return true}}
+    function fieldDisabled(key){const s=config.settings;if(['useSegmentCount','segmentCount','segmentDuration','forceSplit'].includes(key)&&s.noSplit)return true;if(['roiEnhancerScale','roiEnhancerStrength','roiEnhancerTile'].includes(key)&&s.roiEnhancer==='none')return true;if(key==='quality'&&!s.useQuality)return true;if(key==='qmin'&&!s.useQMin)return true;if(key==='qmax'&&!s.useQMax)return true;if(['fps','fpsDenominator'].includes(key)&&!s.useFPS)return true;if(key==='preFPSConversion'&&!s.useFPS)return true;return false}
+    const dependencyKeys=new Set(['restorationModel','detectionModel','useMaxClipLength','useRestoreMaxFrames','roiEnhancer','encodingMode','useSegmentCount','noSplit','useQuality','useQMin','useQMax','useFPS','useMPSMemoryFraction','previewRestorationModel','previewDetectionModel','previewRealtimeOptimization']);
     function changed(key,value){config.settings[key]=value;if(key==='roiEnhancer')config.settings.roiEnhancerModel='';if(dependencyKeys.has(key))renderSettings();$('modelName').textContent=config.settings.restorationModel||'復元モデル未選択'}
-    function sectionNote(tab,title){const s=config.settings;if(tab==='basic'&&title==='実行'&&s.restorationEngine!=='python')return'FP16 / Apple Silicon自動最適化で、デコードから書き出しまでを1つのSwiftプロセスで実行します。';if(tab==='processing'&&title==='並列処理'&&s.restorationEngine!=='python')return'Swiftネイティブの自動段階並列を使用します。';if(tab==='processing'&&title==='セグメント'&&s.noSplit)return'元動画をsegmentsへコピーせず、そのまま1本で処理します。';if(tab==='output'&&title==='FFmpeg詳細設定')return'例: -pix_fmt yuv420p10le -profile:v main10 -b:v 20M';if(tab==='playback'&&title==='再生設定'&&s.previewRealtimeOptimization)return'復元は維持し、再生中は合成パラメータとROIエンハンサーを完全バイパスします。';return''}
+    function sectionNote(tab,title){const s=config.settings;if(tab==='basic'&&title==='実行')return'FP16 / Apple Silicon自動最適化で、デコードから書き出しまでを1つのSwiftプロセスで実行します。';if(tab==='processing'&&title==='並列処理')return'Swiftネイティブの自動段階並列を使用します。';if(tab==='processing'&&title==='セグメント'&&s.noSplit)return'元動画をsegmentsへコピーせず、そのまま1本で処理します。';if(tab==='output'&&title==='FFmpeg詳細設定')return'例: -pix_fmt yuv420p10le -profile:v main10 -b:v 20M';if(tab==='playback'&&title==='再生設定'&&s.previewRealtimeOptimization)return'復元は維持し、再生中は合成パラメータとROIエンハンサーを完全バイパスします。';return''}
     function renderSettings(){if(!config)return;for(const [tab,sections] of settingTabs){const root=$('settings-'+tab);root.replaceChildren();for(const [title,fields] of sections){const section=el('section',undefined,'settings-group'),heading=el('h2',title),grid=el('div',undefined,'formgrid');section.append(heading);for(const spec of fields){const [key,label,type]=spec;if(!fieldVisible(key))continue;const labelNode=el('label',label);grid.append(labelNode);let control;if(type==='bool'){control=el('input');control.type='checkbox';control.checked=Boolean(config.settings[key]);control.onchange=()=>changed(key,control.checked)}else if(type==='boolSelect'){control=el('select');for(const pair of [[true,'個数'],[false,'秒数']]){const option=el('option',pair[1]);option.value=String(pair[0]);option.selected=Boolean(config.settings[key])===pair[0];control.append(option)}control.onchange=()=>changed(key,control.value==='true')}else if(type==='path'){control=pathControl(key,spec[3])}else if(type==='modelValue'){control=modelValueControl(key)}else if(type==='range'){const wrap=el('div',undefined,'row'),range=el('input'),value=el('span',String(config.settings[key]??''),'meta');range.type='range';range.min=spec[3];range.max=spec[4];range.step=spec[5];range.value=config.settings[key]??spec[3];range.oninput=()=>{const number=Number(range.value);config.settings[key]=number;value.textContent=String(number)};wrap.append(range,value);control=wrap}else if(type==='select'||type==='roiModel'){control=el('select');let choices=optionsFor(spec);const current=config.settings[key];if(current!==null&&current!==undefined&&!choices.some(x=>x.value===current))choices.push({value:current,label:(config.assetLabels[key]||current),available:true,reason:''});for(const choice of choices){const suffix=choice.available?'':`（${choice.reason||'未導入'}）`,option=el('option',choice.label+suffix);option.value=choice.value;option.selected=choice.value===current;option.disabled=!choice.available&&choice.value!==current;if(choice.reason)option.title=choice.reason;control.append(option)}control.onchange=()=>changed(key,control.value);if(type==='roiModel'){const wrap=el('div',undefined,'pathbox'),browse=el('button','参照','ghost');browse.type='button';browse.onclick=()=>openBrowser(key,'model');wrap.append(control,browse);control=wrap}}else{control=el(type==='textarea'?'textarea':'input');if(type==='number'){control.type='number';control.min=spec[3];control.max=spec[4];control.step=spec[5];control.value=config.settings[key]??'';control.onchange=()=>changed(key,Number(control.value))}else{control.value=config.settings[key]??'';control.oninput=()=>changed(key,control.value)}}if(fieldDisabled(key)){for(const item of control.matches?.('input,select,textarea,button')?[control]:control.querySelectorAll?.('input,select,textarea,button')||[])item.disabled=true}grid.append(control)}const note=sectionNote(tab,title);if(note){const noteNode=el('p',note,'meta field-note');grid.append(noteNode)}section.append(grid);root.append(section)}}}
     function pathControl(key,purpose){const w=el('div',undefined,'pathbox'),label=el('span',config.assetLabels[key]||'未選択','pathlabel'),choose=el('button','参照','ghost'),clear=el('button','解除','secondary');choose.type='button';choose.onclick=()=>openBrowser(key,purpose);clear.type='button';clear.onclick=()=>{config.settings[key]='';config.assetLabels[key]='';renderSettings()};w.append(label,choose,clear);return w}
     function modelValueControl(key){const w=el('div',undefined,'pathbox'),value=config.settings[key]||'',usingAsset=String(value).startsWith('asset-'),input=el('input'),choose=el('button','参照','ghost'),clear=el('button','解除','secondary');input.type='text';input.value=usingAsset?'':value;input.placeholder=usingAsset?(config.assetLabels[key]||'選択済みモデル'):'モデルIDまたはファイルを選択';input.oninput=()=>{config.settings[key]=input.value;config.assetLabels[key]=''};choose.type='button';choose.onclick=()=>openBrowser(key,'model');clear.type='button';clear.onclick=()=>{config.settings[key]='';config.assetLabels[key]='';renderSettings()};w.append(input,choose,clear);return w}

@@ -129,12 +129,18 @@ class MosaicVideoDataset(data.Dataset):
         self.filter_video_quality = opt.get('filter_video_quality', False)
         self.native_roi_crop = opt.get('native_roi_crop', False)
         self.return_mosaic_mask = opt.get('return_mosaic_mask', False)
+        self.time_reverse = opt.get('time_reverse', False)
         self.rotation_probability = opt.get('rotation_probability', 0.3)
         self.filter_watermark_thresh = 0.1
         self.repad = True
 
         self.metadata = []
         for meta_path in glob.glob(os.path.join(opt['metadata_root_dir'], '*')):
+            # External macOS volumes commonly contain AppleDouble sidecars.
+            # They mirror the metadata filenames but are binary resource-fork
+            # records, not restoration metadata JSON.
+            if os.path.basename(meta_path).startswith('._'):
+                continue
             meta = RestorationDatasetMetadataV2.from_json_file(meta_path)
             if meta.frames_count < self.min_frame_count:
                 continue
@@ -242,6 +248,12 @@ class MosaicVideoDataset(data.Dataset):
                 img_gts = repad_image(img_gts, scaled_pads, mode='zero')
                 if mask_lqs is not None:
                     mask_lqs = repad_image(mask_lqs, scaled_pads, mode='zero')
+
+        if self.time_reverse and rng_random.random() < 0.5:
+            img_gts.reverse()
+            img_lqs.reverse()
+            if mask_lqs is not None:
+                mask_lqs.reverse()
 
         if self.use_hflip and rng_random.random() < 0.5:
             img_gts = [np.fliplr(img) for img in img_gts]

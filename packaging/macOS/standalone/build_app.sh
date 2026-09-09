@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="${0:A:h:h:h:h}"
 PACKAGE_DIR="$ROOT/packaging/macOS/standalone"
+REMOTE_APP_SOURCE_DIR="$ROOT/apps/MiohRemote/MiohRemote"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build/macos-standalone}"
 COREAI_DISTRIBUTION="${COREAI_DISTRIBUTION:-dedicated}"
 APP_BASENAME="${APP_BASENAME:-mioh}"
@@ -21,45 +22,23 @@ MIOH_MODELESS_DISTRIBUTION="${MIOH_MODELESS_DISTRIBUTION:-0}"
 USER_MANUAL_PDF="${USER_MANUAL_PDF:-$ROOT/output/pdf/mioh-user-manual-ja.pdf}"
 CONTENTS="$APP/Contents"
 RESOURCES="$CONTENTS/Resources"
+COREAI_ARCHITECTURE="${COREAI_ARCHITECTURE:-h17s}"
+DEDICATED_PREBUILT_MODELS="${DEDICATED_PREBUILT_MODELS:-$ROOT/model_weights/mioh-dedicated-$COREAI_ARCHITECTURE}"
 LADA_STANDALONE_PYTHON_ENV="${LADA_STANDALONE_PYTHON_ENV:-${LADA_STANDALONE_VENV:-$ROOT/.venv-coreai}}"
 LADA_STANDALONE_PYTHON_ENV="${LADA_STANDALONE_PYTHON_ENV:A}"
-# The dedicated build targets Core AI hardware and runs entirely inside the
-# Swift pipeline, so it bundles no interpreter. The portable/universal build
-# still ships the Python restoration and preview path for machines without a
-# usable Core AI restorer, so it carries a full runtime in Resources/runtime.
-if [[ "$COREAI_DISTRIBUTION" == "portable" ]]; then
-  MIOH_BUNDLE_PYTHON_RUNTIME="${MIOH_BUNDLE_PYTHON_RUNTIME:-1}"
-else
-  MIOH_BUNDLE_PYTHON_RUNTIME="${MIOH_BUNDLE_PYTHON_RUNTIME:-0}"
-fi
-if [[ "$MIOH_BUNDLE_PYTHON_RUNTIME" == 1 || "$MIOH_MODELESS_DISTRIBUTION" != 1 ]]; then
+# Dedicated builds consume checked native assets and have no Python dependency.
+# Python remains available only to the separate portable model-export path.
+if [[ "$COREAI_DISTRIBUTION" == "portable" \
+      && "$MIOH_MODELESS_DISTRIBUTION" != 1 ]]; then
   if [[ ! -x "$LADA_STANDALONE_PYTHON_ENV/bin/python" ]]; then
     print -u2 "Missing build-time Python: $LADA_STANDALONE_PYTHON_ENV/bin/python"
-    print -u2 "Set LADA_STANDALONE_PYTHON_ENV to the environment to package."
-    exit 1
-  fi
-fi
-PYTHON_SOURCE="${PYTHON_SOURCE:-$HOME/.local/share/uv/python/cpython-3.12-macos-aarch64-none}"
-PYTHON_SOURCE="${PYTHON_SOURCE:A}"
-SITE_PACKAGES="${SITE_PACKAGES:-$LADA_STANDALONE_PYTHON_ENV/lib/python3.12/site-packages}"
-if [[ "$MIOH_BUNDLE_PYTHON_RUNTIME" == 1 ]]; then
-  if [[ ! -d "$PYTHON_SOURCE" ]]; then
-    print -u2 "Missing interpreter to bundle: $PYTHON_SOURCE"
-    print -u2 "Set PYTHON_SOURCE, or install it with: uv python install 3.12"
-    exit 1
-  fi
-  if [[ ! -d "$SITE_PACKAGES" ]]; then
-    print -u2 "Missing site-packages for standalone build: $SITE_PACKAGES"
-    print -u2 "Set LADA_STANDALONE_PYTHON_ENV to the single Python environment to package."
+    print -u2 "Set LADA_STANDALONE_PYTHON_ENV to the model build environment."
     exit 1
   fi
 fi
 COMPILED_MODELS="${COMPILED_MODELS:-$BUILD_DIR/compiled-models}"
-COREAI_ARCHITECTURE="${COREAI_ARCHITECTURE:-h17s}"
 COMPILED_COREML_MODELS="${COMPILED_COREML_MODELS:-$BUILD_DIR/compiled-coreml-models}"
 FFMPEG_CACHE="${FFMPEG_CACHE:-$BUILD_DIR/ffmpeg-static}"
-VENDORED_MPS_DEFORM_CONV="$PACKAGE_DIR/vendor/mps-deform-conv-0.2.2"
-MPS_DEFORM_BUILD_SOURCE="$BUILD_DIR/mps-deform-conv-source"
 PREVIEW_ENCODER_TARGET="arm64-apple-macosx26.0"
 
 rm -rf "$APP" "$BUILD_DIR/Lada.app"
@@ -70,8 +49,6 @@ typeset -a APP_SWIFT_FLAGS
 APP_SWIFT_FLAGS=()
 if [[ "$COREAI_DISTRIBUTION" == "portable" ]]; then
   APP_SWIFT_FLAGS+=(-D MIOH_PORTABLE_COREAI)
-else
-  APP_SWIFT_FLAGS+=(-D MIOH_DEDICATED_VARIABLE_HQ)
 fi
 typeset -a SWIFT_SUBPROCESS_FLAGS
 SWIFT_SUBPROCESS_FLAGS=()
@@ -92,21 +69,25 @@ xcrun swiftc \
   -framework CoreVideo \
   -framework Metal \
   -framework Network \
+  -framework QuickLookThumbnailing \
   -framework Security \
   -framework SceneKit \
+  -framework UniformTypeIdentifiers \
   -framework WebKit \
   "${APP_SWIFT_FLAGS[@]}" \
-  "$PACKAGE_DIR/IPadBrowserLibraryStore.swift" \
-  "$PACKAGE_DIR/IPadWebMediaDiscovery.swift" \
-  "$PACKAGE_DIR/IPadMediaURLResolver.swift" \
-  "$PACKAGE_DIR/IPadAuthenticatedMediaProxy.swift" \
-  "$PACKAGE_DIR/IPadMPEGTSRemuxer.swift" \
-  "$PACKAGE_DIR/IPadInteractiveMediaBrowser.swift" \
+  "$REMOTE_APP_SOURCE_DIR/IPadBrowserLibraryStore.swift" \
+  "$REMOTE_APP_SOURCE_DIR/IPadWebMediaDiscovery.swift" \
+  "$REMOTE_APP_SOURCE_DIR/IPadMediaURLResolver.swift" \
+  "$REMOTE_APP_SOURCE_DIR/IPadAuthenticatedMediaProxy.swift" \
+  "$REMOTE_APP_SOURCE_DIR/IPadMPEGTSRemuxer.swift" \
+  "$REMOTE_APP_SOURCE_DIR/IPadInteractiveMediaBrowser.swift" \
   "$PACKAGE_DIR/MacChildProcessPipe.swift" \
   "$PACKAGE_DIR/MacNativeExportBatch.swift" \
+  "$PACKAGE_DIR/InputPanelThumbnailCache.swift" \
   "$PACKAGE_DIR/MiohApp.swift" \
   "$PACKAGE_DIR/MacMediaBrowser.swift" \
   "$PACKAGE_DIR/MacHLSAVFoundationCapture.swift" \
+  "$PACKAGE_DIR/MacHLSUnifiedPlayback.swift" \
   "$PACKAGE_DIR/MacHLSRealtimePipeline.swift" \
   "$PACKAGE_DIR/RealtimePlayer.swift" \
   "$PACKAGE_DIR/RemoteControlServer.swift" \
@@ -170,9 +151,9 @@ if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
     -parse-as-library \
     -target arm64-apple-macosx27.0 \
     -framework CoreAI \
-    -framework Metal \
-    "$PACKAGE_DIR/VariableBasicVSRPPRunner.swift" \
-    -o "$RESOURCES/bin/lada-basicvsrpp-variable-hq-runner"
+    -framework CoreML \
+    "$PACKAGE_DIR/DedicatedModelVerifier.swift" \
+    -o "$RESOURCES/bin/mioh-dedicated-model-verifier"
 fi
 
 cp "$PACKAGE_DIR/Info.plist" "$CONTENTS/Info.plist"
@@ -180,44 +161,6 @@ if [[ -d "$PACKAGE_DIR/Localizations" ]]; then
   for localization in "$PACKAGE_DIR/Localizations"/*.lproj(N); do
     ditto "$localization" "$RESOURCES/${localization:t}"
   done
-fi
-if [[ "$MIOH_BUNDLE_PYTHON_RUNTIME" == 1 ]]; then
-  ditto "$PYTHON_SOURCE" "$RESOURCES/runtime"
-  mkdir -p "$RESOURCES/runtime/lib/python3.12/site-packages"
-  rsync -a --exclude '.DS_Store' \
-    "$SITE_PACKAGES/" "$RESOURCES/runtime/lib/python3.12/site-packages/"
-  rm -f "$RESOURCES/runtime/lib/python3.12/site-packages"/__editable__.lada-*.pth(N)
-  rm -f "$RESOURCES/runtime/lib/python3.12/site-packages"/__editable___lada_*_finder.py(N)
-  rm -f "$RESOURCES/runtime/lib/python3.12/site-packages/_virtualenv.pth"
-  rm -f "$RESOURCES/runtime/lib/python3.12/site-packages/_virtualenv.py"
-  rm -rf "$RESOURCES/runtime/lib/python3.12/site-packages"/lada-*.dist-info(N)
-  uv pip install \
-    --python "$RESOURCES/runtime/bin/python3.12" \
-    --break-system-packages \
-    --no-deps \
-    --no-build-isolation \
-    --reinstall \
-    "$ROOT"
-  rm -rf "$MPS_DEFORM_BUILD_SOURCE"
-  ditto "$VENDORED_MPS_DEFORM_CONV" "$MPS_DEFORM_BUILD_SOURCE"
-  uv pip install \
-    --python "$RESOURCES/runtime/bin/python3.12" \
-    --break-system-packages \
-    --no-deps \
-    --no-build-isolation \
-    --reinstall \
-    "$MPS_DEFORM_BUILD_SOURCE"
-  if [[ "${MIOH_SKIP_HARDWARE_SMOKE:-0}" != "1" ]]; then
-    PYTHONHOME="$RESOURCES/runtime" \
-    PYTHONPATH="$RESOURCES/runtime/lib/python3.12/site-packages" \
-      "$RESOURCES/runtime/bin/python3.12" \
-      "$PACKAGE_DIR/verify_mps_deform_conv.py"
-  fi
-  cp "$ROOT/process_video_parallel.py" \
-    "$RESOURCES/runtime/lib/python3.12/site-packages/process_video_parallel.py"
-  cp "$PACKAGE_DIR/mioh_preview_worker.py" \
-    "$RESOURCES/runtime/lib/python3.12/site-packages/mioh_preview_worker.py"
-  rm -f "$RESOURCES/runtime/lib/python3.12/site-packages"/lada-*.dist-info/direct_url.json(N)
 fi
 mkdir -p "$FFMPEG_CACHE"
 if [[ ! -x "$FFMPEG_CACHE/ffmpeg" ]]; then
@@ -238,7 +181,7 @@ cp "$FFMPEG_CACHE/ffmpeg" "$RESOURCES/bin/ffmpeg"
 cp "$FFMPEG_CACHE/ffprobe" "$RESOURCES/bin/ffprobe"
 
 MODEL_TOOLS_SOURCE="$PACKAGE_DIR/model-tools"
-if [[ -d "$MODEL_TOOLS_SOURCE" ]]; then
+if [[ "$COREAI_DISTRIBUTION" == "portable" && -d "$MODEL_TOOLS_SOURCE" ]]; then
   mkdir -p "$RESOURCES/model-tools/scripts"
   ditto "$MODEL_TOOLS_SOURCE" "$RESOURCES/model-tools"
   ditto "$ROOT/scripts/apple" "$RESOURCES/model-tools/scripts/apple"
@@ -246,6 +189,9 @@ if [[ -d "$MODEL_TOOLS_SOURCE" ]]; then
   # application and model-tools bundle until it is deliberately reintroduced.
   find "$RESOURCES/model-tools/scripts/apple" \
     -maxdepth 1 -type f -iname '*rfdetr*' -delete
+  # Upscaler models and their download tooling ship only with Mioh Upscaler.
+  find "$RESOURCES/model-tools/scripts/apple" \
+    -maxdepth 1 -type f -name 'download_adcsr_coreai.sh' -delete
   find "$RESOURCES/model-tools/scripts/apple" \
     -type d -name __pycache__ -prune -exec rm -rf {} +
   cp "$ROOT/scripts/download_nomos_roi_enhancers.py" \
@@ -257,22 +203,21 @@ fi
 
 if [[ "$MIOH_MODELESS_DISTRIBUTION" != 1 ]]; then
 
-MODEL_ASSETS=(
-  lada_mosaic_restoration_model_generic_v1.2.pth
-  RealESRGAN_x2plus.pth
-  RealESRGAN_x4plus.pth
-  RealESRGAN_x2plus_256.mlpackage
-  RealESRGAN_x4plus_256.mlpackage
-  realesr-general-x4v3_256.mlpackage
-  MewZoom-V1-4X-Unet_256.mlpackage
-  swinir-real-x4_256.mlpackage
-  4xNomosWebPhoto_RealPLKSR_256.mlpackage
-)
-for asset in "${MODEL_ASSETS[@]}"; do
-  if [[ -e "$ROOT/model_weights/$asset" ]]; then
-    ditto "$ROOT/model_weights/$asset" "$RESOURCES/models/$asset"
-  fi
-done
+if [[ "$COREAI_DISTRIBUTION" == "portable" ]]; then
+  MODEL_ASSETS=(
+    RealESRGAN_x2plus_256.mlpackage
+    RealESRGAN_x4plus_256.mlpackage
+    realesr-general-x4v3_256.mlpackage
+    MewZoom-V1-4X-Unet_256.mlpackage
+    swinir-real-x4_256.mlpackage
+    4xNomosWebPhoto_RealPLKSR_256.mlpackage
+  )
+  for asset in "${MODEL_ASSETS[@]}"; do
+    if [[ -e "$ROOT/model_weights/$asset" ]]; then
+      ditto "$ROOT/model_weights/$asset" "$RESOURCES/models/$asset"
+    fi
+  done
+fi
 if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
   RFDETR_SOURCE_ASSETS=(
     rfdetr-v6-576-fp32.aimodel
@@ -292,6 +237,12 @@ COREML_DETECTION_ASSETS=(
   lada_mosaic_detection_model_v4_accurate.mlpackage
   lada_mosaic_detection_model_vr_v2_accurate.mlpackage
 )
+if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
+  COREML_DETECTION_ASSETS+=(
+    rfdetr-v6-576-fp32.mlpackage
+    rfdetr-v6-large-768-fp32.mlpackage
+  )
+fi
 mkdir -p "$COMPILED_COREML_MODELS"
 for package in "${COREML_DETECTION_ASSETS[@]}"; do
   source_model="$ROOT/model_weights/$package"
@@ -335,17 +286,19 @@ COREAI_DETECTION_STEMS=(
   lada_mosaic_detection_model_v4_accurate
   lada_mosaic_detection_model_vr_v2_accurate
 )
-for stem in "${COREAI_DETECTION_STEMS[@]}"; do
-  detection_checkpoint="$ROOT/model_weights/$stem.pt"
-  detection_asset="$ROOT/model_weights/$stem-fp16.aimodel"
-  if [[ ! -d "$detection_asset" || "$detection_checkpoint" -nt "$detection_asset" ]]; then
-    PYTHONPATH="$ROOT" "$LADA_STANDALONE_PYTHON_ENV/bin/python" \
-      "$ROOT/scripts/apple/export_v4_fast_coreai.py" \
-      --model "$detection_checkpoint" \
-      --output "$detection_asset" \
-      --allow-overwrite
-  fi
-done
+if [[ "$COREAI_DISTRIBUTION" == "portable" ]]; then
+  for stem in "${COREAI_DETECTION_STEMS[@]}"; do
+    detection_checkpoint="$ROOT/model_weights/$stem.pt"
+    detection_asset="$ROOT/model_weights/$stem-fp16.aimodel"
+    if [[ ! -d "$detection_asset" || "$detection_checkpoint" -nt "$detection_asset" ]]; then
+      PYTHONPATH="$ROOT" "$LADA_STANDALONE_PYTHON_ENV/bin/python" \
+        "$ROOT/scripts/apple/export_v4_fast_coreai.py" \
+        --model "$detection_checkpoint" \
+        --output "$detection_asset" \
+        --allow-overwrite
+    fi
+  done
+fi
 
 COREAI_MODEL_ASSETS=(
   basicvsrpp-v1.2-t18-fp16.aimodel
@@ -362,17 +315,6 @@ COREAI_MODEL_ASSETS=(
   realesr-general-x4v3-256-fp16.aimodel
   4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel
 )
-VARIABLE_COREAI_SOURCE_MODELS="${VARIABLE_COREAI_SOURCE_MODELS:-$BUILD_DIR/variable-basicvsrpp-source}"
-if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
-  default_variable_checkpoint="$ROOT/model_weights/hf2500-plus-fc2-forward-consistency-w005-500-ema.pth"
-else
-  default_variable_checkpoint="$ROOT/model_weights/lada_mosaic_restoration_model_generic_v1.2.pth"
-fi
-VARIABLE_COREAI_CHECKPOINT="${VARIABLE_COREAI_CHECKPOINT:-$default_variable_checkpoint}"
-if [[ ! -f "$VARIABLE_COREAI_CHECKPOINT" ]]; then
-  print -u2 "Missing variable restoration checkpoint: $VARIABLE_COREAI_CHECKPOINT"
-  exit 1
-fi
 VARIABLE_COREAI_ASSETS=(
   spatial6 flow6
   backward_1_start6 backward_1_continue6
@@ -396,187 +338,76 @@ variable_continuations_use_native_state() {
     done
   done
 }
-VARIABLE_COREAI_STEP1_SOURCE_MODELS="${VARIABLE_COREAI_STEP1_SOURCE_MODELS:-$BUILD_DIR/variable-basicvsrpp-step1-source}"
-VARIABLE_COREAI_STEP1_ASSETS=(
-  spatial flow
-  backward_1_init backward_1_first backward_1_later
-  forward_1_init forward_1_first forward_1_later
-  backward_2_init backward_2_first backward_2_later
-  forward_2_init forward_2_first forward_2_later
-  reconstruction
-)
-needs_variable_export=0
-for name in "${VARIABLE_COREAI_ASSETS[@]}"; do
-  source_asset="$VARIABLE_COREAI_SOURCE_MODELS/basicvsrpp-variable-$name.aimodel"
-  if [[ ! -d "$source_asset" \
-        || "$VARIABLE_COREAI_CHECKPOINT" -nt "$source_asset" \
-        || "$ROOT/scripts/apple/basicvsrpp_coreai_kernels.py" -nt "$source_asset" \
-        || "$ROOT/scripts/apple/export_basicvsrpp_variable_chunk6.py" -nt "$source_asset" ]]; then
-    needs_variable_export=1
-    break
+if [[ "$COREAI_DISTRIBUTION" == "portable" ]]; then
+  VARIABLE_COREAI_SOURCE_MODELS="${VARIABLE_COREAI_SOURCE_MODELS:-$BUILD_DIR/variable-basicvsrpp-source}"
+  VARIABLE_COREAI_CHECKPOINT="${VARIABLE_COREAI_CHECKPOINT:-$ROOT/model_weights/lada_mosaic_restoration_model_generic_v1.2.pth}"
+  if [[ ! -f "$VARIABLE_COREAI_CHECKPOINT" ]]; then
+    print -u2 "Missing portable variable restoration checkpoint: $VARIABLE_COREAI_CHECKPOINT"
+    exit 1
   fi
-done
-if (( ! needs_variable_export )) \
-  && ! variable_continuations_use_native_state "$VARIABLE_COREAI_SOURCE_MODELS"; then
-  needs_variable_export=1
-fi
-if (( needs_variable_export )); then
-  mkdir -p "$VARIABLE_COREAI_SOURCE_MODELS"
-  PYTHONPATH="$ROOT" "$LADA_STANDALONE_PYTHON_ENV/bin/python" \
-    "$ROOT/scripts/apple/export_basicvsrpp_variable_chunk6.py" \
-    --checkpoint "$VARIABLE_COREAI_CHECKPOINT" \
-    --output-dir "$VARIABLE_COREAI_SOURCE_MODELS" \
-    --native-state-continuations \
-    --overwrite
-fi
-if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
-  needs_step1_export=0
-  for name in "${VARIABLE_COREAI_STEP1_ASSETS[@]}"; do
-    source_asset="$VARIABLE_COREAI_STEP1_SOURCE_MODELS/basicvsrpp-variable-$name.aimodel"
+  needs_variable_export=0
+  for name in "${VARIABLE_COREAI_ASSETS[@]}"; do
+    source_asset="$VARIABLE_COREAI_SOURCE_MODELS/basicvsrpp-variable-$name.aimodel"
     if [[ ! -d "$source_asset" \
           || "$VARIABLE_COREAI_CHECKPOINT" -nt "$source_asset" \
           || "$ROOT/scripts/apple/basicvsrpp_coreai_kernels.py" -nt "$source_asset" \
-          || "$ROOT/scripts/apple/benchmark_basicvsrpp_variable_coreai.py" -nt "$source_asset" ]]; then
-      needs_step1_export=1
+          || "$ROOT/scripts/apple/export_basicvsrpp_variable_chunk6.py" -nt "$source_asset" ]]; then
+      needs_variable_export=1
       break
     fi
   done
-  if (( needs_step1_export )); then
-    mkdir -p "$VARIABLE_COREAI_STEP1_SOURCE_MODELS"
+  if (( ! needs_variable_export )) \
+    && ! variable_continuations_use_native_state "$VARIABLE_COREAI_SOURCE_MODELS"; then
+    needs_variable_export=1
+  fi
+  if (( needs_variable_export )); then
+    mkdir -p "$VARIABLE_COREAI_SOURCE_MODELS"
     PYTHONPATH="$ROOT" "$LADA_STANDALONE_PYTHON_ENV/bin/python" \
-      "$ROOT/scripts/apple/benchmark_basicvsrpp_variable_coreai.py" \
+      "$ROOT/scripts/apple/export_basicvsrpp_variable_chunk6.py" \
       --checkpoint "$VARIABLE_COREAI_CHECKPOINT" \
-      --output-dir "$VARIABLE_COREAI_STEP1_SOURCE_MODELS" \
-      --export \
-      --export-only \
+      --output-dir "$VARIABLE_COREAI_SOURCE_MODELS" \
+      --native-state-continuations \
       --overwrite
   fi
 fi
 if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
-mkdir -p "$COMPILED_MODELS"
-find "$COMPILED_MODELS" -maxdepth 1 -type d -name '*.aimodelc' \
-  ! -name "*.$COREAI_ARCHITECTURE.aimodelc" -exec rm -rf {} +
-
-typeset -A expected_coreai_models
-for asset in "${COREAI_MODEL_ASSETS[@]}"; do
-  compiled_name="${asset:r}.$COREAI_ARCHITECTURE.aimodelc"
-  expected_coreai_models[$compiled_name]=1
-done
-generic_variable_collection_name="basicvsrpp-v1.2-variable-coreai.$COREAI_ARCHITECTURE.aimodelc"
-variable_collection_name="$generic_variable_collection_name"
-expected_coreai_models[$generic_variable_collection_name]=1
-if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
-  hq_variable_collection_name="basicvsrpp-v1.2-variable-hq-coreai.$COREAI_ARCHITECTURE.aimodelc"
-  expected_coreai_models[$hq_variable_collection_name]=1
-fi
-for model in "$COMPILED_MODELS"/*.$COREAI_ARCHITECTURE.aimodelc(N); do
-  if [[ -z "${expected_coreai_models[${model:t}]-}" ]]; then
-    rm -rf "$model"
+  DEDICATED_COREAI_ASSETS=(
+    basicvsrpp-v1.2-t18-fp16.$COREAI_ARCHITECTURE.aimodelc
+    basicvsrpp-v1.2-t36-fp16.$COREAI_ARCHITECTURE.aimodelc
+    basicvsrpp-v1.2-t90-fp16.$COREAI_ARCHITECTURE.aimodelc
+    lada_mosaic_detection_model_v2-fp16.$COREAI_ARCHITECTURE.aimodelc
+    lada_mosaic_detection_model_v3.1_fast-fp16.$COREAI_ARCHITECTURE.aimodelc
+    lada_mosaic_detection_model_v3.1_accurate-fp16.$COREAI_ARCHITECTURE.aimodelc
+    lada_mosaic_detection_model_v4_fast-fp16.$COREAI_ARCHITECTURE.aimodelc
+    lada_mosaic_detection_model_v4_accurate-fp16.$COREAI_ARCHITECTURE.aimodelc
+    lada_mosaic_detection_model_vr_v2_accurate-fp16.$COREAI_ARCHITECTURE.aimodelc
+    RealESRGAN_x2plus-256-fp16.$COREAI_ARCHITECTURE.aimodelc
+    RealESRGAN_x4plus-256-fp16.$COREAI_ARCHITECTURE.aimodelc
+    realesr-general-x4v3-256-fp16.$COREAI_ARCHITECTURE.aimodelc
+    4xNomosWebPhoto_RealPLKSR-256-fp16.$COREAI_ARCHITECTURE.aimodelc
+  )
+  if [[ ! -d "$DEDICATED_PREBUILT_MODELS" ]]; then
+    print -u2 "Missing native Dedicated model set: $DEDICATED_PREBUILT_MODELS"
+    exit 1
   fi
-done
-
-for asset in "${COREAI_MODEL_ASSETS[@]}"; do
-  source_model="$ROOT/model_weights/$asset"
-  compiled_name="${asset:r}.$COREAI_ARCHITECTURE.aimodelc"
-  compiled_model="$COMPILED_MODELS/$compiled_name"
-  if [[ ! -d "$compiled_model" || "$source_model" -nt "$compiled_model" ]]; then
-    rm -rf "$compiled_model"
-    xcrun coreai-build compile \
-      "$source_model" \
-      --output "$COMPILED_MODELS" \
-      --platform macOS \
-      --min-deployment-version 27.0 \
-      --preferred-compute gpu \
-      --architecture "$COREAI_ARCHITECTURE"
-  fi
-
-  inspect_file="$BUILD_DIR/${compiled_name}.inspect.json"
-  xcrun coreai-build inspect "$compiled_model" --json > "$inspect_file"
-  "$LADA_STANDALONE_PYTHON_ENV/bin/python" - "$inspect_file" "$COREAI_ARCHITECTURE" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as handle:
-    details = json.load(handle)
-architecture = sys.argv[2]
-if architecture not in details.get("supportedArchitectures", []):
-    raise SystemExit(f"compiled model does not support {architecture}: {sys.argv[1]}")
-if architecture == "h17s" and "M5 Pro" not in details.get("supportedChips", []):
-    raise SystemExit(f"h17s model is not specialized for M5 Pro: {sys.argv[1]}")
-PY
-  rm -f "$inspect_file"
-  ditto "$compiled_model" "$RESOURCES/models/$compiled_name"
-done
-
-variable_collection="$COMPILED_MODELS/$variable_collection_name"
-if [[ -f "$variable_collection/metadata.json" ]]; then
-  # coreai-build treats an output directory ending in .aimodelc as the model
-  # destination itself. Remove an interrupted/legacy single-model payload so
-  # this path can remain the collection that contains all chunk assets.
-  rm -rf "$variable_collection"
-fi
-mkdir -p "$variable_collection"
-variable_compile_output="$BUILD_DIR/variable-basicvsrpp-compiled-stage"
-mkdir -p "$variable_compile_output"
-typeset -A expected_variable_assets
-for name in "${VARIABLE_COREAI_ASSETS[@]}"; do
-  source_asset="$VARIABLE_COREAI_SOURCE_MODELS/basicvsrpp-variable-$name.aimodel"
-  compiled_name="basicvsrpp-variable-$name.$COREAI_ARCHITECTURE.aimodelc"
-  compiled_asset="$variable_collection/$compiled_name"
-  expected_variable_assets[$compiled_name]=1
-  if [[ ! -d "$compiled_asset" || "$source_asset" -nt "$compiled_asset" ]]; then
-    rm -rf "$compiled_asset"
-    rm -rf "$variable_compile_output/$compiled_name"
-    xcrun coreai-build compile \
-      "$source_asset" \
-      --output "$variable_compile_output" \
-      --platform macOS \
-      --min-deployment-version 27.0 \
-      --preferred-compute gpu \
-      --architecture "$COREAI_ARCHITECTURE"
-    ditto "$variable_compile_output/$compiled_name" "$compiled_asset"
-  fi
-done
-for compiled_asset in "$variable_collection"/*.$COREAI_ARCHITECTURE.aimodelc(N); do
-  if [[ -z "${expected_variable_assets[${compiled_asset:t}]-}" ]]; then
-    rm -rf "$compiled_asset"
-  fi
-done
-ditto "$variable_collection" "$RESOURCES/models/$variable_collection_name"
-if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
-  step1_collection="$COMPILED_MODELS/$hq_variable_collection_name"
-  if [[ -f "$step1_collection/metadata.json" ]]; then
-    rm -rf "$step1_collection"
-  fi
-  mkdir -p "$step1_collection"
-  step1_compile_output="$BUILD_DIR/variable-basicvsrpp-step1-compiled-stage"
-  mkdir -p "$step1_compile_output"
-  typeset -A expected_step1_assets
-  for name in "${VARIABLE_COREAI_STEP1_ASSETS[@]}"; do
-    source_asset="$VARIABLE_COREAI_STEP1_SOURCE_MODELS/basicvsrpp-variable-$name.aimodel"
-    compiled_name="basicvsrpp-variable-$name.$COREAI_ARCHITECTURE.aimodelc"
-    compiled_asset="$step1_collection/$compiled_name"
-    expected_step1_assets[$compiled_name]=1
-    if [[ ! -d "$compiled_asset" || "$source_asset" -nt "$compiled_asset" ]]; then
-      rm -rf "$compiled_asset"
-      rm -rf "$step1_compile_output/$compiled_name"
-      xcrun coreai-build compile \
-        "$source_asset" \
-        --output "$step1_compile_output" \
-        --platform macOS \
-        --min-deployment-version 27.0 \
-        --preferred-compute gpu \
-        --architecture "$COREAI_ARCHITECTURE"
-      ditto "$step1_compile_output/$compiled_name" "$compiled_asset"
+  for asset in "${DEDICATED_COREAI_ASSETS[@]}"; do
+    source_model="$DEDICATED_PREBUILT_MODELS/$asset"
+    if [[ ! -d "$source_model" ]]; then
+      print -u2 "Missing native Dedicated model: $source_model"
+      exit 1
     fi
+    ditto "$source_model" "$RESOURCES/models/$asset"
   done
-  for compiled_asset in "$step1_collection"/*.$COREAI_ARCHITECTURE.aimodelc(N); do
-    if [[ -z "${expected_step1_assets[${compiled_asset:t}]-}" ]]; then
-      rm -rf "$compiled_asset"
-    fi
-  done
-  ditto "$step1_collection" "$RESOURCES/models/$hq_variable_collection_name"
-fi
+  # The public variable identifier is the established pre-large-ROI model.
+  # Large-ROI weights and their separate runtime path are not packaged.
+  standard_variable_asset="basicvsrpp-v1.2-standard-variable-coreai.$COREAI_ARCHITECTURE.aimodelc"
+  active_variable_asset="basicvsrpp-v1.2-variable-coreai.$COREAI_ARCHITECTURE.aimodelc"
+  source_standard_variable="$DEDICATED_PREBUILT_MODELS/$standard_variable_asset"
+  if [[ ! -d "$source_standard_variable" ]]; then
+    print -u2 "Missing standard variable restoration model: $source_standard_variable"
+    exit 1
+  fi
+  ditto "$source_standard_variable" "$RESOURCES/models/$active_variable_asset"
 else
   for asset in "${COREAI_MODEL_ASSETS[@]}"; do
     source_model="$ROOT/model_weights/$asset"
@@ -594,13 +425,20 @@ else
   done
 fi
 
-# Keep the exact variable-restoration checkpoint auditable after the model has
-# been split into eleven (and, for dedicated builds, fifteen HQ) compiled
-# assets. The absolute build-machine path is intentionally omitted.
-"$LADA_STANDALONE_PYTHON_ENV/bin/python" - \
-  "$VARIABLE_COREAI_CHECKPOINT" \
-  "$RESOURCES/models/basicvsrpp-v1.2-variable-coreai.provenance.json" \
-  "$COREAI_DISTRIBUTION" <<'PY'
+if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
+  source_metadata="$DEDICATED_PREBUILT_MODELS/basicvsrpp-v1.2-standard-variable-coreai.provenance.json"
+  if [[ ! -f "$source_metadata" ]]; then
+    print -u2 "Missing standard variable restoration metadata: $source_metadata"
+    exit 1
+  fi
+  cp "$source_metadata" \
+    "$RESOURCES/models/basicvsrpp-v1.2-variable-coreai.provenance.json"
+else
+  # Portable exports retain an auditable checkpoint identity. The Dedicated
+  # build copies immutable provenance alongside its prebuilt native assets.
+  write_variable_coreai_provenance() {
+  "$LADA_STANDALONE_PYTHON_ENV/bin/python" - \
+    "$1" "$2" "$3" "$4" "$5" <<'PY'
 import hashlib
 import json
 import sys
@@ -609,43 +447,78 @@ from pathlib import Path
 checkpoint = Path(sys.argv[1])
 destination = Path(sys.argv[2])
 distribution = sys.argv[3]
+hq_asset_count = int(sys.argv[4])
+expected_sha256 = sys.argv[5]
 digest = hashlib.sha256()
 with checkpoint.open("rb") as handle:
     for chunk in iter(lambda: handle.read(1024 * 1024), b""):
         digest.update(chunk)
+checkpoint_sha256 = digest.hexdigest()
+if expected_sha256 and checkpoint_sha256 != expected_sha256:
+    raise SystemExit(
+        f"checkpoint SHA-256 mismatch: {checkpoint_sha256}; "
+        f"expected {expected_sha256}"
+    )
 payload = {
     "format_version": 1,
     "checkpoint_filename": checkpoint.name,
-    "checkpoint_sha256": digest.hexdigest(),
+    "checkpoint_sha256": checkpoint_sha256,
     "checkpoint_size": checkpoint.stat().st_size,
     "distribution": distribution,
     "chunk_size": 6,
     "chunk_asset_count": 11,
-    "hq_asset_count": 15 if distribution == "dedicated" else 0,
+    "hq_asset_count": hq_asset_count,
 }
 destination.write_text(
     json.dumps(payload, indent=2, sort_keys=True) + "\n",
     encoding="utf-8",
 )
 PY
+  }
+  write_variable_coreai_provenance \
+    "$VARIABLE_COREAI_CHECKPOINT" \
+    "$RESOURCES/models/basicvsrpp-v1.2-variable-coreai.provenance.json" \
+    "$COREAI_DISTRIBUTION" \
+    0 \
+    ""
+fi
 else
   print "Modeless distribution: skipping bundled model assets and Core ML/Core AI exports"
 fi
 
-if [[ "$MIOH_MODELESS_DISTRIBUTION" != 1 ]]; then
 # Cluster identity is derived from portable source assets, never from the
 # machine-specific compiled .aimodelc/.mlmodelc layout. Dedicated Macs and
 # portable iPad/Mac Workers can therefore compare the same model identity.
 # The variable restorer is one logical model made from exactly eleven source
 # assets; its digest is the tree digest of that virtual collection.
 CANONICAL_MODEL_MANIFEST="$RESOURCES/models/mioh-cluster-model-identities-v1.json"
-VARIABLE_COREAI_SOURCE_MODELS="${VARIABLE_COREAI_SOURCE_MODELS:-$BUILD_DIR/variable-basicvsrpp-source}"
-if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
-  canonical_default_checkpoint="$ROOT/model_weights/hf2500-plus-fc2-forward-consistency-w005-500-ema.pth"
+if [[ "$MIOH_MODELESS_DISTRIBUTION" == 1 ]]; then
+  print "Modeless distribution: skipping cluster model identity manifest"
+elif [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
+  source_manifest="$DEDICATED_PREBUILT_MODELS/mioh-cluster-model-identities-v1.json"
+  if [[ ! -f "$source_manifest" ]]; then
+    print -u2 "Missing native Dedicated identity manifest: $source_manifest"
+    exit 1
+  fi
+  cp "$source_manifest" "$CANONICAL_MODEL_MANIFEST"
+  # The runtime model was renamed to the public variable identifier above.
+  # Keep the cluster identity tied to those standard weights and remove the
+  # retired implementation-only alias.
+  plutil -convert xml1 "$CANONICAL_MODEL_MANIFEST"
+  /usr/libexec/PlistBuddy \
+    -c 'Delete :models:basicvsrpp-v1.2-coreai-variable' \
+    "$CANONICAL_MODEL_MANIFEST"
+  /usr/libexec/PlistBuddy \
+    -c 'Copy :models:basicvsrpp-v1.2-coreai-variable-standard :models:basicvsrpp-v1.2-coreai-variable' \
+    "$CANONICAL_MODEL_MANIFEST"
+  /usr/libexec/PlistBuddy \
+    -c 'Delete :models:basicvsrpp-v1.2-coreai-variable-standard' \
+    "$CANONICAL_MODEL_MANIFEST"
+  plutil -convert json "$CANONICAL_MODEL_MANIFEST"
 else
-  canonical_default_checkpoint="$ROOT/model_weights/lada_mosaic_restoration_model_generic_v1.2.pth"
-fi
-VARIABLE_COREAI_CHECKPOINT="${VARIABLE_COREAI_CHECKPOINT:-$canonical_default_checkpoint}"
+VARIABLE_COREAI_SOURCE_MODELS="${VARIABLE_COREAI_SOURCE_MODELS:-$BUILD_DIR/variable-basicvsrpp-source}"
+canonical_standard_variable_root=""
+VARIABLE_COREAI_CHECKPOINT="${VARIABLE_COREAI_CHECKPOINT:-$ROOT/model_weights/lada_mosaic_restoration_model_generic_v1.2.pth}"
 CANONICAL_VARIABLE_ASSETS=(
   spatial6 flow6
   backward_1_start6 backward_1_continue6
@@ -686,6 +559,7 @@ fi
 "$LADA_STANDALONE_PYTHON_ENV/bin/python" - \
   "$ROOT/model_weights" \
   "$VARIABLE_COREAI_SOURCE_MODELS" \
+  "$canonical_standard_variable_root" \
   "$CANONICAL_MODEL_MANIFEST" <<'PY'
 import hashlib
 import json
@@ -695,7 +569,8 @@ from pathlib import Path
 
 weights = Path(sys.argv[1])
 variable_root = Path(sys.argv[2])
-destination = Path(sys.argv[3])
+standard_variable_root = Path(sys.argv[3]) if sys.argv[3] else None
+destination = Path(sys.argv[4])
 
 
 def update_file(digest, path):
@@ -790,6 +665,16 @@ models["basicvsrpp-v1.2-coreai-variable"] = {
     "asset_type": "source-collection",
     "source_assets": [asset.name for asset in variable_assets],
 }
+if standard_variable_root is not None:
+    standard_variable_assets = [
+        standard_variable_root / f"basicvsrpp-variable-{name}.aimodel"
+        for name in variable_names
+    ]
+    models["basicvsrpp-v1.2-coreai-variable-standard"] = {
+        "sha256": collection_digest(standard_variable_assets),
+        "asset_type": "source-collection",
+        "source_assets": [asset.name for asset in standard_variable_assets],
+    }
 
 detection_stems = {
     "v2": "lada_mosaic_detection_model_v2",
@@ -819,7 +704,9 @@ optional_assets = {
     "nomos-webphoto-realplksr-x4": "4xNomosWebPhoto_RealPLKSR_256.mlpackage",
     "nomos-webphoto-realplksr-x4-coreml": "4xNomosWebPhoto_RealPLKSR_256.mlpackage",
     "jasna-v6-coreai": "rfdetr-v6-576-fp32.aimodel",
+    "jasna-v6-coreml": "rfdetr-v6-576-fp32.mlpackage",
     "jasna-v6-large-coreai": "rfdetr-v6-large-768-fp32.aimodel",
+    "jasna-v6-large-coreml": "rfdetr-v6-large-768-fp32.mlpackage",
 }
 for model_id, source in optional_assets.items():
     add(model_id, source, required=False)
@@ -838,9 +725,6 @@ fi
 
 cp "$ROOT/LICENSE.md" "$RESOURCES/LICENSE.md"
 ditto "$ROOT/LICENSES" "$RESOURCES/LICENSES"
-if [[ "$MIOH_BUNDLE_PYTHON_RUNTIME" == 1 ]]; then
-  cp "$VENDORED_MPS_DEFORM_CONV/LICENSE" "$RESOURCES/LICENSES/mps-deform-conv.txt"
-fi
 
 if [[ -n "${MIOH_PREBUILT_APP_ICON:-}" ]]; then
   ditto "$MIOH_PREBUILT_APP_ICON" "$RESOURCES/AppIcon.icns"
@@ -867,10 +751,8 @@ chmod +x "$CONTENTS/MacOS/mioh" \
   "$RESOURCES/bin/lada-basicvsrpp-variable-runner"
 chmod +x "$RESOURCES/bin/mioh-native-coreai-preview"
 if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
-  chmod +x "$RESOURCES/bin/lada-basicvsrpp-variable-hq-runner"
-fi
-if [[ "$MIOH_BUNDLE_PYTHON_RUNTIME" == 1 ]]; then
-  chmod +x "$RESOURCES/runtime/bin/python3.12"
+  chmod +x \
+    "$RESOURCES/bin/mioh-dedicated-model-verifier"
 fi
 
 if [[ "$MIOH_MODELESS_DISTRIBUTION" == 1 ]]; then
@@ -878,17 +760,9 @@ if [[ "$MIOH_MODELESS_DISTRIBUTION" == 1 ]]; then
 elif [[ "${MIOH_SKIP_HARDWARE_SMOKE:-0}" == "1" ]]; then
   print "Skipping MPS/Core AI hardware smoke tests by request"
 elif [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
-  PYTHONPATH="$ROOT" \
-  LADA_MODEL_WEIGHTS_DIR="$RESOURCES/models" \
-  LADA_COREAI_ARCHITECTURE="$COREAI_ARCHITECTURE" \
-  LADA_COREAI_SWIFT_RUNNER="$RESOURCES/bin/lada-coreai-runner" \
-  LADA_VARIABLE_COREAI_SWIFT_RUNNER="$RESOURCES/bin/lada-basicvsrpp-variable-runner" \
-  LADA_VARIABLE_COREAI_HQ_SWIFT_RUNNER="$RESOURCES/bin/lada-basicvsrpp-variable-hq-runner" \
-    "$LADA_STANDALONE_PYTHON_ENV/bin/python" \
-    "$PACKAGE_DIR/verify_coreai_models.py" \
-    --resources "$RESOURCES" \
-    --distribution "$COREAI_DISTRIBUTION" \
-    --architecture "$COREAI_ARCHITECTURE"
+  "$RESOURCES/bin/mioh-dedicated-model-verifier" \
+    "$RESOURCES/models" \
+    "$COREAI_ARCHITECTURE"
 else
   env -u LADA_COREAI_ARCHITECTURE -u LADA_COREAI_SWIFT_RUNNER \
     PYTHONPATH="$ROOT" \
@@ -901,29 +775,19 @@ else
     --smoke-model basicvsrpp-v1.2-coreai
 fi
 
-if [[ "$MIOH_BUNDLE_PYTHON_RUNTIME" == 1 ]]; then
-  find "$RESOURCES/runtime" -type d -name '__pycache__' -prune -exec rm -rf {} +
-  find "$RESOURCES/runtime" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
-  # The build environment also serves local RF-DETR experiments. Do not inherit
-  # that prototype or its CLI into the production mioh runtime.
-  rm -rf \
-    "$RESOURCES/runtime/lib/python3.12/site-packages/rfdetr" \
-    "$RESOURCES/runtime/lib/python3.12/site-packages/lada/models/rfdetr" \
-    "$RESOURCES/runtime/lib/python3.12/site-packages"/rfdetr-*.dist-info(N)
-  rm -f "$RESOURCES/runtime/bin/rfdetr"
-  rm -rf \
-    "$RESOURCES/runtime/bin/pip" \
-    "$RESOURCES/runtime/bin/pip3" \
-    "$RESOURCES/runtime/bin/pip3.12" \
-    "$RESOURCES/runtime/lib/python3.12/site-packages/pip" \
-    "$RESOURCES/runtime/lib/python3.12/site-packages"/pip-*.dist-info(N) \
-    "$RESOURCES/runtime/lib/python3.12/site-packages/setuptools" \
-    "$RESOURCES/runtime/lib/python3.12/site-packages"/setuptools-*.dist-info(N) \
-    "$RESOURCES/runtime/lib/python3.12/site-packages/wheel" \
-    "$RESOURCES/runtime/lib/python3.12/site-packages"/wheel-*.dist-info(N) \
-    "$RESOURCES/runtime/lib/python3.12/site-packages/tests" \
-    "$RESOURCES/runtime/lib/python3.12/site-packages/test" \
-    "$RESOURCES/runtime/lib/python3.12/site-packages/yapftests"
+if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
+  dedicated_python_files=("$APP"/**/*.(py|pyc|pyo)(N))
+  if (( ${#dedicated_python_files[@]} )); then
+    print -u2 "Dedicated app unexpectedly contains Python files:"
+    print -u2 -- "${(F)dedicated_python_files}"
+    exit 1
+  fi
+  dedicated_python_weights=("$RESOURCES/models"/**/*.pth(N))
+  if (( ${#dedicated_python_weights[@]} )); then
+    print -u2 "Dedicated app unexpectedly contains Python checkpoints:"
+    print -u2 -- "${(F)dedicated_python_weights}"
+    exit 1
+  fi
 fi
 
 codesign --force --deep --sign - "$APP"

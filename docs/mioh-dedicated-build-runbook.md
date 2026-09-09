@@ -4,42 +4,54 @@ This file records the local source-of-truth inputs required to reproduce the
 dedicated `mioh.app`. It is intentionally separate from the public Universal
 release runbook.
 
-## Active restoration checkpoint
+## Native model set
 
-The dedicated application currently ships
-`basicvsrpp-v1.2-coreai-variable` generated from:
+The Dedicated application is built without Python. It consumes the immutable,
+M5 Pro-specialized native model set at:
 
 ```text
-model_weights/hf2500-plus-fc2-forward-consistency-w005-500-ema.pth
+model_weights/mioh-dedicated-h17s/
+```
+
+That directory contains the compiled `.aimodelc` assets, variable-model
+collections, checkpoint provenance, and cluster identity manifest required to
+rebuild the app after deleting `build/`. It is intentionally ignored by Git
+because it is approximately 2.8 GB, but it lives on the internal system drive
+with the other `model_weights` assets.
+
+The Dedicated build exposes the standard variable model as
+`basicvsrpp-v1.2-coreai-variable`. Its source checkpoint is:
+
+```text
+model_weights/basicvsrpp-v1.2-detail-recovery-30000-ema.pth
 ```
 
 Expected SHA-256:
 
 ```text
-5bf6da33536500f5b130a2c1ed2794ae1fb707d68967f23cdfcc5b3134b7a1a4
+a8428a0ba7b056664914cd9f653232cfa7cd3d628f34e56399adb59bd943c065
 ```
 
-This is the `HF2500 + fc2_best 500-step + known-grid forward-consistency
-weight=0.05 / 500-step EMA` checkpoint. It is not the old iter9000 model and
-not the generic v1.2 checkpoint. The additional continuation applies the exact
-re-mosaic observation constraint only to complete, fully masked grid cells.
+The large-ROI Phase A/B model, native tile compositor, model alias, and UI
+switch are deliberately not packaged. All ROI sizes use the established
+single-ROI 256 px restoration path and the standard checkpoint above.
 
 ## Rebuilding after deleting `build/`
 
 The `build/` directory contains generated artifacts and may be deleted. The
-installed `/Applications/mioh.app`, source tree, virtual environment, model
-weights, and the checkpoint above remain under the `lada` source directory.
+installed `/Applications/mioh.app`, source tree, and native model set remain
+under the `lada` source directory. A Python environment and `.pth` checkpoint
+conversion are not part of the Dedicated build.
 
-The dedicated build now selects the local active checkpoint automatically:
+The Dedicated build selects the local native model set automatically:
 
 ```zsh
 cd /path/to/lada
 packaging/macOS/standalone/build_app.sh
 ```
 
-Portable/Universal builds continue to select
-`model_weights/lada_mosaic_restoration_model_generic_v1.2.pth`. An explicit
-`VARIABLE_COREAI_CHECKPOINT` still overrides either default when needed.
+Universal builds keep their separate portable model-export path. That path does
+not affect the normal M5 Pro Dedicated build.
 
 After building, verify the packaged provenance file:
 

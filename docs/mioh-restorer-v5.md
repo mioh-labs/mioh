@@ -39,11 +39,16 @@ The quality-first V5-HQ path is also implemented and verified independently:
 
 On the M5 Pro, an actual 256px MPS training step completed in 5.33 seconds with
 8.32 GiB driver memory in Stage 1. A full backward pass through the dynamic
-warp completed with 11.70 GiB driver memory. PyTorch MPS lacks
-`grid_sampler_2d_backward`, so **training only** uses its documented CPU
-fallback for that derivative. The exported inference program does not use that
-fallback: the conversion smoke test succeeded with 9,627 operations, including
-111 custom Metal grid-sample calls and 32 custom Metal DCNv2 calls.
+warp completed with 11.70 GiB driver memory. Those measurements used PyTorch's
+documented CPU fallback because PyTorch MPS lacks
+`grid_sampler_2d_backward`. Lada now fills that missing dispatch with an
+experimental, cached Objective-C++/Metal extension. It stays on PyTorch's
+current MPS stream, accumulates in FP32, and supports all 2D interpolation,
+padding and `align_corners` combinations. Set
+`LADA_MPS_GRID_SAMPLE_BACKWARD=0` to retain the old fallback while comparing a
+training run. The exported inference program does not use either backward
+path: the conversion smoke test succeeded with 9,627 operations, including 111
+custom Metal grid-sample calls and 32 custom Metal DCNv2 calls.
 
 Run a fresh V5-HQ curriculum with:
 
@@ -160,6 +165,36 @@ allowed to finish unchanged so it remains a comparable baseline.
 
 This is the required input pipeline for the next run, not a request to mutate
 the currently running Stage 2 experiment.
+
+The lossless balanced manifest builder implements this policy without changing
+the source dataset:
+
+```shell
+python scripts/training/build-mioh-restorer-v5-balanced-manifest.py \
+  --metadata-root /path/to/train/crop_unscaled_meta \
+  --output /path/to/new-manifests/train-native-balanced.jsonl \
+  --report /path/to/new-reports/train.json
+```
+
+It caps each source at 50 deterministic windows, requires masks in all five
+quality outputs, hard-limits 5-20% boundary crops to 15%, and stratifies the
+remaining samples by native bucket, motion and mask occupancy.  It emits only
+source paths, frame ranges and even crop coordinates; RGB is neither decoded
+nor re-encoded while the manifest is built.  Lossless timestamp samples from
+multipart FC2 sources can be grouped correctly with
+`--strip-sampled-timestamp --canonicalize-fc2-source-id`.
+
+The verified balanced V3 full curriculum can be launched or resumed with:
+
+```shell
+zsh scripts/training/run-mioh-restorer-v5-hq-balanced-v3.sh
+```
+
+V3 promotes small native crops to 256px because the V5-HQ BasicVSR++ backbone
+requires at least 64px after its quarter-resolution downsample. It uses a
+dedicated work root, all six V5-HQ stages, batch size one and one
+optimizer update per native 256px or 384px sample. Completed stages are used as immutable
+parents and an interrupted current stage resumes from its latest checkpoint.
 
 V5 uses five fixed, square input shapes compiled from shared weights:
 

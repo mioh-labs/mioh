@@ -25,6 +25,31 @@ class DetectionBackendSelectionTests(unittest.TestCase):
             )
         )
 
+    def test_jasna_v6_coreml_models_are_registered(self):
+        model = ModelFiles.get_detection_model_by_name("jasna-v6-coreml")
+        large = ModelFiles.get_detection_model_by_name(
+            "jasna-v6-large-coreml"
+        )
+
+        self.assertIsNotNone(model)
+        self.assertIsNotNone(large)
+        self.assertTrue(
+            model.path.endswith(
+                (
+                    "rfdetr-v6-576-fp32.mlpackage",
+                    "rfdetr-v6-576-fp32.mlmodelc",
+                )
+            )
+        )
+        self.assertTrue(
+            large.path.endswith(
+                (
+                    "rfdetr-v6-large-768-fp32.mlpackage",
+                    "rfdetr-v6-large-768-fp32.mlmodelc",
+                )
+            )
+        )
+
     def test_cli_does_not_expose_detection_backend_argument(self):
         parser = setup_argparser()
         args = parser.parse_args(["--input", "in.mp4"])
@@ -65,6 +90,60 @@ class DetectionBackendSelectionTests(unittest.TestCase):
                         )
         torch_model.assert_not_called()
         coreml_model.assert_called_once()
+
+    def test_load_models_uses_rfdetr_coreml_backend_for_jasna_package(self):
+        with mock.patch(
+            "lada.models.rfdetr.RFDETRCoreMLSegmentationModel"
+        ) as rfdetr_model:
+            with mock.patch(
+                "lada.models.basicvsrpp.inference.load_model"
+            ) as load_model_mock:
+                with mock.patch(
+                    "lada.restorationpipeline.basicvsrpp_mosaic_restorer."
+                    "BasicvsrppMosaicRestorer"
+                ) as restorer_mock:
+                    load_model_mock.return_value = object()
+                    restorer_mock.return_value = object()
+                    load_models(
+                        torch.device("mps"),
+                        "basicvsrpp-v1.2",
+                        "restoration.pth",
+                        None,
+                        "rfdetr-v6-576-fp32.mlpackage",
+                        False,
+                        False,
+                    )
+
+        rfdetr_model.assert_called_once()
+        self.assertEqual(rfdetr_model.call_args.kwargs["resolution"], 576)
+        self.assertEqual(rfdetr_model.call_args.kwargs["conf"], 0.35)
+
+    def test_load_models_uses_768_contract_for_jasna_large_coreml(self):
+        with mock.patch(
+            "lada.models.rfdetr.RFDETRCoreMLSegmentationModel"
+        ) as rfdetr_model:
+            with mock.patch(
+                "lada.models.basicvsrpp.inference.load_model"
+            ) as load_model_mock:
+                with mock.patch(
+                    "lada.restorationpipeline.basicvsrpp_mosaic_restorer."
+                    "BasicvsrppMosaicRestorer"
+                ) as restorer_mock:
+                    load_model_mock.return_value = object()
+                    restorer_mock.return_value = object()
+                    load_models(
+                        torch.device("mps"),
+                        "basicvsrpp-v1.2",
+                        "restoration.pth",
+                        None,
+                        "rfdetr-v6-large-768-fp32.mlpackage",
+                        False,
+                        False,
+                    )
+
+        rfdetr_model.assert_called_once()
+        self.assertEqual(rfdetr_model.call_args.kwargs["resolution"], 768)
+        self.assertEqual(rfdetr_model.call_args.kwargs["conf"], 0.40)
 
     def test_load_models_uses_coreml_backend_for_compiled_model_path(self):
         with mock.patch("lada.restorationpipeline.Yolo11SegmentationModel") as torch_model:

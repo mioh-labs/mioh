@@ -11,10 +11,16 @@ PACKAGE = ROOT / "packaging" / "macOS" / "standalone"
 APP_SOURCE = PACKAGE / "MiohApp.swift"
 PLAYER_SOURCE = PACKAGE / "RealtimePlayer.swift"
 BUILD_SCRIPT = PACKAGE / "build_app.sh"
-REMOTE_APP_SOURCE = PACKAGE
+REMOTE_APP_SOURCE = ROOT / "apps" / "MiohRemote" / "MiohRemote"
 INTERACTIVE_BROWSER_SOURCE = REMOTE_APP_SOURCE / "IPadInteractiveMediaBrowser.swift"
 RESOLVER_SOURCE = REMOTE_APP_SOURCE / "IPadMediaURLResolver.swift"
 RELAY_PROBE_HARNESS = ROOT / "tests" / "swift" / "MacBrowserHLSRelayProbeHarness.swift"
+CAPTURE_RATE_HARNESS = (
+    ROOT / "tests" / "swift" / "MacHLSCaptureRatePolicyHarness.swift"
+)
+ACCELERATED_CAPTURE_HARNESS = (
+    ROOT / "tests" / "swift" / "MacHLSAVFoundationCaptureHarness.swift"
+)
 
 
 class MacHLSBrowserContractTests(unittest.TestCase):
@@ -60,14 +66,21 @@ class MacHLSBrowserContractTests(unittest.TestCase):
             with self.subTest(source=source_name):
                 self.assertIn(source_name, self.build)
 
-    def test_avfoundation_asset_keeps_parent_master_and_external_audio(self):
+    def test_avfoundation_asset_uses_selected_quality_and_browser_proxy_when_available(self):
         self.assert_contracts(
             self.player,
             [
-                "avFoundationCapture = MacHLSAVFoundationCapture(",
-                "url: source.playbackURL",
-                "sourceItem = avFoundationCapture.makePlaybackItem()",
-                "avFoundationCapture: avFoundationCapture",
+                "let safariCompatiblePlaybackURL = requestedHLSQuality == .automatic",
+                "? source.playbackURL",
+                ": source.mediaURL",
+                "let makeAVFoundationCapture: (URL) -> MacHLSAVFoundationCapture",
+                "url: url",
+                "makeAVFoundationCapture(\n            safariCompatiblePlaybackURL",
+                "if selectedResourceLoader != nil",
+                "resourceLoader: selectedResourceLoader",
+                "capture = makeAVFoundationCapture(localPlaybackURL)",
+                "sourceItem = capture.makePlaybackItem()",
+                "avFoundationCapture: activeAVFoundationCapture",
             ],
         )
 
@@ -77,13 +90,21 @@ class MacHLSBrowserContractTests(unittest.TestCase):
             [
                 "var previewUseSafariCompatibleHLS: Bool?",
                 "@Published var previewUseSafariCompatibleHLS = false",
+                "var previewHLSQuality: String?",
+                "@Published var previewHLSQuality = PreviewHLSQuality.automatic.rawValue",
                 "previewUseSafariCompatibleHLS: false",
+                "previewHLSQuality: PreviewHLSQuality.automatic.rawValue",
                 "previewUseSafariCompatibleHLS: previewUseSafariCompatibleHLS",
+                "previewHLSQuality: previewHLSQuality",
                 "snapshot.previewUseSafariCompatibleHLS ?? false",
+                "snapshot.previewHLSQuality ?? \"\"",
                 'Section("HLS再生")',
                 'Picker(\n          "HLS通信",',
                 'Text("高速（区間先読み）").tag(false)',
                 'Text("Safari互換（429回避）").tag(true)',
+                'Picker("HLS画質", selection: $runner.previewHLSQuality)',
+                "ForEach(PreviewHLSQuality.allCases)",
+                "指定画質以下で最も高いvariantを固定使用",
                 "変更は次回のHLS復元再生から適用されます。",
             ],
         )
@@ -91,6 +112,8 @@ class MacHLSBrowserContractTests(unittest.TestCase):
             self.player,
             [
                 "let useSafariCompatibleHLS = runner.previewUseSafariCompatibleHLS",
+                "let requestedHLSQuality = PreviewHLSQuality(",
+                "allowsVariantFallback: requestedHLSQuality == .automatic",
                 "if useSafariCompatibleHLS {",
                 "HLS通信: 高速な区間先読み方式を使用します",
             ],
@@ -99,6 +122,31 @@ class MacHLSBrowserContractTests(unittest.TestCase):
             "struct RealtimePlayerView: View", 1
         )[1]
         self.assertNotIn('Picker(\n              "HLS通信",', playback_view)
+
+    def test_requested_hls_quality_is_resolved_before_both_playback_modes(self):
+        _, browser = self.source_containing("MacMediaBrowserController")
+        _, producer = self.source_containing("MacHLSRealtimeProducer")
+
+        self.assert_contracts(
+            browser,
+            [
+                "let requestedQuality = PreviewHLSQuality(",
+                "constrainedTo: requestedQuality",
+                "while let currentHeight = selected.hlsPlaylist?.masterMetadata?.height",
+                "currentHeight > targetHeight",
+                "resolveNextHLSVariant(for: selected)",
+                '"HLS画質: \\(requestedQuality.label) / "',
+                "player.startHLS(\n          source: source,",
+            ],
+        )
+        self.assert_contracts(
+            producer,
+            [
+                "private let allowsVariantFallback: Bool",
+                "allowsVariantFallback: Bool = true",
+                "if allowsVariantFallback, !playlist.isLive,",
+            ],
+        )
 
     def test_content_view_has_browser_and_playback_navigation_targets(self):
         self.assert_contracts(
@@ -195,7 +243,7 @@ class MacHLSBrowserContractTests(unittest.TestCase):
                 "IPadResolvedMediaSource",
                 ".resolve(",
                 "let selection = try await Self.preferredHLS(",
-                "let source = selection.source",
+                "let source = try await Self.source(",
                 "player.startHLS(",
                 "source:",
                 "runner:",
@@ -213,7 +261,8 @@ class MacHLSBrowserContractTests(unittest.TestCase):
         self.assert_contracts(
             self.interactive_browser,
             [
-                "func acquireMediaPlaybackHandoffLease() async throws",
+                "func acquireMediaPlaybackHandoffLease(",
+                "replacingActive: Bool = false",
                 "mediaWebView.setAllMediaPlaybackSuspended(suspended)",
                 "await withCheckedContinuation",
                 "if let transientPopupWebView",
@@ -551,37 +600,242 @@ class MacHLSBrowserContractTests(unittest.TestCase):
         self.assertIn("runAVFoundationCapture(", capture_branch)
         self.assertIn("return", capture_branch)
 
+        compatible_path = producer.split(
+            "private func runAVFoundationCapture(", 1
+        )[1].split("/// May be called", 1)[0]
+        self.assertIn("avFoundationCoreSegmentCountIfReady(", compatible_path)
+        self.assertIn("coreStartIndex: coreStartIndex", compatible_path)
+        self.assertIn("coreEndIndex: coreEndIndex", compatible_path)
+        self.assertIn("avFoundationSteadyRestoreBatchCoreSegments = 4", producer)
+        self.assertNotIn("coreIndex: 1", compatible_path)
+
+    def test_avfoundation_capture_fills_at_two_x_until_target(self):
+        _, capture = self.source_containing("final class MacHLSAVFoundationCapture")
+        _, producer = self.source_containing("MacHLSRealtimeProducer")
+        self.assert_contracts(
+            capture,
+            [
+                "struct MacHLSCaptureRatePolicy",
+                "acceleratedRate: Float = 2",
+                "ratePolicy.finishWarmup()",
+                "setRestoredBufferLead(",
+                "player.rate = desired",
+            ],
+        )
+        self.assertNotIn("beginFrameGapRecovery", capture)
+        self.assertNotIn("seekCapturePlayer(toSourceSeconds", capture)
+        self.assertNotIn("reportRestorationRealtimeFactor", capture)
+        self.assertNotIn("reportRestorationRealtimeFactor", producer)
+        update_restored = self.player.split(
+            "private func updateBufferedDuration()", 1
+        )[1].split("\n  private func ", 1)[0]
+        self.assertIn(
+            "hlsAVFoundationCapture?.setRestoredBufferLead(bufferedSeconds)",
+            update_restored,
+        )
+
+    def test_avfoundation_capture_rate_policy_runtime(self):
+        if sys.platform != "darwin":
+            self.skipTest("AVFoundation capture policy requires macOS")
+        swiftc = shutil.which("swiftc")
+        if swiftc is None:
+            xcrun = shutil.which("xcrun")
+            if xcrun is not None:
+                swiftc = subprocess.check_output(
+                    [xcrun, "--find", "swiftc"], text=True
+                ).strip()
+        if not swiftc:
+            self.skipTest("Swift compiler is required")
+
+        capture_name, _ = self.source_containing(
+            "final class MacHLSAVFoundationCapture"
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="mioh-hls-capture-rate-"
+        ) as directory:
+            directory_path = Path(directory)
+            executable = directory_path / "capture-rate-policy"
+            build = subprocess.run(
+                [
+                    swiftc,
+                    "-module-cache-path",
+                    str(directory_path / "module-cache"),
+                    "-parse-as-library",
+                    str(PACKAGE / capture_name),
+                    str(CAPTURE_RATE_HARNESS),
+                    "-framework",
+                    "AVFoundation",
+                    "-framework",
+                    "VideoToolbox",
+                    "-o",
+                    str(executable),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(
+                build.returncode,
+                0,
+                f"Capture rate policy did not compile:\n"
+                f"{build.stdout}{build.stderr}",
+            )
+            completed = subprocess.run(
+                [str(executable)],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        self.assertIn("Mac HLS capture rate policy passed", completed.stdout)
+
+    def test_avfoundation_accelerated_capture_preserves_fixture_frames(self):
+        if sys.platform != "darwin":
+            self.skipTest("AVFoundation capture requires macOS")
+        ffmpeg = shutil.which("ffmpeg")
+        ffprobe = shutil.which("ffprobe")
+        swiftc = shutil.which("swiftc")
+        if not ffmpeg or not ffprobe or not swiftc:
+            self.skipTest("ffmpeg, ffprobe and swiftc are required")
+
+        capture_name, _ = self.source_containing(
+            "final class MacHLSAVFoundationCapture"
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="mioh-hls-accelerated-capture-"
+        ) as directory:
+            root = Path(directory)
+            source = root / "source.mp4"
+            output = root / "captured"
+            output.mkdir()
+            subprocess.run(
+                [
+                    ffmpeg,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=320x180:rate=30:duration=8",
+                    "-an",
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-g",
+                    "60",
+                    "-y",
+                    str(source),
+                ],
+                check=True,
+                timeout=60,
+            )
+            executable = root / "accelerated-capture"
+            build = subprocess.run(
+                [
+                    swiftc,
+                    "-module-cache-path",
+                    str(root / "module-cache"),
+                    "-parse-as-library",
+                    str(PACKAGE / capture_name),
+                    str(ACCELERATED_CAPTURE_HARNESS),
+                    "-framework",
+                    "AVFoundation",
+                    "-framework",
+                    "VideoToolbox",
+                    "-o",
+                    str(executable),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(
+                build.returncode,
+                0,
+                f"Accelerated capture harness did not compile:\n"
+                f"{build.stdout}{build.stderr}",
+            )
+            completed = subprocess.run(
+                [str(executable), str(source), str(output), "8"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"Accelerated capture failed:\n"
+                f"{completed.stdout}{completed.stderr}",
+            )
+            frame_count = 0
+            for segment in sorted(output.glob("*.mp4")):
+                probe = subprocess.run(
+                    [
+                        ffprobe,
+                        "-v",
+                        "error",
+                        "-select_streams",
+                        "v:0",
+                        "-count_frames",
+                        "-show_entries",
+                        "stream=nb_read_frames",
+                        "-of",
+                        "default=nokey=1:noprint_wrappers=1",
+                        str(segment),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                frame_count += int(probe.stdout.strip())
+
+        self.assertIn(
+            "Mac HLS AVFoundation accelerated capture passed",
+            completed.stdout,
+        )
+        self.assertIn("2.00倍で先読みを増やします", completed.stdout)
+        self.assertGreaterEqual(
+            frame_count,
+            236,
+            f"accelerated capture retained only {frame_count}/240 frames",
+        )
+
     def test_hls_clock_and_capture_share_one_avurlasset(self):
         start_hls = self.player.split("func startHLS(", 1)[1]
         start_hls = start_hls.split("\n  private func ", 1)[0]
 
         # Safari-compatible mode keeps its look-ahead decoder and audible
-        # clock on the capture object's single AVURLAsset. Fast mode keeps the
-        # previous proxy and interval-prefetch path as a separate branch.
+        # clock on the capture object's single AVURLAsset. Browser-only CDNs
+        # feed that asset through the same WebKit-backed loopback proxy used by
+        # Remote; direct/public URLs retain the shortest AVFoundation path.
         self.assert_contracts(
             start_hls,
             [
-                "url: source.playbackURL",
-                "sourceItem = avFoundationCapture.makePlaybackItem()",
-                "avFoundationCapture: avFoundationCapture",
+                "makeAVFoundationCapture(\n            safariCompatiblePlaybackURL",
+                "sourceItem = capture.makePlaybackItem()",
+                "avFoundationCapture: activeAVFoundationCapture",
                 "hlsMediaProxy = nil",
                 "let createdProxy = IPadAuthenticatedMediaProxy(",
                 "resourceLoader: selectedResourceLoader",
                 "try await proxy.start()",
-                "proxy.localURL(",
+                "self.localHLSPlaybackURL(",
+                "capture = makeAVFoundationCapture(localPlaybackURL)",
+                "HLS通信: Safari/WebKit通信をローカル再生へ接続しました",
             ],
         )
-        safari_branch = start_hls.split("if useSafariCompatibleHLS {", 1)[1].split(
-            "} else {", 1
-        )[0]
-        self.assertNotIn("proxy.localURL(", safari_branch)
-        self.assertNotIn("IPadAuthenticatedMediaProxy(", safari_branch)
+        self.assertLess(
+            start_hls.index("try await proxy.start()"),
+            start_hls.index("capture = makeAVFoundationCapture(localPlaybackURL)"),
+        )
 
     def test_vod_hls_attaches_source_player_only_at_first_restored_segment(self):
         start_hls = self.player.split("func startHLS(", 1)[1]
         start_hls = start_hls.split("\n  private func ", 1)[0]
         before_run, event_sink = start_hls.split(
-            "try await producer.run", 1
+            "try await createdProducer.run", 1
         )
 
         # Construct the audible item from the shared AVURLAsset early, but a
@@ -591,8 +845,8 @@ class MacHLSBrowserContractTests(unittest.TestCase):
         self.assert_contracts(
             before_run,
             [
-                "avFoundationCapture = MacHLSAVFoundationCapture(",
-                "sourceItem = avFoundationCapture.makePlaybackItem()",
+                "let makeAVFoundationCapture: (URL) -> MacHLSAVFoundationCapture",
+                "sourceItem = capture.makePlaybackItem()",
                 "var sourceItemInstalled = false",
                 "if playlist.isLive {",
                 "installPreparedHLSSourceItem(",
@@ -632,12 +886,18 @@ class MacHLSBrowserContractTests(unittest.TestCase):
         )
         self.assertNotIn("sourcePlayer.play()", installer)
 
-    def test_vod_hls_source_buffer_is_capped_without_reducing_restored_queue_limit(self):
+    def test_vod_hls_source_buffer_caps_fast_mode_but_not_safari_compatible_mode(self):
         start_hls = self.player.split("func startHLS(", 1)[1]
         start_hls = start_hls.split("\n  private func ", 1)[0]
-        self.assertIn(
-            "min(6, max(2, runner.previewBufferLimit))",
+        self.assert_contracts(
             start_hls,
+            [
+                "playlist.isLive || useSafariCompatibleHLS",
+                "? max(2, runner.previewBufferLimit)",
+                ": min(6, max(2, runner.previewBufferLimit))",
+                "forwardBufferSeconds: runner.previewBufferLimit",
+                "hlsAVFoundationCapture = avFoundationCapture",
+            ],
         )
 
         setter = self.player.split("func setBufferLimit(", 1)[1]
@@ -645,9 +905,10 @@ class MacHLSBrowserContractTests(unittest.TestCase):
         self.assert_contracts(
             setter,
             [
-                "let sourceBufferSeconds = isLiveHLSInput",
+                "let sourceBufferSeconds = isLiveHLSInput || hlsAVFoundationCapture != nil",
                 "min(6, max(2, seconds))",
                 "preferredForwardBufferDuration = sourceBufferSeconds",
+                "hlsAVFoundationCapture?.setForwardBufferDuration(seconds)",
                 "hlsProducer?.updateOutputBufferLimits(hlsOutputBufferLimits(for: seconds))",
             ],
         )
@@ -660,7 +921,7 @@ class MacHLSBrowserContractTests(unittest.TestCase):
         start_hls = self.player.split("func startHLS(", 1)[1]
         start_hls = start_hls.split("\n  private func ", 1)[0]
         fallback = start_hls.split(
-            "if let fallback = producer.takePendingVariantFallbackSource()", 1
+            "let fallback = producer.takePendingVariantFallbackSource()", 1
         )[1].split("producer.cancel()", 2)[1]
         self.assert_contracts(
             fallback,
@@ -709,7 +970,10 @@ class MacHLSBrowserContractTests(unittest.TestCase):
         update_restored = self.player.split(
             "private func updateBufferedDuration()", 1
         )[1].split("\n  private func ", 1)[0]
-        self.assertIn("bufferedSeconds = max(0, last.endSeconds - position)", update_restored)
+        self.assertIn(
+            "bufferedSeconds = max(0, last.endSeconds - position)",
+            update_restored,
+        )
 
     def test_hls_source_item_observes_status_time_control_and_stalls(self):
         installer = self.player.split(
@@ -735,7 +999,7 @@ class MacHLSBrowserContractTests(unittest.TestCase):
                 "\\.status",
                 "sourcePlayer.observe(",
                 "\\.timeControlStatus",
-                ".AVPlayerItemPlaybackStalled",
+                "AVPlayerItem.playbackStalledNotification",
                 "updateHLSPlaybackState(item:",
             ],
         )
@@ -763,9 +1027,9 @@ class MacHLSBrowserContractTests(unittest.TestCase):
         tick = tick.split("\n  private var ", 1)[0]
         self.assertNotIn("sourcePlayer.timeControlStatus != .playing", self.player)
         stalled_observer = self.player.split(
-            ".AVPlayerItemPlaybackStalled", 1
+            "AVPlayerItem.playbackStalledNotification", 1
         )[1].split("hlsNotificationTokens.append(stalled)", 1)[0]
-        self.assertIn("self.restoredPlayer.pause()", stalled_observer)
+        self.assertIn("self.updateHLSPlaybackState(item: item, generation: generation)", stalled_observer)
         self.assertNotIn("absorbHLSSourceWaitWithRestoredBuffer", stalled_observer)
 
         update_state = self.player.split(
@@ -804,21 +1068,31 @@ class MacHLSBrowserContractTests(unittest.TestCase):
                 "hlsSynchronizedStartRevision",
                 "sourcePlayer.currentItem === sourceItem",
                 "restoredPlayer.currentItem === restoredItem",
-                "self.sourcePlayer.play()",
-                "self.restoredPlayer.play()",
+                "self.startHLSPlayersAtSharedHostTime()",
             ],
         )
-        self.assertLess(
-            synchronized_start.index("self.sourcePlayer.play()"),
-            synchronized_start.index("self.restoredPlayer.play()"),
-        )
+        shared_start = self.player.split(
+            "private func startHLSPlayersAtSharedHostTime()", 1
+        )[1].split("\n  private func ", 1)[0]
+        for player in ("sourcePlayer", "restoredPlayer"):
+            self.assertLess(
+                shared_start.index(f"{player}.automaticallyWaitsToMinimizeStalling = false"),
+                shared_start.index(f"{player}.setRate(1, time:"),
+            )
+        self.assertEqual(shared_start.count("atHostTime: hostTime)"), 2)
+        self.assertNotIn(".play()", shared_start)
+        self.assertIn("hlsSynchronizedStartRevision == revision", shared_start)
+        self.assertIn("updateHLSPlaybackState(item: item", shared_start)
+        self.assertIn("hlsSynchronizedStartInFlight { return }", update_state)
+        self.assertIn("hlsHostSynchronizedStartPendingUntil != 0 { return }", update_state)
+        self.assertIn("resumeIfBuffered()", update_state)
 
     def test_terminal_hls_source_failure_keeps_the_restored_queue_playing(self):
         observers = self.player.split(
             "func installHLSPlaybackObservers(", 1
         )[1].split("\n  private func ", 1)[0]
         failed_to_end = observers.split(
-            ".AVPlayerItemFailedToPlayToEndTime", 1
+            "AVPlayerItem.failedToPlayToEndTimeNotification", 1
         )[1].split("hlsNotificationTokens.append(failedToEnd)", 1)[0]
         self.assertIn("degradeHLSSourcePlayback(", failed_to_end)
         self.assertNotIn("self.fail(", failed_to_end)
@@ -1070,8 +1344,7 @@ class MacHLSBrowserContractTests(unittest.TestCase):
                 "releaseConsumedSegments(through: targetSegment.sequence - 1)",
                 "sourcePlayer.pause()",
                 "HLS音声と復元映像を同期中",
-                "self.sourcePlayer.play()",
-                "self.restoredPlayer.play()",
+                "self.beginSynchronizedHLSStart()",
                 "復元映像がHLS音声へ追いつくのを待っています",
                 "hlsDriftResumeToleranceSeconds",
             ],
@@ -1107,7 +1380,7 @@ class MacHLSBrowserContractTests(unittest.TestCase):
                 "let hlsVODStartupSegmentCount = 3",
                 "let hlsVODRebufferSegmentCount = 2",
                 "private var itemEndNotificationTokens:",
-                "producer.updateOutputBufferLimits(",
+                "createdProducer.updateOutputBufferLimits(",
                 "hlsOutputBufferLimits(for: runner.previewBufferLimit)",
             ],
         )

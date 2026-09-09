@@ -111,7 +111,6 @@ class ModelFiles:
         ModelFile('basicvsrpp-v1.2-coreai-t36', _("BasicVSR++ v1.2 fixed-T36 on Core AI with Metal 4 kernels"), _coreai_model_path('basicvsrpp-v1.2-t36-fp16.aimodel')),
         ModelFile('basicvsrpp-v1.2-coreai-t90', _("BasicVSR++ v1.2 fixed-T90 on Core AI with Metal 4 kernels"), _coreai_model_path('basicvsrpp-v1.2-t90-fp16.aimodel')),
         ModelFile('basicvsrpp-v1.2-coreai-variable', _("BasicVSR++ v1.2 variable-length Swift/Core AI pipeline (fast chunk6)"), _variable_coreai_model_path()),
-        ModelFile('basicvsrpp-v1.2-coreai-variable-hq', _("BasicVSR++ v1.2 variable-length Swift/Core AI pipeline (quality-priority step1)"), _variable_coreai_model_path("basicvsrpp-v1.2-variable-hq-coreai")),
         ModelFile('deepmosaics', _("Restoration model from abandoned DeepMosaics project"), os.path.join(MODEL_WEIGHTS_DIR, '3rd_party', 'clean_youknow_video.pth')),
     ]
     _WELL_KNOWN_DETECTION_MODELS = [
@@ -131,6 +130,18 @@ class ModelFiles:
         ModelFile('v4-accurate-coreai', _("v4-accurate FP16 running with Core AI"), _coreai_model_path('lada_mosaic_detection_model_v4_accurate-fp16.aimodel')),
         ModelFile('vr-v2-accurate-coreml', _("VR-focused accurate mosaic detector via Core ML"), _coreml_detection_path('lada_mosaic_detection_model_vr_v2_accurate.mlpackage')),
         ModelFile('vr-v2-accurate-coreai', _("VR-focused accurate mosaic detector FP16 via Core AI"), _coreai_model_path('lada_mosaic_detection_model_vr_v2_accurate-fp16.aimodel')),
+        ModelFile(
+            'jasna-v6-coreml',
+            _("Jasna RF-DETR v6 mosaic detector at 576px via Core ML"),
+            _coreml_detection_path('rfdetr-v6-576-fp32.mlpackage'),
+        ),
+        ModelFile(
+            'jasna-v6-large-coreml',
+            _("Jasna RF-DETR v6 Large detector for 4K at 768px via Core ML"),
+            _coreml_detection_path(
+                'rfdetr-v6-large-768-fp32.mlpackage'
+            ),
+        ),
         ModelFile(
             'jasna-v6-coreai',
             _("Jasna RF-DETR v6 mosaic detector at 576px via Core AI"),

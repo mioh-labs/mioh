@@ -18,13 +18,16 @@ from lada.models.basicvsrpp.recoverable_hf_dataset import (
 )
 
 
-def _write_manifest(tmp_path: Path, *, origins: list[list[int]] | None = None) -> Path:
+def _write_manifest(
+    tmp_path: Path,
+    *,
+    origins: list[list[int]] | None = None,
+    forced_final_crop_offset: list[int] | None = None,
+) -> Path:
     if origins is None:
         origins = [[32 + index * 2, 32 + index * 2] for index in range(9)]
     manifest = tmp_path / "recoverable.jsonl"
-    manifest.write_text(
-        json.dumps(
-            {
+    value = {
                 "name": "source:000000:tile-00",
                 "target_video": "target.mp4",
                 "mask_video": "mask.mkv",
@@ -36,8 +39,10 @@ def _write_manifest(tmp_path: Path, *, origins: list[list[int]] | None = None) -
                 "mosaic_block_size": 8,
                 "recoverability": {"score": 1.0},
             }
-        )
-        + "\n",
+    if forced_final_crop_offset is not None:
+        value["forced_final_crop_offset"] = forced_final_crop_offset
+    manifest.write_text(
+        json.dumps(value) + "\n",
         encoding="utf-8",
     )
     return manifest
@@ -228,6 +233,32 @@ def test_recoverable_hf_shared_crop_keeps_roi_at_512_edge(
     inside = sample.mask[0].expand_as(sample.gt_img[0]) > 0
     torch.testing.assert_close(
         item["inputs"][0][inside], expected_mosaic_tensor[inside]
+    )
+
+
+def test_recoverable_hf_dataset_honors_forced_native_tile_offset(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    manifest = _write_manifest(
+        tmp_path,
+        origins=[[32, 32]] * 9,
+        forced_final_crop_offset=[0, 256],
+    )
+    rgb = _rgb_frames()
+    masks = [np.full((576, 576), 255, dtype=np.uint8) for _ in range(9)]
+    _patch_decode(monkeypatch, rgb=rgb, masks=masks)
+
+    item = RecoverableHFMosaicVideoDataset(
+        manifest, training=False, seed=31
+    )[0]
+    sample = item["data_samples"]
+    assert sample.metainfo["native_final_crop_offset"] == (0, 256)
+    assert sample.metainfo["native_crop_selection"] == "forced-native-tile"
+    expected = rgb[0][288:544, 32:288]
+    torch.testing.assert_close(
+        sample.gt_img[0],
+        torch.from_numpy(expected.transpose(2, 0, 1).copy()),
     )
 
 

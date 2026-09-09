@@ -52,19 +52,13 @@ def load_restoration_model(
         else:
             raise ValueError(f"Unsupported MiohRestorer model asset: {model_path}")
         return MiohMosaicRestorer(runtime), "zero"
-    if model_name.endswith(("-coreai-variable", "-coreai-variable-hq")):
+    if model_name.endswith("-coreai-variable"):
         from lada.restorationpipeline.basicvsrpp_coreai_restorer import (
             CoreAIVariableBasicvsrppMosaicRestorer,
         )
 
-        runner_path = None
-        if model_name.endswith("-coreai-variable-hq"):
-            runner_path = os.environ.get(
-                "LADA_VARIABLE_COREAI_HQ_SWIFT_RUNNER"
-            )
         return CoreAIVariableBasicvsrppMosaicRestorer(
             Path(model_path),
-            runner_path=runner_path,
         ), "zero"
     if model_path.endswith((".aimodel", ".aimodelc")):
         from lada.restorationpipeline.basicvsrpp_coreai_restorer import (
@@ -119,9 +113,18 @@ def load_models(
         classes = None
     detection_filename = os.path.basename(str(mosaic_detection_model_path))
     if detection_filename.startswith("rfdetr-v6-"):
-        from lada.models.rfdetr import RFDETRCoreAISegmentationModel
         is_large = detection_filename.startswith("rfdetr-v6-large-")
-        mosaic_detection_model = RFDETRCoreAISegmentationModel(
+        if str(mosaic_detection_model_path).endswith(
+            (".mlpackage", ".mlmodelc")
+        ):
+            from lada.models.rfdetr import RFDETRCoreMLSegmentationModel
+
+            model_class = RFDETRCoreMLSegmentationModel
+        else:
+            from lada.models.rfdetr import RFDETRCoreAISegmentationModel
+
+            model_class = RFDETRCoreAISegmentationModel
+        mosaic_detection_model = model_class(
             mosaic_detection_model_path,
             device,
             resolution=768 if is_large else 576,
