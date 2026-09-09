@@ -4,7 +4,7 @@ set -euo pipefail
 APP="/Applications/mioh-universal.app"
 FORCE=0
 MINIMAL=0
-MIOH_RELEASE_TAG="${MIOH_RELEASE_TAG:-v0.14.3-011}"
+MIOH_RELEASE_TAG="${MIOH_RELEASE_TAG:-v0.14.3-012}"
 typeset -a FAILURES
 FAILURES=()
 
