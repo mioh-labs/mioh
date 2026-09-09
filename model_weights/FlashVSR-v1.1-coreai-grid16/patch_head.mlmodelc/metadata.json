@@ -1,0 +1,219 @@
+[
+  {
+    "metadataOutputVersion" : "3.0",
+    "storagePrecision" : "Float16",
+    "outputSchema" : [
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float16",
+        "formattedType" : "MultiArray (Float16 1 × 1536 × 1536)",
+        "shortDescription" : "",
+        "shape" : "[1, 1536, 1536]",
+        "name" : "x",
+        "type" : "MultiArray"
+      }
+    ],
+    "modelParameters" : [
+
+    ],
+    "specificationVersion" : 9,
+    "functions" : [
+      {
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 16 × 6 × 32 × 32)",
+            "shortDescription" : "",
+            "shape" : "[1, 16, 6, 32, 32]",
+            "name" : "latent",
+            "type" : "MultiArray"
+          }
+        ],
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "storagePrecision" : "Float16",
+        "stateSchema" : [
+
+        ],
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1536 × 1536)",
+            "shortDescription" : "",
+            "shape" : "[1, 1536, 1536]",
+            "name" : "x",
+            "type" : "MultiArray"
+          }
+        ],
+        "name" : "patch_first",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.conv" : 1,
+          "Ios18.transpose" : 1,
+          "Ios18.reshape" : 1
+        }
+      },
+      {
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 16 × 2 × 32 × 32)",
+            "shortDescription" : "",
+            "shape" : "[1, 16, 2, 32, 32]",
+            "name" : "latent",
+            "type" : "MultiArray"
+          }
+        ],
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "storagePrecision" : "Float16",
+        "stateSchema" : [
+
+        ],
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 512 × 1536)",
+            "shortDescription" : "",
+            "shape" : "[1, 512, 1536]",
+            "name" : "x",
+            "type" : "MultiArray"
+          }
+        ],
+        "name" : "patch_next",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.conv" : 1,
+          "Ios18.transpose" : 1,
+          "Ios18.reshape" : 1
+        }
+      },
+      {
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1536 × 1536)",
+            "shortDescription" : "",
+            "shape" : "[1, 1536, 1536]",
+            "name" : "x",
+            "type" : "MultiArray"
+          }
+        ],
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "storagePrecision" : "Float16",
+        "stateSchema" : [
+
+        ],
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 16 × 6 × 32 × 32)",
+            "shortDescription" : "",
+            "shape" : "[1, 16, 6, 32, 32]",
+            "name" : "latent",
+            "type" : "MultiArray"
+          }
+        ],
+        "name" : "head_first",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.mul" : 1,
+          "Ios18.convTranspose" : 1,
+          "Ios18.linear" : 1,
+          "Ios18.layerNorm" : 1,
+          "Ios18.transpose" : 2,
+          "Ios18.add" : 1,
+          "Ios18.reshape" : 3
+        }
+      },
+      {
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 512 × 1536)",
+            "shortDescription" : "",
+            "shape" : "[1, 512, 1536]",
+            "name" : "x",
+            "type" : "MultiArray"
+          }
+        ],
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "storagePrecision" : "Float16",
+        "stateSchema" : [
+
+        ],
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 16 × 2 × 32 × 32)",
+            "shortDescription" : "",
+            "shape" : "[1, 16, 2, 32, 32]",
+            "name" : "latent",
+            "type" : "MultiArray"
+          }
+        ],
+        "name" : "head_next",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.mul" : 1,
+          "Ios18.convTranspose" : 1,
+          "Ios18.linear" : 1,
+          "Ios18.layerNorm" : 1,
+          "Ios18.transpose" : 2,
+          "Ios18.add" : 1,
+          "Ios18.reshape" : 3
+        }
+      }
+    ],
+    "mlProgramOperationTypeHistogram" : {
+      "Ios18.conv" : 1,
+      "Ios18.transpose" : 1,
+      "Ios18.reshape" : 1
+    },
+    "isUpdatable" : "0",
+    "stateSchema" : [
+
+    ],
+    "availability" : {
+      "macOS" : "15.0",
+      "tvOS" : "18.0",
+      "visionOS" : "2.0",
+      "watchOS" : "11.0",
+      "iOS" : "18.0",
+      "macCatalyst" : "18.0"
+    },
+    "computePrecision" : "Mixed (Float16, Int32)",
+    "modelType" : {
+      "name" : "MLModelType_mlProgram"
+    },
+    "inputSchema" : [
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float16",
+        "formattedType" : "MultiArray (Float16 1 × 16 × 6 × 32 × 32)",
+        "shortDescription" : "",
+        "shape" : "[1, 16, 6, 32, 32]",
+        "name" : "latent",
+        "type" : "MultiArray"
+      }
+    ],
+    "defaultFunctionName" : "patch_first",
+    "generatedClassName" : "patch_head",
+    "userDefinedMetadata" : {
+
+    },
+    "method" : "predict"
+  }
+]

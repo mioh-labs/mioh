@@ -344,7 +344,9 @@ class V5PerceptualLoss(nn.Module):
     FEATURE_LAYERS = (3, 8, 15)
     FEATURE_WEIGHTS = (0.1, 0.2, 1.0)
 
-    def __init__(self, *, image_size: int = 224) -> None:
+    def __init__(
+        self, *, image_size: int = 224, preserve_native_scale: bool = False
+    ) -> None:
         super().__init__()
         if image_size < 32:
             raise ValueError("perceptual image size must be at least 32")
@@ -355,6 +357,7 @@ class V5PerceptualLoss(nn.Module):
         ).features[: max(self.FEATURE_LAYERS) + 1].eval()
         self.features.requires_grad_(False)
         self.image_size = image_size
+        self.preserve_native_scale = bool(preserve_native_scale)
         self.register_buffer(
             "mean", torch.tensor((0.485, 0.456, 0.406)).reshape(1, 3, 1, 1)
         )
@@ -376,13 +379,17 @@ class V5PerceptualLoss(nn.Module):
         shape = restored.shape
         if restored.shape != target.shape or restored.ndim != 5:
             raise ValueError("perceptual tensors must be matching B,T,C,H,W")
+        if self.preserve_native_scale:
+            restored, target, mask = self._native_roi_crop(restored, target, mask)
+            shape = restored.shape
         restored = restored.reshape(-1, 3, *shape[-2:])
         target = target.reshape(-1, 3, *shape[-2:])
         mask = mask.reshape(-1, 1, *shape[-2:])
         size = (self.image_size, self.image_size)
-        restored = F.interpolate(restored, size=size, mode="bilinear", align_corners=False)
-        target = F.interpolate(target, size=size, mode="bilinear", align_corners=False)
-        mask = F.interpolate(mask, size=size, mode="bilinear", align_corners=False)
+        if not self.preserve_native_scale:
+            restored = F.interpolate(restored, size=size, mode="bilinear", align_corners=False)
+            target = F.interpolate(target, size=size, mode="bilinear", align_corners=False)
+            mask = F.interpolate(mask, size=size, mode="bilinear", align_corners=False)
         mask = F.max_pool2d(mask, 5, stride=1, padding=2)
         restored_features = self._extract((restored - self.mean) / self.std)
         with torch.no_grad():
@@ -394,3 +401,37 @@ class V5PerceptualLoss(nn.Module):
             layer_mask = F.interpolate(mask, size=prediction.shape[-2:], mode="bilinear", align_corners=False)
             losses.append(weight * masked_mean((prediction - truth).abs(), layer_mask))
         return sum(losses) / sum(self.FEATURE_WEIGHTS)
+
+    def _native_roi_crop(
+        self,
+        restored: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Take one native-pixel crop per batch without resampling the ROI."""
+
+        height, width = restored.shape[-2:]
+        crop_height = min(self.image_size, height)
+        crop_width = min(self.image_size, width)
+        restored_crops = []
+        target_crops = []
+        mask_crops = []
+        for batch_index in range(restored.shape[0]):
+            union = mask[batch_index].amax(dim=(0, 1))
+            positions = torch.nonzero(union > 0, as_tuple=False)
+            if positions.numel():
+                center_y = int(torch.round(positions[:, 0].float().mean()).item())
+                center_x = int(torch.round(positions[:, 1].float().mean()).item())
+            else:
+                center_y, center_x = height // 2, width // 2
+            top = min(max(center_y - crop_height // 2, 0), height - crop_height)
+            left = min(max(center_x - crop_width // 2, 0), width - crop_width)
+            selection = (..., slice(top, top + crop_height), slice(left, left + crop_width))
+            restored_crops.append(restored[batch_index][selection])
+            target_crops.append(target[batch_index][selection])
+            mask_crops.append(mask[batch_index][selection])
+        return (
+            torch.stack(restored_crops),
+            torch.stack(target_crops),
+            torch.stack(mask_crops),
+        )

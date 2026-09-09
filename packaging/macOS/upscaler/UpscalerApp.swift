@@ -50,8 +50,8 @@ private struct UpscalerContentView: View {
     .onAppear {
       guard !checkedInitialModelSetup else { return }
       checkedInitialModelSetup = true
-      if !upscaler.selectedModelReady {
-        presentModelSetup()
+      if !upscaler.selectedModelReady || !h3Generation.modelReady {
+        presentInitialModelSetup()
       }
     }
     .onChange(of: upscaler.upscalerModel) { _, _ in
@@ -62,6 +62,7 @@ private struct UpscalerContentView: View {
     .sheet(isPresented: $showingModelSetup) {
       UpscalerModelSetupView(controller: modelSetup) {
         upscaler.applyModelSetupDestination(modelSetup.destinationPath)
+        h3Generation.applyModelSetupManifest(modelSetup.miniMaxH3ManifestPath)
       }
     }
   }
@@ -94,7 +95,8 @@ private struct UpscalerContentView: View {
       Divider()
       MiniMaxH3GenerationView(
         controller: h3Generation,
-        upscalerInputURL: upscaler.inputURL
+        upscalerInputURL: upscaler.inputURL,
+        presentModelSetup: presentH3ModelSetup
       )
       Divider()
       videoGenerationFooter
@@ -106,7 +108,7 @@ private struct UpscalerContentView: View {
       applicationIcon
       VStack(alignment: .leading, spacing: 2) {
         Text("動画生成").font(.title2.weight(.semibold))
-        Text("MiniMax H3")
+        Text("MiniMax H3 / 10Eros-Max H3")
           .font(.caption).foregroundStyle(.secondary)
       }
       Spacer()
@@ -530,6 +532,23 @@ private struct UpscalerContentView: View {
     modelSetup.prepare(
       for: upscaler.selectedUpscaler,
       preferredPath: upscaler.selectedModelRootPath
+    )
+    showingModelSetup = true
+  }
+
+  private func presentInitialModelSetup() {
+    modelSetup.prepareInitial(
+      for: upscaler.selectedUpscaler,
+      preferredPath: upscaler.selectedModelRootPath,
+      h3ManifestPath: h3Generation.manifestPath,
+      h3Ready: h3Generation.modelReady
+    )
+    showingModelSetup = true
+  }
+
+  private func presentH3ModelSetup() {
+    modelSetup.prepareForMiniMaxH3(
+      preferredManifestPath: h3Generation.manifestPath
     )
     showingModelSetup = true
   }

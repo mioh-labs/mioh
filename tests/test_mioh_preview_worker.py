@@ -104,6 +104,28 @@ class PreviewProtocolTests(unittest.TestCase):
             compatible, _ = self.worker._native_swift_preview_compatibility(args)
         self.assertFalse(compatible)
 
+    def test_native_swift_preview_rejects_excluded_start612_model(self):
+        args = self.worker.build_parser().parse_args([
+            "--input", "in.mp4",
+            "--output-dir", "out",
+            "--restoration-model",
+            "basicvsrpp-v1.2-start612-coreai-variable",
+            "--detection-model", "v4-accurate-coreai",
+        ])
+        with tempfile.NamedTemporaryFile() as runner, mock.patch.dict(
+            os.environ,
+            {
+                "LADA_NATIVE_SWIFT_PREVIEW": "1",
+                "LADA_NATIVE_COREAI_PREVIEW_RUNNER": runner.name,
+            },
+            clear=False,
+        ):
+            compatible, _reason = (
+                self.worker._native_swift_preview_compatibility(args)
+            )
+
+        self.assertFalse(compatible)
+
     def test_native_swift_preview_preserves_nonzero_postprocessing(self):
         args = self.worker.build_parser().parse_args([
             "--input", "in.mp4",
@@ -143,6 +165,36 @@ class PreviewProtocolTests(unittest.TestCase):
             )
         )
 
+    def test_native_swift_preview_accepts_jasna_v6_coreml_models(self):
+        for detector in ("jasna-v6-coreml", "jasna-v6-large-coreml"):
+            with self.subTest(detector=detector):
+                args = self.worker.build_parser().parse_args([
+                    "--input", "in.mp4",
+                    "--output-dir", "out",
+                    "--restoration-model",
+                    "basicvsrpp-v1.2-coreai-variable",
+                    "--detection-model", detector,
+                ])
+                with tempfile.NamedTemporaryFile() as runner, mock.patch.dict(
+                    os.environ,
+                    {
+                        "LADA_NATIVE_SWIFT_PREVIEW": "1",
+                        "LADA_NATIVE_COREAI_PREVIEW_RUNNER": runner.name,
+                    },
+                    clear=False,
+                ):
+                    compatible, reason = (
+                        self.worker._native_swift_preview_compatibility(args)
+                    )
+
+                self.assertTrue(compatible, reason)
+
+    def test_native_swift_preview_uses_gpu_for_jasna_coreml(self):
+        source = WORKER_PATH.read_text()
+
+        self.assertIn('"jasna-v6-large-coreml",', source)
+        self.assertIn('detection_compute_units = "cpuAndGPU"', source)
+
     def test_native_swift_preview_treats_negative_restore_max_frames_as_auto(self):
         config = SimpleNamespace(
             restore_max_frames=-1,
@@ -174,6 +226,7 @@ class PreviewProtocolTests(unittest.TestCase):
             '"crossfade": bool(config.restore_crossfade)',
         ]:
             self.assertIn(contract, source)
+        self.assertNotIn("nativeLargeROITiles", source)
 
 
 class SegmentEncoderTests(unittest.TestCase):

@@ -173,6 +173,7 @@ struct RemoteClusterRestorationOptions: Codable, Hashable, Sendable {
   let crossfade: Bool
   let detectionEmptyLookahead: Int
   let detectFaceMosaics: Bool
+  let detectionMaskReuseSkipFrames: Int?
   let blendFeather: Float
   let sharpenStrength: Float
   let detailBoost: Float
@@ -197,7 +198,8 @@ struct RemoteClusterRestorationOptions: Codable, Hashable, Sendable {
       && Self.isSHA256(detectorAssetSHA256)
       && restorationClipLength > 0 && temporalOverlap >= 0
       && temporalOverlap < restorationClipLength
-      && detectionEmptyLookahead >= 1
+      && (1...300).contains(detectionEmptyLookahead)
+      && detectionMaskReuseSkipFrames.map { (0...8).contains($0) } != false
       && blendFeather.isFinite && blendFeather >= 0
       && sharpenStrength.isFinite && detailBoost.isFinite
       && textureMix.isFinite && smoothStrength.isFinite

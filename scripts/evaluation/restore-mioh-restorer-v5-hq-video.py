@@ -20,7 +20,10 @@ from types import SimpleNamespace
 import torch
 
 from lada.cli.main import process_video_file
-from lada.models.mioh_restorer.model_v5_hq import MiohRestorerV5HQ
+from lada.models.mioh_restorer.model_v5_hq import (
+    MiohRestorerV5HQ,
+    MiohRestorerV5HQConfig,
+)
 from lada.models.yolo.yolo11_coreml_segmentation_model import (
     Yolo11CoreMLSegmentationModel,
 )
@@ -31,12 +34,21 @@ from lada.utils import ImageTensor
 class V5HQCheckpointMosaicRestorer(MiohMosaicRestorer):
     """Clip adapter for a five-output V5-HQ training checkpoint."""
 
-    def __init__(self, checkpoint: Path, device: torch.device) -> None:
+    def __init__(
+        self, checkpoint: Path, device: torch.device, *, checkpoint_state: str = "ema"
+    ) -> None:
         payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
         if payload.get("variant") != "hq":
             raise ValueError(f"not a V5-HQ checkpoint: {checkpoint}")
-        self.model = MiohRestorerV5HQ()
-        self.model.load_state_dict(payload["ema_state_dict"], strict=True)
+        state_key = "ema_state_dict" if checkpoint_state == "ema" else "state_dict"
+        state = payload.get(state_key)
+        if not isinstance(state, dict):
+            raise ValueError(f"checkpoint has no {state_key}: {checkpoint}")
+        raw_config = payload.get("config")
+        if not isinstance(raw_config, dict):
+            raise ValueError(f"checkpoint has no model config: {checkpoint}")
+        self.model = MiohRestorerV5HQ(MiohRestorerV5HQConfig(**raw_config))
+        self.model.load_state_dict(state, strict=True)
         self.model.eval().to(device)
         self.device = device
         self.dtype = torch.float32
@@ -147,6 +159,12 @@ def parse_args() -> argparse.Namespace:
         default=Path("model_weights/lada_mosaic_detection_model_v4_accurate.mlpackage"),
     )
     parser.add_argument("--max-clip-length", type=int, default=180)
+    parser.add_argument(
+        "--checkpoint-state",
+        choices=("ema", "raw"),
+        default="ema",
+        help="choose EMA or live training weights from the checkpoint",
+    )
     return parser.parse_args()
 
 
@@ -159,7 +177,9 @@ def main() -> int:
     detector = Yolo11CoreMLSegmentationModel(
         str(args.detector), device, classes=None, conf=0.15
     )
-    restorer = V5HQCheckpointMosaicRestorer(args.checkpoint, device)
+    restorer = V5HQCheckpointMosaicRestorer(
+        args.checkpoint, device, checkpoint_state=args.checkpoint_state
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="mioh-v5-hq-") as temporary:
         process_video_file(

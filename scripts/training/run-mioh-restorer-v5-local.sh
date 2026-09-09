@@ -47,7 +47,7 @@ echo "Work root: $work_root"
 if [[ "$variant" == "hq" ]]; then
   echo "Quality-first hybrid: BasicVSR++ recurrent initialization + V5-HQ refiner"
   echo "BasicVSR++ initialization: $basicvsrpp_checkpoint"
-  echo "MPS grid-sample backward uses the documented CPU fallback."
+  echo "MPS grid-sample backward: cached native Metal dispatch (set LADA_MPS_GRID_SAMPLE_BACKWARD=0 for CPU fallback)."
 else
   echo "No V3/V4/BasicVSR++ checkpoint or external flow model is used."
 fi

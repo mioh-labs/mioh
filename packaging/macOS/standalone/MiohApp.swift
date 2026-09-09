@@ -6,9 +6,12 @@ import SwiftUI
 
 private let appProgressPrefix = "@@LADA_PROGRESS@@"
 private let miohMaximumClipFrames = 180
-
 func L(_ key: String) -> String {
   NSLocalizedString(key, comment: "")
+}
+
+func restorationModelLabel(_ identifier: String) -> String {
+  return L(identifier)
 }
 
 struct AppProgressEvent: Decodable {
@@ -96,6 +99,7 @@ struct NativeExportConfiguration: Codable, Sendable {
   let roiEnhancerStrength: Float
   let roiEnhancerScale: Int
   let detectionEmptyLookahead: Int
+  let detectionMaskReuseSkipFrames: Int
   let detectFaceMosaics: Bool
   let crossfade: Bool
   let targetFPS: Int?
@@ -147,8 +151,11 @@ private struct NativePreviewLaunchConfiguration: Encodable {
   let roiEnhancerStrength: Float
   let roiEnhancerScale: Int
   let detectionEmptyLookahead: Int
+  let detectionMaskReuseSkipFrames: Int
   let detectFaceMosaics: Bool
   let crossfade: Bool
+  let maximumFPS: Int?
+  let preFPSConversion: Bool
   let videoCodec: String = "h264"
 }
 
@@ -267,36 +274,31 @@ struct PlatformCapabilities {
   }
 
   var defaultRestorationModel: String {
-    supportsCoreAI ? "basicvsrpp-v1.2-coreai-t90" : "basicvsrpp-v1.2"
+    "basicvsrpp-v1.2-coreai-t90"
   }
 
   var previewRestorationModel: String {
-    supportsCoreAI ? "basicvsrpp-v1.2-coreai-variable" : "basicvsrpp-v1.2"
+    "basicvsrpp-v1.2-coreai-variable"
   }
 
   var previewDetectionModel: String {
     supportsCoreAI ? "v4-fast-coreai" : "v4-fast-coreml"
   }
 
-  let baseRestorationModels = ["basicvsrpp-v1.2", "カスタム"]
   var coreAIRestorationModels: [String] {
-    var models = [
+    [
       "basicvsrpp-v1.2-coreai-t90", "basicvsrpp-v1.2-coreai-t36",
       "basicvsrpp-v1.2-coreai", "basicvsrpp-v1.2-coreai-variable",
     ]
-#if MIOH_DEDICATED_VARIABLE_HQ
-    models.append("basicvsrpp-v1.2-coreai-variable-hq")
-#endif
-    return models
   }
 
   var restorationModels: [String] {
-    supportsCoreAI ? coreAIRestorationModels + baseRestorationModels : baseRestorationModels
+    coreAIRestorationModels
   }
 
   let baseDetectionModels = [
     "v2-coreml", "v3.1-fast-coreml", "v3.1-accurate-coreml",
-    "v4-fast-coreml", "v4-accurate-coreml", "vr-v2-accurate-coreml", "カスタム",
+    "v4-fast-coreml", "v4-accurate-coreml", "vr-v2-accurate-coreml",
   ]
 
   var detectionModels: [String] {
@@ -306,6 +308,8 @@ struct PlatformCapabilities {
         "v4-fast-coreai", "v4-accurate-coreai", "vr-v2-accurate-coreai",
       ]
 #if !MIOH_PORTABLE_COREAI
+    models.append("jasna-v6-coreml")
+    models.append("jasna-v6-large-coreml")
     models.append("jasna-v6-coreai")
     models.append("jasna-v6-large-coreai")
 #endif
@@ -313,18 +317,11 @@ struct PlatformCapabilities {
   }
 
   var previewDetectionModels: [String] {
-    detectionModels.filter { !$0.hasPrefix("jasna-v6") }
+    detectionModels.filter {
+      !$0.hasPrefix("jasna-v6") || $0.hasSuffix("-coreml")
+    }
   }
 
-  /// Only the portable/universal package ships `Resources/runtime`, so only it
-  /// can fall back to the Python restoration and preview path.
-  var bundlesPythonRuntime: Bool {
-#if MIOH_PORTABLE_COREAI
-    return true
-#else
-    return false
-#endif
-  }
 }
 
 /// Installation/runtime status exposed to the authenticated Web remote.
@@ -634,6 +631,7 @@ struct MiohUserDefaultsSnapshot: Codable {
   var detectionModel: String
   var customDetectionModel: String
   var detectionEmptyLookahead: Int
+  var detectionMaskReuseSkipFrames: Int?
   var detectFaceMosaics: Bool
 
   var previewBufferLimit: Double
@@ -642,6 +640,7 @@ struct MiohUserDefaultsSnapshot: Codable {
   var previewDetectionModel: String?
   var previewCustomDetectionModel: String?
   var previewRealtimeOptimization: Bool?
+  var previewLimitHighFrameRate: Bool?
   var previewUseSafariCompatibleHLS: Bool?
   var previewHLSQuality: String?
   var previewProjectionMode: String?
@@ -716,6 +715,7 @@ struct MiohUserDefaultsSnapshot: Codable {
       detectionModel: "v2-coreml",
       customDetectionModel: "",
       detectionEmptyLookahead: 10,
+      detectionMaskReuseSkipFrames: 0,
       detectFaceMosaics: false,
       previewBufferLimit: 8.0,
       previewRestorationModel: capabilities.previewRestorationModel,
@@ -723,6 +723,7 @@ struct MiohUserDefaultsSnapshot: Codable {
       previewDetectionModel: capabilities.previewDetectionModel,
       previewCustomDetectionModel: "",
       previewRealtimeOptimization: true,
+      previewLimitHighFrameRate: false,
       previewUseSafariCompatibleHLS: false,
       previewHLSQuality: PreviewHLSQuality.automatic.rawValue,
       previewProjectionMode: "通常",
@@ -761,9 +762,8 @@ final class RestorationRunner: ObservableObject {
   @Published var ladaTempDirectory = ""
   @Published var overwrite = false
 
-  // "native" runs the Swift Core AI pipeline. "python" runs the bundled
-  // interpreter against process_video_parallel.py / mioh_preview_worker.py and
-  // only exists in the portable/universal package.
+  // Kept in the persisted/remote schema for backward compatibility. Runtime
+  // execution is always the Swift Core AI pipeline.
   @Published var restorationEngine = "native"
 
   @Published var parallelWorkers = 1
@@ -823,6 +823,7 @@ final class RestorationRunner: ObservableObject {
   @Published var detectionModel: String
   @Published var customDetectionModel = ""
   @Published var detectionEmptyLookahead = 10
+  @Published var detectionMaskReuseSkipFrames = 0
   @Published var detectFaceMosaics = false
 
   @Published var previewBufferLimit = 8.0
@@ -831,6 +832,7 @@ final class RestorationRunner: ObservableObject {
   @Published var previewDetectionModel: String
   @Published var previewCustomDetectionModel = ""
   @Published var previewRealtimeOptimization = true
+  @Published var previewLimitHighFrameRate = false
   @Published var previewUseSafariCompatibleHLS = false
   @Published var previewHLSQuality = PreviewHLSQuality.automatic.rawValue
   @Published var previewProjectionMode = "通常"
@@ -882,10 +884,14 @@ final class RestorationRunner: ObservableObject {
     "hevc-apple-gpu-balanced", "av1-cpu-uhq",
   ]
   var restorationModels: [String] { capabilities.restorationModels }
+  var nativePreviewRestorationModels: [String] {
+    capabilities.supportsCoreAI ? capabilities.coreAIRestorationModels : []
+  }
+  var previewRestorationModels: [String] {
+    nativePreviewRestorationModels
+  }
   var detectionModels: [String] { capabilities.detectionModels }
   var previewDetectionModels: [String] { capabilities.previewDetectionModels }
-  var supportsPythonEngine: Bool { capabilities.bundlesPythonRuntime }
-  var usesPythonEngine: Bool { supportsPythonEngine && restorationEngine == "python" }
   var preservesRealtimeCompositeParameters: Bool {
 #if MIOH_PORTABLE_COREAI
     return false
@@ -899,26 +905,12 @@ final class RestorationRunner: ObservableObject {
   /// prevents selecting a model that is absent from this installation.
   func restorationModelAvailability(
     _ model: String,
-    engine: String? = nil
+    engine _: String? = nil
   ) -> MiohModelAvailability {
-    let pythonEngine = supportsPythonEngine
-      && (engine ?? restorationEngine) == "python"
-    if model == "カスタム" {
-      return pythonEngine ? .available : .nativeUnsupported
-    }
-    if !pythonEngine, !capabilities.supportsCoreAI {
+    if !capabilities.supportsCoreAI {
       return .nativeUnsupported
     }
     guard let resources = try? resourceDirectory() else { return .notInstalled }
-    if pythonEngine, model == "basicvsrpp-v1.2" {
-      let python = resources.appendingPathComponent("runtime/bin/python3.12")
-      let weights = resources.appendingPathComponent(
-        "models/lada_mosaic_restoration_model_generic_v1.2.pth"
-      )
-      return FileManager.default.isExecutableFile(atPath: python.path)
-          && FileManager.default.fileExists(atPath: weights.path)
-        ? .available : .notInstalled
-    }
     guard model.contains("coreai") else { return .nativeUnsupported }
     guard let asset = nativeRestorationAsset(resources: resources, model: model)
     else { return .notInstalled }
@@ -929,14 +921,9 @@ final class RestorationRunner: ObservableObject {
 
   func detectionModelAvailability(
     _ model: String,
-    engine: String? = nil
+    engine _: String? = nil
   ) -> MiohModelAvailability {
-    let pythonEngine = supportsPythonEngine
-      && (engine ?? restorationEngine) == "python"
-    if model == "カスタム" {
-      return pythonEngine ? .available : .nativeUnsupported
-    }
-    if !pythonEngine, !capabilities.supportsCoreAI {
+    if !capabilities.supportsCoreAI {
       return .nativeUnsupported
     }
     guard let resources = try? resourceDirectory() else { return .notInstalled }
@@ -946,10 +933,8 @@ final class RestorationRunner: ObservableObject {
 
   func roiEnhancerModelAvailability(
     _ model: String,
-    engine: String? = nil
+    engine _: String? = nil
   ) -> MiohModelAvailability {
-    let pythonEngine = supportsPythonEngine
-      && (engine ?? restorationEngine) == "python"
     if model.isEmpty { return .available }
     guard let resources = try? resourceDirectory() else { return .notInstalled }
     if nativeROIEnhancerAsset(
@@ -959,18 +944,7 @@ final class RestorationRunner: ObservableObject {
     ) != nil {
       return .available
     }
-    guard pythonEngine else { return .nativeUnsupported }
-    let filenames: [String: String] = [
-      "realesrgan-x2": "RealESRGAN_x2plus.pth",
-      "realesrgan-x4": "RealESRGAN_x4plus.pth",
-      "nomos-webphoto-realplksr-x4": "4xNomosWebPhoto_RealPLKSR.safetensors",
-      "nomos-uni-span-x4": "4xNomosUni_span_multijpg.safetensors",
-      "nomos-uni-compact-x2": "2xNomosUni_compact_multijpg.safetensors",
-    ]
-    guard let filename = filenames[model] else { return .notInstalled }
-    return FileManager.default.fileExists(
-      atPath: resources.appendingPathComponent("models/\(filename)").path
-    ) ? .available : .notInstalled
+    return .nativeUnsupported
   }
 
   /// The rates a user can actually pick, each as its exact rational. NTSC
@@ -1021,10 +995,6 @@ final class RestorationRunner: ObservableObject {
     }
     return options.sorted { $0.value < $1.value }
   }
-
-  /// process_video_parallel.py takes an integer `--fps`, so the Python engine
-  /// gets the nearest whole rate.
-  var pythonTargetFPS: Int { max(1, Int(targetFPSValue.rounded())) }
 
   private func refreshSourceInfo(for url: URL?) {
     sourceInfo = nil
@@ -1203,15 +1173,6 @@ final class RestorationRunner: ObservableObject {
     inputURL != nil && outputURL != nil && !isRunning
   }
 
-  func chooseInput() {
-    let panel = NSOpenPanel()
-    panel.title = "入力を選択"
-    panel.canChooseFiles = true
-    panel.canChooseDirectories = true
-    panel.allowsMultipleSelection = false
-    if panel.runModal() == .OK { inputURL = panel.url }
-  }
-
   func chooseOutput() {
     let panel = NSOpenPanel()
     panel.title = "出力フォルダを選択"
@@ -1264,16 +1225,6 @@ final class RestorationRunner: ObservableObject {
       normalizeModelSelections()
       let resources = try resourceDirectory()
       resetNativeExportBatchState()
-      if usesPythonEngine {
-        let pythonTask = try makePythonExportTask(
-          resources: resources,
-          input: inputURL,
-          output: outputURL
-        )
-        try launch(pythonTask.process, pipe: pythonTask.output)
-        appendPythonExportStartLog(input: inputURL, output: outputURL)
-        return
-      }
       let plan = try MacNativeExportBatchPlanner.plan(
         input: inputURL,
         selectedOutput: outputURL,
@@ -1551,7 +1502,6 @@ final class RestorationRunner: ObservableObject {
       "basicvsrpp-v1.2-coreai-t36",
       "basicvsrpp-v1.2-coreai-t90",
       "basicvsrpp-v1.2-coreai-variable",
-      "basicvsrpp-v1.2-coreai-variable-hq",
     ].contains(restorationModel)
     else {
       throw RunnerError.unsupportedFeature(
@@ -1566,8 +1516,7 @@ final class RestorationRunner: ObservableObject {
       )
     }
     // Swift owns the decoder/detector/restorer/encoder pipeline. The native
-    // lane count controls its independent Core AI restoration runners;
-    // Python device, precision, executor and merge options remain separate.
+    // lane count controls its independent Core AI restoration runners.
     guard encodingMode == "preset",
       encoderOptions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
       !useQuality, !useQMin, !useQMax,
@@ -1750,6 +1699,10 @@ final class RestorationRunner: ObservableObject {
       roiEnhancerStrength: nativeEnhancer == nil ? 0 : Float(roiEnhancerStrength),
       roiEnhancerScale: nativeEnhancer?.scale ?? max(1, roiEnhancerScale),
       detectionEmptyLookahead: max(0, detectionEmptyLookahead),
+      detectionMaskReuseSkipFrames: min(
+        max(detectionMaskReuseSkipFrames, 0),
+        8
+      ),
       detectFaceMosaics: detectFaceMosaics,
       crossfade: restoreCrossfade,
       targetFPS: useFPS ? max(1, fps) : nil,
@@ -1890,10 +1843,12 @@ final class RestorationRunner: ObservableObject {
       restorationClipLength: clipFrames,
       temporalOverlap: overlap,
       crossfade: restoreCrossfade,
-      // Worker v1 deliberately uses endpoint lookahead only. It prevents
-      // coordinator UI defaults from changing shard semantics.
-      detectionEmptyLookahead: 1,
+      detectionEmptyLookahead: min(max(detectionEmptyLookahead, 1), 300),
       detectFaceMosaics: detectFaceMosaics,
+      detectionMaskReuseSkipFrames: min(
+        max(detectionMaskReuseSkipFrames, 0),
+        8
+      ),
       blendFeather: Float(blendFeather),
       sharpenStrength: Float(sharpenStrength),
       detailBoost: Float(detailBoost),
@@ -1978,8 +1933,7 @@ final class RestorationRunner: ObservableObject {
     }
     guard request.protocolVersion == RemoteClusterJobRequest.protocolVersion,
       request.mediaRange.isValid,
-      request.options.isValid,
-      request.options.detectionEmptyLookahead == 1
+      request.options.isValid
     else {
       throw RunnerError.unsupportedFeature(
         "クラスタジョブの設定がworker v1契約と一致しません"
@@ -2217,7 +2171,9 @@ final class RestorationRunner: ObservableObject {
         ? 0 : request.options.roiEnhancerStrength,
       roiEnhancerScale: enhancer?.scale
         ?? max(1, request.options.roiEnhancerScale),
-      detectionEmptyLookahead: 1,
+      detectionEmptyLookahead: request.options.detectionEmptyLookahead,
+      detectionMaskReuseSkipFrames:
+        request.options.detectionMaskReuseSkipFrames ?? 0,
       detectFaceMosaics: request.options.detectFaceMosaics,
       crossfade: request.options.crossfade,
       targetFPS: request.options.targetFPSNumerator,
@@ -2355,8 +2311,8 @@ final class RestorationRunner: ObservableObject {
   /// Returns the digest of the portable source model represented by a model
   /// ID. Both coordinator and Worker use this path, so a Mac `.aimodelc` and
   /// an iPad `.aimodel` compare equal when they came from the same source.
-  /// Models absent from the v1 manifest (for example dedicated-only HQ assets)
-  /// retain the previous runtime-tree digest as a compatibility fallback.
+  /// Models absent from the v1 manifest retain the previous runtime-tree
+  /// digest as a compatibility fallback.
   private func remoteClusterCanonicalAssetDigest(
     resources: URL,
     modelIdentifier: String,
@@ -2515,309 +2471,6 @@ final class RestorationRunner: ObservableObject {
     return hasher.finalize().map { String(format: "%02x", $0) }.joined()
   }
 
-  // MARK: - Bundled Python engine
-  //
-  // Only the portable/universal package carries Resources/runtime. These
-  // entry points drive process_video_parallel.py and mioh_preview_worker.py
-  // through that interpreter, which is the fallback for machines where the
-  // Swift Core AI pipeline is unavailable or produces worse results.
-
-  private func bundledPythonExecutable(resources: URL) throws -> URL {
-    let python = resources.appendingPathComponent("runtime/bin/python3.12")
-    guard capabilities.bundlesPythonRuntime,
-      FileManager.default.isExecutableFile(atPath: python.path)
-    else {
-      throw RunnerError.missingResource("Python runtime")
-    }
-    return python
-  }
-
-  private func makePythonExportTask(
-    resources: URL,
-    input: URL,
-    output: URL
-  ) throws -> (process: Process, output: Pipe) {
-    let python = try bundledPythonExecutable(resources: resources)
-    let processor = resources.appendingPathComponent(
-      "runtime/lib/python3.12/site-packages/process_video_parallel.py"
-    )
-    guard FileManager.default.fileExists(atPath: processor.path) else {
-      throw RunnerError.missingResource("Parallel processor")
-    }
-
-    let task = Process()
-    task.executableURL = python
-    task.currentDirectoryURL = processor.deletingLastPathComponent()
-    task.arguments = [processor.path] + (try processingArguments(
-      resources: resources,
-      input: input,
-      output: output
-    ))
-    task.environment = environment(resources: resources, python: python)
-
-    let pipe = Pipe()
-    task.standardOutput = pipe
-    task.standardError = pipe
-    // The Python runner reports progress as plain text, not the native
-    // pipeline's JSON events, and owns its own temporary directories.
-    runningNativeExport = false
-    processInput = nil
-    return (task, pipe)
-  }
-
-  func previewArguments(
-    resources: URL,
-    outputDirectory: URL,
-    input: URL
-  ) throws -> [String] {
-    normalizeModelSelections()
-    let previewModel = try resolvedPreviewRestorationModel(in: resources)
-    try rejectUnsupportedCoreAIModel(previewModel)
-    let detection = try resolvedPreviewDetectionModel(in: resources)
-    let skipsCompositeParameters = previewRealtimeOptimization
-    if !skipsCompositeParameters && roiEnhancer != "none" {
-      try rejectUnsupportedCoreAIModel(roiEnhancerModel)
-    }
-    var args = [
-      "--input",
-      input.isFileURL ? input.path : input.absoluteString,
-      "--output-dir",
-      outputDirectory.path,
-    ]
-    add(&args, "--device", device)
-    args.append(fp16 ? "--fp16" : "--no-fp16")
-    add(&args, "--restoration-model", previewModel)
-    add(&args, "--detection-model", detection)
-    let automaticClipLength: Int
-    switch previewModel {
-    case "basicvsrpp-v1.2-coreai": automaticClipLength = 98
-    case "basicvsrpp-v1.2-coreai-t36": automaticClipLength = 104
-    case "basicvsrpp-v1.2-coreai-t90": automaticClipLength = 178
-    case "basicvsrpp-v1.2-coreai-variable":
-      automaticClipLength = previewRealtimeOptimization ? 90 : 180
-    case "basicvsrpp-v1.2-coreai-variable-hq":
-      automaticClipLength = 180
-    default: automaticClipLength = 180
-    }
-    add(
-      &args,
-      "--max-clip-length",
-      min(
-        miohMaximumClipFrames,
-        useMaxClipLength ? maxClipLength : automaticClipLength
-      )
-    )
-    if useRestoreMaxFrames {
-      add(
-        &args,
-        "--restore-max-frames",
-        restoreMaxFrames > 0
-          ? min(miohMaximumClipFrames, restoreMaxFrames)
-          : restoreMaxFrames
-      )
-    }
-    add(&args, "--restore-temporal-overlap", restoreTemporalOverlap)
-    args.append(restoreCrossfade ? "--enable-crossfade" : "--disable-crossfade")
-    add(&args, "--sharpen-strength", skipsCompositeParameters ? 0 : sharpenStrength)
-    add(&args, "--detail-boost", skipsCompositeParameters ? 0 : detailBoost)
-    add(&args, "--blend-feather", blendFeather)
-    add(&args, "--texture-mix", skipsCompositeParameters ? 0 : textureMix)
-    add(&args, "--smooth-strength", skipsCompositeParameters ? 0 : smoothStrength)
-    add(&args, "--roi-enhancer", skipsCompositeParameters ? "none" : roiEnhancer)
-    if !skipsCompositeParameters {
-      addOptional(&args, "--roi-enhancer-model", roiEnhancerModel)
-    }
-    add(&args, "--roi-enhancer-scale", roiEnhancerScale)
-    add(&args, "--roi-enhancer-strength", skipsCompositeParameters ? 0 : roiEnhancerStrength)
-    add(&args, "--roi-enhancer-tile", roiEnhancerTile)
-    add(&args, "--effect-upscale", skipsCompositeParameters ? 1 : effectUpscale)
-    add(&args, "--detection-empty-lookahead", detectionEmptyLookahead)
-    addFlag(&args, "--detect-face-mosaics", detectFaceMosaics)
-    add(&args, "--buffer-limit", previewBufferLimit)
-    if previewRealtimeOptimization { args.append("--realtime-optimize") }
-    return args
-  }
-
-  private func processingArguments(resources: URL, input: URL, output: URL) throws -> [String] {
-    var args = ["--input", input.path, "--output", output.path]
-    add(&args, "--temp-dir", tempDirectory)
-    addOptional(&args, "--ffmpeg-temp-dir", ffmpegTempDirectory)
-    addOptional(&args, "--lada-temp-dir", ladaTempDirectory)
-    add(&args, "--parallel-workers", parallelWorkers)
-    add(&args, "--executor", executor)
-    if noSplit {
-      args.append("--no-split")
-    } else if useSegmentCount {
-      add(&args, "--segment-count", segmentCount)
-    } else {
-      add(&args, "--segment-duration", segmentDuration)
-    }
-    add(&args, "--merge-encoder", mergeEncoder)
-    addFlag(&args, "--delete-segments", deleteSegments)
-    addFlag(&args, "--keep-temp", keepTemp)
-    addFlag(&args, "--force-split", forceSplit)
-    add(&args, "--device", device)
-    args.append(fp16 ? "--fp16" : "--no-fp16")
-
-    if encodingMode == "preset" {
-      add(&args, "--encoding-preset", encodingPreset)
-    } else if encodingMode == "custom" {
-      add(&args, "--encoder", encoder)
-    }
-    addOptional(&args, "--encoder-options", encoderOptions)
-    add(&args, "--bitrate-multiplier", bitrateMultiplier)
-    if useQuality { add(&args, "--quality", quality) }
-    if useQMin { add(&args, "--qmin", qmin) }
-    if useQMax { add(&args, "--qmax", qmax) }
-    if useFPS { add(&args, "--fps", pythonTargetFPS) }
-    addFlag(&args, "--pre-fps-conversion", useFPS && preFPSConversion && !noSplit)
-    addFlag(&args, "--mp4-fast-start", mp4FastStart)
-    args.append(autoOptimize ? "--auto-optimize" : "--no-auto-optimize")
-
-    let restoration = try resolvedRestorationModel(in: resources)
-    add(&args, "--mosaic-restoration-model", restoration)
-    if useMaxClipLength {
-      add(&args, "--max-clip-length", min(miohMaximumClipFrames, maxClipLength))
-    }
-    if useRestoreMaxFrames {
-      add(
-        &args,
-        "--restore-max-frames",
-        restoreMaxFrames > 0
-          ? min(miohMaximumClipFrames, restoreMaxFrames)
-          : restoreMaxFrames
-      )
-    }
-    add(&args, "--restore-temporal-overlap", restoreTemporalOverlap)
-    args.append(restoreCrossfade ? "--enable-crossfade" : "--disable-crossfade")
-    add(&args, "--restore-sharpen-strength", sharpenStrength)
-    add(&args, "--restore-detail-boost", detailBoost)
-    add(&args, "--restore-blend-feather", blendFeather)
-    add(&args, "--restore-texture-mix", textureMix)
-    add(&args, "--restore-smooth-strength", smoothStrength)
-    add(&args, "--restore-effect-upscale", effectUpscale)
-    add(&args, "--restore-roi-enhancer", roiEnhancer)
-    if roiEnhancer != "none" {
-      try rejectUnsupportedCoreAIModel(roiEnhancerModel)
-    }
-    addOptional(&args, "--restore-roi-enhancer-model-path", roiEnhancerModel)
-    add(&args, "--restore-roi-enhancer-scale", roiEnhancerScale)
-    add(&args, "--restore-roi-enhancer-strength", roiEnhancerStrength)
-    add(&args, "--restore-roi-enhancer-tile", roiEnhancerTile)
-
-    add(&args, "--mosaic-detection-model", try resolvedDetectionModel(in: resources))
-    add(&args, "--mosaic-detection-empty-lookahead", detectionEmptyLookahead)
-    args.append(detectFaceMosaics ? "--detect-face-mosaics" : "--no-detect-face-mosaics")
-    add(&args, "--memory-cleanup-interval", memoryCleanupInterval)
-    add(&args, "--cleanup-trigger-gb", cleanupTriggerGB)
-    if useMPSMemoryFraction { add(&args, "--mps-memory-fraction", mpsMemoryFraction) }
-    addFlag(&args, "--log-mps-memory", logMPSMemory)
-    addFlag(&args, "--overwrite", overwrite)
-    return args
-  }
-
-  private func resolvedRestorationModel(in resources: URL) throws -> String {
-    if restorationModel == "カスタム" {
-      guard !customRestorationModel.isEmpty else { throw RunnerError.missingValue("復元モデル") }
-      try rejectUnsupportedCoreAIModel(customRestorationModel)
-      return customRestorationModel
-    }
-    return restorationModel
-  }
-
-  private func resolvedPreviewRestorationModel(in resources: URL) throws -> String {
-    if previewRestorationModel == "カスタム" {
-      guard !previewCustomRestorationModel.isEmpty else {
-        throw RunnerError.missingValue("再生用復元モデル")
-      }
-      try rejectUnsupportedCoreAIModel(previewCustomRestorationModel)
-      return previewCustomRestorationModel
-    }
-    try rejectUnsupportedCoreAIModel(previewRestorationModel)
-    return previewRestorationModel
-  }
-
-  private func resolvedDetectionModel(in resources: URL) throws -> String {
-    if detectionModel == "カスタム" {
-      guard !customDetectionModel.isEmpty else { throw RunnerError.missingValue("検出モデル") }
-      try rejectUnsupportedCoreAIModel(customDetectionModel)
-      return customDetectionModel
-    }
-    return detectionModel
-  }
-
-  private func resolvedPreviewDetectionModel(in resources: URL) throws -> String {
-    if previewDetectionModel == "カスタム" {
-      guard !previewCustomDetectionModel.isEmpty else {
-        throw RunnerError.missingValue("再生用検出モデル")
-      }
-      try rejectUnsupportedCoreAIModel(previewCustomDetectionModel)
-      return previewCustomDetectionModel
-    }
-    try rejectUnsupportedCoreAIModel(previewDetectionModel)
-    return previewDetectionModel
-  }
-
-  func environment(resources: URL, python: URL) -> [String: String] {
-    var result = ProcessInfo.processInfo.environment
-    let sitePackages = resources.appendingPathComponent("runtime/lib/python3.12/site-packages")
-    result["PYTHONHOME"] = resources.appendingPathComponent("runtime").path
-    result["PYTHONPATH"] = sitePackages.path
-    result["LADA_MODEL_WEIGHTS_DIR"] = resources.appendingPathComponent("models").path
-    result["LADA_PREVIEW_VIDEOTOOLBOX_RUNNER"] = resources
-      .appendingPathComponent("bin/mioh-preview-videotoolbox-encoder").path
-    if capabilities.supportsCoreAI {
-      result["LADA_NATIVE_COREAI_PREVIEW_RUNNER"] = resources
-        .appendingPathComponent("bin/mioh-native-coreai-preview").path
-      result["LADA_NATIVE_SWIFT_PREVIEW"] = "1"
-      result["LADA_COREAI_SWIFT_RUNNER"] = resources.appendingPathComponent("bin/lada-coreai-runner").path
-      result["LADA_VARIABLE_COREAI_SWIFT_RUNNER"] = resources.appendingPathComponent("bin/lada-basicvsrpp-variable-runner").path
-#if MIOH_DEDICATED_VARIABLE_HQ
-      result["LADA_VARIABLE_COREAI_HQ_SWIFT_RUNNER"] = resources.appendingPathComponent("bin/lada-basicvsrpp-variable-hq-runner").path
-#endif
-#if MIOH_PORTABLE_COREAI
-      result.removeValue(forKey: "LADA_COREAI_ARCHITECTURE")
-#else
-      result["LADA_COREAI_ARCHITECTURE"] = "h17s"
-#endif
-    } else {
-      result.removeValue(forKey: "LADA_COREAI_PYTHON")
-      result.removeValue(forKey: "LADA_NATIVE_COREAI_PREVIEW_RUNNER")
-      result.removeValue(forKey: "LADA_NATIVE_SWIFT_PREVIEW")
-      result.removeValue(forKey: "LADA_COREAI_SWIFT_RUNNER")
-      result.removeValue(forKey: "LADA_VARIABLE_COREAI_SWIFT_RUNNER")
-      result.removeValue(forKey: "LADA_VARIABLE_COREAI_HQ_SWIFT_RUNNER")
-      result.removeValue(forKey: "LADA_COREAI_ARCHITECTURE")
-    }
-    result["PATH"] = [resources.appendingPathComponent("bin").path, "/usr/bin", "/bin", "/usr/sbin", "/sbin"].joined(separator: ":")
-    result["PYTHONUNBUFFERED"] = "1"
-    result["PYTHONDONTWRITEBYTECODE"] = "1"
-    result["PYTHONWARNINGS"] = "ignore::SyntaxWarning"
-    result["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
-    result["LADA_DEFORM_CONV_BACKEND"] = "mps_deform_conv"
-    result["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
-    result["LADA_APP_PROGRESS"] = "1"
-    return result
-  }
-
-  private func appendPythonExportStartLog(input: URL, output: URL) {
-    appendLog(
-      """
-      ======================================================================
-      Python書き出し（バンドルランタイム）
-      ======================================================================
-      入力: \(input.path)
-      出力: \(output.path)
-      復元モデル: \(restorationModel)
-      検出モデル: \(detectionModel)
-      デバイス: \(device) / \(fp16 ? "FP16" : "FP32")
-      並列数: \(parallelWorkers)（\(executor)）
-      ======================================================================
-
-      """
-    )
-  }
-
   private func appendNativeExportStartLog(
     input: URL,
     output: URL,
@@ -2854,6 +2507,7 @@ final class RestorationRunner: ObservableObject {
       エフェクト倍率: \(configuration.effectUpscale)x
       ROIエンハンサー: \(configuration.roiEnhancerModel == nil ? "無効" : "有効（\(roiEnhancerModel)、強度 \(String(format: "%.2f", configuration.roiEnhancerStrength))）")
       空検出先読み: \(configuration.detectionEmptyLookahead)フレーム
+      検出後スキップ: \(configuration.detectionMaskReuseSkipFrames)フレーム
       顔モザイク検出: \(configuration.detectFaceMosaics ? "有効" : "無効")
       FPS変換: \(configuration.targetFPS == nil ? "なし" : "\(targetFPSDescription)fps（\(configuration.preFPSConversion ? "復元前" : "復元後")）")
       エンコーダー: \(codec) VideoToolbox
@@ -2906,10 +2560,6 @@ final class RestorationRunner: ObservableObject {
       prefix = "basicvsrpp-v1.2-t18-fp16"
       fixedFrameCount = 18
       runnerName = "lada-coreai-runner"
-    case "basicvsrpp-v1.2-coreai-variable-hq":
-      prefix = "basicvsrpp-v1.2-variable-hq-coreai"
-      fixedFrameCount = nil
-      runnerName = "lada-basicvsrpp-variable-hq-runner"
     case "basicvsrpp-v1.2-coreai-variable":
       prefix = "basicvsrpp-v1.2-variable-coreai"
       fixedFrameCount = nil
@@ -2950,11 +2600,33 @@ final class RestorationRunner: ObservableObject {
       .replacingOccurrences(of: "-coreai", with: "")
       .replacingOccurrences(of: "-coreml", with: "")
     if base == "jasna-v6" || base == "jasna-v6-large" {
-      guard !requestsCoreML else { return nil }
       let large = base == "jasna-v6-large"
       let stem = large
         ? "rfdetr-v6-large-768-fp32"
         : "rfdetr-v6-576-fp32"
+      if requestsCoreML {
+        for suffix in [".mlmodelc", ".mlpackage"] {
+          if let coreML = firstModelAsset(
+            in: models,
+            prefixes: [stem],
+            suffix: suffix
+          ) {
+            return (
+              coreML,
+              "rfdetr",
+              large ? 768 : 576,
+              0,
+              200,
+              3,
+              16,
+              large ? 0.40 : 0.35,
+              "cpuAndGPU"
+            )
+          }
+        }
+        return nil
+      }
+      guard requestsCoreAI else { return nil }
       for suffix in [".aimodelc", ".aimodel"] {
         if let coreAI = firstModelAsset(
           in: models,
@@ -3029,8 +2701,8 @@ final class RestorationRunner: ObservableObject {
   /// Resolve the selected UI model to a backend the Swift pipeline can load.
   /// Core AI selections stay on Core AI when a compiled asset is available;
   /// Core ML and legacy PyTorch labels resolve to the equivalent Core ML
-  /// export. This keeps the user's chosen model semantics without bringing
-  /// Python back into the native pipeline.
+  /// export. This keeps the user's chosen model semantics in the native
+  /// pipeline.
   private func nativeROIEnhancerAsset(
     resources: URL,
     model: String,
@@ -3276,6 +2948,7 @@ final class RestorationRunner: ObservableObject {
       detectionModel: detectionModel,
       customDetectionModel: customDetectionModel,
       detectionEmptyLookahead: detectionEmptyLookahead,
+      detectionMaskReuseSkipFrames: detectionMaskReuseSkipFrames,
       detectFaceMosaics: detectFaceMosaics,
       previewBufferLimit: previewBufferLimit,
       previewRestorationModel: previewRestorationModel,
@@ -3283,6 +2956,7 @@ final class RestorationRunner: ObservableObject {
       previewDetectionModel: previewDetectionModel,
       previewCustomDetectionModel: previewCustomDetectionModel,
       previewRealtimeOptimization: previewRealtimeOptimization,
+      previewLimitHighFrameRate: previewLimitHighFrameRate,
       previewUseSafariCompatibleHLS: previewUseSafariCompatibleHLS,
       previewHLSQuality: previewHLSQuality,
       previewProjectionMode: previewProjectionMode,
@@ -3306,19 +2980,12 @@ final class RestorationRunner: ObservableObject {
     ffmpegTempDirectory = snapshot.ffmpegTempDirectory
     ladaTempDirectory = snapshot.ladaTempDirectory
     overwrite = snapshot.overwrite
-    restorationEngine = supportsPythonEngine
-      && snapshot.restorationEngine == "python" ? "python" : "native"
+    restorationEngine = "native"
 
-    if supportsPythonEngine {
-      parallelWorkers = min(max(snapshot.parallelWorkers, 1), 16)
-      executor = ["process", "thread"].contains(snapshot.executor)
-        ? snapshot.executor : "process"
-    } else {
-      // Kept in the persisted schema for backward-compatible decoding only.
-      // Native export uses nativeParallelWorkers instead of this Python field.
-      parallelWorkers = 1
-      executor = "process"
-    }
+    // Kept in the persisted schema for backward-compatible decoding only.
+    // Native export uses nativeParallelWorkers instead of these legacy fields.
+    parallelWorkers = 1
+    executor = "process"
     nativeParallelWorkers = min(
       max(snapshot.nativeParallelWorkers ?? 1, 1),
       3
@@ -3327,23 +2994,17 @@ final class RestorationRunner: ObservableObject {
     segmentCount = min(max(snapshot.segmentCount, 1), 128)
     segmentDuration = min(max(snapshot.segmentDuration, 10), 3600)
     noSplit = snapshot.noSplit ?? false
-    mergeEncoder = supportsPythonEngine ? snapshot.mergeEncoder : "copy"
+    mergeEncoder = "copy"
     deleteSegments = snapshot.deleteSegments
     keepTemp = snapshot.keepTemp
     forceSplit = snapshot.forceSplit
 
-    if supportsPythonEngine {
-      device = snapshot.device
-      fp16 = snapshot.fp16
-      autoOptimize = snapshot.autoOptimize
-    } else {
-      // Native Core AI export has one supported execution contract. Preserve
-      // these fields in the on-disk schema so older preferences still decode,
-      // but never let stale Python-era values make a native export fail.
-      device = "mps"
-      fp16 = true
-      autoOptimize = true
-    }
+    // Native Core AI export has one supported execution contract. Preserve
+    // these fields in the on-disk schema so older preferences still decode,
+    // but never let stale values make a native export fail.
+    device = "mps"
+    fp16 = true
+    autoOptimize = true
 
     encodingMode = ["auto", "preset", "custom"].contains(snapshot.encodingMode) ? snapshot.encodingMode : "preset"
     encodingPreset = encodingPresets.contains(snapshot.encodingPreset) ? snapshot.encodingPreset : "hevc-apple-gpu-balanced"
@@ -3372,7 +3033,7 @@ final class RestorationRunner: ObservableObject {
       : snapshot.restoreMaxFrames
     restoreTemporalOverlap = min(max(snapshot.restoreTemporalOverlap ?? 8, 0), 120)
     restoreCrossfade = snapshot.restoreCrossfade ?? true
-    sharpenStrength = min(max(snapshot.sharpenStrength, 0), 2)
+    sharpenStrength = min(max(snapshot.sharpenStrength, 0), 5)
     detailBoost = min(max(snapshot.detailBoost, 0), 1)
     blendFeather = min(max(snapshot.blendFeather, 0), 3)
     textureMix = min(max(snapshot.textureMix, 0), 1)
@@ -3387,10 +3048,14 @@ final class RestorationRunner: ObservableObject {
     detectionModel = detectionModels.contains(snapshot.detectionModel) ? snapshot.detectionModel : "v2-coreml"
     customDetectionModel = snapshot.customDetectionModel
     detectionEmptyLookahead = min(max(snapshot.detectionEmptyLookahead, 0), 300)
+    detectionMaskReuseSkipFrames = min(
+      max(snapshot.detectionMaskReuseSkipFrames ?? 0, 0),
+      8
+    )
     detectFaceMosaics = snapshot.detectFaceMosaics
 
     previewBufferLimit = min(max(snapshot.previewBufferLimit, 1), 60)
-    previewRestorationModel = restorationModels.contains(
+    previewRestorationModel = previewRestorationModels.contains(
       snapshot.previewRestorationModel ?? ""
     ) ? snapshot.previewRestorationModel! : capabilities.previewRestorationModel
     previewCustomRestorationModel = snapshot.previewCustomRestorationModel ?? ""
@@ -3399,6 +3064,7 @@ final class RestorationRunner: ObservableObject {
     ) ? snapshot.previewDetectionModel! : capabilities.previewDetectionModel
     previewCustomDetectionModel = snapshot.previewCustomDetectionModel ?? ""
     previewRealtimeOptimization = snapshot.previewRealtimeOptimization ?? true
+    previewLimitHighFrameRate = snapshot.previewLimitHighFrameRate ?? false
     previewUseSafariCompatibleHLS =
       snapshot.previewUseSafariCompatibleHLS ?? false
     previewHLSQuality = PreviewHLSQuality(
@@ -3444,8 +3110,9 @@ final class RestorationRunner: ObservableObject {
         "Swiftネイティブ再生はカスタム復元モデルに未対応です"
       )
     }
-    let previewModel = previewRestorationModel
-    try rejectUnsupportedCoreAIModel(previewModel)
+    let selectedPreviewModel = previewRestorationModel
+    try rejectUnsupportedCoreAIModel(selectedPreviewModel)
+    let previewModel = selectedPreviewModel
     guard previewDetectionModel != "カスタム" else {
       throw RunnerError.unsupportedFeature(
         "Swiftネイティブ再生はカスタム検出モデルに未対応です"
@@ -3509,7 +3176,10 @@ final class RestorationRunner: ObservableObject {
     } else {
       nativeEnhancer = nil
     }
-    let temporalLimit = detection.computeUnits == nil ? 30 : 36
+    let usesVariableTemporalModel = restoration.fixedFrameCount == nil
+    let temporalLimit = usesVariableTemporalModel
+      ? 48
+      : (detection.computeUnits == nil ? 30 : 36)
     var requestedFrames = min(
       miohMaximumClipFrames,
       useMaxClipLength ? maxClipLength : temporalLimit
@@ -3522,7 +3192,7 @@ final class RestorationRunner: ObservableObject {
       min(temporalLimit, max(2, requestedFrames))
     )
     let previewOverlap = min(
-      max(0, restoreTemporalOverlap),
+      max(0, usesVariableTemporalModel ? 6 : restoreTemporalOverlap),
       max(0, temporalFrames - 1)
     )
     let ffmpeg = resources.appendingPathComponent("bin/ffmpeg")
@@ -3572,8 +3242,14 @@ final class RestorationRunner: ObservableObject {
       roiEnhancerStrength: nativeEnhancer == nil ? 0 : Float(effectiveEnhancerStrength),
       roiEnhancerScale: nativeEnhancer?.scale ?? max(1, roiEnhancerScale),
       detectionEmptyLookahead: max(0, detectionEmptyLookahead),
+      detectionMaskReuseSkipFrames: min(
+        max(detectionMaskReuseSkipFrames, 0),
+        8
+      ),
       detectFaceMosaics: detectFaceMosaics,
-      crossfade: restoreCrossfade
+      crossfade: restoreCrossfade,
+      maximumFPS: previewLimitHighFrameRate ? 30 : nil,
+      preFPSConversion: true
     )
     var environment = ProcessInfo.processInfo.environment
     environment["PATH"] = [
@@ -3600,7 +3276,7 @@ final class RestorationRunner: ObservableObject {
     if !restorationModels.contains(restorationModel) {
       restorationModel = capabilities.defaultRestorationModel
     }
-    if !restorationModels.contains(previewRestorationModel) {
+    if !previewRestorationModels.contains(previewRestorationModel) {
       previewRestorationModel = capabilities.previewRestorationModel
     }
     if !previewDetectionModels.contains(previewDetectionModel) {
@@ -3647,22 +3323,6 @@ final class RestorationRunner: ObservableObject {
     {
       throw RunnerError.unsupportedFeature("CoreAIモデルにはmacOS 27以降が必要です")
     }
-  }
-
-  private func add(_ args: inout [String], _ option: String, _ value: String) {
-    args.append(contentsOf: [option, value])
-  }
-
-  private func add<T>(_ args: inout [String], _ option: String, _ value: T) {
-    args.append(contentsOf: [option, String(describing: value)])
-  }
-
-  private func addOptional(_ args: inout [String], _ option: String, _ value: String) {
-    if !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { add(&args, option, value) }
-  }
-
-  private func addFlag(_ args: inout [String], _ option: String, _ enabled: Bool) {
-    if enabled { args.append(option) }
   }
 
   private func consume(_ text: String) {
@@ -3745,18 +3405,20 @@ final class RestorationRunner: ObservableObject {
         let preparationSeconds = payload["preparation_seconds"] as? Double ?? 0
         let restorationSeconds = payload["restoration_seconds"] as? Double ?? 0
         let compositionSeconds = payload["composition_seconds"] as? Double ?? 0
+        let batchLanes = payload["native_parallel_workers"] as? Int ?? 1
         func elapsedPercent(_ seconds: Double) -> Double {
           elapsed > 0 ? seconds / elapsed * 100 : 0
         }
         appendLog(
           String(
             format:
-              "処理統計: %dフレーム / 検出対象%dフレーム / 復元%dクリップ / %.1ffps / 経過 %@\n処理内訳（工程は並行するため割合の合計は100%%になりません）: 検出 %.2f秒 (%.1f%%) / 準備 %.2f秒 (%.1f%%) / 復元 %.2f秒 (%.1f%%) / 合成 %.2f秒 (%.1f%%)\n",
+              "処理統計: %dフレーム / 検出対象%dフレーム / 復元%dクリップ / %.1ffps / 経過 %@\n並列構成: 時間バッチ%dレーン\n処理内訳（工程は並行するため割合の合計は100%%になりません）: 検出 %.2f秒 (%.1f%%) / 準備 %.2f秒 (%.1f%%) / 復元 %.2f秒 (%.1f%%) / 合成 %.2f秒 (%.1f%%)\n",
             frames,
             detected,
             batches,
             fps,
             nativeLogDuration(elapsed),
+            batchLanes,
             detectionSeconds,
             elapsedPercent(detectionSeconds),
             preparationSeconds,
@@ -3912,6 +3574,7 @@ struct PathRow: View {
   let icon: String
   let url: URL?
   let action: () -> Void
+  var actionLabel: String?
 
   var body: some View {
     HStack(spacing: 12) {
@@ -3922,8 +3585,13 @@ struct PathRow: View {
           .lineLimit(1).truncationMode(.middle)
           .frame(maxWidth: .infinity, alignment: .leading)
       }
-      Button(action: action) { Image(systemName: "folder") }
-        .buttonStyle(.borderless).help(L("選択"))
+      if let actionLabel {
+        Button(L(actionLabel), action: action)
+          .buttonStyle(.bordered)
+      } else {
+        Button(action: action) { Image(systemName: "folder") }
+          .buttonStyle(.borderless).help(L("選択"))
+      }
     }
     .frame(minHeight: 42)
   }
@@ -4001,6 +3669,7 @@ struct PathSettingRow: View {
   }
 }
 
+
 private enum WorkspaceTab: Hashable {
   case basic
   case browser
@@ -4071,10 +3740,12 @@ struct ContentView: View {
     }
     .frame(minWidth: 820, minHeight: 680)
     .onAppear {
+      InputPanelThumbnailCache.shared.prepare(initialURL: runner.inputURL)
       cluster.attach(runner: runner)
       remoteControl.attach(runner: runner, player: player)
       remoteControl.attachCluster(cluster)
       remoteControl.attachStreaming(remoteStreaming)
+      remoteControl.activateIfRemembered()
       if remoteControl.enabled {
         player.setStreamingEventConsumer(remoteStreaming.eventConsumer())
       }
@@ -4088,6 +3759,30 @@ struct ContentView: View {
       } else {
         player.setStreamingEventConsumer(nil)
         remoteStreaming.stop()
+      }
+    }
+  }
+
+  private func chooseInput() {
+    let panel = NSOpenPanel()
+    let thumbnailCache = InputPanelThumbnailCache.shared
+    // Never compete with the standard panel's own Quick Look work.
+    thumbnailCache.pause()
+    panel.title = "入力ファイルまたはフォルダを選択"
+    panel.allowedContentTypes = []
+    panel.canChooseFiles = true
+    panel.canChooseDirectories = true
+    panel.allowsMultipleSelection = false
+    if let inputURL = runner.inputURL {
+      panel.directoryURL = inputURL.hasDirectoryPath
+        ? inputURL : inputURL.deletingLastPathComponent()
+    }
+    panel.begin { response in
+      guard response == .OK, let url = panel.url else { return }
+      Task { @MainActor in
+        runner.inputURL = url.standardizedFileURL
+        // Warm the selected folder for the next dialog, after this one closes.
+        thumbnailCache.prepare(initialURL: url)
       }
     }
   }
@@ -4117,7 +3812,13 @@ struct ContentView: View {
   private var basicTab: some View {
     Form {
       Section("ファイル") {
-        PathRow(title: "入力", icon: "film", url: runner.inputURL, action: runner.chooseInput)
+        PathRow(
+          title: "入力",
+          icon: "film",
+          url: runner.inputURL,
+          action: chooseInput,
+          actionLabel: "入力を選択…"
+        )
         if runner.inputURL != nil {
           SourceInfoRow(
             info: runner.sourceInfo,
@@ -4131,31 +3832,14 @@ struct ContentView: View {
         PathSettingRow(title: "mioh一時フォルダ", value: $runner.ladaTempDirectory) { runner.choosePath(\.ladaTempDirectory) }
       }
       Section("実行") {
-        if runner.supportsPythonEngine {
-          Picker("実行エンジン", selection: $runner.restorationEngine) {
-            Text("Swiftネイティブ / Core AI").tag("native")
-            Text("Python（バンドルランタイム）").tag("python")
-          }
-          Text(runner.usesPythonEngine
-            ? "バンドルされたPython 3.12でprocess_video_parallel.pyを実行します"
-            : "デコードから書き出しまでを1つのSwiftプロセスで実行します")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-        } else {
-          LabeledContent("実行エンジン") {
-            Text("Swiftネイティブ / Core AI")
-          }
+        LabeledContent("実行エンジン") {
+          Text("Swiftネイティブ / Core AI")
         }
-        if runner.usesPythonEngine {
-          Picker("デバイス", selection: $runner.device) {
-            Text("MPS").tag("mps"); Text("CPU").tag("cpu"); Text("CUDA 0").tag("cuda:0")
-          }
-          Toggle("FP16", isOn: $runner.fp16)
-          Toggle("自動最適化", isOn: $runner.autoOptimize)
-        } else {
-          LabeledContent("精度・最適化") {
-            Text("FP16 / Apple Silicon自動最適化")
-          }
+        Text("デコードから書き出しまでをSwiftネイティブ経路で実行します")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+        LabeledContent("精度・最適化") {
+          Text("FP16 / Apple Silicon自動最適化")
         }
         Toggle("既存結果を上書き", isOn: $runner.overwrite)
       }
@@ -4165,29 +3849,18 @@ struct ContentView: View {
   private var processingTab: some View {
     Form {
       Section("並列処理") {
-        if runner.usesPythonEngine {
-          LabeledContent("並列数") { Stepper(value: $runner.parallelWorkers, in: 1...16) { Text("\(runner.parallelWorkers)") } }
-            .disabled(runner.noSplit)
-          Picker("実行方式", selection: $runner.executor) { Text("プロセス").tag("process"); Text("スレッド").tag("thread") }
-            .disabled(runner.noSplit)
-        } else {
-          LabeledContent("実行方式") {
-            Text("Swiftネイティブ（段階並列）")
-          }
-          Picker("ネイティブ並列数", selection: $runner.nativeParallelWorkers) {
-            Text("1 — 標準").tag(1)
-            Text("2 — 高負荷").tag(2)
-            Text("3 — 最大").tag(3)
-          }
-          .pickerStyle(.segmented)
-          Text(
-            runner.nativeParallelWorkers == 1
-              ? "復元runnerを1つ使用します"
-              : "復元runnerを\(runner.nativeParallelWorkers)つ使用し、連続バッチを同時処理します"
-          )
-            .font(.caption)
-            .foregroundStyle(.secondary)
+        LabeledContent("実行方式") {
+          Text("Swiftネイティブ（段階並列）")
         }
+        Picker("ネイティブ並列数", selection: $runner.nativeParallelWorkers) {
+          Text("1 — 標準").tag(1)
+          Text("2 — 高負荷").tag(2)
+          Text("3 — 最大").tag(3)
+        }
+        .pickerStyle(.segmented)
+        Text("連続する時間バッチを\(runner.nativeParallelWorkers)レーンで処理します")
+          .font(.caption)
+          .foregroundStyle(.secondary)
       }
       Section("セグメント") {
         Toggle("分割しない", isOn: $runner.noSplit)
@@ -4206,9 +3879,6 @@ struct ContentView: View {
           LabeledContent("長さ（秒）") { Stepper(value: $runner.segmentDuration, in: 10...3600, step: 10) { Text("\(runner.segmentDuration)") } }
             .disabled(runner.noSplit)
         }
-        if runner.usesPythonEngine {
-          LabeledContent("結合エンコーダー") { TextField("", text: $runner.mergeEncoder).frame(width: 220) }
-        }
         Toggle("処理済みセグメントを削除", isOn: $runner.deleteSegments)
         Toggle("一時ファイルを保持", isOn: $runner.keepTemp)
         Toggle("強制的に再分割", isOn: $runner.forceSplit)
@@ -4221,10 +3891,9 @@ struct ContentView: View {
     Form {
       Section("モデル") {
         Picker("復元モデル", selection: $runner.restorationModel) {
-          ForEach(runner.restorationModels, id: \.self) { Text(L($0)).tag($0) }
-        }
-        if runner.restorationModel == "カスタム" {
-          PathSettingRow(title: "モデルパス", value: $runner.customRestorationModel) { runner.choosePath(\.customRestorationModel) }
+          ForEach(runner.restorationModels, id: \.self) {
+            Text(restorationModelLabel($0)).tag($0)
+          }
         }
         Toggle("最大クリップ長を指定", isOn: $runner.useMaxClipLength)
         if runner.useMaxClipLength {
@@ -4242,7 +3911,7 @@ struct ContentView: View {
         Toggle("クロスフェードを有効化", isOn: $runner.restoreCrossfade)
       }
       Section("合成") {
-        doubleSliderField("シャープ", value: $runner.sharpenStrength, range: 0...2, step: 0.05)
+        doubleSliderField("シャープ", value: $runner.sharpenStrength, range: 0...5, step: 0.05)
         doubleSliderField("ディテール", value: $runner.detailBoost, range: 0...1, step: 0.05)
         doubleSliderField("境界フェザー", value: $runner.blendFeather, range: 0...3, step: 0.05)
         doubleSliderField("テクスチャ", value: $runner.textureMix, range: 0...1, step: 0.01)
@@ -4283,18 +3952,27 @@ struct ContentView: View {
     }.formStyle(.grouped)
   }
 
+
   private var detectionTab: some View {
     Form {
       Section("検出モデル") {
         Picker("モデル", selection: $runner.detectionModel) {
           ForEach(runner.detectionModels, id: \.self) { Text(L($0)).tag($0) }
         }
-        if runner.detectionModel == "カスタム" {
-          PathSettingRow(title: "モデルパス", value: $runner.customDetectionModel) { runner.choosePath(\.customDetectionModel) }
-        }
         LabeledContent("無検出時の判定間隔") {
           Stepper(value: $runner.detectionEmptyLookahead, in: 0...300) { Text("\(runner.detectionEmptyLookahead)") }
         }
+        LabeledContent("検出後のマスク再利用") {
+          Stepper(
+            value: $runner.detectionMaskReuseSkipFrames,
+            in: 0...8
+          ) {
+            Text("\(runner.detectionMaskReuseSkipFrames)フレーム")
+          }
+        }
+        Text("無検出時の先頭・末尾判定は常に先に実行します。検出がある範囲だけ、1〜8では指定した後続フレームへ直前の領域とマスクを再利用し、保存とリアルタイム再生の両方を高速化します。0は従来どおりです。")
+          .font(.caption)
+          .foregroundStyle(.secondary)
         Toggle("顔モザイクを検出", isOn: $runner.detectFaceMosaics)
       }
     }.formStyle(.grouped)
@@ -4350,13 +4028,8 @@ struct ContentView: View {
         Text("\(runner.targetFPSDescription)fps\(runner.targetFPSDetail)で書き出します。元動画より高いレートは指定できません")
           .font(.caption)
           .foregroundStyle(.secondary)
-        if runner.usesPythonEngine {
-          Text("Pythonエンジンは整数FPSのみ対応です（\(runner.pythonTargetFPS)fpsで実行します）")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-        }
         Toggle("復元前にFPS変換", isOn: $runner.preFPSConversion)
-          .disabled(!runner.useFPS || (runner.usesPythonEngine && runner.noSplit))
+          .disabled(!runner.useFPS)
       }
     }.formStyle(.grouped)
   }
@@ -4410,18 +4083,12 @@ struct ContentView: View {
       }
       Section("ローカルネットワーク操作") {
         Toggle(
-          "Webリモコンを有効にする",
+          "同じLANからmiohを操作する",
           isOn: Binding(
             get: { remoteControl.enabled },
             set: { remoteControl.setEnabled($0) }
           )
         )
-        LabeledContent("ポート") {
-          TextField("", value: $remoteControl.port, format: .number)
-            .multilineTextAlignment(.trailing)
-            .frame(width: 90)
-            .disabled(remoteControl.enabled)
-        }
         LabeledContent("状態") {
           Text(remoteControl.status)
             .foregroundStyle(
@@ -4434,23 +4101,22 @@ struct ContentView: View {
             Text("同じLANから接続できるアドレスを確認中です。")
               .font(.caption)
               .foregroundStyle(.secondary)
-          } else {
-            ForEach(remoteControl.urls, id: \.absoluteString) { url in
-              LabeledContent("接続URL") {
-                HStack(spacing: 8) {
-                  Text(url.absoluteString)
-                    .font(.system(.body, design: .monospaced))
-                    .textSelection(.enabled)
-                  Button("コピー") {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(url.absoluteString, forType: .string)
-                  }
-                  Button("開く") { NSWorkspace.shared.open(url) }
+          } else if let url = remoteControl.urls.first {
+            LabeledContent("接続") {
+              HStack(spacing: 8) {
+                Button("Webリモコンを開く") { NSWorkspace.shared.open(url) }
+                  .buttonStyle(.borderedProminent)
+                Button("接続情報をコピー") {
+                  NSPasteboard.general.clearContents()
+                  NSPasteboard.general.setString(
+                    "\(url.absoluteString)\n\(remoteControl.token)",
+                    forType: .string
+                  )
                 }
               }
             }
           }
-          LabeledContent("アクセスコード") {
+          LabeledContent("初回アクセスコード") {
             HStack(spacing: 8) {
               Text(remoteControl.token)
                 .font(.system(.caption, design: .monospaced))
@@ -4460,14 +4126,36 @@ struct ContentView: View {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(remoteControl.token, forType: .string)
               }
-              Button("再生成", role: .destructive) {
-                remoteControl.regenerateToken()
-              }
             }
           }
-          Text("接続先のブラウザで12文字のアクセスコードを入力してください。大文字小文字・ハイフンの有無は問いません。信頼できる家庭・社内LAN専用です。")
+          Text("mioh Remoteでは表示されたMacをタップし、このコードを初回だけ入力します。次回からは自動接続します。")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+          DisclosureGroup("詳細設定") {
+            LabeledContent("ポート") {
+              TextField("", value: $remoteControl.port, format: .number)
+                .multilineTextAlignment(.trailing)
+                .frame(width: 90)
+                .disabled(remoteControl.enabled)
+            }
+            ForEach(remoteControl.urls, id: \.absoluteString) { url in
+              LabeledContent("接続URL") {
+                Text(url.absoluteString)
+                  .font(.system(.caption, design: .monospaced))
+                  .textSelection(.enabled)
+              }
+            }
+            Button("アクセスコードを再生成", role: .destructive) {
+              remoteControl.regenerateToken()
+            }
+          }
+          Text("信頼できる家庭・社内LAN専用です。インターネットには公開しないでください。")
             .font(.caption)
             .foregroundStyle(.orange)
+        } else {
+          Text("一度有効にすると、このMacでは次回起動時から自動で待ち受けます。")
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
       }
       Section("ローカル復元クラスタ") {
@@ -4610,6 +4298,11 @@ struct ContentView: View {
   }
 
   private var footer: some View {
+    restorationFooter
+  }
+
+
+  private var restorationFooter: some View {
     HStack(spacing: 10) {
       Button(action: runner.revealOutput) { Image(systemName: "folder.badge.gearshape") }
         .help(L("出力をFinderで表示")).disabled(runner.outputURL == nil)
@@ -4634,7 +4327,8 @@ struct ContentView: View {
           .disabled(
             cluster.useForExport && cluster.role == .coordinator
               ? !cluster.canStartExport(runner: runner)
-              : (!runner.canStart || (cluster.role == .worker && cluster.serviceActive))
+              : (!runner.canStart
+                || (cluster.role == .worker && cluster.serviceActive))
           )
       }
     }.padding(.horizontal, 20).frame(height: 58)

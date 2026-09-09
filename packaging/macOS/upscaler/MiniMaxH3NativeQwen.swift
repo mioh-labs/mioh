@@ -226,7 +226,8 @@ struct H3QwenPresentation: Sendable {
     video: H3Tensor,
     tokenizer: H3QwenBPETokenizer,
     fixedSequenceLength: Int? = nil,
-    identityReferenceCount: Int? = nil
+    identityReferenceCount: Int? = nil,
+    maximumVisionBlocks: Int = 10
   ) throws -> H3QwenPresentation {
     guard video.shape.count == 5, video.shape[0] == 1, video.shape[1] == 3 else {
       throw H3NativeError.invalidTensor(
@@ -246,18 +247,29 @@ struct H3QwenPresentation: Sendable {
     if let identityReferenceCount {
       guard identityReferenceCount > 0,
         identityReferenceCount <= H3Geometry.identityVisionBlocks,
-        frameCount == identityReferenceCount * 2
+        frameCount >= identityReferenceCount * 2
       else {
         throw H3NativeError.invalidTensor(
           "identity references need one paired visual block per image"
         )
       }
-      sampleIndices = Array(0..<frameCount)
-    } else {
-      sampleIndices = H3Geometry.qwenVideoSampleIndices(frameCount: frameCount)
-      if sampleIndices.count % 2 == 1, let last = sampleIndices.last {
-        sampleIndices.append(last)
+      let identityFrames = identityReferenceCount * 2
+      if frameCount == identityFrames {
+        sampleIndices = Array(0..<frameCount)
+      } else {
+        let remainingFrameCount = frameCount - identityFrames
+        let remainingBlocks = max(1, maximumVisionBlocks - identityReferenceCount)
+        sampleIndices = Array(0..<identityFrames)
+          + H3Geometry.qwenVideoSampleIndices(
+            frameCount: remainingFrameCount,
+            maximumBlocks: remainingBlocks
+          ).map { $0 + identityFrames }
       }
+    } else {
+      sampleIndices = H3Geometry.qwenVideoSampleIndices(
+        frameCount: frameCount,
+        maximumBlocks: maximumVisionBlocks
+      )
     }
 
     var tokenIDs: [Int32] = []
@@ -269,12 +281,19 @@ struct H3QwenPresentation: Sendable {
       tokenIDs += try tokenizer.encode("<Video 1>: ")
     }
     for block in stride(from: 0, to: sampleIndices.count, by: 2) {
-      if let identityReferenceCount {
+      let visualBlock = block / 2
+      if let identityReferenceCount, visualBlock < identityReferenceCount {
         let imageIndex = min(identityReferenceCount - 1, block / 2)
         tokenIDs += try tokenizer.encode("<Picture \(imageIndex + 1)>: ")
       } else {
-        let timestamp0 = Double(block) / 2.0
-        let timestamp1 = Double(block + 1) / 2.0
+        let videoFrameOffset = (identityReferenceCount ?? 0) * 2
+        if identityReferenceCount != nil, visualBlock == identityReferenceCount {
+          tokenIDs += try tokenizer.encode("<Video 1>: ")
+        }
+        let timestamp0 = Double(sampleIndices[block] - videoFrameOffset)
+          / Double(H3Geometry.framesPerSecond)
+        let timestamp1 = Double(sampleIndices[block + 1] - videoFrameOffset)
+          / Double(H3Geometry.framesPerSecond)
         let timestamp = (timestamp0 + timestamp1) / 2.0
         tokenIDs += try tokenizer.encode(String(format: "<%.1f seconds>", timestamp))
       }

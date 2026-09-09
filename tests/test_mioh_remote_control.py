@@ -13,6 +13,8 @@ APP_SOURCE = PACKAGE / "MiohApp.swift"
 PLAYER_SOURCE = PACKAGE / "RealtimePlayer.swift"
 BUILD_SCRIPT = PACKAGE / "build_app.sh"
 INFO_PLIST = PACKAGE / "Info.plist"
+REMOTE_APP_CONTENT = ROOT / "apps" / "MiohRemote" / "MiohRemote" / "ContentView.swift"
+REMOTE_APP_STORE = ROOT / "apps" / "MiohRemote" / "MiohRemote" / "RemoteStore.swift"
 
 
 class MiohRemoteControlTests(unittest.TestCase):
@@ -31,7 +33,8 @@ class MiohRemoteControlTests(unittest.TestCase):
 
         for contract in [
             "@Published private(set) var enabled = false",
-            "@Published var port = 8888",
+            "@Published var port: Int",
+            "port = (1...65_535).contains(savedPort) ? savedPort : 8888",
             "parameters.acceptLocalOnly = true",
             "maximumConnections = 16",
             "maximumHeaderBytes = 32 * 1024",
@@ -44,6 +47,43 @@ class MiohRemoteControlTests(unittest.TestCase):
         ]:
             self.assertIn(contract, source)
         self.assertNotIn("parameters.allowLocalEndpointReuse = true", source)
+
+    def test_remote_remembers_one_time_enablement_and_port(self):
+        source = REMOTE_SOURCE.read_text()
+        app = APP_SOURCE.read_text()
+
+        for contract in [
+            'enabledDefaultsKey = "mioh.remote-control.enabled.v1"',
+            'portDefaultsKey = "mioh.remote-control.port.v1"',
+            "func activateIfRemembered()",
+            "UserDefaults.standard.set(newValue, forKey: Self.enabledDefaultsKey)",
+        ]:
+            self.assertIn(contract, source)
+        self.assertIn("remoteControl.activateIfRemembered()", app)
+        self.assertIn('Toggle(\n          "同じLANからmiohを操作する"', app)
+        self.assertIn('DisclosureGroup("詳細設定")', app)
+        self.assertIn('Button("Webリモコンを開く")', app)
+
+    def test_remote_app_auto_reconnects_and_hides_manual_address_entry(self):
+        content = REMOTE_APP_CONTENT.read_text()
+        store = REMOTE_APP_STORE.read_text()
+
+        for contract in [
+            "func hasSavedCredentials(for endpoint: MiohServerEndpoint) -> Bool",
+            "func connect(to endpoint: MiohServerEndpoint) async",
+            "var accessTokenIsComplete: Bool",
+            "var canConnect: Bool",
+        ]:
+            self.assertIn(contract, store)
+        for contract in [
+            "attemptAutomaticConnection(discovery.endpoints)",
+            ".onChange(of: discovery.endpoints)",
+            ".onChange(of: store.token)",
+            'DisclosureGroup("手動接続")',
+            '"保存済み・タップして接続"',
+            '"タップして初回コードを入力"',
+        ]:
+            self.assertIn(contract, content)
 
     def test_remote_uses_keychain_bearer_auth_for_every_api(self):
         source = REMOTE_SOURCE.read_text()
@@ -130,6 +170,27 @@ class MiohRemoteControlTests(unittest.TestCase):
         self.assertIn("func currentDefaultsSnapshot() -> MiohUserDefaultsSnapshot", app)
         self.assertIn("func apply(defaults snapshot: MiohUserDefaultsSnapshot)", app)
         self.assertIn("selectedPreviewDetectionModel = previewDetectionModel", app)
+        self.assertIn(
+            "(1...3).contains(value.nativeParallelWorkers ?? 1)", source
+        )
+        self.assertIn(
+            "['nativeParallelWorkers','ネイティブ並列数','number',1,3,1]",
+            source,
+        )
+        self.assertIn(
+            "case'nativeParallelWorkers':case'detectionMaskReuseSkipFrames':case'previewRestorationModel':case'previewDetectionModel':return true",
+            source,
+        )
+        self.assertIn('let engines = ["native"]', source)
+        self.assertNotIn('let engines = runner.supportsPythonEngine', source)
+        self.assertIn(
+            "(0...8).contains(value.detectionMaskReuseSkipFrames ?? 0)",
+            source,
+        )
+        self.assertIn(
+            "['detectionMaskReuseSkipFrames','検出後スキップ','number',0,8,1]",
+            source,
+        )
         self.assertNotIn("private func currentDefaultsSnapshot", app)
         self.assertNotIn("private func apply(defaults", app)
 
@@ -261,7 +322,7 @@ class MiohRemoteControlTests(unittest.TestCase):
         )
         self.assertIsNotNone(snapshot_match)
         fields = re.findall(r"^\s*var\s+(\w+):", snapshot_match.group(1), re.M)
-        self.assertEqual(len(fields), 74)
+        self.assertEqual(len(fields), 79)
         for field in fields:
             self.assertIn(f"['{field}'", source, field)
         self.assertIn("replaceChildren", source)

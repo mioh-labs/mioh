@@ -1,0 +1,597 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 60;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A00000000000000000000001 /* MiohRemoteApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000011 /* MiohRemoteApp.swift */; };
+		A00000000000000000000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000012 /* ContentView.swift */; };
+		A00000000000000000000003 /* RemoteStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000013 /* RemoteStore.swift */; };
+		A00000000000000000000004 /* MiohRemoteKit in Frameworks */ = {isa = PBXBuildFile; productRef = A00000000000000000000051 /* MiohRemoteKit */; };
+		A00000000000000000000005 /* IPadWorkerStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000016 /* IPadWorkerStore.swift */; };
+		A00000000000000000000006 /* MiohIPadWorkerEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000017 /* MiohIPadWorkerEngine.swift */; };
+		A00000000000000000000007 /* MiohIPadFrameProcessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000018 /* MiohIPadFrameProcessor.swift */; };
+		A00000000000000000000008 /* MiohIPadVideoWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000019 /* MiohIPadVideoWriter.swift */; };
+		A00000000000000000000009 /* mioh-cluster-model-identities-v1.json in Resources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000001A /* mioh-cluster-model-identities-v1.json */; };
+		A0000000000000000000000A /* basicvsrpp-v1.2-t18-fp16.aimodel in Resources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000001B /* basicvsrpp-v1.2-t18-fp16.aimodel */; };
+		A0000000000000000000000B /* lada_mosaic_detection_model_v4_fast-fp16.aimodel in Resources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000001C /* lada_mosaic_detection_model_v4_fast-fp16.aimodel */; };
+		A0000000000000000000000C /* MiohSFTPKit in Frameworks */ = {isa = PBXBuildFile; productRef = A00000000000000000000053 /* MiohSFTPKit */; };
+		A0000000000000000000000D /* THIRD_PARTY_NOTICES.md in Resources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000001D /* THIRD_PARTY_NOTICES.md */; };
+		A0000000000000000000000E /* ThirdPartyLicenses in Resources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000001E /* ThirdPartyLicenses */; };
+		B00000000000000000000001 /* MiohIPadVariableRestorer.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000101 /* MiohIPadVariableRestorer.swift */; };
+		C00000000000000000000001 /* IPadStandaloneStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000101 /* IPadStandaloneStore.swift */; };
+		C00000000000000000000002 /* IPadStandaloneView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000102 /* IPadStandaloneView.swift */; };
+		C00000000000000000000003 /* IPadSFTPBrowser.swift in Sources */ = {isa = PBXBuildFile; fileRef = C00000000000000000000103 /* IPadSFTPBrowser.swift */; };
+		L00000000000000000000001 /* IPadSFTPRangeProxy.swift in Sources */ = {isa = PBXBuildFile; fileRef = L00000000000000000000101 /* IPadSFTPRangeProxy.swift */; };
+		D00000000000000000000001 /* IPadMediaURLResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = D00000000000000000000101 /* IPadMediaURLResolver.swift */; };
+		E00000000000000000000001 /* IPadWebMediaDiscovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = E00000000000000000000101 /* IPadWebMediaDiscovery.swift */; };
+		F00000000000000000000001 /* IPadAuthenticatedMediaProxy.swift in Sources */ = {isa = PBXBuildFile; fileRef = F00000000000000000000101 /* IPadAuthenticatedMediaProxy.swift */; };
+		G00000000000000000000001 /* IPadInteractiveMediaBrowser.swift in Sources */ = {isa = PBXBuildFile; fileRef = G00000000000000000000101 /* IPadInteractiveMediaBrowser.swift */; };
+		H00000000000000000000001 /* IPadBrowserLibraryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = H00000000000000000000101 /* IPadBrowserLibraryStore.swift */; };
+		I00000000000000000000001 /* IPadMPEGTSRemuxer.swift in Sources */ = {isa = PBXBuildFile; fileRef = I00000000000000000000101 /* IPadMPEGTSRemuxer.swift */; };
+		J00000000000000000000001 /* IPadPersistentPlayerSurface.swift in Sources */ = {isa = PBXBuildFile; fileRef = J00000000000000000000101 /* IPadPersistentPlayerSurface.swift */; };
+		K00000000000000000000001 /* IPadHLSAVFoundationCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = K00000000000000000000101 /* IPadHLSAVFoundationCapture.swift */; };
+		A10000000000000000000001 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000101 /* Assets.xcassets */; };
+		B00000000000000000000002 /* basicvsrpp-v1.2-t36-fp16.aimodel in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000102 /* basicvsrpp-v1.2-t36-fp16.aimodel */; };
+		B00000000000000000000003 /* basicvsrpp-v1.2-t90-fp16.aimodel in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000103 /* basicvsrpp-v1.2-t90-fp16.aimodel */; };
+		B00000000000000000000004 /* lada_mosaic_detection_model_v2-fp16.aimodel in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000104 /* lada_mosaic_detection_model_v2-fp16.aimodel */; };
+		B00000000000000000000005 /* lada_mosaic_detection_model_v3.1_fast-fp16.aimodel in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000105 /* lada_mosaic_detection_model_v3.1_fast-fp16.aimodel */; };
+		B00000000000000000000006 /* lada_mosaic_detection_model_v3.1_accurate-fp16.aimodel in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000106 /* lada_mosaic_detection_model_v3.1_accurate-fp16.aimodel */; };
+		B00000000000000000000007 /* lada_mosaic_detection_model_v4_accurate-fp16.aimodel in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000107 /* lada_mosaic_detection_model_v4_accurate-fp16.aimodel */; };
+		B00000000000000000000008 /* lada_mosaic_detection_model_vr_v2_accurate-fp16.aimodel in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000108 /* lada_mosaic_detection_model_vr_v2_accurate-fp16.aimodel */; };
+		E10000000000000000000001 /* lada_mosaic_detection_model_v2.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = E10000000000000000000101 /* lada_mosaic_detection_model_v2.mlpackage */; };
+		E10000000000000000000002 /* lada_mosaic_detection_model_v3.1_fast.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = E10000000000000000000102 /* lada_mosaic_detection_model_v3.1_fast.mlpackage */; };
+		E10000000000000000000003 /* lada_mosaic_detection_model_v3.1_accurate.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = E10000000000000000000103 /* lada_mosaic_detection_model_v3.1_accurate.mlpackage */; };
+		E10000000000000000000004 /* lada_mosaic_detection_model_v4_fast.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = E10000000000000000000104 /* lada_mosaic_detection_model_v4_fast.mlpackage */; };
+		E10000000000000000000005 /* lada_mosaic_detection_model_v4_accurate.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = E10000000000000000000105 /* lada_mosaic_detection_model_v4_accurate.mlpackage */; };
+		E10000000000000000000006 /* lada_mosaic_detection_model_vr_v2_accurate.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = E10000000000000000000106 /* lada_mosaic_detection_model_vr_v2_accurate.mlpackage */; };
+		B00000000000000000000009 /* variable spatial6 in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000109 /* variable spatial6 */; };
+		B0000000000000000000000A /* variable flow6 in Resources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000010A /* variable flow6 */; };
+		B0000000000000000000000B /* variable backward 1 start in Resources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000010B /* variable backward 1 start */; };
+		B0000000000000000000000C /* variable backward 1 continue in Resources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000010C /* variable backward 1 continue */; };
+		B0000000000000000000000D /* variable forward 1 start in Resources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000010D /* variable forward 1 start */; };
+		B0000000000000000000000E /* variable forward 1 continue in Resources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000010E /* variable forward 1 continue */; };
+		B0000000000000000000000F /* variable backward 2 start in Resources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000010F /* variable backward 2 start */; };
+		B00000000000000000000010 /* variable backward 2 continue in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000110 /* variable backward 2 continue */; };
+		B00000000000000000000011 /* variable forward 2 start in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000111 /* variable forward 2 start */; };
+		B00000000000000000000012 /* variable forward 2 continue in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000112 /* variable forward 2 continue */; };
+		B00000000000000000000013 /* variable reconstruction6 in Resources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000113 /* variable reconstruction6 */; };
+		D10000000000000000000001 /* h17g variable spatial6 in Resources */ = {isa = PBXBuildFile; fileRef = D10000000000000000000101 /* h17g variable spatial6 */; };
+		D10000000000000000000002 /* h17g variable flow6 in Resources */ = {isa = PBXBuildFile; fileRef = D10000000000000000000102 /* h17g variable flow6 */; };
+		D10000000000000000000003 /* h17g variable backward 1 start in Resources */ = {isa = PBXBuildFile; fileRef = D10000000000000000000103 /* h17g variable backward 1 start */; };
+		D10000000000000000000004 /* h17g variable backward 1 continue in Resources */ = {isa = PBXBuildFile; fileRef = D10000000000000000000104 /* h17g variable backward 1 continue */; };
+		D10000000000000000000005 /* h17g variable forward 1 start in Resources */ = {isa = PBXBuildFile; fileRef = D10000000000000000000105 /* h17g variable forward 1 start */; };
+		D10000000000000000000006 /* h17g variable forward 1 continue in Resources */ = {isa = PBXBuildFile; fileRef = D10000000000000000000106 /* h17g variable forward 1 continue */; };
+		D10000000000000000000007 /* h17g variable backward 2 start in Resources */ = {isa = PBXBuildFile; fileRef = D10000000000000000000107 /* h17g variable backward 2 start */; };
+		D10000000000000000000008 /* h17g variable backward 2 continue in Resources */ = {isa = PBXBuildFile; fileRef = D10000000000000000000108 /* h17g variable backward 2 continue */; };
+		D10000000000000000000009 /* h17g variable forward 2 start in Resources */ = {isa = PBXBuildFile; fileRef = D10000000000000000000109 /* h17g variable forward 2 start */; };
+		D1000000000000000000000A /* h17g variable forward 2 continue in Resources */ = {isa = PBXBuildFile; fileRef = D1000000000000000000010A /* h17g variable forward 2 continue */; };
+		D1000000000000000000000B /* h17g variable reconstruction6 in Resources */ = {isa = PBXBuildFile; fileRef = D1000000000000000000010B /* h17g variable reconstruction6 */; };
+		D1000000000000000000000C /* h17g v4 fast detector in Resources */ = {isa = PBXBuildFile; fileRef = D1000000000000000000010C /* h17g v4 fast detector */; };
+		D20000000000000000000001 /* h17g v2 detector in Resources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000101 /* h17g v2 detector */; };
+		D20000000000000000000002 /* h17g v3.1 fast detector in Resources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000102 /* h17g v3.1 fast detector */; };
+		D20000000000000000000003 /* h17g v3.1 accurate detector in Resources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000103 /* h17g v3.1 accurate detector */; };
+		D20000000000000000000004 /* h17g v4 accurate detector in Resources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000104 /* h17g v4 accurate detector */; };
+		D20000000000000000000005 /* h17g vr v2 accurate detector in Resources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000105 /* h17g vr v2 accurate detector */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		A00000000000000000000010 /* MiohRemote.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MiohRemote.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A00000000000000000000011 /* MiohRemoteApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MiohRemoteApp.swift; sourceTree = "<group>"; };
+		A00000000000000000000012 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		A00000000000000000000013 /* RemoteStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteStore.swift; sourceTree = "<group>"; };
+		A00000000000000000000014 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A00000000000000000000015 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
+		A00000000000000000000016 /* IPadWorkerStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IPadWorkerStore.swift; sourceTree = "<group>"; };
+		A00000000000000000000017 /* MiohIPadWorkerEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MiohIPadWorkerEngine.swift; sourceTree = "<group>"; };
+		A00000000000000000000018 /* MiohIPadFrameProcessor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MiohIPadFrameProcessor.swift; sourceTree = "<group>"; };
+		A00000000000000000000019 /* MiohIPadVideoWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MiohIPadVideoWriter.swift; sourceTree = "<group>"; };
+		A0000000000000000000001A /* mioh-cluster-model-identities-v1.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "mioh-cluster-model-identities-v1.json"; sourceTree = "<group>"; };
+		A0000000000000000000001B /* basicvsrpp-v1.2-t18-fp16.aimodel */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "basicvsrpp-v1.2-t18-fp16.aimodel"; path = "../../model_weights/basicvsrpp-v1.2-t18-fp16.aimodel"; sourceTree = SOURCE_ROOT; };
+		A0000000000000000000001C /* lada_mosaic_detection_model_v4_fast-fp16.aimodel */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "lada_mosaic_detection_model_v4_fast-fp16.aimodel"; path = "../../model_weights/lada_mosaic_detection_model_v4_fast-fp16.aimodel"; sourceTree = SOURCE_ROOT; };
+		A0000000000000000000001D /* THIRD_PARTY_NOTICES.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = THIRD_PARTY_NOTICES.md; sourceTree = "<group>"; };
+		A0000000000000000000001E /* ThirdPartyLicenses */ = {isa = PBXFileReference; lastKnownFileType = folder; path = ThirdPartyLicenses; sourceTree = "<group>"; };
+		B00000000000000000000101 /* MiohIPadVariableRestorer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MiohIPadVariableRestorer.swift; sourceTree = "<group>"; };
+		C00000000000000000000101 /* IPadStandaloneStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IPadStandaloneStore.swift; sourceTree = "<group>"; };
+		C00000000000000000000102 /* IPadStandaloneView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IPadStandaloneView.swift; sourceTree = "<group>"; };
+		C00000000000000000000103 /* IPadSFTPBrowser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IPadSFTPBrowser.swift; sourceTree = "<group>"; };
+		L00000000000000000000101 /* IPadSFTPRangeProxy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IPadSFTPRangeProxy.swift; sourceTree = "<group>"; };
+		D00000000000000000000101 /* IPadMediaURLResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IPadMediaURLResolver.swift; sourceTree = "<group>"; };
+		E00000000000000000000101 /* IPadWebMediaDiscovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IPadWebMediaDiscovery.swift; sourceTree = "<group>"; };
+		F00000000000000000000101 /* IPadAuthenticatedMediaProxy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IPadAuthenticatedMediaProxy.swift; sourceTree = "<group>"; };
+		G00000000000000000000101 /* IPadInteractiveMediaBrowser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IPadInteractiveMediaBrowser.swift; sourceTree = "<group>"; };
+		H00000000000000000000101 /* IPadBrowserLibraryStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IPadBrowserLibraryStore.swift; sourceTree = "<group>"; };
+		I00000000000000000000101 /* IPadMPEGTSRemuxer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IPadMPEGTSRemuxer.swift; sourceTree = "<group>"; };
+		J00000000000000000000101 /* IPadPersistentPlayerSurface.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IPadPersistentPlayerSurface.swift; sourceTree = "<group>"; };
+		K00000000000000000000101 /* IPadHLSAVFoundationCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IPadHLSAVFoundationCapture.swift; sourceTree = "<group>"; };
+		A10000000000000000000101 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		B00000000000000000000102 /* basicvsrpp-v1.2-t36-fp16.aimodel */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "basicvsrpp-v1.2-t36-fp16.aimodel"; path = "../../model_weights/basicvsrpp-v1.2-t36-fp16.aimodel"; sourceTree = SOURCE_ROOT; };
+		B00000000000000000000103 /* basicvsrpp-v1.2-t90-fp16.aimodel */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "basicvsrpp-v1.2-t90-fp16.aimodel"; path = "../../model_weights/basicvsrpp-v1.2-t90-fp16.aimodel"; sourceTree = SOURCE_ROOT; };
+		B00000000000000000000104 /* lada_mosaic_detection_model_v2-fp16.aimodel */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "lada_mosaic_detection_model_v2-fp16.aimodel"; path = "../../model_weights/lada_mosaic_detection_model_v2-fp16.aimodel"; sourceTree = SOURCE_ROOT; };
+		B00000000000000000000105 /* lada_mosaic_detection_model_v3.1_fast-fp16.aimodel */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "lada_mosaic_detection_model_v3.1_fast-fp16.aimodel"; path = "../../model_weights/lada_mosaic_detection_model_v3.1_fast-fp16.aimodel"; sourceTree = SOURCE_ROOT; };
+		B00000000000000000000106 /* lada_mosaic_detection_model_v3.1_accurate-fp16.aimodel */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "lada_mosaic_detection_model_v3.1_accurate-fp16.aimodel"; path = "../../model_weights/lada_mosaic_detection_model_v3.1_accurate-fp16.aimodel"; sourceTree = SOURCE_ROOT; };
+		B00000000000000000000107 /* lada_mosaic_detection_model_v4_accurate-fp16.aimodel */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "lada_mosaic_detection_model_v4_accurate-fp16.aimodel"; path = "../../model_weights/lada_mosaic_detection_model_v4_accurate-fp16.aimodel"; sourceTree = SOURCE_ROOT; };
+		B00000000000000000000108 /* lada_mosaic_detection_model_vr_v2_accurate-fp16.aimodel */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "lada_mosaic_detection_model_vr_v2_accurate-fp16.aimodel"; path = "../../model_weights/lada_mosaic_detection_model_vr_v2_accurate-fp16.aimodel"; sourceTree = SOURCE_ROOT; };
+		E10000000000000000000101 /* lada_mosaic_detection_model_v2.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "lada_mosaic_detection_model_v2.mlpackage"; path = "../../model_weights/lada_mosaic_detection_model_v2.mlpackage"; sourceTree = SOURCE_ROOT; };
+		E10000000000000000000102 /* lada_mosaic_detection_model_v3.1_fast.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "lada_mosaic_detection_model_v3.1_fast.mlpackage"; path = "../../model_weights/lada_mosaic_detection_model_v3.1_fast.mlpackage"; sourceTree = SOURCE_ROOT; };
+		E10000000000000000000103 /* lada_mosaic_detection_model_v3.1_accurate.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "lada_mosaic_detection_model_v3.1_accurate.mlpackage"; path = "../../model_weights/lada_mosaic_detection_model_v3.1_accurate.mlpackage"; sourceTree = SOURCE_ROOT; };
+		E10000000000000000000104 /* lada_mosaic_detection_model_v4_fast.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "lada_mosaic_detection_model_v4_fast.mlpackage"; path = "../../model_weights/lada_mosaic_detection_model_v4_fast.mlpackage"; sourceTree = SOURCE_ROOT; };
+		E10000000000000000000105 /* lada_mosaic_detection_model_v4_accurate.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "lada_mosaic_detection_model_v4_accurate.mlpackage"; path = "../../model_weights/lada_mosaic_detection_model_v4_accurate.mlpackage"; sourceTree = SOURCE_ROOT; };
+		E10000000000000000000106 /* lada_mosaic_detection_model_vr_v2_accurate.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "lada_mosaic_detection_model_vr_v2_accurate.mlpackage"; path = "../../model_weights/lada_mosaic_detection_model_vr_v2_accurate.mlpackage"; sourceTree = SOURCE_ROOT; };
+		B00000000000000000000109 /* variable spatial6 */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "basicvsrpp-variable-spatial6.aimodel"; path = "../../build/macos-standalone/variable-basicvsrpp-source/basicvsrpp-variable-spatial6.aimodel"; sourceTree = SOURCE_ROOT; };
+		B0000000000000000000010A /* variable flow6 */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "basicvsrpp-variable-flow6.aimodel"; path = "../../build/macos-standalone/variable-basicvsrpp-source/basicvsrpp-variable-flow6.aimodel"; sourceTree = SOURCE_ROOT; };
+		B0000000000000000000010B /* variable backward 1 start */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "basicvsrpp-variable-backward_1_start6.aimodel"; path = "../../build/macos-standalone/variable-basicvsrpp-source/basicvsrpp-variable-backward_1_start6.aimodel"; sourceTree = SOURCE_ROOT; };
+		B0000000000000000000010C /* variable backward 1 continue */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "basicvsrpp-variable-backward_1_continue6.aimodel"; path = "../../build/macos-standalone/variable-basicvsrpp-source/basicvsrpp-variable-backward_1_continue6.aimodel"; sourceTree = SOURCE_ROOT; };
+		B0000000000000000000010D /* variable forward 1 start */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "basicvsrpp-variable-forward_1_start6.aimodel"; path = "../../build/macos-standalone/variable-basicvsrpp-source/basicvsrpp-variable-forward_1_start6.aimodel"; sourceTree = SOURCE_ROOT; };
+		B0000000000000000000010E /* variable forward 1 continue */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "basicvsrpp-variable-forward_1_continue6.aimodel"; path = "../../build/macos-standalone/variable-basicvsrpp-source/basicvsrpp-variable-forward_1_continue6.aimodel"; sourceTree = SOURCE_ROOT; };
+		B0000000000000000000010F /* variable backward 2 start */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "basicvsrpp-variable-backward_2_start6.aimodel"; path = "../../build/macos-standalone/variable-basicvsrpp-source/basicvsrpp-variable-backward_2_start6.aimodel"; sourceTree = SOURCE_ROOT; };
+		B00000000000000000000110 /* variable backward 2 continue */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "basicvsrpp-variable-backward_2_continue6.aimodel"; path = "../../build/macos-standalone/variable-basicvsrpp-source/basicvsrpp-variable-backward_2_continue6.aimodel"; sourceTree = SOURCE_ROOT; };
+		B00000000000000000000111 /* variable forward 2 start */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "basicvsrpp-variable-forward_2_start6.aimodel"; path = "../../build/macos-standalone/variable-basicvsrpp-source/basicvsrpp-variable-forward_2_start6.aimodel"; sourceTree = SOURCE_ROOT; };
+		B00000000000000000000112 /* variable forward 2 continue */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "basicvsrpp-variable-forward_2_continue6.aimodel"; path = "../../build/macos-standalone/variable-basicvsrpp-source/basicvsrpp-variable-forward_2_continue6.aimodel"; sourceTree = SOURCE_ROOT; };
+		B00000000000000000000113 /* variable reconstruction6 */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "basicvsrpp-variable-reconstruction6.aimodel"; path = "../../build/macos-standalone/variable-basicvsrpp-source/basicvsrpp-variable-reconstruction6.aimodel"; sourceTree = SOURCE_ROOT; };
+		D10000000000000000000101 /* h17g variable spatial6 */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "basicvsrpp-variable-spatial6.h17g.aimodelc"; path = "../../build/ios-coreai-h17g/basicvsrpp-variable-spatial6.h17g.aimodelc"; sourceTree = SOURCE_ROOT; };
+		D10000000000000000000102 /* h17g variable flow6 */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "basicvsrpp-variable-flow6.h17g.aimodelc"; path = "../../build/ios-coreai-h17g/basicvsrpp-variable-flow6.h17g.aimodelc"; sourceTree = SOURCE_ROOT; };
+		D10000000000000000000103 /* h17g variable backward 1 start */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "basicvsrpp-variable-backward_1_start6.h17g.aimodelc"; path = "../../build/ios-coreai-h17g/basicvsrpp-variable-backward_1_start6.h17g.aimodelc"; sourceTree = SOURCE_ROOT; };
+		D10000000000000000000104 /* h17g variable backward 1 continue */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "basicvsrpp-variable-backward_1_continue6.h17g.aimodelc"; path = "../../build/ios-coreai-h17g/basicvsrpp-variable-backward_1_continue6.h17g.aimodelc"; sourceTree = SOURCE_ROOT; };
+		D10000000000000000000105 /* h17g variable forward 1 start */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "basicvsrpp-variable-forward_1_start6.h17g.aimodelc"; path = "../../build/ios-coreai-h17g/basicvsrpp-variable-forward_1_start6.h17g.aimodelc"; sourceTree = SOURCE_ROOT; };
+		D10000000000000000000106 /* h17g variable forward 1 continue */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "basicvsrpp-variable-forward_1_continue6.h17g.aimodelc"; path = "../../build/ios-coreai-h17g/basicvsrpp-variable-forward_1_continue6.h17g.aimodelc"; sourceTree = SOURCE_ROOT; };
+		D10000000000000000000107 /* h17g variable backward 2 start */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "basicvsrpp-variable-backward_2_start6.h17g.aimodelc"; path = "../../build/ios-coreai-h17g/basicvsrpp-variable-backward_2_start6.h17g.aimodelc"; sourceTree = SOURCE_ROOT; };
+		D10000000000000000000108 /* h17g variable backward 2 continue */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "basicvsrpp-variable-backward_2_continue6.h17g.aimodelc"; path = "../../build/ios-coreai-h17g/basicvsrpp-variable-backward_2_continue6.h17g.aimodelc"; sourceTree = SOURCE_ROOT; };
+		D10000000000000000000109 /* h17g variable forward 2 start */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "basicvsrpp-variable-forward_2_start6.h17g.aimodelc"; path = "../../build/ios-coreai-h17g/basicvsrpp-variable-forward_2_start6.h17g.aimodelc"; sourceTree = SOURCE_ROOT; };
+		D1000000000000000000010A /* h17g variable forward 2 continue */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "basicvsrpp-variable-forward_2_continue6.h17g.aimodelc"; path = "../../build/ios-coreai-h17g/basicvsrpp-variable-forward_2_continue6.h17g.aimodelc"; sourceTree = SOURCE_ROOT; };
+		D1000000000000000000010B /* h17g variable reconstruction6 */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "basicvsrpp-variable-reconstruction6.h17g.aimodelc"; path = "../../build/ios-coreai-h17g/basicvsrpp-variable-reconstruction6.h17g.aimodelc"; sourceTree = SOURCE_ROOT; };
+		D1000000000000000000010C /* h17g v4 fast detector */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "lada_mosaic_detection_model_v4_fast-fp16.h17g.aimodelc"; path = "../../build/ios-coreai-h17g/lada_mosaic_detection_model_v4_fast-fp16.h17g.aimodelc"; sourceTree = SOURCE_ROOT; };
+		D20000000000000000000101 /* h17g v2 detector */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "lada_mosaic_detection_model_v2-fp16.h17g.aimodelc"; path = "../../build/ios-coreai-h17g/lada_mosaic_detection_model_v2-fp16.h17g.aimodelc"; sourceTree = SOURCE_ROOT; };
+		D20000000000000000000102 /* h17g v3.1 fast detector */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "lada_mosaic_detection_model_v3.1_fast-fp16.h17g.aimodelc"; path = "../../build/ios-coreai-h17g/lada_mosaic_detection_model_v3.1_fast-fp16.h17g.aimodelc"; sourceTree = SOURCE_ROOT; };
+		D20000000000000000000103 /* h17g v3.1 accurate detector */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "lada_mosaic_detection_model_v3.1_accurate-fp16.h17g.aimodelc"; path = "../../build/ios-coreai-h17g/lada_mosaic_detection_model_v3.1_accurate-fp16.h17g.aimodelc"; sourceTree = SOURCE_ROOT; };
+		D20000000000000000000104 /* h17g v4 accurate detector */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "lada_mosaic_detection_model_v4_accurate-fp16.h17g.aimodelc"; path = "../../build/ios-coreai-h17g/lada_mosaic_detection_model_v4_accurate-fp16.h17g.aimodelc"; sourceTree = SOURCE_ROOT; };
+		D20000000000000000000105 /* h17g vr v2 accurate detector */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "lada_mosaic_detection_model_vr_v2_accurate-fp16.h17g.aimodelc"; path = "../../build/ios-coreai-h17g/lada_mosaic_detection_model_vr_v2_accurate-fp16.h17g.aimodelc"; sourceTree = SOURCE_ROOT; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A00000000000000000000020 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A00000000000000000000004 /* MiohRemoteKit in Frameworks */,
+				A0000000000000000000000C /* MiohSFTPKit in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A00000000000000000000030 = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000031 /* MiohRemote */,
+				A00000000000000000000033 /* Worker Models */,
+				A00000000000000000000032 /* Products */,
+				A00000000000000000000015 /* README.md */,
+				A0000000000000000000001D /* THIRD_PARTY_NOTICES.md */,
+				A0000000000000000000001E /* ThirdPartyLicenses */,
+			);
+			sourceTree = "<group>";
+		};
+		A00000000000000000000031 /* MiohRemote */ = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000011 /* MiohRemoteApp.swift */,
+				A00000000000000000000012 /* ContentView.swift */,
+				A00000000000000000000013 /* RemoteStore.swift */,
+				A00000000000000000000016 /* IPadWorkerStore.swift */,
+				A00000000000000000000017 /* MiohIPadWorkerEngine.swift */,
+				A00000000000000000000018 /* MiohIPadFrameProcessor.swift */,
+				A00000000000000000000019 /* MiohIPadVideoWriter.swift */,
+				B00000000000000000000101 /* MiohIPadVariableRestorer.swift */,
+				C00000000000000000000101 /* IPadStandaloneStore.swift */,
+				C00000000000000000000102 /* IPadStandaloneView.swift */,
+				C00000000000000000000103 /* IPadSFTPBrowser.swift */,
+				L00000000000000000000101 /* IPadSFTPRangeProxy.swift */,
+				D00000000000000000000101 /* IPadMediaURLResolver.swift */,
+				E00000000000000000000101 /* IPadWebMediaDiscovery.swift */,
+				F00000000000000000000101 /* IPadAuthenticatedMediaProxy.swift */,
+				G00000000000000000000101 /* IPadInteractiveMediaBrowser.swift */,
+				H00000000000000000000101 /* IPadBrowserLibraryStore.swift */,
+				I00000000000000000000101 /* IPadMPEGTSRemuxer.swift */,
+				J00000000000000000000101 /* IPadPersistentPlayerSurface.swift */,
+				K00000000000000000000101 /* IPadHLSAVFoundationCapture.swift */,
+				A10000000000000000000101 /* Assets.xcassets */,
+				A0000000000000000000001A /* mioh-cluster-model-identities-v1.json */,
+				A00000000000000000000014 /* Info.plist */,
+			);
+			path = MiohRemote;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000032 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000010 /* MiohRemote.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000033 /* Worker Models */ = {
+			isa = PBXGroup;
+			children = (
+				A0000000000000000000001B /* basicvsrpp-v1.2-t18-fp16.aimodel */,
+				A0000000000000000000001C /* lada_mosaic_detection_model_v4_fast-fp16.aimodel */,
+				B00000000000000000000102 /* basicvsrpp-v1.2-t36-fp16.aimodel */,
+				B00000000000000000000103 /* basicvsrpp-v1.2-t90-fp16.aimodel */,
+				B00000000000000000000104 /* lada_mosaic_detection_model_v2-fp16.aimodel */,
+				B00000000000000000000105 /* lada_mosaic_detection_model_v3.1_fast-fp16.aimodel */,
+				B00000000000000000000106 /* lada_mosaic_detection_model_v3.1_accurate-fp16.aimodel */,
+				B00000000000000000000107 /* lada_mosaic_detection_model_v4_accurate-fp16.aimodel */,
+				B00000000000000000000108 /* lada_mosaic_detection_model_vr_v2_accurate-fp16.aimodel */,
+				E10000000000000000000101 /* lada_mosaic_detection_model_v2.mlpackage */,
+				E10000000000000000000102 /* lada_mosaic_detection_model_v3.1_fast.mlpackage */,
+				E10000000000000000000103 /* lada_mosaic_detection_model_v3.1_accurate.mlpackage */,
+				E10000000000000000000104 /* lada_mosaic_detection_model_v4_fast.mlpackage */,
+				E10000000000000000000105 /* lada_mosaic_detection_model_v4_accurate.mlpackage */,
+				E10000000000000000000106 /* lada_mosaic_detection_model_vr_v2_accurate.mlpackage */,
+				B00000000000000000000109 /* variable spatial6 */,
+				B0000000000000000000010A /* variable flow6 */,
+				B0000000000000000000010B /* variable backward 1 start */,
+				B0000000000000000000010C /* variable backward 1 continue */,
+				B0000000000000000000010D /* variable forward 1 start */,
+				B0000000000000000000010E /* variable forward 1 continue */,
+				B0000000000000000000010F /* variable backward 2 start */,
+				B00000000000000000000110 /* variable backward 2 continue */,
+				B00000000000000000000111 /* variable forward 2 start */,
+				B00000000000000000000112 /* variable forward 2 continue */,
+				B00000000000000000000113 /* variable reconstruction6 */,
+				D10000000000000000000101 /* h17g variable spatial6 */,
+				D10000000000000000000102 /* h17g variable flow6 */,
+				D10000000000000000000103 /* h17g variable backward 1 start */,
+				D10000000000000000000104 /* h17g variable backward 1 continue */,
+				D10000000000000000000105 /* h17g variable forward 1 start */,
+				D10000000000000000000106 /* h17g variable forward 1 continue */,
+				D10000000000000000000107 /* h17g variable backward 2 start */,
+				D10000000000000000000108 /* h17g variable backward 2 continue */,
+				D10000000000000000000109 /* h17g variable forward 2 start */,
+				D1000000000000000000010A /* h17g variable forward 2 continue */,
+				D1000000000000000000010B /* h17g variable reconstruction6 */,
+				D1000000000000000000010C /* h17g v4 fast detector */,
+				D20000000000000000000101 /* h17g v2 detector */,
+				D20000000000000000000102 /* h17g v3.1 fast detector */,
+				D20000000000000000000103 /* h17g v3.1 accurate detector */,
+				D20000000000000000000104 /* h17g v4 accurate detector */,
+				D20000000000000000000105 /* h17g vr v2 accurate detector */,
+			);
+			name = "Worker Models";
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A00000000000000000000040 /* MiohRemote */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A00000000000000000000062 /* Build configuration list for PBXNativeTarget "MiohRemote" */;
+			buildPhases = (
+				A00000000000000000000021 /* Sources */,
+				A00000000000000000000020 /* Frameworks */,
+				A00000000000000000000022 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = MiohRemote;
+			packageProductDependencies = (
+				A00000000000000000000051 /* MiohRemoteKit */,
+				A00000000000000000000053 /* MiohSFTPKit */,
+			);
+			productName = MiohRemote;
+			productReference = A00000000000000000000010 /* MiohRemote.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A00000000000000000000050 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2700;
+				LastUpgradeCheck = 2700;
+				TargetAttributes = {
+					A00000000000000000000040 = {
+						CreatedOnToolsVersion = 27.0;
+					};
+				};
+			};
+			buildConfigurationList = A00000000000000000000061 /* Build configuration list for PBXProject "MiohRemote" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = A00000000000000000000030;
+			packageReferences = (
+				A00000000000000000000052 /* XCLocalSwiftPackageReference "../../packages/MiohRemoteKit" */,
+			);
+			productRefGroup = A00000000000000000000032 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A00000000000000000000040 /* MiohRemote */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A00000000000000000000022 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000000000000000000001 /* Assets.xcassets in Resources */,
+				A0000000000000000000000D /* THIRD_PARTY_NOTICES.md in Resources */,
+				A0000000000000000000000E /* ThirdPartyLicenses in Resources */,
+				A00000000000000000000009 /* mioh-cluster-model-identities-v1.json in Resources */,
+				A0000000000000000000000A /* basicvsrpp-v1.2-t18-fp16.aimodel in Resources */,
+				A0000000000000000000000B /* lada_mosaic_detection_model_v4_fast-fp16.aimodel in Resources */,
+				B00000000000000000000002 /* basicvsrpp-v1.2-t36-fp16.aimodel in Resources */,
+				B00000000000000000000003 /* basicvsrpp-v1.2-t90-fp16.aimodel in Resources */,
+				B00000000000000000000004 /* lada_mosaic_detection_model_v2-fp16.aimodel in Resources */,
+				B00000000000000000000005 /* lada_mosaic_detection_model_v3.1_fast-fp16.aimodel in Resources */,
+				B00000000000000000000006 /* lada_mosaic_detection_model_v3.1_accurate-fp16.aimodel in Resources */,
+				B00000000000000000000007 /* lada_mosaic_detection_model_v4_accurate-fp16.aimodel in Resources */,
+				B00000000000000000000008 /* lada_mosaic_detection_model_vr_v2_accurate-fp16.aimodel in Resources */,
+				E10000000000000000000001 /* lada_mosaic_detection_model_v2.mlpackage in Resources */,
+				E10000000000000000000002 /* lada_mosaic_detection_model_v3.1_fast.mlpackage in Resources */,
+				E10000000000000000000003 /* lada_mosaic_detection_model_v3.1_accurate.mlpackage in Resources */,
+				E10000000000000000000004 /* lada_mosaic_detection_model_v4_fast.mlpackage in Resources */,
+				E10000000000000000000005 /* lada_mosaic_detection_model_v4_accurate.mlpackage in Resources */,
+				E10000000000000000000006 /* lada_mosaic_detection_model_vr_v2_accurate.mlpackage in Resources */,
+				B00000000000000000000009 /* variable spatial6 in Resources */,
+				B0000000000000000000000A /* variable flow6 in Resources */,
+				B0000000000000000000000B /* variable backward 1 start in Resources */,
+				B0000000000000000000000C /* variable backward 1 continue in Resources */,
+				B0000000000000000000000D /* variable forward 1 start in Resources */,
+				B0000000000000000000000E /* variable forward 1 continue in Resources */,
+				B0000000000000000000000F /* variable backward 2 start in Resources */,
+				B00000000000000000000010 /* variable backward 2 continue in Resources */,
+				B00000000000000000000011 /* variable forward 2 start in Resources */,
+				B00000000000000000000012 /* variable forward 2 continue in Resources */,
+				B00000000000000000000013 /* variable reconstruction6 in Resources */,
+				D10000000000000000000001 /* h17g variable spatial6 in Resources */,
+				D10000000000000000000002 /* h17g variable flow6 in Resources */,
+				D10000000000000000000003 /* h17g variable backward 1 start in Resources */,
+				D10000000000000000000004 /* h17g variable backward 1 continue in Resources */,
+				D10000000000000000000005 /* h17g variable forward 1 start in Resources */,
+				D10000000000000000000006 /* h17g variable forward 1 continue in Resources */,
+				D10000000000000000000007 /* h17g variable backward 2 start in Resources */,
+				D10000000000000000000008 /* h17g variable backward 2 continue in Resources */,
+				D10000000000000000000009 /* h17g variable forward 2 start in Resources */,
+				D1000000000000000000000A /* h17g variable forward 2 continue in Resources */,
+				D1000000000000000000000B /* h17g variable reconstruction6 in Resources */,
+				D1000000000000000000000C /* h17g v4 fast detector in Resources */,
+				D20000000000000000000001 /* h17g v2 detector in Resources */,
+				D20000000000000000000002 /* h17g v3.1 fast detector in Resources */,
+				D20000000000000000000003 /* h17g v3.1 accurate detector in Resources */,
+				D20000000000000000000004 /* h17g v4 accurate detector in Resources */,
+				D20000000000000000000005 /* h17g vr v2 accurate detector in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A00000000000000000000021 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A00000000000000000000001 /* MiohRemoteApp.swift in Sources */,
+				A00000000000000000000002 /* ContentView.swift in Sources */,
+				A00000000000000000000003 /* RemoteStore.swift in Sources */,
+				A00000000000000000000005 /* IPadWorkerStore.swift in Sources */,
+				A00000000000000000000006 /* MiohIPadWorkerEngine.swift in Sources */,
+				A00000000000000000000007 /* MiohIPadFrameProcessor.swift in Sources */,
+				A00000000000000000000008 /* MiohIPadVideoWriter.swift in Sources */,
+				B00000000000000000000001 /* MiohIPadVariableRestorer.swift in Sources */,
+				C00000000000000000000001 /* IPadStandaloneStore.swift in Sources */,
+				C00000000000000000000002 /* IPadStandaloneView.swift in Sources */,
+				C00000000000000000000003 /* IPadSFTPBrowser.swift in Sources */,
+				L00000000000000000000001 /* IPadSFTPRangeProxy.swift in Sources */,
+				D00000000000000000000001 /* IPadMediaURLResolver.swift in Sources */,
+				E00000000000000000000001 /* IPadWebMediaDiscovery.swift in Sources */,
+				F00000000000000000000001 /* IPadAuthenticatedMediaProxy.swift in Sources */,
+				G00000000000000000000001 /* IPadInteractiveMediaBrowser.swift in Sources */,
+				H00000000000000000000001 /* IPadBrowserLibraryStore.swift in Sources */,
+				I00000000000000000000001 /* IPadMPEGTSRemuxer.swift in Sources */,
+				J00000000000000000000001 /* IPadPersistentPlayerSurface.swift in Sources */,
+				K00000000000000000000001 /* IPadHLSAVFoundationCapture.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		A00000000000000000000070 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		A00000000000000000000071 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				COPY_PHASE_STRIP = YES;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+			};
+			name = Release;
+		};
+		A00000000000000000000072 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 4;
+				DEVELOPMENT_TEAM = D4X53SN63Z;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = MiohRemote/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.mioh-labs.MiohRemote";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		A00000000000000000000073 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 4;
+				DEVELOPMENT_TEAM = D4X53SN63Z;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = MiohRemote/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.mioh-labs.MiohRemote";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A00000000000000000000061 /* Build configuration list for PBXProject "MiohRemote" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A00000000000000000000070 /* Debug */,
+				A00000000000000000000071 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A00000000000000000000062 /* Build configuration list for PBXNativeTarget "MiohRemote" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A00000000000000000000072 /* Debug */,
+				A00000000000000000000073 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		A00000000000000000000052 /* XCLocalSwiftPackageReference "../../packages/MiohRemoteKit" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../../packages/MiohRemoteKit;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		A00000000000000000000051 /* MiohRemoteKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A00000000000000000000052 /* XCLocalSwiftPackageReference "../../packages/MiohRemoteKit" */;
+			productName = MiohRemoteKit;
+		};
+		A00000000000000000000053 /* MiohSFTPKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A00000000000000000000052 /* XCLocalSwiftPackageReference "../../packages/MiohRemoteKit" */;
+			productName = MiohSFTPKit;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = A00000000000000000000050 /* Project object */;
+}

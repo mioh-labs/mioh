@@ -436,6 +436,18 @@ enum H3ConditioningMode: String, Codable, Sendable {
   case fl2va
 }
 
+enum H3MusicVideoContinuationMode: String, Codable, Sendable, CaseIterable {
+  /// Continuum's exact 22-frame AV target prefix plus the two immediately
+  /// preceding H3-Extend context tokens. This is the recommended long-form
+  /// route: the overlap is bit-exact while older motion remains visible to
+  /// attention without duplicating the protected prefix.
+  case hybridAV = "hybrid-av"
+  case latentPrefix = "latent-prefix"
+  case firstFrame = "first"
+  case firstAndProvidedLast = "first-last-provided"
+  case firstAndGeneratedLast = "first-last-generated"
+}
+
 struct H3PipelineManifest: Codable, Sendable {
   let schemaVersion: Int
   let modelIdentifier: String
@@ -583,33 +595,99 @@ struct H3PipelineManifest: Codable, Sendable {
 struct H3NativeJob: Codable, Sendable {
   let input: String?
   let inputImages: [String]?
+  let inputImageSubjects: [Int]?
+  let referenceEditMode: H3ReferenceEditMode?
+  let referenceEditTargetDescription: String?
+  let referenceEditTargetIndex: Int?
+  let physicalReferenceMask: Bool?
   let output: String
   let prompt: String
   let cacheDirectory: String
   let width: Int
   let height: Int
+  let outputWidth: Int?
+  let outputHeight: Int?
+  let audioInput: String?
+  let audioStartSeconds: Double?
   let durationSeconds: Double
   let seed: UInt64
   let backend: H3BackendKind?
+  let outputTrimStartSeconds: Double?
+  let outputDurationSeconds: Double?
   let preserveSourceAudioWhenDecoderIsUnavailable: Bool?
+  var musicVideoCutPointsSeconds: [Double]? = nil
+  var musicVideoContinuationMode: H3MusicVideoContinuationMode? = nil
+  var musicVideoLastFrameDirectory: String? = nil
+  /// Optional interval-specific composition anchors for a flat MV timeline.
+  /// Files are named `entry-0000.png`, `entry-0001.png`, ... by the flat
+  /// prompt entry index. Only entries whose transition is `cut` are read.
+  var musicVideoStoryboardDirectory: String? = nil
 
-  func validate(conditioningMode: H3ConditioningMode = .ref2va) throws {
+  var resolvedMusicVideoContinuationMode: H3MusicVideoContinuationMode {
+    musicVideoContinuationMode ?? .hybridAV
+  }
+
+  var resolvedOutputWidth: Int { outputWidth ?? width }
+  var resolvedOutputHeight: Int { outputHeight ?? height }
+  var resolvedAudioStartSeconds: Double { audioStartSeconds ?? 0 }
+  var resolvedOutputTrimStartSeconds: Double { outputTrimStartSeconds ?? 0 }
+  var resolvedOutputDurationSeconds: Double {
+    outputDurationSeconds ?? durationSeconds
+  }
+
+  func validate(
+    conditioningMode: H3ConditioningMode = .ref2va,
+    allowsLatentOnlyContinuation: Bool = false
+  ) throws {
     let video = input?.trimmingCharacters(in: .whitespacesAndNewlines)
     let images = inputImages?.filter {
       !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     } ?? []
-    switch conditioningMode {
-    case .ref2va:
-      guard (video?.isEmpty == false) != !images.isEmpty else {
+    if let inputImageSubjects {
+      guard inputImageSubjects.count == images.count,
+        inputImageSubjects.allSatisfy({
+          (1...H3Geometry.identityVisionBlocks).contains($0)
+        })
+      else {
         throw H3NativeError.invalidJob(
-          "select exactly one input video or one or more input images"
+          "inputImageSubjects must match inputImages and use Subject numbers 1...\(H3Geometry.identityVisionBlocks)"
         )
       }
-      if let video, !video.isEmpty {
-        guard FileManager.default.fileExists(atPath: video) else {
-          throw H3NativeError.missingAsset(video)
+    }
+    if (referenceEditMode ?? .none) != .none {
+      guard conditioningMode == .ref2va else {
+        throw H3NativeError.invalidJob("reference edit modes require Ref2VA")
+      }
+      guard video?.isEmpty == false, !images.isEmpty else {
+        throw H3NativeError.invalidJob(
+          "reference edit modes require one source video and at least one image"
+        )
+      }
+      if let referenceEditTargetIndex, referenceEditTargetIndex < 0 {
+        throw H3NativeError.invalidJob(
+          "referenceEditTargetIndex must be non-negative"
+        )
+      }
+    }
+    switch conditioningMode {
+    case .ref2va:
+      if allowsLatentOnlyContinuation {
+        guard video?.isEmpty != false, images.isEmpty else {
+          throw H3NativeError.invalidJob(
+            "latent-only continuation cannot also use reference media"
+          )
         }
       } else {
+        guard video?.isEmpty == false || !images.isEmpty else {
+          throw H3NativeError.invalidJob(
+            "select an input video, one or more input images, or both"
+          )
+        }
+        if let video, !video.isEmpty {
+          guard FileManager.default.fileExists(atPath: video) else {
+            throw H3NativeError.missingAsset(video)
+          }
+        }
         guard images.count <= H3Geometry.identityVisionBlocks else {
           throw H3NativeError.invalidJob(
             "at most \(H3Geometry.identityVisionBlocks) identity images are supported"
@@ -622,9 +700,38 @@ struct H3NativeJob: Codable, Sendable {
         }
       }
     case .fl2va:
-      guard video?.isEmpty != false, images.isEmpty else {
+      guard video?.isEmpty != false, images.count <= 2 else {
         throw H3NativeError.invalidJob(
-          "the native FL2VA profile currently accepts prompt-only generation"
+          "native FL2VA accepts prompt-only generation, a first frame, or first and last frames"
+        )
+      }
+      for image in images {
+        guard FileManager.default.fileExists(atPath: image) else {
+          throw H3NativeError.missingAsset(image)
+        }
+      }
+    }
+    let audio = audioInput?.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let audio, !audio.isEmpty {
+      let acceptsExternalAudio = conditioningMode == .ref2va
+        ? ((!images.isEmpty || video?.isEmpty == false)
+          || allowsLatentOnlyContinuation)
+        : ((1...2).contains(images.count) && video?.isEmpty != false)
+      guard acceptsExternalAudio
+      else {
+        throw H3NativeError.invalidJob(
+          "external lip-sync audio requires Ref2VA images, an exact continuation latent, or an FL2VA first frame"
+        )
+      }
+      guard FileManager.default.fileExists(atPath: audio) else {
+        throw H3NativeError.missingAsset(audio)
+      }
+      guard resolvedAudioStartSeconds.isFinite, resolvedAudioStartSeconds >= 0 else {
+        throw H3NativeError.invalidJob("audioStartSeconds must be non-negative")
+      }
+      guard durationSeconds <= H3Geometry.audioConditioningSeconds else {
+        throw H3NativeError.invalidJob(
+          "external lip-sync audio supports shots up to 10 seconds"
         )
       }
     }
@@ -634,13 +741,57 @@ struct H3NativeJob: Codable, Sendable {
     guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
       throw H3NativeError.invalidJob("prompt is empty")
     }
+    guard resolvedOutputTrimStartSeconds.isFinite,
+      resolvedOutputTrimStartSeconds >= 0,
+      resolvedOutputDurationSeconds.isFinite,
+      resolvedOutputDurationSeconds > 0,
+      resolvedOutputTrimStartSeconds + resolvedOutputDurationSeconds
+        <= durationSeconds + 1e-6
+    else {
+      throw H3NativeError.invalidJob(
+        "output trim and duration must fit inside generated duration"
+      )
+    }
     guard width >= 32, height >= 32, width % 32 == 0, height % 32 == 0 else {
       throw H3NativeError.invalidJob(
         "width and height must be positive multiples of 32"
       )
     }
+    guard (outputWidth == nil) == (outputHeight == nil) else {
+      throw H3NativeError.invalidJob(
+        "outputWidth and outputHeight must be specified together"
+      )
+    }
+    guard resolvedOutputWidth > 0, resolvedOutputHeight > 0,
+      resolvedOutputWidth <= width, resolvedOutputHeight <= height,
+      resolvedOutputWidth % 2 == 0, resolvedOutputHeight % 2 == 0,
+      (width - resolvedOutputWidth) % 2 == 0,
+      (height - resolvedOutputHeight) % 2 == 0
+    else {
+      throw H3NativeError.invalidJob(
+        "output dimensions must be even and form a centered crop of the generation canvas"
+      )
+    }
     guard durationSeconds >= 2, durationSeconds <= 15 else {
       throw H3NativeError.invalidJob("reference duration must be 2...15 seconds")
+    }
+    if resolvedOutputWidth == 1920, resolvedOutputHeight == 1080 {
+      guard width == 1920, height == 1088,
+        abs(durationSeconds - 6) < 0.001
+      else {
+        throw H3NativeError.invalidJob(
+          "the 1920x1080 profile requires a 1920x1088 canvas and exactly 6 seconds"
+        )
+      }
+    }
+    if let musicVideoCutPointsSeconds {
+      guard musicVideoCutPointsSeconds.allSatisfy({
+        $0.isFinite && $0 > 0
+      }) else {
+        throw H3NativeError.invalidJob(
+          "music-video cut points must contain positive finite seconds"
+        )
+      }
     }
   }
 }
@@ -648,6 +799,10 @@ struct H3NativeJob: Codable, Sendable {
 enum H3Geometry {
   static let framesPerSecond = 24
   static let audioLatentFramesPerSecond = 40
+  // The converted audio VAE encoder has a fixed ten-second input contract.
+  // Shorter music-video shots are zero-padded before encoding and their latent
+  // is cropped to the target temporal shape.
+  static let audioConditioningSeconds = 10.0
   // Keep two of the compiled ten Qwen vision slots available for prompt text.
   // Eight 405-token image blocks still leave roughly 800 tokens for motion,
   // soundscape and music instructions; ten blocks leave only 16.
@@ -682,6 +837,18 @@ enum H3Geometry {
     return count
   }
 
+  /// Returns the latest complete H3 causal frame boundary at or before the
+  /// requested frame. This is used when a fixed generation profile decodes
+  /// beyond the duration that is actually written to the movie.
+  static func alignedFrameCount(notAfter proposed: Int) -> Int {
+    guard proposed >= 5 else { return 0 }
+    return proposed - (proposed - 5) % 17
+  }
+
+  static func isAlignedFrameCount(_ count: Int) -> Bool {
+    count >= 5 && count % 17 == 5
+  }
+
   static func referenceFrameCount(available: Int, output: Int) throws -> Int {
     var count = min(available, output)
     guard count >= 5 else {
@@ -700,9 +867,33 @@ enum H3Geometry {
     Int((Double(pixelFrames) / 24.0 * 40.0).rounded())
   }
 
-  static func qwenVideoSampleIndices(frameCount: Int) -> [Int] {
-    guard frameCount > 0 else { return [] }
-    return Array(stride(from: 0, to: frameCount, by: 12))
+  static func qwenVideoSampleIndices(
+    frameCount: Int,
+    maximumBlocks: Int = 10
+  ) -> [Int] {
+    guard frameCount > 0, maximumBlocks > 0 else { return [] }
+    let candidates = Array(stride(from: 0, to: frameCount, by: 12))
+    let maximumFrames = maximumBlocks * 2
+    var selected: [Int]
+    if candidates.count <= maximumFrames {
+      selected = candidates
+    } else {
+      // The compiled Qwen graph has a fixed number of paired vision blocks.
+      // Preserve the complete time range for long references by uniformly
+      // selecting from the normal 2 fps candidates instead of truncating the
+      // tail of the clip.
+      selected = (0..<maximumFrames).map { index in
+        let candidateIndex = Int(
+          (Double(index) * Double(candidates.count - 1)
+            / Double(maximumFrames - 1)).rounded()
+        )
+        return candidates[candidateIndex]
+      }
+    }
+    if selected.count % 2 == 1, let last = selected.last {
+      selected.append(last)
+    }
+    return selected
   }
 
   static func adaptCanvas(width: Int, height: Int) -> (width: Int, height: Int) {
@@ -727,6 +918,834 @@ enum H3Geometry {
       max(32, Int((nominalWidth / 32).rounded()) * 32),
       max(32, Int((nominalHeight / 32).rounded()) * 32)
     )
+  }
+}
+
+enum H3ShotPromptSelector {
+  private static let structuredSectionNames: Set<String> = [
+    "subject_definitions",
+    "summary",
+    "retention_analysis",
+    "detailed_description",
+    "integrated_multimodal_description",
+    "overall_soundscape",
+    "non_diegetic_music",
+  ]
+  private static let continuationSectionNames: Set<String> = [
+    "subject_definitions",
+    "retention_analysis",
+    "overall_soundscape",
+    "non_diegetic_music",
+  ]
+
+  static func contains(_ prompt: String, shotIndex: Int) -> Bool {
+    guard shotIndex >= 0,
+      let matches = try? shotMatches(in: prompt)
+    else { return false }
+    let requestedNumber = shotIndex + 1
+    return matches.contains { match in
+      guard let numberRange = Range(match.range(at: 1), in: prompt) else {
+        return false
+      }
+      return Int(prompt[numberRange]) == requestedNumber
+    }
+  }
+
+  /// Keeps global Ref2VA sections plus only the requested `[Shot N]` block.
+  /// This prevents a long-form prompt from being interpreted as a montage
+  /// inside every independently generated logical Shot.
+  static func select(_ prompt: String, shotIndex: Int) throws -> String {
+    guard shotIndex >= 0 else {
+      throw H3NativeError.invalidJob("logical shot index must be non-negative")
+    }
+    let fullRange = NSRange(prompt.startIndex..<prompt.endIndex, in: prompt)
+    let shotMatches = try shotMatches(in: prompt)
+    guard let firstShot = shotMatches.first else { return prompt }
+
+    let suffixExpression = try NSRegularExpression(
+      pattern: #"^[\t ]*(overall_soundscape|non_diegetic_music):"#,
+      options: [.anchorsMatchLines, .caseInsensitive]
+    )
+    let suffixSearchRange = NSRange(
+      location: firstShot.range.location,
+      length: fullRange.length - firstShot.range.location
+    )
+    let suffixStart = suffixExpression.firstMatch(
+      in: prompt,
+      range: suffixSearchRange
+    )?.range.location ?? fullRange.length
+
+    let requestedNumber = shotIndex + 1
+    let requestedMatchIndex = shotMatches.firstIndex { match in
+      guard let numberRange = Range(match.range(at: 1), in: prompt) else {
+        return false
+      }
+      return Int(prompt[numberRange]) == requestedNumber
+    }
+
+    let prefix = substring(
+      prompt,
+      range: NSRange(location: 0, length: firstShot.range.location)
+    )
+    let selectedBlock: String
+    if let requestedMatchIndex {
+      let start = shotMatches[requestedMatchIndex].range.location
+      let nextStart = requestedMatchIndex + 1 < shotMatches.count
+        ? shotMatches[requestedMatchIndex + 1].range.location
+        : fullRange.length
+      selectedBlock = substring(
+        prompt,
+        range: NSRange(
+          location: start,
+          length: max(0, min(nextStart, suffixStart) - start)
+        )
+      )
+    } else {
+      // The runtime may create more musical Shots than the prompt names.
+      // Keep global guidance, but never fall back to all named scenes.
+      selectedBlock = ""
+    }
+    let suffix = suffixStart < fullRange.length
+      ? substring(
+        prompt,
+        range: NSRange(
+          location: suffixStart,
+          length: fullRange.length - suffixStart
+        )
+      )
+      : ""
+
+    var orderedParts: [String]
+    let detailsExpression = try NSRegularExpression(
+      pattern: #"^[\t ]*detailed_description:[^\r\n]*(?:\r?\n|$)"#,
+      options: [.anchorsMatchLines, .caseInsensitive]
+    )
+    let prefixRange = NSRange(prefix.startIndex..<prefix.endIndex, in: prefix)
+    if !selectedBlock.isEmpty,
+      let details = detailsExpression.firstMatch(
+        in: prefix,
+        range: prefixRange
+      )
+    {
+      let headerEnd = NSMaxRange(details.range)
+      let prefixThroughHeader = substring(
+        prefix,
+        range: NSRange(location: 0, length: headerEnd)
+      )
+      let detailedPreamble = substring(
+        prefix,
+        range: NSRange(
+          location: headerEnd,
+          length: prefixRange.length - headerEnd
+        )
+      )
+      // Put the current Shot's actual location immediately after the section
+      // header. The runner inserts its priority directive at the same point,
+      // so both survive Qwen's finite prompt-token budget ahead of the longer
+      // global visual guidance.
+      orderedParts = [
+        prefixThroughHeader, selectedBlock, detailedPreamble, suffix,
+      ]
+    } else {
+      orderedParts = [prefix, selectedBlock, suffix]
+    }
+
+    return orderedParts
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { !$0.isEmpty }
+      .joined(separator: "\n\n")
+  }
+
+  /// Keeps identity and audio invariants but removes every scene/action block.
+  /// A continuation Part already receives the preceding target latent as its
+  /// fixed history; repeating the Shot prose makes the model restart the same
+  /// action instead of advancing beyond that history.
+  static func continuationContext(_ prompt: String) -> String {
+    var activeSection: String?
+    var keptLines: [String] = []
+    for line in prompt.components(separatedBy: .newlines) {
+      let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+      let lowercased = trimmed.lowercased()
+      if lowercased.hasSuffix(":"), !lowercased.contains(" ") {
+        let candidate = String(lowercased.dropLast())
+        if structuredSectionNames.contains(candidate) {
+          activeSection = candidate
+          if continuationSectionNames.contains(candidate) {
+            keptLines.append(line)
+          }
+          continue
+        }
+      }
+      if let activeSection, continuationSectionNames.contains(activeSection) {
+        keptLines.append(line)
+      }
+    }
+    return keptLines
+      .joined(separator: "\n")
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  private static func substring(_ text: String, range: NSRange) -> String {
+    guard let swiftRange = Range(range, in: text) else { return "" }
+    return String(text[swiftRange])
+  }
+
+  private static func shotMatches(in prompt: String) throws
+    -> [NSTextCheckingResult]
+  {
+    let expression = try NSRegularExpression(
+      pattern: #"^[\t ]*\[Shot[\t ]+(\d+)\][\t ]*"#,
+      options: [.anchorsMatchLines, .caseInsensitive]
+    )
+    return expression.matches(
+      in: prompt,
+      range: NSRange(prompt.startIndex..<prompt.endIndex, in: prompt)
+    )
+  }
+}
+
+struct H3FlatTimelinePromptEntry: Sendable, Equatable {
+  let startSeconds: Double
+  let endSeconds: Double
+  let transition: H3MusicVideoTransition
+  let body: String
+}
+
+struct H3FlatTimelinePromptPlan: Sendable, Equatable {
+  let prefixThroughDetailedDescription: String
+  let detailedPreamble: String
+  let suffix: String
+  let entries: [H3FlatTimelinePromptEntry]
+
+  func compiledPrompt(
+    entryIndex: Int,
+    directive: String,
+    entryBodyOverride: String? = nil
+  ) throws -> String {
+    guard entries.indices.contains(entryIndex) else {
+      throw H3NativeError.invalidJob(
+        "flat timeline prompt index \(entryIndex) is out of range"
+      )
+    }
+    return [
+      prefixThroughDetailedDescription,
+      directive,
+      detailedPreamble,
+      entryBodyOverride ?? entries[entryIndex].body,
+      suffix,
+    ]
+    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+    .filter { !$0.isEmpty }
+    .joined(separator: "\n\n")
+  }
+}
+
+/// Parses an app-side, flat long-form timeline embedded inside
+/// `detailed_description`. Markers such as `[0.000-8.000 cut]` are never sent
+/// to H3; each invocation receives only its concrete interval body plus the
+/// normal six-section Ref2VA context.
+enum H3FlatTimelinePrompt {
+  /// Flat-timeline transitions are implemented by the app, outside each H3
+  /// invocation.  A leading editorial cue such as "Hard cut to ..." must not
+  /// be sent to a single generated interval: H3 may perform that edit midway
+  /// through its own clip instead of starting in the requested composition.
+  static func singleTakeBody(_ body: String) -> String {
+    guard let expression = try? NSRegularExpression(
+      pattern: #"^\s*(?:(?:final\s+)?hard\s+cut|cut)\s+to\s+"#,
+      options: [.caseInsensitive]
+    ) else {
+      return body
+    }
+    let range = NSRange(body.startIndex..<body.endIndex, in: body)
+    return expression.stringByReplacingMatches(
+      in: body,
+      range: range,
+      withTemplate: "This single uninterrupted take begins with "
+    )
+  }
+
+  static func parse(_ prompt: String) throws -> H3FlatTimelinePromptPlan? {
+    let fullRange = NSRange(prompt.startIndex..<prompt.endIndex, in: prompt)
+    let detailsExpression = try NSRegularExpression(
+      pattern: #"^[\t ]*detailed_description:[^\r\n]*(?:\r?\n|$)"#,
+      options: [.anchorsMatchLines, .caseInsensitive]
+    )
+    guard let details = detailsExpression.firstMatch(
+      in: prompt,
+      range: fullRange
+    ) else { return nil }
+    let suffixExpression = try NSRegularExpression(
+      pattern: #"^[\t ]*overall_soundscape:"#,
+      options: [.anchorsMatchLines, .caseInsensitive]
+    )
+    let suffixSearch = NSRange(
+      location: NSMaxRange(details.range),
+      length: fullRange.length - NSMaxRange(details.range)
+    )
+    let suffixStart = suffixExpression.firstMatch(
+      in: prompt,
+      range: suffixSearch
+    )?.range.location ?? fullRange.length
+    let bodyRange = NSRange(
+      location: NSMaxRange(details.range),
+      length: max(0, suffixStart - NSMaxRange(details.range))
+    )
+    let body = substring(prompt, range: bodyRange)
+    let markerExpression = try NSRegularExpression(
+      pattern: #"^[\t ]*\[([0-9]+(?:\.[0-9]+)?)\s*-\s*([0-9]+(?:\.[0-9]+)?)s?\s+(cut|continue)\][\t ]*$"#,
+      options: [.anchorsMatchLines, .caseInsensitive]
+    )
+    let bodyFullRange = NSRange(body.startIndex..<body.endIndex, in: body)
+    let matches = markerExpression.matches(in: body, range: bodyFullRange)
+    guard !matches.isEmpty else { return nil }
+
+    let prefix = substring(
+      prompt,
+      range: NSRange(location: 0, length: NSMaxRange(details.range))
+    )
+    let preamble = substring(
+      body,
+      range: NSRange(location: 0, length: matches[0].range.location)
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    let suffix = suffixStart < fullRange.length
+      ? substring(
+        prompt,
+        range: NSRange(
+          location: suffixStart,
+          length: fullRange.length - suffixStart
+        )
+      )
+      : ""
+    var entries: [H3FlatTimelinePromptEntry] = []
+    entries.reserveCapacity(matches.count)
+    for index in matches.indices {
+      let match = matches[index]
+      guard let startRange = Range(match.range(at: 1), in: body),
+        let endRange = Range(match.range(at: 2), in: body),
+        let transitionRange = Range(match.range(at: 3), in: body),
+        let start = Double(body[startRange]),
+        let end = Double(body[endRange]),
+        let transition = H3MusicVideoTransition(
+          rawValue: body[transitionRange].lowercased()
+        )
+      else {
+        throw H3NativeError.invalidJob("invalid flat timeline marker")
+      }
+      let contentStart = NSMaxRange(match.range)
+      let contentEnd = index + 1 < matches.count
+        ? matches[index + 1].range.location
+        : bodyFullRange.length
+      let content = substring(
+        body,
+        range: NSRange(
+          location: contentStart,
+          length: max(0, contentEnd - contentStart)
+        )
+      ).trimmingCharacters(in: .whitespacesAndNewlines)
+      guard start >= 0, end > start, !content.isEmpty else {
+        throw H3NativeError.invalidJob(
+          "flat timeline entries need increasing times and non-empty text"
+        )
+      }
+      if let previous = entries.last {
+        guard abs(previous.endSeconds - start) <= 1.0 / 24.0 + 1e-6 else {
+          throw H3NativeError.invalidJob(
+            "flat timeline must be contiguous at \(start) seconds"
+          )
+        }
+      } else if start > 1.0 / 24.0 + 1e-6 {
+        throw H3NativeError.invalidJob("flat timeline must start at zero")
+      }
+      entries.append(
+        H3FlatTimelinePromptEntry(
+          startSeconds: start,
+          endSeconds: end,
+          transition: transition,
+          body: content
+        )
+      )
+    }
+    guard entries.first?.transition == .cut else {
+      throw H3NativeError.invalidJob(
+        "the first flat timeline entry must use cut"
+      )
+    }
+    return H3FlatTimelinePromptPlan(
+      prefixThroughDetailedDescription: prefix,
+      detailedPreamble: preamble,
+      suffix: suffix,
+      entries: entries
+    )
+  }
+
+  private static func substring(_ text: String, range: NSRange) -> String {
+    guard let swiftRange = Range(range, in: text) else { return "" }
+    return String(text[swiftRange])
+  }
+}
+
+enum H3MusicVideoSeed {
+  static func value(base: UInt64, intervalIndex: Int) -> UInt64 {
+    precondition(intervalIndex >= 0)
+    return base
+      &+ UInt64(intervalIndex) &* 0x9E37_79B9_7F4A_7C15
+  }
+}
+
+enum H3AudioConditioning {
+  static let partContinuationLatentFrames = H3Geometry.audioLatentFrames(
+    pixelFrames: H3VideoConditioning.partContinuationPixelFrames
+  )
+  // H3-Extend's two tokens immediately before a phase-zero seven-token tile
+  // are phases three and four. Together they span eight pixel frames, or
+  // 13.333 audio-latent ticks at 40 Hz; the native implementation rounds this
+  // context window to thirteen ticks.
+  static let hybridHistoryLatentFrames = 13
+  static let hybridStoredLatentFrames =
+    partContinuationLatentFrames + hybridHistoryLatentFrames
+
+  static func samplerState(
+    clean: [Float],
+    noise: [Float],
+    videoSigma: Float,
+    videoShift: Float,
+    audioShift: Float
+  ) -> [Float] {
+    precondition(clean.count == noise.count)
+    let sigmaV = max(videoSigma, 1e-6)
+    let base = sigmaV / (videoShift + sigmaV * (1 - videoShift))
+    let sigmaA = max(
+      1e-12,
+      audioShift * base / (1 + (audioShift - 1) * base)
+    )
+    let carryInverse = sigmaV / sigmaA
+    return clean.indices.map { index in
+      ((1 - sigmaA) * clean[index] + sigmaA * noise[index]) * carryInverse
+    }
+  }
+
+  static func tail(
+    _ tensor: H3Tensor,
+    maximumFrames: Int,
+    endingAtPixelFrameCount: Int? = nil
+  ) throws -> H3Tensor {
+    guard tensor.shape.count == 4, tensor.shape[0] == 1,
+      tensor.shape[1] == 32, tensor.shape[2] == 2,
+      tensor.shape[3] > 0, maximumFrames > 0
+    else {
+      throw H3NativeError.invalidTensor(
+        "generated audio latent must be [1,32,2,T], got \(tensor.shape)"
+      )
+    }
+    let sourceEnd: Int
+    if let endingAtPixelFrameCount {
+      sourceEnd = H3Geometry.audioLatentFrames(
+        pixelFrames: endingAtPixelFrameCount
+      )
+      guard sourceEnd <= tensor.shape[3] else {
+        throw H3NativeError.invalidTensor(
+          "visible continuation audio end \(sourceEnd) exceeds source time \(tensor.shape[3])"
+        )
+      }
+    } else {
+      sourceEnd = tensor.shape[3]
+    }
+    guard sourceEnd >= maximumFrames else {
+      throw H3NativeError.invalidTensor(
+        "continuation needs \(maximumFrames) audio latent frames, found \(sourceEnd)"
+      )
+    }
+    return try slice(
+      tensor,
+      frames: (sourceEnd - maximumFrames)..<sourceEnd
+    )
+  }
+
+  static func slice(_ tensor: H3Tensor, frames: Range<Int>) throws
+    -> H3Tensor
+  {
+    guard tensor.shape.count == 4, tensor.shape[0] == 1,
+      tensor.shape[1] == 32, tensor.shape[2] == 2,
+      frames.lowerBound >= 0, !frames.isEmpty,
+      frames.upperBound <= tensor.shape[3]
+    else {
+      throw H3NativeError.invalidTensor(
+        "audio continuation slice \(frames) does not fit \(tensor.shape)"
+      )
+    }
+    let source = try tensor.floatValues().map(Float16.init)
+    let sourceTime = tensor.shape[3]
+    let outputTime = frames.count
+    var output = [Float16](
+      repeating: 0,
+      count: tensor.shape[1] * tensor.shape[2] * outputTime
+    )
+    for channel in 0..<tensor.shape[1] {
+      for side in 0..<tensor.shape[2] {
+        let sourceOffset = (channel * tensor.shape[2] + side) * sourceTime
+          + frames.lowerBound
+        let targetOffset = (channel * tensor.shape[2] + side) * outputTime
+        output.replaceSubrange(
+          targetOffset..<(targetOffset + outputTime),
+          with: source[sourceOffset..<(sourceOffset + outputTime)]
+        )
+      }
+    }
+    return try H3Tensor(
+      float16: output,
+      shape: [1, tensor.shape[1], tensor.shape[2], outputTime]
+    )
+  }
+
+  static func replacingPrefix(
+    in target: H3Tensor,
+    with prefix: H3Tensor
+  ) throws -> H3Tensor {
+    guard target.shape.count == 4, prefix.shape.count == 4,
+      target.shape[0...2].elementsEqual(prefix.shape[0...2]),
+      prefix.shape[3] < target.shape[3]
+    else {
+      throw H3NativeError.invalidTensor(
+        "audio prefix \(prefix.shape) does not fit target \(target.shape)"
+      )
+    }
+    var values = try target.floatValues()
+    let prefixValues = try prefix.floatValues()
+    let targetTime = target.shape[3]
+    let prefixTime = prefix.shape[3]
+    for channel in 0..<target.shape[1] {
+      for side in 0..<target.shape[2] {
+        let targetOffset = (channel * target.shape[2] + side) * targetTime
+        let prefixOffset = (channel * target.shape[2] + side) * prefixTime
+        values.replaceSubrange(
+          targetOffset..<(targetOffset + prefixTime),
+          with: prefixValues[prefixOffset..<(prefixOffset + prefixTime)]
+        )
+      }
+    }
+    return try H3Tensor(float32: values, shape: target.shape)
+      .converted(to: target.scalarType)
+  }
+}
+
+enum H3VideoConditioning {
+  // One decoder tile consumes seven latent tokens. Keeping the complete tile
+  // also preserves H3's 5-token causal phase: generated clips are 5n+2 tokens,
+  // so their final seven-token suffix starts at phase zero. A continuation
+  // Part places this suffix at the beginning of its own target latent and
+  // clamps it throughout sampling. Seven tokens decode to 22 frames; those
+  // duplicate frames are trimmed from the completed Part.
+  static let partContinuationTokens = 7
+  static let partContinuationPixelFrames = 22
+  static let hybridHistoryTokens = 2
+  static let hybridStoredTokens = partContinuationTokens + hybridHistoryTokens
+
+  static func prefixValues(
+    from target: [Float],
+    targetShape: [Int],
+    prefixShape: [Int]
+  ) throws -> [Float] {
+    try validateTargetPrefix(
+      target: target,
+      targetShape: targetShape,
+      prefixValues: nil,
+      prefixShape: prefixShape
+    )
+    let channels = targetShape[1]
+    let targetTime = targetShape[2]
+    let prefixTime = prefixShape[2]
+    let plane = targetShape[3] * targetShape[4]
+    var result = [Float](
+      repeating: 0,
+      count: channels * prefixTime * plane
+    )
+    for channel in 0..<channels {
+      for token in 0..<prefixTime {
+        let sourceOffset = (channel * targetTime + token) * plane
+        let destinationOffset = (channel * prefixTime + token) * plane
+        result.replaceSubrange(
+          destinationOffset..<(destinationOffset + plane),
+          with: target[sourceOffset..<(sourceOffset + plane)]
+        )
+      }
+    }
+    return result
+  }
+
+  static func clampTargetPrefix(
+    target: [Float],
+    targetShape: [Int],
+    cleanPrefix: [Float],
+    noisePrefix: [Float],
+    prefixShape: [Int],
+    sigma: Float
+  ) throws -> [Float] {
+    try validateTargetPrefix(
+      target: target,
+      targetShape: targetShape,
+      prefixValues: cleanPrefix,
+      prefixShape: prefixShape
+    )
+    guard noisePrefix.count == cleanPrefix.count else {
+      throw H3NativeError.invalidTensor(
+        "continuation prefix noise count does not match the clean prefix"
+      )
+    }
+    let channels = targetShape[1]
+    let targetTime = targetShape[2]
+    let prefixTime = prefixShape[2]
+    let plane = targetShape[3] * targetShape[4]
+    let amount = max(0, min(1, sigma))
+    let cleanAmount = 1 - amount
+    var result = target
+    for channel in 0..<channels {
+      for token in 0..<prefixTime {
+        let destinationOffset = (channel * targetTime + token) * plane
+        let sourceOffset = (channel * prefixTime + token) * plane
+        for element in 0..<plane {
+          let sourceIndex = sourceOffset + element
+          result[destinationOffset + element] =
+            cleanAmount * cleanPrefix[sourceIndex]
+            + amount * noisePrefix[sourceIndex]
+        }
+      }
+    }
+    return result
+  }
+
+  private static func validateTargetPrefix(
+    target: [Float],
+    targetShape: [Int],
+    prefixValues: [Float]?,
+    prefixShape: [Int]
+  ) throws {
+    guard targetShape.count == 5, prefixShape.count == 5,
+      targetShape[0] == 1, prefixShape[0] == 1,
+      targetShape[1] == 24, prefixShape[1] == 24,
+      prefixShape[2] == partContinuationTokens,
+      prefixShape[2] <= targetShape[2],
+      prefixShape[3] == targetShape[3],
+      prefixShape[4] == targetShape[4],
+      target.count == targetShape.reduce(1, *)
+    else {
+      throw H3NativeError.invalidTensor(
+        "continuation prefix \(prefixShape) does not fit target \(targetShape)"
+      )
+    }
+    if let prefixValues,
+      prefixValues.count != prefixShape.reduce(1, *)
+    {
+      throw H3NativeError.invalidTensor(
+        "continuation prefix values do not match \(prefixShape)"
+      )
+    }
+  }
+
+  static func tail(
+    _ tensor: H3Tensor,
+    maximumTokens: Int = partContinuationTokens,
+    endingAtPixelFrameCount: Int? = nil
+  ) throws -> H3Tensor {
+    guard tensor.shape.count == 5, tensor.shape[0] == 1,
+      tensor.shape[1] == 24, tensor.shape[2] > 0, maximumTokens > 0
+    else {
+      throw H3NativeError.invalidTensor(
+        "generated video latent must be [1,24,T,H,W], got \(tensor.shape)"
+      )
+    }
+    let sourceTime = tensor.shape[2]
+    let sourceEnd: Int
+    if let endingAtPixelFrameCount {
+      guard H3Geometry.isAlignedFrameCount(endingAtPixelFrameCount) else {
+        throw H3NativeError.invalidTensor(
+          "visible continuation end \(endingAtPixelFrameCount) is not a 5+17n H3 frame boundary"
+        )
+      }
+      let alignedFrames = H3Geometry.alignedFrameCount(
+        notAfter: endingAtPixelFrameCount
+      )
+      guard alignedFrames >= 5 else {
+        throw H3NativeError.invalidTensor(
+          "visible continuation needs at least five pixel frames"
+        )
+      }
+      sourceEnd = H3Geometry.videoLatentFrames(pixelFrames: alignedFrames)
+      guard sourceEnd <= sourceTime else {
+        throw H3NativeError.invalidTensor(
+          "visible continuation latent end \(sourceEnd) exceeds source time \(sourceTime)"
+        )
+      }
+    } else {
+      sourceEnd = sourceTime
+    }
+    let tokenCount = min(maximumTokens, sourceEnd)
+    guard tokenCount == maximumTokens else {
+      throw H3NativeError.invalidTensor(
+        "continuation needs \(maximumTokens) latent tokens, found \(sourceEnd)"
+      )
+    }
+    let source = try tensor.floatValues().map(Float16.init)
+    let plane = tensor.shape[3] * tensor.shape[4]
+    var output = [Float16](
+      repeating: 0,
+      count: tensor.shape[0] * tensor.shape[1] * tokenCount * plane
+    )
+    for channel in 0..<tensor.shape[1] {
+      for token in 0..<tokenCount {
+        let sourceOffset = (
+          (channel * sourceTime + sourceEnd - tokenCount + token) * plane
+        )
+        let targetOffset = (channel * tokenCount + token) * plane
+        output.replaceSubrange(
+          targetOffset..<(targetOffset + plane),
+          with: source[sourceOffset..<(sourceOffset + plane)]
+        )
+      }
+    }
+    return try H3Tensor(
+      float16: output,
+      shape: [1, tensor.shape[1], tokenCount, tensor.shape[3], tensor.shape[4]]
+    )
+  }
+
+  static func slice(_ tensor: H3Tensor, tokens: Range<Int>) throws
+    -> H3Tensor
+  {
+    guard tensor.shape.count == 5, tensor.shape[0] == 1,
+      tensor.shape[1] == 24, tokens.lowerBound >= 0, !tokens.isEmpty,
+      tokens.upperBound <= tensor.shape[2]
+    else {
+      throw H3NativeError.invalidTensor(
+        "video continuation slice \(tokens) does not fit \(tensor.shape)"
+      )
+    }
+    let source = try tensor.floatValues().map(Float16.init)
+    let sourceTime = tensor.shape[2]
+    let outputTime = tokens.count
+    let plane = tensor.shape[3] * tensor.shape[4]
+    var output = [Float16](
+      repeating: 0,
+      count: tensor.shape[1] * outputTime * plane
+    )
+    for channel in 0..<tensor.shape[1] {
+      for token in 0..<outputTime {
+        let sourceOffset = (
+          (channel * sourceTime + tokens.lowerBound + token) * plane
+        )
+        let targetOffset = (channel * outputTime + token) * plane
+        output.replaceSubrange(
+          targetOffset..<(targetOffset + plane),
+          with: source[sourceOffset..<(sourceOffset + plane)]
+        )
+      }
+    }
+    return try H3Tensor(
+      float16: output,
+      shape: [1, tensor.shape[1], outputTime, tensor.shape[3], tensor.shape[4]]
+    )
+  }
+}
+
+struct H3TemporalContinuationState: Sendable {
+  let video: H3Tensor
+  let audio: H3Tensor?
+}
+
+private struct H3StoredTemporalTensor: Codable {
+  let shape: [Int]
+  let scalarType: H3ScalarType
+  let bytes: Data
+}
+
+private struct H3TemporalLatentFileV1: Codable {
+  let schemaVersion: Int
+  let shape: [Int]
+  let scalarType: H3ScalarType
+  let bytes: Data
+}
+
+private struct H3TemporalLatentFileV2: Codable {
+  let schemaVersion: Int
+  let video: H3StoredTemporalTensor
+  let audio: H3StoredTemporalTensor?
+}
+
+enum H3TemporalLatentStore {
+  static func write(_ state: H3TemporalContinuationState, to url: URL) throws {
+    let video = try state.video.converted(to: .float16)
+    let audio = try state.audio?.converted(to: .float16)
+    let payload = H3TemporalLatentFileV2(
+      schemaVersion: 2,
+      video: H3StoredTemporalTensor(
+        shape: video.shape,
+        scalarType: video.scalarType,
+        bytes: video.bytes
+      ),
+      audio: audio.map {
+        H3StoredTemporalTensor(
+          shape: $0.shape,
+          scalarType: $0.scalarType,
+          bytes: $0.bytes
+        )
+      }
+    )
+    let encoder = PropertyListEncoder()
+    encoder.outputFormat = .binary
+    try encoder.encode(payload).write(to: url, options: .atomic)
+  }
+
+  static func load(from url: URL) throws -> H3TemporalContinuationState {
+    let data = try Data(contentsOf: url)
+    let propertyList = try PropertyListSerialization.propertyList(
+      from: data,
+      options: [],
+      format: nil
+    )
+    guard let dictionary = propertyList as? [String: Any],
+      let schemaVersion = dictionary["schemaVersion"] as? Int
+    else {
+      throw H3NativeError.cache(
+        "invalid temporal latent state in \(url.path)"
+      )
+    }
+    switch schemaVersion {
+    case 1:
+      let payload = try PropertyListDecoder().decode(
+        H3TemporalLatentFileV1.self,
+        from: data
+      )
+      return H3TemporalContinuationState(
+        video: try H3Tensor(
+          shape: payload.shape,
+          scalarType: payload.scalarType,
+          bytes: payload.bytes
+        ),
+        audio: nil
+      )
+    case 2:
+      let payload = try PropertyListDecoder().decode(
+        H3TemporalLatentFileV2.self,
+        from: data
+      )
+      return H3TemporalContinuationState(
+        video: try H3Tensor(
+          shape: payload.video.shape,
+          scalarType: payload.video.scalarType,
+          bytes: payload.video.bytes
+        ),
+        audio: try payload.audio.map {
+          try H3Tensor(
+            shape: $0.shape,
+            scalarType: $0.scalarType,
+            bytes: $0.bytes
+          )
+        }
+      )
+    default:
+      throw H3NativeError.cache(
+        "unsupported temporal latent schema \(schemaVersion) in \(url.path)"
+      )
+    }
   }
 }
 

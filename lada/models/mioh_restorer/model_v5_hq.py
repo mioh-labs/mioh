@@ -32,6 +32,28 @@ from lada.models.basicvsrpp.mmagic.flow_warp import flow_warp
 from .model_v5 import QUALITY_OUTPUT_INDICES
 
 
+def feather_texture_compositor_mask(
+    effective_mask: torch.Tensor,
+    compositor_mask: torch.Tensor,
+    *,
+    radius: int,
+) -> torch.Tensor:
+    """Keep texture inside the real ROI with a short, bounded soft edge."""
+
+    if effective_mask.shape != compositor_mask.shape or effective_mask.ndim != 5:
+        raise ValueError("texture masks must have matching [B,T,1,H,W] shapes")
+    if radius < 0:
+        raise ValueError("texture mask feather radius cannot be negative")
+    effective = effective_mask.clamp(0, 1)
+    if radius:
+        batch, frames, channels, height, width = effective.shape
+        flat = effective.reshape(batch * frames, channels, height, width)
+        kernel = 2 * radius + 1
+        feathered = F.avg_pool2d(flat, kernel, stride=1, padding=radius)
+        effective = torch.maximum(effective, feathered.reshape_as(effective))
+    return torch.minimum(effective, compositor_mask.clamp(0, 1))
+
+
 @dataclass(frozen=True)
 class MiohRestorerV5HQConfig:
     """Fixed export contract for one V5-HQ specialization."""
@@ -44,6 +66,10 @@ class MiohRestorerV5HQConfig:
     attention_channels: int = 24
     attention_radius: int = 1
     maximum_residual_offset: float = 4.0
+    raw_temporal_candidates: bool = False
+    raw_temporal_encoder_channels: int = 0
+    raw_temporal_nearest_warp: bool = False
+    raw_temporal_zero_input: bool = False
 
     def validate(self) -> None:
         if self.input_frames < 3:
@@ -60,6 +86,24 @@ class MiohRestorerV5HQConfig:
             raise ValueError("V5-HQ attention radius must be positive")
         if self.maximum_residual_offset <= 0:
             raise ValueError("V5-HQ residual offset limit must be positive")
+        if self.raw_temporal_encoder_channels < 0:
+            raise ValueError("raw temporal encoder channels cannot be negative")
+        if self.raw_temporal_encoder_channels and not self.raw_temporal_candidates:
+            raise ValueError(
+                "raw temporal encoder requires raw temporal candidates"
+            )
+        if self.raw_temporal_nearest_warp and not self.raw_temporal_candidates:
+            raise ValueError("nearest raw warp requires raw temporal candidates")
+        if self.raw_temporal_zero_input and not self.raw_temporal_candidates:
+            raise ValueError("zeroed raw input requires raw temporal candidates")
+        if self.raw_temporal_candidates and any(
+            index - self.attention_radius < 0
+            or index + self.attention_radius >= self.input_frames
+            for index in self.output_indices
+        ):
+            raise ValueError(
+                "raw temporal candidates require a complete window around every output"
+            )
 
 
 class _ResidualBlock(nn.Module):
@@ -190,7 +234,23 @@ class MiohRestorerV5HQ(nn.Module):
             _ResidualBlock(channels),
         )
         self.deformable_attention = FlowResidualDeformableAttention(self.config)
-        head_channels = channels * 3 + 8
+        if self.config.raw_temporal_encoder_channels:
+            raw_channels = self.config.raw_temporal_encoder_channels
+            self.raw_temporal_encoder: nn.Module | None = nn.Sequential(
+                nn.Conv2d(3, raw_channels, 3, padding=1),
+                nn.SiLU(),
+                _ResidualBlock(raw_channels),
+                _ResidualBlock(raw_channels),
+            )
+        else:
+            raw_channels = 3
+            self.raw_temporal_encoder = None
+        raw_temporal_channels = (
+            (2 * self.config.attention_radius + 1) * raw_channels * 2
+            if self.config.raw_temporal_candidates
+            else 0
+        )
+        head_channels = channels * 3 + 8 + raw_temporal_channels
         self.fusion = nn.Sequential(
             nn.Conv2d(head_channels, channels * 2, 3, padding=1),
             nn.SiLU(),
@@ -228,13 +288,24 @@ class MiohRestorerV5HQ(nn.Module):
     def load_basicvsrpp_checkpoint(self, checkpoint: str | Path) -> None:
         """Initialize only the recurrent backbone from a Lada v1.2 checkpoint."""
 
-        payload = torch.load(Path(checkpoint), map_location="cpu", weights_only=False)
+        payload = torch.load(Path(checkpoint), map_location="cpu", weights_only=True)
         if not isinstance(payload, dict):
             raise TypeError("BasicVSR++ checkpoint must contain a state dictionary")
+        raw = payload.get("state_dict", payload)
+        if not isinstance(raw, dict):
+            raise TypeError("BasicVSR++ checkpoint state_dict is invalid")
+        # Dedicated checkpoints retain both the live generator and its EMA.
+        # Prefer the EMA because that is the state exported by mioh. Generic
+        # v1.2 checkpoints only have the historical ``generator.`` prefix.
+        prefix = (
+            "generator_ema."
+            if any(str(key).startswith("generator_ema.") for key in raw)
+            else "generator."
+        )
         state = {
-            key.removeprefix("generator."): value
-            for key, value in payload.items()
-            if key.startswith("generator.")
+            str(key).removeprefix(prefix): value
+            for key, value in raw.items()
+            if str(key).startswith(prefix)
         }
         if not state:
             raise ValueError("checkpoint contains no generator weights")
@@ -286,8 +357,32 @@ class MiohRestorerV5HQ(nn.Module):
             cursor += count
         return result
 
+    @staticmethod
+    def _aligned_raw_candidates(
+        raw_features: torch.Tensor,
+        candidates: Sequence[int],
+        flows: torch.Tensor,
+        *,
+        interpolation: str = "bilinear",
+    ) -> torch.Tensor:
+        """Warp un-restored candidate pixels/features with the attention flow."""
+
+        raw = raw_features[:, list(candidates)]
+        batch, count, channels, height, width = raw.shape
+        if flows.shape != (batch, count, 2, height, width):
+            raise ValueError("raw temporal candidate flow shape is invalid")
+        return flow_warp(
+            raw.reshape(batch * count, channels, height, width),
+            flows.reshape(batch * count, 2, height, width).permute(0, 2, 3, 1),
+            interpolation=interpolation,
+            padding_mode="border",
+        ).reshape(batch, count, channels, height, width)
+
     def forward_components(
-        self, values: torch.Tensor
+        self,
+        values: torch.Tensor,
+        *,
+        texture_compositor_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if values.ndim != 5 or values.shape[1] != self.config.input_frames:
             raise ValueError(
@@ -302,44 +397,95 @@ class MiohRestorerV5HQ(nn.Module):
         detail = self.detail_encoder(
             detail_inputs.reshape(batch * frames, 5, height, width)
         ).reshape(batch, frames, self.config.detail_channels, height, width)
+        raw_features = rgb
+        if self.raw_temporal_encoder is not None:
+            raw_channels = self.config.raw_temporal_encoder_channels
+            raw_features = self.raw_temporal_encoder(
+                rgb.reshape(batch * frames, 3, height, width)
+            ).reshape(batch, frames, raw_channels, height, width)
 
         references = self.config.output_indices
+        if texture_compositor_mask is not None:
+            expected_mask_shape = (
+                batch,
+                len(references),
+                1,
+                height,
+                width,
+            )
+            if tuple(texture_compositor_mask.shape) != expected_mask_shape:
+                raise ValueError(
+                    "texture compositor mask must be "
+                    f"{expected_mask_shape}, got {tuple(texture_compositor_mask.shape)}"
+                )
+            texture_compositor_mask = texture_compositor_mask.clamp(0, 1)
         candidate_sets = [self._candidate_indices(index) for index in references]
         flows = self._direct_flows(restored_all, references, candidate_sets)
         outputs = []
         confidences = []
         bases = []
         textures = []
-        for reference, candidates, candidate_flows in zip(
-            references, candidate_sets, flows, strict=True
-        ):
+        for output_offset, (
+            reference,
+            candidates,
+            candidate_flows,
+        ) in enumerate(zip(references, candidate_sets, flows, strict=True)):
             reference_feature = detail[:, reference]
             candidate_features = detail[:, list(candidates)]
-            fused, _weights, _total_flow = self.deformable_attention(
+            fused, _weights, total_flow = self.deformable_attention(
                 reference_feature, candidate_features, candidate_flows
             )
             source = rgb[:, reference]
             basic = restored_all[:, reference]
             mask = values[:, reference, 3:4].clamp(0, 1)
             reliability = values[:, reference, 4:5].clamp(0, 1)
-            features = self.fusion(
-                torch.cat(
-                    (
-                        reference_feature,
-                        fused,
-                        torch.abs(reference_feature - fused),
-                        source,
-                        basic,
-                        mask,
-                        reliability,
+            fusion_inputs = [
+                reference_feature,
+                fused,
+                torch.abs(reference_feature - fused),
+                source,
+                basic,
+                mask,
+                reliability,
+            ]
+            if self.config.raw_temporal_candidates:
+                aligned_raw = self._aligned_raw_candidates(
+                    raw_features,
+                    candidates,
+                    total_flow,
+                    interpolation=(
+                        "nearest"
+                        if self.config.raw_temporal_nearest_warp
+                        else "bilinear"
                     ),
-                    dim=1,
                 )
-            )
+                raw_reference = raw_features[:, reference]
+                raw_difference = torch.abs(
+                    aligned_raw - raw_reference[:, None]
+                )
+                if self.config.raw_temporal_zero_input:
+                    aligned_raw = torch.zeros_like(aligned_raw)
+                    raw_difference = torch.zeros_like(raw_difference)
+                fusion_inputs.extend(
+                    (
+                        aligned_raw.flatten(1, 2),
+                        raw_difference.flatten(1, 2),
+                    )
+                )
+            features = self.fusion(torch.cat(fusion_inputs, dim=1))
             base = basic - source + self.base_head(features)
             texture = self.texture_head(features)
             confidence = torch.sigmoid(self.confidence_head(features)) * reliability
-            output = source + mask * (base + confidence * texture)
+            texture_mask = (
+                mask
+                if texture_compositor_mask is None
+                else texture_compositor_mask[:, output_offset]
+            )
+            output = (
+                source
+                + mask * base
+                + texture_mask * confidence * texture
+            )
             outputs.append(output)
             confidences.append(confidence)
             bases.append(base)

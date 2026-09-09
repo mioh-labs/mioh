@@ -182,18 +182,20 @@ final class MacHLSAVFoundationCapture {
       forwardBufferSeconds,
       segmentSeconds * 4
     )
-    let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
-      kCVPixelBufferPixelFormatTypeKey as String:
-        Int(kCVPixelFormatType_32BGRA),
-      kCVPixelBufferIOSurfacePropertiesKey as String: [:],
-    ])
+    let output = AVPlayerItemVideoOutput(
+      pixelBufferAttributes: CVPixelBufferAttributes(
+        pixelFormatTypes: [
+          CVPixelFormatType(rawValue: kCVPixelFormatType_32BGRA)
+        ]
+      )
+    )
     output.suppressesPlayerRendering = true
     item.add(output)
     captureItem = item
     videoOutput = output
     didReachEnd = false
     endObserver = NotificationCenter.default.addObserver(
-      forName: .AVPlayerItemDidPlayToEndTime,
+      forName: AVPlayerItem.didPlayToEndTimeNotification,
       object: item,
       queue: .main
     ) { [weak self, weak item] _ in
@@ -248,11 +250,12 @@ final class MacHLSAVFoundationCapture {
 
         let itemTime = output.itemTime(forHostTime: CACurrentMediaTime())
         if output.hasNewPixelBuffer(forItemTime: itemTime) {
-          var displayTime = CMTime.invalid
-          if let pixelBuffer = output.copyPixelBuffer(
-            forItemTime: itemTime,
-            itemTimeForDisplay: &displayTime
-          ) {
+          let frame = output.pixelBufferAndDisplayTime(forItemTime: itemTime)
+          if let readOnlyPixelBuffer = frame.pixelBuffer {
+            let pixelBuffer: CVPixelBuffer = readOnlyPixelBuffer.withUnsafeBuffer {
+              $0
+            }
+            let displayTime = frame.itemTimeForDisplay
             let rawSeconds = CMTimeGetSeconds(
               displayTime.isValid ? displayTime : itemTime
             )
@@ -479,8 +482,7 @@ private final class MacHLSCaptureSegmentWriter {
   private var lastPTS: Int64?
   private var framesInSegment = 0
   private var writer: AVAssetWriter?
-  private var input: AVAssetWriterInput?
-  private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
+  private var pixelBufferReceiver: AVAssetWriterInput.PixelBufferReceiver?
   private var workingURL: URL?
   private var finalURL: URL?
 
@@ -521,28 +523,24 @@ private final class MacHLSCaptureSegmentWriter {
       completed = try await close(endNanoseconds: ptsNanoseconds)
     }
     if writer == nil { try open(startNanoseconds: ptsNanoseconds) }
-    guard let writer, let input, let adaptor else {
+    guard writer != nil, let receiver = pixelBufferReceiver else {
       throw MacHLSAVFoundationCapture.CaptureError.encoder(
         "一時映像のwriterを開始できません"
       )
     }
-    while !input.isReadyForMoreMediaData {
-      try Task.checkCancellation()
-      if writer.status == .failed || writer.status == .cancelled {
-        throw MacHLSAVFoundationCapture.CaptureError.encoder(
-          writer.error?.localizedDescription ?? "映像入力が停止しました"
-        )
-      }
-      try await Task.sleep(nanoseconds: 250_000)
-    }
+    try Task.checkCancellation()
     let presentationTime = CMTime(
       value: Int64(framesInSegment * fpsDenominator),
       timescale: Int32(fpsNumerator)
     )
-    guard adaptor.append(pixelBuffer, withPresentationTime: presentationTime)
-    else {
+    do {
+      try await receiver.append(
+        CVReadOnlyPixelBuffer(unsafeBuffer: pixelBuffer),
+        with: presentationTime
+      )
+    } catch {
       throw MacHLSAVFoundationCapture.CaptureError.encoder(
-        writer.error?.localizedDescription ?? "フレームを書き込めません"
+        "フレームを書き込めません: \(error.localizedDescription)"
       )
     }
     framesInSegment += 1
@@ -591,35 +589,30 @@ private final class MacHLSCaptureSegmentWriter {
       ],
     ]
     let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
-    input.expectsMediaDataInRealTime = true
     let exactTimeScale = CMTimeScale(fpsNumerator)
     writer.movieTimeScale = exactTimeScale
     input.mediaTimeScale = exactTimeScale
-    let adaptor = AVAssetWriterInputPixelBufferAdaptor(
-      assetWriterInput: input,
-      sourcePixelBufferAttributes: [
-        kCVPixelBufferPixelFormatTypeKey as String:
-          Int(kCVPixelFormatType_32BGRA),
-        kCVPixelBufferWidthKey as String: width,
-        kCVPixelBufferHeightKey as String: height,
-        kCVPixelBufferIOSurfacePropertiesKey as String: [:],
-      ]
+    var attributes = CVPixelBufferCreationAttributes(
+      pixelFormatType: CVPixelFormatType(
+        rawValue: kCVPixelFormatType_32BGRA
+      ),
+      size: CVImageSize(width: width, height: height)
     )
-    guard writer.canAdd(input) else {
+    attributes.backing = .ioSurface
+    let receiver = writer.inputPixelBufferReceiver(
+      for: input,
+      pixelBufferAttributes: attributes
+    )
+    do {
+      try writer.start()
+    } catch {
       throw MacHLSAVFoundationCapture.CaptureError.encoder(
-        "H.264入力を追加できません"
-      )
-    }
-    writer.add(input)
-    guard writer.startWriting() else {
-      throw MacHLSAVFoundationCapture.CaptureError.encoder(
-        writer.error?.localizedDescription ?? "writerを開始できません"
+        "writerを開始できません: \(error.localizedDescription)"
       )
     }
     writer.startSession(atSourceTime: .zero)
     self.writer = writer
-    self.input = input
-    self.adaptor = adaptor
+    pixelBufferReceiver = receiver
     workingURL = working
     finalURL = final
     segmentStartNanoseconds = startNanoseconds
@@ -627,17 +620,16 @@ private final class MacHLSCaptureSegmentWriter {
   }
 
   private func close(endNanoseconds: Int64) async throws -> Output {
-    guard let writer, let input, let workingURL, let finalURL,
+    guard let writer, let receiver = pixelBufferReceiver, let workingURL,
+      let finalURL,
       let start = segmentStartNanoseconds
     else {
       throw MacHLSAVFoundationCapture.CaptureError.encoder(
         "開始していない区間を終了できません"
       )
     }
-    input.markAsFinished()
-    await withCheckedContinuation { continuation in
-      writer.finishWriting { continuation.resume() }
-    }
+    receiver.finish()
+    await writer.finishWriting()
     guard writer.status == .completed else {
       throw MacHLSAVFoundationCapture.CaptureError.encoder(
         writer.error?.localizedDescription ?? "一時映像を確定できません"
@@ -656,8 +648,7 @@ private final class MacHLSCaptureSegmentWriter {
 
   private func reset() {
     writer = nil
-    input = nil
-    adaptor = nil
+    pixelBufferReceiver = nil
     workingURL = nil
     finalURL = nil
     segmentStartNanoseconds = nil

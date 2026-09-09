@@ -60,6 +60,30 @@ def test_roi_laplacian_error_integrates_with_sample_wise_evaluator() -> None:
     }
 
 
+def test_roi_evaluator_skips_empty_frames_in_a_sequence() -> None:
+    metric = METRICS.build(dict(type='ROILaplacianError'))
+    target = torch.zeros(2, 3, 7, 7)
+    prediction = target.clone()
+    prediction[1, :, 3, 3] = 1.0
+    mask = torch.zeros(2, 1, 7, 7)
+    mask[1, :, 3, 3] = 255.0
+
+    metric.process(
+        data_batch=[],
+        data_samples=[
+            {
+                'gt_img': target,
+                'mask': mask,
+                'output': {'pred_img': prediction},
+            }
+        ],
+    )
+
+    assert metric.compute_metrics(metric.results) == {
+        'ROILaplacianError': pytest.approx(4.0)
+    }
+
+
 def test_roi_laplacian_error_rejects_empty_roi() -> None:
     with pytest.raises(ValueError, match='positive pixel'):
         roi_laplacian_error(

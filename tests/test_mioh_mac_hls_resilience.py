@@ -84,7 +84,7 @@ class MacHLSResilienceContractTests(unittest.TestCase):
                 self.assertIn(loop_contract, current)
 
         for contract in [
-            "!playlist.isLive, !didAttemptVariantFallback,",
+            "if allowsVariantFallback, !playlist.isLive,",
             "!sameOriginVariantFallbackRejected",
             "sameOriginVariantFallbackRejected = true",
             "resolveNextHLSVariant(for: activeSource)",

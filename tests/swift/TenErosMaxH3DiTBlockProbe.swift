@@ -23,18 +23,23 @@ struct TenErosMaxH3DiTBlockProbe {
     let scalarType = H3ScalarType(
       rawValue: metadata["scalarType"] as? String ?? "bfloat16"
     ) ?? .bfloat16
-    let semantics = [
+    var semantics = [
       "hiddenStates", "timestepCoordinates", "modulationWeights",
       "ropeCosine", "ropeSine",
     ]
-    let modelNames = [
+    var modelNames = [
       "hidden_states", "timestep_coordinates", "modulation_weights",
       "rope_cosine", "rope_sine",
     ]
-    let files = [
+    var files = [
       "hidden_states.f32", "timestep_coordinates.f32",
       "modulation_weights.f32", "rope_cosine.f32", "rope_sine.f32",
     ]
+    if let saltName = metadata["graphSaltInputName"] as? String {
+      semantics.append("graphIdentitySalt")
+      modelNames.append(saltName)
+      files.append("graph_identity_salt.f32")
+    }
     var constraints: [String: H3TensorConstraint] = [:]
     var inputs: [String: H3Tensor] = [:]
     for index in semantics.indices {
@@ -53,7 +58,7 @@ struct TenErosMaxH3DiTBlockProbe {
       let manifest = H3StageManifest(
         backend: .coreAI,
         asset: modelPath,
-        function: "main",
+        function: metadata["entrypointName"] as? String ?? "main",
         computeUnits: ProcessInfo.processInfo.environment[
           "H3_PROBE_COMPUTE"
         ] ?? "gpu",

@@ -68,6 +68,7 @@ class V5NativeManifestEntry:
     mask_reliability: tuple[float, ...]
     mosaic_block_size: float
     source_video_id: str
+    forced_final_crop_offset: tuple[int, int] | None = None
 
     @classmethod
     def from_dict(cls, value: dict[str, object], root: Path) -> "V5NativeManifestEntry":
@@ -77,6 +78,13 @@ class V5NativeManifestEntry:
 
         origins = tuple((int(pair[0]), int(pair[1])) for pair in value["origins"])  # type: ignore[index]
         reliability = tuple(float(item) for item in value["mask_reliability"])  # type: ignore[arg-type]
+        forced_offset_value = value.get("forced_final_crop_offset")
+        forced_final_crop_offset = None
+        if forced_offset_value is not None:
+            forced_final_crop_offset = (
+                int(forced_offset_value[0]),  # type: ignore[index]
+                int(forced_offset_value[1]),  # type: ignore[index]
+            )
         entry = cls(
             name=str(value["name"]),
             target_video=resolve(value["target_video"]),
@@ -87,6 +95,7 @@ class V5NativeManifestEntry:
             mask_reliability=reliability,
             mosaic_block_size=float(value["mosaic_block_size"]),
             source_video_id=str(value["source_video_id"]),
+            forced_final_crop_offset=forced_final_crop_offset,
         )
         entry.validate()
         return entry
@@ -106,6 +115,15 @@ class V5NativeManifestEntry:
             raise ValueError("mask reliability must be in [0, 1]")
         if self.mosaic_block_size <= 0:
             raise ValueError("mosaic block size must be positive")
+        if self.forced_final_crop_offset is not None:
+            left, top = self.forced_final_crop_offset
+            maximum = self.bucket - 256
+            if not (0 <= left <= maximum and 0 <= top <= maximum):
+                raise ValueError(
+                    "forced final crop offset must fit inside the native bucket"
+                )
+            if left % 2 or top % 2:
+                raise ValueError("forced final crop offset must use even pixels")
 
 
 def read_v5_native_manifest(path: Path) -> list[V5NativeManifestEntry]:
@@ -229,6 +247,7 @@ class MiohRestorerV5NativeDataset(Dataset):
         horizontal_flip: bool = True,
         time_reverse: bool = True,
         deterministic: bool = False,
+        mosaic_block_size_range: tuple[float, float] | None = None,
     ) -> None:
         self.entries = read_v5_native_manifest(Path(manifest))
         if not output_indices or any(index < 0 or index >= NUM_INPUT_FRAMES for index in output_indices):
@@ -238,6 +257,11 @@ class MiohRestorerV5NativeDataset(Dataset):
         self.horizontal_flip = horizontal_flip
         self.time_reverse = time_reverse
         self.deterministic = deterministic
+        self.mosaic_block_size_range = mosaic_block_size_range
+        if mosaic_block_size_range is not None:
+            minimum, maximum = mosaic_block_size_range
+            if minimum <= 0 or maximum < minimum:
+                raise ValueError("invalid mosaic block size range")
 
     def __len__(self) -> int:
         return len(self.entries)
@@ -284,9 +308,14 @@ class MiohRestorerV5NativeDataset(Dataset):
             random.seed(index)
             np.random.seed(index % (2**32))
         try:
+            requested_block_size = (
+                rng.uniform(*self.mosaic_block_size_range)
+                if self.mosaic_block_size_range is not None
+                else entry.mosaic_block_size
+            )
             mosaic_size, mosaic_mode, rectangle_ratio, feather_size = (
                 get_random_parameters_by_block_size(
-                    entry.mosaic_block_size,
+                    requested_block_size,
                     randomize_size=True,
                     repeatable_random=False,
                 )
@@ -331,6 +360,10 @@ class MiohRestorerV5NativeDataset(Dataset):
         mask_tensor = torch.stack(
             [torch.from_numpy(value).float().div_(255.0).unsqueeze(0) for value in affected_masks]
         ).clamp_(0.0, 1.0)
+        # Keep the actual mosaic footprint separate from the stabilized
+        # compositor mask. The guard ring remains useful at inference, but it
+        # must not dilute restoration losses with source==target pixels.
+        loss_mask_tensor = mask_tensor.clone()
         # Match the production V5 compositor: retain neighbouring detections
         # softly and include a small guard band. The added clean context ring
         # has an identity target, teaching the model a stable transition
@@ -345,6 +378,7 @@ class MiohRestorerV5NativeDataset(Dataset):
             "inputs": values,
             "targets": target_rgb[list(self.output_indices)],
             "masks": mask_tensor[list(self.output_indices)],
+            "loss_masks": loss_mask_tensor[list(self.output_indices)],
             "bucket": entry.bucket,
             "name": entry.name,
             "source_video_id": entry.source_video_id,

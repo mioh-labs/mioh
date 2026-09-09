@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Lada Authors
 # SPDX-License-Identifier: AGPL-3.0
 
-"""Prepare a fresh BasicVSR++ fine-tuning checkpoint from EMA weights.
+"""Prepare a fresh BasicVSR++ checkpoint from selected generator weights.
 
 MMEngine GAN checkpoints contain both ``generator`` (the weights updated by the
 optimizer) and ``generator_ema`` (the weights used for inference).  Loading such
@@ -161,6 +161,7 @@ def prepare_checkpoint(
     *,
     trust_checkpoint: bool,
     overwrite: bool = False,
+    source_state: str = "ema",
 ) -> dict[str, Any]:
     """Create a model-only initialization checkpoint from a trusted source."""
 
@@ -187,16 +188,22 @@ def prepare_checkpoint(
         raise TypeError(
             f"checkpoint root must be a mapping, got {type(checkpoint).__name__}"
         )
-    source_state = checkpoint.get("state_dict")
-    if not isinstance(source_state, Mapping):
+    checkpoint_state = checkpoint.get("state_dict")
+    if not isinstance(checkpoint_state, Mapping):
         raise TypeError("checkpoint must contain a mapping named 'state_dict'")
 
-    suffixes = _validate_generator_pairs(source_state)
-    output_state = copy.deepcopy(source_state)
+    suffixes = _validate_generator_pairs(checkpoint_state)
+    if source_state == "ema":
+        source_prefix = EMA_PREFIX
+    elif source_state == "raw":
+        source_prefix = RAW_PREFIX
+    else:
+        raise ValueError(f"source_state must be 'ema' or 'raw', got {source_state!r}")
+    output_state = copy.deepcopy(checkpoint_state)
     for suffix in suffixes:
-        ema_value = source_state[EMA_PREFIX + suffix]
-        output_state[RAW_PREFIX + suffix] = _clone_tensor(ema_value)
-        output_state[EMA_PREFIX + suffix] = _clone_tensor(ema_value)
+        selected_value = checkpoint_state[source_prefix + suffix]
+        output_state[RAW_PREFIX + suffix] = _clone_tensor(selected_value)
+        output_state[EMA_PREFIX + suffix] = _clone_tensor(selected_value)
 
     reset_step_counters = _reset_step_counters(output_state)
     provenance = {
@@ -205,7 +212,7 @@ def prepare_checkpoint(
         "source_checkpoint": str(source_path),
         "source_sha256": source_sha256,
         "source_metadata": _source_metadata(checkpoint),
-        "source_prefix": EMA_PREFIX,
+        "source_prefix": source_prefix,
         "destination_prefixes": [RAW_PREFIX, EMA_PREFIX],
         "generator_suffix_count": len(suffixes),
         "state_entry_count": len(output_state),
@@ -225,7 +232,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Prepare a fresh BasicVSR++ fine-tuning checkpoint whose raw and "
-            "EMA generators both start from the source EMA weights."
+            "EMA generators both start from a selected source branch."
         )
     )
     parser.add_argument("source", type=Path, help="trusted MMEngine checkpoint")
@@ -238,6 +245,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--overwrite", action="store_true", help="replace an existing output file"
     )
+    parser.add_argument(
+        "--source-state",
+        choices=("ema", "raw"),
+        default="ema",
+        help="generator branch copied into both output branches (default: ema)",
+    )
     return parser.parse_args()
 
 
@@ -248,6 +261,7 @@ def main() -> int:
         args.output,
         trust_checkpoint=args.trust_checkpoint,
         overwrite=args.overwrite,
+        source_state=args.source_state,
     )
     print(f"Prepared: {args.output.expanduser().resolve()}")
     print(f"Source SHA-256: {provenance['source_sha256']}")

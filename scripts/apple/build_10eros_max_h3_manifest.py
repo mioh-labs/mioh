@@ -15,7 +15,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--denoiser-manifest", type=Path)
     parser.add_argument(
         "--model-identifier",
-        default="10eros-max-h3-turbo-hybrid-beta3-native-v1",
+        default="10eros-max-h3-turbo-hybrid-beta5-native-v1",
     )
     parser.add_argument(
         "--conditioning-mode",
@@ -104,13 +104,19 @@ def main() -> int:
             {"audio": ("float32", [1, 2, 324000])},
         ),
     }
-    sigmas = (
-        simple_flow_sigmas(steps=20, shift=12.0)
-        if args.conditioning_mode == "fl2va"
-        # The current 10Eros-Max TURBO recipe specifies ER-SDE with the
-        # standard Simple scheduler at six steps.  Keep this derived from the
-        # flow shift instead of freezing the older hand-tuned seven-step list.
-        else simple_flow_sigmas(steps=6, shift=12.0)
+    # beta2 FL2VA used the older 20-step res_multistep recipe. The current
+    # 10Eros-Max TURBO beta4/beta5 hybrid models are trained for six-step
+    # schedule in both Ref2VA and FL2VA modes. Keep the beta2 behavior when
+    # an older identifier is requested so archived manifests remain
+    # reproducible.
+    identifier = args.model_identifier.lower()
+    is_current_turbo = "turbo" in identifier and (
+        "beta4" in identifier or "beta5" in identifier
+    )
+    uses_six_step_turbo = args.conditioning_mode == "ref2va" or is_current_turbo
+    sigmas = simple_flow_sigmas(
+        steps=6 if uses_six_step_turbo else 20,
+        shift=12.0,
     )
     manifest = {
         "schemaVersion": 1,
@@ -122,11 +128,7 @@ def main() -> int:
             denoiser_path.read_text(encoding="utf-8")
         ),
         "stages": stages,
-        "sampler": (
-            "res_multistep"
-            if args.conditioning_mode == "fl2va"
-            else "er_sde"
-        ),
+        "sampler": "er_sde" if uses_six_step_turbo else "res_multistep",
         "samplerNoise": 1.0,
         "samplerMaxStage": 3,
         "sigmas": sigmas,

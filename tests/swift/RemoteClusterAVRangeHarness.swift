@@ -128,6 +128,7 @@ private func makeRequest(
       crossfade: true,
       detectionEmptyLookahead: 1,
       detectFaceMosaics: false,
+      detectionMaskReuseSkipFrames: 0,
       blendFeather: 1,
       sharpenStrength: 0,
       detailBoost: 0,

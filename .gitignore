@@ -26,6 +26,8 @@ model_weights/**/*.mlirb
 model_weights/**/*.mlpackage/
 model_weights/**/*.aimodel/
 model_weights/**/*.aimodelc/
+model_weights/mioh-dedicated-*/
+model_weights/AdcSR-CoreAI-LICENSE.txt
 
 # Xcode per-user UI and scheme state
 **/xcuserdata/

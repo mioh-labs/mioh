@@ -14,6 +14,7 @@ from lada.models.basicvsrpp.mmagic.data_sample import DataSample
 from lada.models.basicvsrpp.mmagic.registry import MODELS
 from lada.models.basicvsrpp.mmagic.roi_loss import (
     KnownGridMosaicConsistencyLoss,
+    ROIHighFrequencyProjectionLoss,
     ROIPixelLoss,
     _known_phase_block_average,
 )
@@ -68,6 +69,51 @@ def test_roi_pixel_loss_ignores_error_outside_mask():
 
     prediction[..., 2, 2] = 1.0
     assert loss(prediction, target, mask) > 0.99
+
+
+def test_hf_projection_loss_rewards_alignment_and_prices_noise():
+    loss = ROIHighFrequencyProjectionLoss(
+        projection_weight=0.0035,
+        orthogonal_energy_weight=0.0015,
+    )
+    coordinates = torch.arange(16)
+    checker = ((coordinates[:, None] + coordinates[None, :]) % 2).float()
+    target = checker.view(1, 1, 16, 16).repeat(1, 3, 1, 1)
+    mask = torch.ones(1, 1, 16, 16)
+
+    zero = torch.zeros_like(target)
+    torch.testing.assert_close(loss(zero, target, mask), torch.tensor(0.0))
+    torch.testing.assert_close(
+        loss(0.5 * target, target, mask), torch.tensor(-0.00175)
+    )
+    torch.testing.assert_close(
+        loss(target, target, mask), torch.tensor(-0.0035)
+    )
+
+    generator = torch.Generator().manual_seed(20260816)
+    noisy = target + 0.2 * torch.randn(target.shape, generator=generator)
+    assert loss(noisy, target, mask) > loss(target, target, mask)
+
+
+def test_clean_detail_recovery_config_starts_from_adopted_raw_model():
+    config = Config.fromfile(
+        'configs/basicvsrpp/'
+        'mosaic_restoration_generic_stage2.19_clean_detail_recovery.py'
+    )
+
+    assert config.model.generator.trainable_modules == list(TAIL_MODULES)
+    projection = config.model.high_frequency_projection_loss
+    assert projection.type == 'ROIHighFrequencyProjectionLoss'
+    assert projection.projection_weight == 0.0035
+    assert projection.orthogonal_energy_weight == 0.0015
+    assert config.model.mosaic_forward_consistency_loss.loss_weight == 0.05
+    assert config.optim_wrapper.generator.optimizer.lr == 3e-7
+    assert config.train_cfg.max_iters == 1500
+    assert config.train_cfg.val_interval == 250
+    assert config.initialization_checkpoint.endswith(
+        'basicvsrpp-v1.2-clean4000-unified-hf3000-'
+        'forward-consistency-w005-500-raw.pth'
+    )
 
 
 def test_known_grid_mosaic_consistency_uses_only_complete_roi_cells():

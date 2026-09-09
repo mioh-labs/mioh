@@ -33,23 +33,39 @@ def remove_existing(path: Path, overwrite: bool) -> None:
 class QuantizedEmbedding(torch.nn.Module):
     def __init__(self, checkpoint: Path) -> None:
         super().__init__()
-        from coreai_torch._compression.custom_layers import WeightDequantizeModule
 
         with safe_open(str(checkpoint), framework="pt", device="cpu") as handle:
+            keys = set(handle.keys())
             weight = handle.get_tensor("model.embed_tokens.weight").contiguous()
-            scale = handle.get_tensor("model.embed_tokens.weight_scale").to(
-                torch.float16
-            ).contiguous()
-        if weight.dtype != torch.int8 or weight.shape != (151936, 5120):
-            raise TypeError(f"unexpected Qwen embedding tensor {weight.shape} {weight.dtype}")
-        self.weight = WeightDequantizeModule(
-            quantized_data=weight,
-            scale=scale,
-            output_dtype=torch.float16,
-        )
+            if "model.embed_tokens.weight_scale" in keys:
+                from coreai_torch._compression.custom_layers import WeightDequantizeModule
+
+                scale = handle.get_tensor("model.embed_tokens.weight_scale").to(
+                    torch.float16
+                ).contiguous()
+                if weight.dtype != torch.int8 or weight.shape != (151936, 5120):
+                    raise TypeError(
+                        f"unexpected Qwen embedding tensor {weight.shape} {weight.dtype}"
+                    )
+                self.weight = WeightDequantizeModule(
+                    quantized_data=weight,
+                    scale=scale,
+                    output_dtype=torch.float16,
+                )
+            else:
+                if weight.shape != (151936, 5120):
+                    raise TypeError(
+                        f"unexpected Qwen embedding tensor {weight.shape} {weight.dtype}"
+                    )
+                self.register_buffer("dense_weight", weight.to(torch.float16))
+                self.weight = None
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.embedding(input_ids, self.weight())
+        if self.weight is not None:
+            weight = self.weight()
+        else:
+            weight = self.dense_weight
+        return torch.nn.functional.embedding(input_ids, weight)
 
 
 def export_coreai(

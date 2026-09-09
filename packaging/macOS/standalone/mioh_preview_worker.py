@@ -631,11 +631,18 @@ def _native_swift_preview_compatibility(config) -> tuple[bool, str]:
         return False, "native Swift preview runner is unavailable"
     if config.restoration_model not in {
         "basicvsrpp-v1.2-coreai-variable",
-        "basicvsrpp-v1.2-coreai-variable-hq",
     }:
         return False, "restoration model is not the variable Core AI model"
-    if "coreai" not in config.detection_model or "jasna" in config.detection_model:
-        return False, "detector is not a supported YOLO Core AI model"
+    supported_yolo_coreai = (
+        "coreai" in config.detection_model
+        and not config.detection_model.startswith("jasna-v6")
+    )
+    supported_rfdetr_coreml = config.detection_model in {
+        "jasna-v6-coreml",
+        "jasna-v6-large-coreml",
+    }
+    if not (supported_yolo_coreai or supported_rfdetr_coreml):
+        return False, "detector is not supported by the native Swift preview"
     # These pixel-domain controls currently remain on the mature Python path.
     # Keeping the gate strict prevents the fast path from silently changing a
     # saved user's appearance settings.
@@ -720,6 +727,13 @@ def run_native_swift_preview(config, output_dir: Path) -> int | None:
     # contention-prone T36 configuration.
     detection_compute_units: str | None = None
     temporal_frame_limit = 30
+    if config.detection_model in {
+        "jasna-v6-coreml",
+        "jasna-v6-large-coreml",
+    }:
+        # The 576px RF-DETR ML Program is substantially faster on the GPU
+        # than on the ANE on Apple silicon (about 40 ms versus 174 ms on M5).
+        detection_compute_units = "cpuAndGPU"
     coreml_detection_name = _native_swift_coreml_detector_name(
         config.detection_model
     )
@@ -737,14 +751,7 @@ def run_native_swift_preview(config, output_dir: Path) -> int | None:
                 detection_compute_units = "cpuAndNeuralEngine"
                 temporal_frame_limit = 36
 
-    if config.restoration_model.endswith("-variable-hq"):
-        restoration_runner = os.environ.get(
-            "LADA_VARIABLE_COREAI_HQ_SWIFT_RUNNER"
-        )
-    else:
-        restoration_runner = os.environ.get(
-            "LADA_VARIABLE_COREAI_SWIFT_RUNNER"
-        )
+    restoration_runner = os.environ.get("LADA_VARIABLE_COREAI_SWIFT_RUNNER")
     native_runner = os.environ.get("LADA_NATIVE_COREAI_PREVIEW_RUNNER")
     if (
         not restoration_runner
@@ -762,11 +769,18 @@ def run_native_swift_preview(config, output_dir: Path) -> int | None:
         max(0, int(config.restore_temporal_overlap)),
         max(0, temporal_frames - 1),
     )
+    rfdetr_detection = config.detection_model.startswith("jasna-v6")
+    rfdetr_large = config.detection_model.startswith("jasna-v6-large")
     payload = {
         "input": str(Path(config.input).resolve()),
         "outputDirectory": str(Path(output_dir).resolve()),
         "detectionModel": str(detection_path.resolve()),
-        "detectionCandidateChannels": candidate_channels,
+        "detectionBackend": "rfdetr" if rfdetr_detection else "yolo",
+        "detectionInputSize": 768 if rfdetr_large else 576,
+        "detectionCandidateChannels": 0 if rfdetr_detection else candidate_channels,
+        "detectionQueries": 200 if rfdetr_detection else None,
+        "detectionLogitClasses": 3 if rfdetr_detection else None,
+        "detectionMaxDet": 16 if rfdetr_detection else None,
         "detectionComputeUnits": detection_compute_units,
         "restorationModels": str(restoration_path.resolve()),
         "restorationRunner": str(Path(restoration_runner).resolve()),
@@ -777,7 +791,9 @@ def run_native_swift_preview(config, output_dir: Path) -> int | None:
         "temporalBatchFrames": temporal_frames,
         "temporalOverlap": temporal_overlap,
         "ringCapacity": max(temporal_frames * 2, 24),
-        "confidenceThreshold": 0.25,
+        "confidenceThreshold": (
+            0.40 if rfdetr_large else 0.35 if rfdetr_detection else 0.25
+        ),
         "iouThreshold": 0.7,
         "contextFraction": 0.30,
         "blendFeather": float(config.blend_feather),

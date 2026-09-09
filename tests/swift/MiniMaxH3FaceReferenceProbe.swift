@@ -72,6 +72,51 @@ struct MiniMaxH3FaceReferenceProbe {
         )
       }
       print("grouped-prompt=PASS")
+
+      let structuredInput = """
+        subject_definitions:
+        <Subject 1> is an adult singer in a red floral dress.
+        <Audio 1> is the complete song.
+
+        summary:
+        [reference generation + audio reuse] A coastal music video.
+
+        retention_analysis:
+        <Subject 1>: fully_preserved - preserve identity.
+        <Audio 1>: fully_copy - reuse the song.
+
+        detailed_description:
+        [Shot 1] <Subject 1> sings while walking beside the sea.
+
+        overall_soundscape:
+        No added ambience.
+
+        non_diegetic_music:
+        <Audio 1> is reused directly.
+        """
+      let structuredPrompt = MiniMaxH3FaceReferenceProcessor.faceOnlyPrompt(
+        structuredInput,
+        references: grouped
+      )
+      guard structuredPrompt.components(separatedBy: "subject_definitions:").count == 2,
+        structuredPrompt.components(separatedBy: "summary:").count == 2,
+        structuredPrompt.components(separatedBy: "retention_analysis:").count == 2,
+        structuredPrompt.components(separatedBy: "detailed_description:").count == 2,
+        structuredPrompt.components(separatedBy: "overall_soundscape:").count == 2,
+        structuredPrompt.components(separatedBy: "non_diegetic_music:").count == 2,
+        structuredPrompt.contains(
+          "Its facial identity comes from <Picture 1>, <Picture 2>"
+        ),
+        structuredPrompt.contains("<Audio 1> is reused directly."),
+        !structuredPrompt.contains("Follow this user direction")
+      else {
+        throw NSError(
+          domain: "MiniMaxH3FaceReferenceProbe",
+          code: 67,
+          userInfo: [NSLocalizedDescriptionKey: "structured prompt was nested"]
+        )
+      }
+      print("structured-prompt=PASS")
     }
     print("faces=\(faces.count)")
   }

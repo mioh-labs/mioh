@@ -4,6 +4,7 @@ import Foundation
 
 enum MacHLSProductionEvent: Sendable {
   case ready(duration: Double, isLive: Bool)
+  case status(String)
   case segment(
     sequence: Int,
     startSeconds: Double,
@@ -522,6 +523,7 @@ final class MacHLSRealtimeProducer {
   private let resourceLoader: (any IPadHLSResourceLoading)?
   private let avFoundationCapture: MacHLSAVFoundationCapture?
   private let allowsVariantFallback: Bool
+  private let playbackPreparer: (any MacHLSPlaybackPreparing)?
 
   private var downloader: IPadHLSResourceDownloader?
   private var prefetchDownloader: IPadHLSResourceDownloader?
@@ -548,6 +550,7 @@ final class MacHLSRealtimeProducer {
   private let vodMinimumSteadyBatchCoreSegments = 2
   private let vodSteadyRestoreBatchCoreSegments = 18
   private let vodSteadyRestoreBatchTargetSeconds = 36.0
+  private let vodLowLeadRestoreBatchTargetSeconds = 12.0
   private let vodSteadyRestoreBatchMaximumBytes: Int64 = 384 * 1_024 * 1_024
   // AVFoundation capture arrives sequentially at 2x, unlike the fast path's
   // already-prefetched VOD inventory. Four steady cores amortize model/process
@@ -564,6 +567,7 @@ final class MacHLSRealtimeProducer {
     resourceLoader: (any IPadHLSResourceLoading)? = nil,
     avFoundationCapture: MacHLSAVFoundationCapture? = nil,
     allowsVariantFallback: Bool = true,
+    playbackPreparer: (any MacHLSPlaybackPreparing)? = nil,
     log: @escaping Logger
   ) {
     self.source = source
@@ -575,6 +579,7 @@ final class MacHLSRealtimeProducer {
     self.resourceLoader = resourceLoader
     self.avFoundationCapture = avFoundationCapture
     self.allowsVariantFallback = allowsVariantFallback
+    self.playbackPreparer = playbackPreparer
     self.log = log
   }
 
@@ -703,6 +708,7 @@ final class MacHLSRealtimeProducer {
     var hasMaterializedCurrentVODSegment = false
     var vodPrefetchSuspendedUntil = Date.distantPast
     var vodPrefetchPauseInProgress = false
+    var lastVODStatus = ""
     // Keep VOD prefetch independent from the restore window. Running downloads
     // and completed inventory are intentionally tracked separately; otherwise
     // completed segments keep occupying task slots until restoration consumes
@@ -1408,7 +1414,19 @@ final class MacHLSRealtimeProducer {
             restorationWindow,
             coreStartIndex: coreStartIndex,
             hasLeftContext: hasRestoredAnyWindow
-          ) else { break }
+          ) else {
+            let status = await vodReadinessStatus(
+              restorationWindow,
+              coreStartIndex: coreStartIndex,
+              hasLeftContext: hasRestoredAnyWindow
+            )
+            if status != lastVODStatus {
+              lastVODStatus = status
+              emit(.status(status))
+            }
+            break
+          }
+          lastVODStatus = ""
           let coreEndIndex = coreStartIndex + coreSegmentCount - 1
           try await restoreWindow(
             restorationWindow,
@@ -1623,6 +1641,7 @@ final class MacHLSRealtimeProducer {
     cancellationRequested = true
     resumeOutputCreditWaiters()
     avFoundationCapture?.cancel()
+    playbackPreparer?.cancel()
     downloader?.cancel()
     prefetchDownloader?.cancel()
     for downloader in prefetchDownloaders { downloader.cancel() }
@@ -2125,6 +2144,7 @@ final class MacHLSRealtimeProducer {
       return vodInitialRestoreBatchCoreSegments
     }
 
+    let targetSeconds = vodRestoreBatchTargetSeconds()
     let maximumCount = min(
       availableCoreCount,
       vodSteadyRestoreBatchCoreSegments
@@ -2138,7 +2158,7 @@ final class MacHLSRealtimeProducer {
       let sourceDuration = max(0, source.timelineEnd - source.timelineStart)
       let sourceBytes = (try? await mediaFileWorker.byteCount(at: source.localURL)) ?? 0
       let exceedsDuration = selectedCount >= minimumCount
-        && selectedDuration + sourceDuration > vodSteadyRestoreBatchTargetSeconds
+        && selectedDuration + sourceDuration > targetSeconds
       let exceedsBytes = selectedCount >= minimumCount
         && sourceBytes > 0
         && selectedBytes + sourceBytes > vodSteadyRestoreBatchMaximumBytes
@@ -2149,7 +2169,7 @@ final class MacHLSRealtimeProducer {
       selectedBytes += sourceBytes
       if selectedCount >= minimumCount,
         selectedCount == vodSteadyRestoreBatchCoreSegments
-          || selectedDuration >= vodSteadyRestoreBatchTargetSeconds
+          || selectedDuration >= targetSeconds
           || selectedBytes >= vodSteadyRestoreBatchMaximumBytes
       {
         return selectedCount
@@ -2165,13 +2185,59 @@ final class MacHLSRealtimeProducer {
     let next = sources[nextIndex]
     let nextDuration = max(0, next.timelineEnd - next.timelineStart)
     let nextBytes = (try? await mediaFileWorker.byteCount(at: next.localURL)) ?? 0
-    if selectedDuration + nextDuration > vodSteadyRestoreBatchTargetSeconds
+    if selectedDuration + nextDuration > targetSeconds
       || (nextBytes > 0
         && selectedBytes + nextBytes > vodSteadyRestoreBatchMaximumBytes)
     {
       return selectedCount
     }
     return nil
+  }
+
+  private func vodRestoreBatchTargetSeconds() -> Double {
+    let lowLeadThreshold = min(
+      18,
+      max(vodLowLeadRestoreBatchTargetSeconds, outputBufferLimits.seconds * 0.30)
+    )
+    return retainedOutputSeconds < lowLeadThreshold
+      ? vodLowLeadRestoreBatchTargetSeconds
+      : vodSteadyRestoreBatchTargetSeconds
+  }
+
+  private func vodReadinessStatus(
+    _ sources: [RestorationSource],
+    coreStartIndex: Int,
+    hasLeftContext: Bool
+  ) async -> String {
+    guard coreStartIndex >= 0, coreStartIndex < sources.count else {
+      return "HLS復元: 次の区間を取得中"
+    }
+    let availableCoreCount = max(0, sources.count - coreStartIndex - 1)
+    let minimumCount = hasLeftContext
+      ? vodMinimumSteadyBatchCoreSegments
+      : vodInitialRestoreBatchCoreSegments
+    if availableCoreCount < minimumCount {
+      return "HLS復元: 右コンテキストを含む入力区間を待機中 "
+        + "\(availableCoreCount)/\(minimumCount)"
+    }
+
+    let targetSeconds = vodRestoreBatchTargetSeconds()
+    var selectedDuration = 0.0
+    var selectedBytes: Int64 = 0
+    let maximumCount = min(
+      availableCoreCount,
+      vodSteadyRestoreBatchCoreSegments
+    )
+    for relativeIndex in 0..<maximumCount {
+      let source = sources[coreStartIndex + relativeIndex]
+      selectedDuration += max(0, source.timelineEnd - source.timelineStart)
+      selectedBytes += (try? await mediaFileWorker.byteCount(at: source.localURL)) ?? 0
+    }
+    return "HLS復元: 入力区間を先読み中 "
+      + "\(maximumCount)本・\(String(format: "%.1f", selectedDuration))秒"
+      + " / 目標\(String(format: "%.1f", targetSeconds))秒"
+      + " / 再生可能\(String(format: "%.1f", retainedOutputSeconds))秒"
+      + " / \(formatBytes(selectedBytes))"
   }
 
   private func restoreWindow(
@@ -2566,9 +2632,27 @@ final class MacHLSRealtimeProducer {
           }
           let outputSequence = nextOutputSequence
           let workerURL = URL(fileURLWithPath: path)
+          let stableURL = restoredDirectory.appendingPathComponent(
+            String(format: "hls-restored-%06d", outputSequence)
+              + (playbackPreparer == nil ? ".mp4" : ".mov"),
+            isDirectory: false
+          )
+          if let playbackPreparer {
+            let audioStarted = Date()
+            try await playbackPreparer.movie(
+              videoURL: workerURL, start: mappedStart, end: mappedEnd, outputURL: stableURL
+            )
+            try checkCancellation()
+            if outputSequence < 3 || outputSequence.isMultiple(of: 30) {
+              log("HLS単一タイムライン: 区間\(outputSequence) 音声+映像統合 "
+                + "\(String(format: "%.3f", Date().timeIntervalSince(audioStarted)))秒\n")
+            }
+          }
           let outputBytes: Int64
           do {
-            outputBytes = try await mediaFileWorker.byteCount(at: workerURL)
+            outputBytes = try await mediaFileWorker.byteCount(
+              at: playbackPreparer == nil ? workerURL : stableURL
+            )
           } catch {
             throw ProductionError.missingOutput(
               "\(workerURL.lastPathComponent): \(error.localizedDescription)"
@@ -2579,15 +2663,13 @@ final class MacHLSRealtimeProducer {
             seconds: mappedEnd - mappedStart,
             bytes: outputBytes
           )
-          let stableURL = restoredDirectory.appendingPathComponent(
-            String(format: "hls-restored-%06d.mp4", outputSequence),
-            isDirectory: false
-          )
           do {
-            try await mediaFileWorker.copyReplacing(
-              from: workerURL,
-              to: stableURL
-            )
+            if playbackPreparer == nil {
+              try await mediaFileWorker.copyReplacing(
+                from: workerURL,
+                to: stableURL
+              )
+            }
           } catch {
             throw ProductionError.missingOutput(
               "\(workerURL.lastPathComponent): \(error.localizedDescription)"

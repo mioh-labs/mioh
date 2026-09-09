@@ -52,9 +52,13 @@ from .native_dataset_v5 import (
 from .curriculum_v5 import V5_STAGES, V5LossWeights, V5TrainingStage
 from .losses_v5 import MiohRestorerV5Loss
 from .adversarial import (
+    SpectralUNetDiscriminator,
     TemporalPatchDiscriminator,
+    discriminator_feature_matching_loss,
     discriminator_hinge_loss,
+    discriminator_roi_patch_weights,
     generator_hinge_loss,
+    roi_temporal_discriminator_input,
     temporal_discriminator_input,
 )
 from .training import (
@@ -110,9 +114,13 @@ __all__ = [
     "MiohRestorerV5Loss",
     "confidence_error_correlation",
     "overlap_consistency_loss",
+    "SpectralUNetDiscriminator",
     "TemporalPatchDiscriminator",
+    "discriminator_feature_matching_loss",
     "discriminator_hinge_loss",
+    "discriminator_roi_patch_weights",
     "generator_hinge_loss",
+    "roi_temporal_discriminator_input",
     "temporal_discriminator_input",
     "MaskedVGG16PerceptualLoss",
     "RestorationLoss",

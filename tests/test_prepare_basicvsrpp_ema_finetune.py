@@ -120,6 +120,34 @@ class PrepareBasicVSRPPEMAFinetuneTests(unittest.TestCase):
                 MODULE.prepare_checkpoint(source, output, trust_checkpoint=True)
             self.assertFalse(output.exists())
 
+    def test_can_copy_raw_to_both_generators(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.pth"
+            output = Path(directory) / "output.pth"
+            source_checkpoint = _checkpoint()
+            torch.save(source_checkpoint, source)
+
+            MODULE.prepare_checkpoint(
+                source,
+                output,
+                trust_checkpoint=True,
+                source_state="raw",
+            )
+            prepared = torch.load(output, map_location="cpu", weights_only=True)
+            state = prepared["state_dict"]
+            torch.testing.assert_close(
+                state["generator.layer.weight"],
+                source_checkpoint["state_dict"]["generator.layer.weight"],
+            )
+            torch.testing.assert_close(
+                state["generator.layer.weight"],
+                state["generator_ema.layer.weight"],
+            )
+            self.assertEqual(
+                prepared["meta"][MODULE.PROVENANCE_KEY]["source_prefix"],
+                MODULE.RAW_PREFIX,
+            )
+
     def test_rejects_shape_mismatch_without_output(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "source.pth"

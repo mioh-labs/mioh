@@ -56,6 +56,33 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--skip-reference", action="store_true")
+    parser.add_argument(
+        "--metal-int8-convrot",
+        action="store_true",
+        help=(
+            "Experimentally replace INT8 ConvRot Linear lowering with an "
+            "embedded Metal TensorOps kernel. This pilot applies tensorwise "
+            "scales after INT8 accumulation, so it is not BF16 bit-exact and "
+            "must not be used for release assets. Currently requires --fixed-shape."
+        ),
+    )
+    parser.add_argument(
+        "--metal-fp8-scaled",
+        action="store_true",
+        help=(
+            "Keep scaled E4M3 checkpoint weights at one byte per value and "
+            "run their linears through an M5 Metal TensorOps kernel. "
+            "Currently requires --fixed-shape."
+        ),
+    )
+    parser.add_argument(
+        "--expand-fp8-scaled",
+        action="store_true",
+        help=(
+            "Expand scaled E4M3 weights to dense BF16. This is a comparison "
+            "path for validating --metal-fp8-scaled and doubles weight storage."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -108,20 +135,74 @@ class DenseLinear(torch.nn.Module):
 
 
 def load_linear(
-    checkpoint: Path, prefix: str, dtype: torch.dtype
+    checkpoint: Path,
+    prefix: str,
+    dtype: torch.dtype,
+    metal_int8_kernels=None,
+    metal_fp8_kernel=None,
+    expand_fp8_scaled: bool = False,
 ) -> torch.nn.Module:
     with safe_open(str(checkpoint), framework="pt", device="cpu") as handle:
         keys = set(handle.keys())
         quantized = f"{prefix}.comfy_quant" in keys
         if not quantized:
+            metadata = handle.metadata() or {}
+            quant_metadata = metadata.get("_quantization_metadata")
+            if quant_metadata is not None:
+                quantized = prefix in json.loads(quant_metadata).get("layers", {})
+        fp8_scaled = (
+            f"{prefix}.weight_scale" in keys
+            and handle.get_tensor(f"{prefix}.weight").dtype
+            == torch.float8_e4m3fn
+        )
+        if fp8_scaled:
+            weight = handle.get_tensor(f"{prefix}.weight")
+            scale = handle.get_tensor(f"{prefix}.weight_scale").float().reshape(1)
+            bias = (
+                handle.get_tensor(f"{prefix}.bias")
+                if f"{prefix}.bias" in keys
+                else None
+            )
+        elif not quantized:
             weight = handle.get_tensor(f"{prefix}.weight")
             bias = (
                 handle.get_tensor(f"{prefix}.bias")
                 if f"{prefix}.bias" in keys
                 else None
             )
+    if fp8_scaled:
+        if metal_fp8_kernel is None and not expand_fp8_scaled:
+            raise ValueError(
+                f"{prefix} is scaled FP8; pass --metal-fp8-scaled to keep "
+                "its compact representation or --expand-fp8-scaled for comparison"
+            )
+        if dtype != torch.bfloat16:
+            raise ValueError("Metal scaled FP8 requires BF16 activations")
+        from pilot_minimax_h3_fp8_scaled import (
+            DenseFP8ScaledLinear,
+            FP8ScaledLinear,
+        )
+
+        weight_bits = weight.view(torch.uint8).transpose(0, 1).contiguous()
+        output_features = weight.shape[0]
+        deployed_bias = (
+            torch.zeros(output_features, dtype=torch.bfloat16)
+            if bias is None
+            else bias.reshape(output_features).to(torch.bfloat16).contiguous()
+        )
+        if expand_fp8_scaled:
+            return DenseFP8ScaledLinear(weight_bits, scale, deployed_bias)
+        return FP8ScaledLinear(metal_fp8_kernel, weight_bits, scale, deployed_bias)
     if quantized:
         weight, scale, bias, group_size = load_convrot_mapping(checkpoint, prefix)
+        if metal_int8_kernels is not None:
+            from ten_eros_h3_coreai_kernels import MetalINT8ConvRotLinear
+
+            if dtype != torch.bfloat16:
+                raise ValueError("Metal INT8 ConvRot pilot requires BF16 activations")
+            return MetalINT8ConvRotLinear(
+                metal_int8_kernels, weight, scale, bias, group_size
+            )
         return ExactINT8ConvRotLinear(
             weight,
             scale.to(dtype),
@@ -133,7 +214,15 @@ def load_linear(
 
 
 class TenErosDiTBlock(torch.nn.Module):
-    def __init__(self, checkpoint: Path, layer: int, dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        checkpoint: Path,
+        layer: int,
+        dtype: torch.dtype,
+        metal_int8_kernels=None,
+        metal_fp8_kernel=None,
+        expand_fp8_scaled: bool = False,
+    ) -> None:
         super().__init__()
         prefix = f"blocks.{layer}"
         with safe_open(str(checkpoint), framework="pt", device="cpu") as handle:
@@ -141,10 +230,22 @@ class TenErosDiTBlock(torch.nn.Module):
             self.norm2 = RMSNorm(handle.get_tensor(f"{prefix}.norm2.weight"), dtype)
             self.q_norm = RMSNorm(handle.get_tensor(f"{prefix}.attn.q_norm.weight"), dtype)
             self.k_norm = RMSNorm(handle.get_tensor(f"{prefix}.attn.k_norm.weight"), dtype)
-        self.qkv = load_linear(checkpoint, f"{prefix}.attn.qkv_proj", dtype)
-        self.out = load_linear(checkpoint, f"{prefix}.attn.out_proj", dtype)
-        self.fc1 = load_linear(checkpoint, f"{prefix}.mlp.fc1", dtype)
-        self.fc2 = load_linear(checkpoint, f"{prefix}.mlp.fc2", dtype)
+        self.qkv = load_linear(
+            checkpoint, f"{prefix}.attn.qkv_proj", dtype,
+            metal_int8_kernels, metal_fp8_kernel, expand_fp8_scaled,
+        )
+        self.out = load_linear(
+            checkpoint, f"{prefix}.attn.out_proj", dtype,
+            metal_int8_kernels, metal_fp8_kernel, expand_fp8_scaled,
+        )
+        self.fc1 = load_linear(
+            checkpoint, f"{prefix}.mlp.fc1", dtype,
+            metal_int8_kernels, metal_fp8_kernel, expand_fp8_scaled,
+        )
+        self.fc2 = load_linear(
+            checkpoint, f"{prefix}.mlp.fc2", dtype,
+            metal_int8_kernels, metal_fp8_kernel, expand_fp8_scaled,
+        )
         self.adaln = load_linear(checkpoint, f"{prefix}.adaln_proj.linear", dtype)
 
     @staticmethod
@@ -207,11 +308,15 @@ class TenErosDiTBlockGroup(torch.nn.Module):
 
     def __init__(
         self, checkpoint: Path, first_layer: int, layer_count: int,
-        dtype: torch.dtype,
+        dtype: torch.dtype, metal_int8_kernels=None, metal_fp8_kernel=None,
+        expand_fp8_scaled: bool = False,
     ) -> None:
         super().__init__()
         self.blocks = torch.nn.ModuleList(
-            TenErosDiTBlock(checkpoint, layer, dtype)
+            TenErosDiTBlock(
+                checkpoint, layer, dtype,
+                metal_int8_kernels, metal_fp8_kernel, expand_fp8_scaled,
+            )
             for layer in range(first_layer, first_layer + layer_count)
         )
 
@@ -307,6 +412,7 @@ def export_coreai(
     fixed_shape: bool,
     entrypoint_name: str,
     graph_salt_name: str,
+    custom_kernels: list | None = None,
 ) -> None:
     import coreai_torch
 
@@ -324,6 +430,8 @@ def export_coreai(
     exported = torch.export.export(model, inputs, dynamic_shapes=dynamic_shapes)
     exported = exported.run_decompositions(coreai_torch.get_decomp_table())
     converter = coreai_torch.TorchConverter()
+    if custom_kernels:
+        converter.register_custom_kernels(custom_kernels)
     converter.add_exported_program(
         exported,
         input_names=[
@@ -358,6 +466,14 @@ def main() -> int:
         raise ValueError("--layer + --layer-count must not exceed 50")
     if args.tokens <= 0 or args.dynamic_max_tokens < args.tokens:
         raise ValueError("invalid token bounds")
+    if args.metal_int8_convrot and not args.fixed_shape:
+        raise ValueError("--metal-int8-convrot currently requires --fixed-shape")
+    if args.metal_fp8_scaled and not args.fixed_shape:
+        raise ValueError("--metal-fp8-scaled currently requires --fixed-shape")
+    if args.metal_int8_convrot and args.metal_fp8_scaled:
+        raise ValueError("select only one Metal weight implementation")
+    if args.metal_fp8_scaled and args.expand_fp8_scaled:
+        raise ValueError("select only one scaled FP8 weight implementation")
     if not args.checkpoint.is_file():
         raise FileNotFoundError(args.checkpoint)
     graph_identity = args.graph_identity or (
@@ -378,8 +494,24 @@ def main() -> int:
         args.reference_directory.mkdir(parents=True, exist_ok=True)
 
     dtype = torch.bfloat16 if args.scalar_type == "bfloat16" else torch.float16
+    custom_kernels = []
+    metal_int8_kernels = None
+    metal_fp8_kernel = None
+    if args.metal_int8_convrot:
+        import coreai_torch
+        from ten_eros_h3_coreai_kernels import build_int8_convrot_linear_kernels
+
+        metal_int8_kernels = build_int8_convrot_linear_kernels(coreai_torch)
+        custom_kernels.extend(metal_int8_kernels)
+    if args.metal_fp8_scaled:
+        import coreai_torch
+        from pilot_minimax_h3_fp8_scaled import build_kernel
+
+        metal_fp8_kernel = build_kernel(coreai_torch)
+        custom_kernels.append(metal_fp8_kernel)
     group = TenErosDiTBlockGroup(
-        args.checkpoint, args.layer, args.layer_count, dtype
+        args.checkpoint, args.layer, args.layer_count, dtype,
+        metal_int8_kernels, metal_fp8_kernel, args.expand_fp8_scaled,
     ).eval()
     inputs = examples(args.tokens, dtype, salt_width)
     reference = None
@@ -402,6 +534,14 @@ def main() -> int:
         "inputShapes": [list(value.shape) for value in inputs],
         "outputShape": [args.tokens, HIDDEN],
     }
+    if args.metal_int8_convrot:
+        metadata["metalINT8ConvRot"] = True
+        metadata["metalINT8ConvRotNumerics"] = "postscale-approximate"
+    if args.metal_fp8_scaled:
+        metadata["metalFP8Scaled"] = True
+        metadata["metalFP8ScaledNumerics"] = "dense-bfloat16-equivalent"
+    if args.expand_fp8_scaled:
+        metadata["expandedFP8Scaled"] = True
     if reference is not None:
         metadata["referenceMean"] = float(reference.mean())
         metadata["referenceRMS"] = float(reference.square().mean().sqrt())
@@ -434,6 +574,7 @@ def main() -> int:
         args.fixed_shape,
         entrypoint_name,
         graph_salt_name,
+        custom_kernels,
     )
     print(args.output)
     return 0

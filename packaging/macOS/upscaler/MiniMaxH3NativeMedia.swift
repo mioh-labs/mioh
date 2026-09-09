@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreGraphics
 import CoreImage
 import CoreMedia
 import CoreVideo
@@ -32,6 +33,14 @@ enum H3NativeMedia {
       max(1, Int(abs(transformed.height).rounded())),
       !audio.isEmpty
     )
+  }
+
+  static func probeDuration(_ url: URL) async throws -> Double {
+    let duration = try await AVURLAsset(url: url).load(.duration).seconds
+    guard duration.isFinite, duration > 0 else {
+      throw H3NativeError.media("media duration is unavailable")
+    }
+    return duration
   }
 
   static func probeImages(_ urls: [URL]) throws -> (width: Int, height: Int) {
@@ -101,6 +110,20 @@ enum H3NativeMedia {
     return try decodeImageFrames(
       urls: urls,
       imageIndices: indices,
+      width: width,
+      height: height
+    )
+  }
+
+  static func decodeReferenceImageSequence(
+    urls: [URL],
+    width: Int,
+    height: Int
+  ) throws -> H3Tensor {
+    _ = try probeImages(urls)
+    return try decodeImageFrames(
+      urls: urls,
+      imageIndices: Array(urls.indices),
       width: width,
       height: height
     )
@@ -244,6 +267,7 @@ enum H3NativeMedia {
   static func decodeReferenceAudio(
     url: URL,
     durationSeconds: Double,
+    startSeconds: Double = 0,
     sampleRate: Int = 32_000
   ) async throws -> H3Tensor {
     let asset = AVURLAsset(url: url)
@@ -275,6 +299,10 @@ enum H3NativeMedia {
       )
     }
     let maximumFrames = max(1, Int((durationSeconds * Double(sampleRate)).rounded()))
+    var discardFrames = max(
+      0,
+      Int((startSeconds * Double(sampleRate)).rounded())
+    )
     var interleaved: [Float] = []
     interleaved.reserveCapacity(maximumFrames * 2)
     while interleaved.count < maximumFrames * 2,
@@ -302,10 +330,29 @@ enum H3NativeMedia {
         }
         return data
       }
-      guard let data = payload else { continue }
-      data.withUnsafeBytes { raw in
-        interleaved.append(contentsOf: raw.bindMemory(to: Float.self))
+      guard let payload else { continue }
+      let values = payload.withUnsafeBytes {
+        Array($0.bindMemory(to: Float.self))
       }
+      guard values.count % 2 == 0 else {
+        throw H3NativeError.media("decoded audio block is not interleaved stereo")
+      }
+      let payloadFrames = values.count / 2
+      // AVFoundation may label decoder pre-roll with the requested time-range
+      // timestamp even though the PCM still starts at an earlier FLAC seek
+      // point. Decode continuously from the beginning and discard an exact
+      // sample count instead of trusting compressed-audio seek timestamps.
+      let skipFrames = min(discardFrames, payloadFrames)
+      discardFrames -= skipFrames
+      guard discardFrames == 0, skipFrames < payloadFrames else { continue }
+      let writtenFrames = interleaved.count / 2
+      let appendFrames = min(
+        payloadFrames - skipFrames,
+        maximumFrames - writtenFrames
+      )
+      let lower = skipFrames * 2
+      let upper = lower + appendFrames * 2
+      interleaved.append(contentsOf: values[lower..<upper])
     }
     guard reader.status != .failed else {
       throw H3NativeError.media(
@@ -332,20 +379,127 @@ enum H3NativeMedia {
     )
   }
 
+  static func fitAudioLatent(
+    _ source: H3Tensor,
+    to targetShape: [Int]
+  ) throws -> H3Tensor {
+    guard source.shape.count == 4, targetShape.count == 4,
+      source.shape[0] == targetShape[0],
+      source.shape[1] == targetShape[1],
+      source.shape[2] == targetShape[2]
+    else {
+      throw H3NativeError.invalidTensor(
+        "audio conditioning latent cannot fit \(source.shape) to \(targetShape)"
+      )
+    }
+    let sourceValues = try source.floatValues()
+    let sourceTime = source.shape[3]
+    let targetTime = targetShape[3]
+    let rows = targetShape[0] * targetShape[1] * targetShape[2]
+    let copyTime = min(sourceTime, targetTime)
+    var target = [Float](repeating: 0, count: rows * targetTime)
+    for row in 0..<rows {
+      let sourceStart = row * sourceTime
+      let targetStart = row * targetTime
+      target.replaceSubrange(
+        targetStart..<(targetStart + copyTime),
+        with: sourceValues[sourceStart..<(sourceStart + copyTime)]
+      )
+    }
+    return try H3Tensor(float32: target, shape: targetShape)
+  }
+
+  static func writeReferenceImage(
+    video: H3Tensor,
+    frame: Int,
+    outputURL: URL
+  ) throws {
+    guard video.shape.count == 5, video.shape[0] == 1, video.shape[1] == 3,
+      video.shape.indices.contains(2), video.shape[2] > frame, frame >= 0
+    else {
+      throw H3NativeError.invalidTensor(
+        "continuation image frame is outside the decoded video"
+      )
+    }
+    let width = video.shape[4]
+    let height = video.shape[3]
+    let pool = try makePixelBufferPool(width: width, height: height)
+    var allocatedPixelBuffer: CVPixelBuffer?
+    let allocationResult = CVPixelBufferPoolCreatePixelBuffer(
+      kCFAllocatorDefault,
+      pool,
+      &allocatedPixelBuffer
+    )
+    guard allocationResult == kCVReturnSuccess,
+      let pixelBuffer = allocatedPixelBuffer
+    else {
+      throw H3NativeError.media(
+        "continuation image pixel allocation returned \(allocationResult)"
+      )
+    }
+    let pixels = try video.floatValues()
+    try writeBGRA(pixels, shape: video.shape, frame: frame, to: pixelBuffer)
+    try FileManager.default.createDirectory(
+      at: outputURL.deletingLastPathComponent(),
+      withIntermediateDirectories: true
+    )
+    if FileManager.default.fileExists(atPath: outputURL.path) {
+      try FileManager.default.removeItem(at: outputURL)
+    }
+    let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)
+      ?? CGColorSpaceCreateDeviceRGB()
+    try imageContext.writePNGRepresentation(
+      of: CIImage(cvPixelBuffer: pixelBuffer),
+      to: outputURL,
+      format: .RGBA8,
+      colorSpace: colorSpace,
+      options: [:]
+    )
+  }
+
   @available(macOS 27.0, *)
   static func writeMovie(
     video: H3Tensor,
     audio: H3Tensor?,
     outputURL: URL,
+    durationSeconds: Double,
+    trimStartSeconds: Double = 0,
+    outputWidth: Int? = nil,
+    outputHeight: Int? = nil,
     frameRate: Int = 24,
     audioSampleRate: Int = 32_000
   ) async throws {
     guard video.shape.count == 5, video.shape[0] == 1, video.shape[1] == 3 else {
       throw H3NativeError.invalidTensor("decoded video must be NCTHW RGB")
     }
-    let frameCount = video.shape[2]
-    let height = video.shape[3]
-    let width = video.shape[4]
+    guard trimStartSeconds.isFinite, trimStartSeconds >= 0 else {
+      throw H3NativeError.media("movie trim start must be non-negative")
+    }
+    let sourceStartFrame = Int(
+      (trimStartSeconds * Double(frameRate)).rounded()
+    )
+    let requestedFrameCount = max(
+      1,
+      Int((durationSeconds * Double(frameRate)).rounded())
+    )
+    guard sourceStartFrame + requestedFrameCount <= video.shape[2] else {
+      throw H3NativeError.media(
+        "movie trim requires \(sourceStartFrame + requestedFrameCount) frames, got \(video.shape[2])"
+      )
+    }
+    let frameCount = requestedFrameCount
+    let sourceHeight = video.shape[3]
+    let sourceWidth = video.shape[4]
+    let height = outputHeight ?? sourceHeight
+    let width = outputWidth ?? sourceWidth
+    guard width > 0, height > 0, width <= sourceWidth, height <= sourceHeight,
+      (sourceWidth - width) % 2 == 0,
+      (sourceHeight - height) % 2 == 0
+    else {
+      throw H3NativeError.media(
+        "movie output must be a centered crop of the decoded video"
+      )
+    }
     let pixels = try video.floatValues()
     let fileManager = FileManager.default
     try fileManager.createDirectory(
@@ -382,7 +536,29 @@ enum H3NativeMedia {
     var audioReceiver: AVAssetWriterInput.SampleBufferReceiver?
     var audioSamples: [Float]?
     if let audio {
-      audioSamples = try interleavedAudio(audio)
+      let decodedSamples = try interleavedAudio(audio)
+      let trimSampleValues = max(
+        0,
+        Int((trimStartSeconds * Double(audioSampleRate)).rounded()) * 2
+      )
+      let requestedSampleValues = max(
+        2,
+        Int((durationSeconds * Double(audioSampleRate)).rounded()) * 2
+      )
+      let upper = min(
+        decodedSamples.count,
+        trimSampleValues + requestedSampleValues
+      )
+      var selected = trimSampleValues < upper
+        ? Array(decodedSamples[trimSampleValues..<upper])
+        : []
+      if selected.count < requestedSampleValues {
+        selected += [Float](
+          repeating: 0,
+          count: requestedSampleValues - selected.count
+        )
+      }
+      audioSamples = selected
       let input = AVAssetWriterInput(
         mediaType: .audio,
         outputSettings: [
@@ -419,7 +595,7 @@ enum H3NativeMedia {
           try writeBGRA(
             pixels,
             shape: video.shape,
-            frame: frame,
+            frame: sourceStartFrame + frame,
             to: unsafeBuffer
           )
         }
@@ -604,15 +780,22 @@ enum H3NativeMedia {
       throw H3NativeError.media("writer pixel base address is unavailable")
     }
     let frameCount = shape[2]
-    let height = shape[3]
-    let width = shape[4]
-    let plane = height * width
+    let sourceHeight = shape[3]
+    let sourceWidth = shape[4]
+    let outputHeight = CVPixelBufferGetHeight(pixelBuffer)
+    let outputWidth = CVPixelBufferGetWidth(pixelBuffer)
+    guard outputWidth <= sourceWidth, outputHeight <= sourceHeight else {
+      throw H3NativeError.media("writer crop exceeds decoded video bounds")
+    }
+    let cropX = (sourceWidth - outputWidth) / 2
+    let cropY = (sourceHeight - outputHeight) / 2
+    let plane = sourceHeight * sourceWidth
     let rowBytes = CVPixelBufferGetBytesPerRow(pixelBuffer)
     let bytes = base.assumingMemoryBound(to: UInt8.self)
-    for y in 0..<height {
+    for y in 0..<outputHeight {
       let row = bytes.advanced(by: y * rowBytes)
-      for x in 0..<width {
-        let spatial = y * width + x
+      for x in 0..<outputWidth {
+        let spatial = (y + cropY) * sourceWidth + (x + cropX)
         func channel(_ c: Int) -> UInt8 {
           let value = pixels[(c * frameCount + frame) * plane + spatial]
           return UInt8(clamping: Int((min(1, max(0, value)) * 255).rounded()))

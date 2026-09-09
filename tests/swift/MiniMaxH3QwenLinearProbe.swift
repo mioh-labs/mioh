@@ -23,6 +23,8 @@ struct MiniMaxH3QwenLinearProbe {
     else {
       throw H3NativeError.invalidArguments("invalid pilot metadata")
     }
+    let scalarType = (dictionary["scalarType"] as? String)
+      .flatMap(H3ScalarType.init(rawValue:)) ?? .float16
     let inputData = try Data(
       contentsOf: referenceDirectory.appendingPathComponent("input.f32")
     )
@@ -41,10 +43,10 @@ struct MiniMaxH3QwenLinearProbe {
       inputs: ["hiddenStates": "hidden_states"],
       outputs: ["projected": "projected"],
       inputConstraints: [
-        "hiddenStates": H3TensorConstraint(scalarType: .float16, shape: inputShape)
+        "hiddenStates": H3TensorConstraint(scalarType: scalarType, shape: inputShape)
       ],
       outputConstraints: [
-        "projected": H3TensorConstraint(scalarType: .float16, shape: outputShape)
+        "projected": H3TensorConstraint(scalarType: scalarType, shape: outputShape)
       ]
     )
     let runner = try await H3StageRunner(
@@ -53,10 +55,8 @@ struct MiniMaxH3QwenLinearProbe {
       baseDirectory: URL(fileURLWithPath: "/")
     )
     let result = try await runner.predict([
-      "hiddenStates": try H3Tensor(
-        float16: inputFloats.map(Float16.init),
-        shape: inputShape
-      )
+      "hiddenStates": try H3Tensor(float32: inputFloats, shape: inputShape)
+        .converted(to: scalarType)
     ])
     guard let projected = result["projected"] else {
       throw H3NativeError.missingTensor("qwenNVFP4Pilot.projected")

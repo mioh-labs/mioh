@@ -293,6 +293,105 @@ class ROIHighFrequencyLoss(nn.Module):
 
 
 @MODELS.register_module()
+class ROIHighFrequencyProjectionLoss(nn.Module):
+    """Reward target-aligned HF while quadratically pricing unrelated energy.
+
+    Absolute projection thresholds are not comparable across training crops:
+    their recoverable detail varies substantially.  This scale-aware objective
+    instead rewards the least-squares target projection and prices orthogonal
+    energy on every crop.  The pixel, temporal, HF and observation losses remain
+    the primary anchors; the deliberately small weights only tilt their local
+    optimum toward faithful detail.
+    """
+
+    def __init__(
+        self,
+        loss_weight: float = 1.0,
+        projection_weight: float = 0.0035,
+        orthogonal_energy_weight: float = 0.0015,
+        mask_dilation: int = 0,
+        eps: float = 1e-8,
+    ) -> None:
+        super().__init__()
+        if min(
+            loss_weight,
+            projection_weight,
+            orthogonal_energy_weight,
+            eps,
+        ) < 0:
+            raise ValueError("HF projection loss values cannot be negative")
+        self.loss_weight = float(loss_weight)
+        self.projection_weight = float(projection_weight)
+        self.orthogonal_energy_weight = float(orthogonal_energy_weight)
+        self.mask_dilation = int(mask_dilation)
+        self.eps = float(eps)
+
+        kernel_1d = torch.tensor((1.0, 4.0, 6.0, 4.0, 1.0))
+        kernel_2d = torch.outer(kernel_1d, kernel_1d)
+        kernel_2d = kernel_2d / kernel_2d.sum()
+        self.register_buffer(
+            "gaussian_kernel",
+            kernel_2d.view(1, 1, 5, 5),
+            persistent=False,
+        )
+
+    def _high_frequency(self, image: torch.Tensor) -> torch.Tensor:
+        channels = image.shape[1]
+        padded = F.pad(image, (2, 2, 2, 2), mode="replicate")
+        blurred = F.conv2d(
+            padded,
+            self.gaussian_kernel.expand(channels, 1, -1, -1),
+            groups=channels,
+        )
+        return image - blurred
+
+    @staticmethod
+    def _masked_mean(
+        values: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
+        expanded = mask.expand_as(values)
+        return (values * expanded).sum() / expanded.sum().clamp_min(1.0)
+
+    def forward(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if prediction.shape != target.shape or prediction.ndim != 4:
+            raise ValueError(
+                "HF projection loss expects matching NCHW prediction and target"
+            )
+        if mask.ndim != 4 or mask.shape[0] != prediction.shape[0]:
+            raise ValueError("HF projection loss mask must be N1HW")
+        mask = _dilate(mask, self.mask_dilation).to(dtype=prediction.dtype)
+        prediction_hf = self._high_frequency(prediction)
+        target_hf = self._high_frequency(target)
+        prediction_centered = prediction_hf - self._masked_mean(
+            prediction_hf, mask
+        )
+        target_centered = target_hf - self._masked_mean(target_hf, mask)
+        target_variance = self._masked_mean(
+            target_centered.square(), mask
+        ).clamp_min(self.eps)
+        prediction_variance = self._masked_mean(
+            prediction_centered.square(), mask
+        ).clamp_min(0.0)
+        covariance = self._masked_mean(
+            prediction_centered * target_centered, mask
+        )
+        projection_gain = covariance / target_variance
+        orthogonal_energy_ratio = (
+            prediction_variance - covariance.square() / target_variance
+        ).clamp_min(0.0) / target_variance
+
+        return self.loss_weight * (
+            -self.projection_weight * projection_gain
+            + self.orthogonal_energy_weight * orthogonal_energy_ratio
+        )
+
+
+@MODELS.register_module()
 class ROITemporalDifferenceLoss(nn.Module):
     """Match real inter-frame changes rather than smoothing moving detail."""
 

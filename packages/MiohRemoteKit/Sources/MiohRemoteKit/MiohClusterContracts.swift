@@ -222,6 +222,7 @@ public struct MiohClusterRestorationOptions: Codable, Hashable, Sendable {
   public let crossfade: Bool
   public let detectionEmptyLookahead: Int
   public let detectFaceMosaics: Bool
+  public let detectionMaskReuseSkipFrames: Int?
   public let blendFeather: Float
   public let sharpenStrength: Float
   public let detailBoost: Float
@@ -248,6 +249,7 @@ public struct MiohClusterRestorationOptions: Codable, Hashable, Sendable {
     crossfade: Bool,
     detectionEmptyLookahead: Int,
     detectFaceMosaics: Bool,
+    detectionMaskReuseSkipFrames: Int? = nil,
     blendFeather: Float,
     sharpenStrength: Float,
     detailBoost: Float,
@@ -273,6 +275,7 @@ public struct MiohClusterRestorationOptions: Codable, Hashable, Sendable {
     self.crossfade = crossfade
     self.detectionEmptyLookahead = detectionEmptyLookahead
     self.detectFaceMosaics = detectFaceMosaics
+    self.detectionMaskReuseSkipFrames = detectionMaskReuseSkipFrames
     self.blendFeather = blendFeather
     self.sharpenStrength = sharpenStrength
     self.detailBoost = detailBoost
@@ -297,6 +300,7 @@ public struct MiohClusterRestorationOptions: Codable, Hashable, Sendable {
       && restorationClipLength > 0 && temporalOverlap >= 0
       && temporalOverlap < restorationClipLength
       && detectionEmptyLookahead >= 1
+      && detectionMaskReuseSkipFrames.map { (0...12).contains($0) } != false
       && blendFeather.isFinite && blendFeather >= 0
       && sharpenStrength.isFinite && detailBoost.isFinite
       && textureMix.isFinite && smoothStrength.isFinite
@@ -313,9 +317,10 @@ public struct MiohClusterRestorationOptions: Codable, Hashable, Sendable {
   }
 
   private static func isSHA256(_ value: String) -> Bool {
-    value.utf8.count == 64 && value.utf8.allSatisfy {
-      (48...57).contains($0) || (97...102).contains($0)
-    }
+    value.utf8.count == 64
+      && value.utf8.allSatisfy {
+        (48...57).contains($0) || (97...102).contains($0)
+      }
   }
 }
 
@@ -360,8 +365,9 @@ public struct MiohClusterRelativePath: RawRepresentable, Codable, Hashable, Send
         if values.isSymbolicLink == true { throw MiohClusterPathError.symbolicLink }
       }
       let candidate = cursor.standardizedFileURL
-      guard Array(candidate.pathComponents.prefix(root.pathComponents.count))
-        == root.pathComponents
+      guard
+        Array(candidate.pathComponents.prefix(root.pathComponents.count))
+          == root.pathComponents
       else { throw MiohClusterPathError.outsideSharedRoot }
       cursor = candidate
     }
@@ -453,11 +459,32 @@ public struct MiohClusterJobMetrics: Codable, Hashable, Sendable {
   public let processedFrames: Int
   public let wallSeconds: Double
   public let outputByteCount: Int64
+  /// Frames that actually entered the restoration model. Pass-through frames
+  /// are intentionally excluded.
+  public let restoredFrames: Int?
+  /// Wall time spent inside restoration-model inference only.
+  public let restorationSeconds: Double?
+  /// Wall time spent preparing 256px ROI tensors and blend masks.
+  public let restorationPreparationSeconds: Double?
+  /// Wall time spent compositing restored ROI tensors into output frames.
+  public let restorationCompositingSeconds: Double?
 
-  public init(processedFrames: Int, wallSeconds: Double, outputByteCount: Int64) {
+  public init(
+    processedFrames: Int,
+    wallSeconds: Double,
+    outputByteCount: Int64,
+    restoredFrames: Int? = nil,
+    restorationSeconds: Double? = nil,
+    restorationPreparationSeconds: Double? = nil,
+    restorationCompositingSeconds: Double? = nil
+  ) {
     self.processedFrames = processedFrames
     self.wallSeconds = wallSeconds
     self.outputByteCount = outputByteCount
+    self.restoredFrames = restoredFrames
+    self.restorationSeconds = restorationSeconds
+    self.restorationPreparationSeconds = restorationPreparationSeconds
+    self.restorationCompositingSeconds = restorationCompositingSeconds
   }
 }
 
@@ -643,8 +670,9 @@ public struct MiohClusterRPCResponse: Codable, Hashable, Sendable {
   }
 }
 
-public typealias MiohClusterJobLauncher = @Sendable (
-  _ request: MiohClusterJobRequest,
-  _ inputURL: URL,
-  _ outputURL: URL
-) async throws -> MiohClusterJobMetrics
+public typealias MiohClusterJobLauncher =
+  @Sendable (
+    _ request: MiohClusterJobRequest,
+    _ inputURL: URL,
+    _ outputURL: URL
+  ) async throws -> MiohClusterJobMetrics
