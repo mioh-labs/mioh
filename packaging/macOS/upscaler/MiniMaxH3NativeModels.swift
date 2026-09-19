@@ -15,6 +15,16 @@ private func h3SpecializationOptions(
   _ type: SpecializationOptions.Type
 ) -> SpecializationOptions
 
+// Xcode 27.2 exports this public Core AI initializer in CoreAI.tbd, but the
+// SDK currently omits it from the generated Swift interface. Keep the bridge
+// availability-gated so binaries targeting 27.0 never resolve it on older OSes.
+@available(macOS 27.2, *)
+@_silgen_name("$s15CoreAIDelegates12AIModelCacheC18usingRootDirectoryAC10Foundation3URLV_tcfC")
+private func h3AIModelCache(
+  _ rootDirectory: URL,
+  _ type: AIModelCache.Type
+) -> AIModelCache
+
 protocol H3InferenceStage: AnyObject, Sendable {
   func predict(_ inputs: [String: H3Tensor]) async throws -> [String: H3Tensor]
 }
@@ -266,16 +276,33 @@ private enum H3CoreAIModelLoader {
     // Reuse Core AI's outer CPU/GPU specialization across block unloads, but
     // leave it purgeable under storage pressure. `.persistent` disables all
     // purge conditions and allowed the H3 cache to grow to tens of GiB.
-    // macOS 27.2 fixes a Core AI bug where this policy could be ignored, so keep
-    // the safe default in production and allow explicit A/B validation through
-    // MIOH_H3_COREAI_CACHE_POLICY without changing manifests or model assets.
+    // Keep the safe default in production. MIOH_H3_COREAI_CACHE_POLICY remains
+    // an A/B validation switch; no public release note confirms that 27.2
+    // changed purge-policy behaviour.
     // This does not cache or suppress MPSGraph's separate internal ANE probe.
+    let cache: AIModelCache
+    if #available(macOS 27.2, *),
+      let customRoot = customCacheRoot()
+    {
+      cache = h3AIModelCache(customRoot, AIModelCache.self)
+    } else {
+      cache = .default
+    }
     return try await AIModel.specialize(
       contentsOf: assetURL,
       options: options,
-      cache: .default,
+      cache: cache,
       cachePolicy: cachePolicy
     )
+  }
+
+  private static func customCacheRoot() -> URL? {
+    let rawValue = ProcessInfo.processInfo.environment[
+      "MIOH_H3_COREAI_CACHE_ROOT"
+    ]?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let rawValue, !rawValue.isEmpty else { return nil }
+    return URL(fileURLWithPath: rawValue, isDirectory: true).standardizedFileURL
   }
 
   private static func cachePolicy() throws -> AIModelCache.Policy {
@@ -352,8 +379,8 @@ private enum H3CoreAIModelLoader {
     case nil, "", "0", "false", "no", "default":
       break
     case "1", "true", "yes":
-      // macOS 27.2 exposes this public flag. H3 generation normally runs
-      // fixed-shape graphs, so leave it disabled unless an OS/Core AI
+      // This flag has been public since macOS 27.0. H3 generation normally
+      // runs fixed-shape graphs, so leave it disabled unless an OS/Core AI
       // revalidation explicitly asks to test dynamic-shape specialization.
       result.expectFrequentReshapes = true
     default:
