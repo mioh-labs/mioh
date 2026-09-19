@@ -5,6 +5,49 @@ import AppKit
 import AVKit
 import SwiftUI
 
+private struct UpscalerMovableWindowConfigurator: NSViewRepresentable {
+  func makeNSView(context: Context) -> NSView {
+    let view = AttachmentView()
+    view.isHidden = true
+    return view
+  }
+
+  func updateNSView(_ nsView: NSView, context: Context) {
+    configure(nsView.window)
+  }
+
+  private func configure(_ window: NSWindow?) {
+    window?.isMovable = true
+    window?.isMovableByWindowBackground = true
+  }
+
+  private final class AttachmentView: NSView {
+    override func viewDidMoveToWindow() {
+      super.viewDidMoveToWindow()
+      window?.isMovable = true
+      window?.isMovableByWindowBackground = true
+    }
+  }
+}
+
+private struct UpscalerWindowDragRegion: NSViewRepresentable {
+  func makeNSView(context: Context) -> NSView { DragView() }
+  func updateNSView(_ nsView: NSView, context: Context) {}
+
+  private final class DragView: NSView {
+    override var mouseDownCanMoveWindow: Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+      guard let window else {
+        super.mouseDown(with: event)
+        return
+      }
+      window.isMovable = true
+      window.performDrag(with: event)
+    }
+  }
+}
+
 @main
 struct MiohUpscalerApp: App {
   var body: some Scene {
@@ -47,6 +90,7 @@ private struct UpscalerContentView: View {
         .tag(UpscalerWorkspaceTab.videoGeneration)
     }
     .frame(minWidth: 820, minHeight: 680)
+    .background(UpscalerMovableWindowConfigurator().frame(width: 0, height: 0))
     .onAppear {
       guard !checkedInitialModelSetup else { return }
       checkedInitialModelSetup = true
@@ -118,6 +162,7 @@ private struct UpscalerContentView: View {
     }
     .padding(.horizontal, 20)
     .frame(height: 66)
+    .background(UpscalerWindowDragRegion())
   }
 
   private var videoGenerationFooter: some View {
@@ -159,6 +204,7 @@ private struct UpscalerContentView: View {
     }
     .padding(.horizontal, 20)
     .frame(height: 66)
+    .background(UpscalerWindowDragRegion())
   }
 
   private var videoSection: some View {
