@@ -1854,6 +1854,16 @@ struct MiniMaxH3NativeRunner {
     }
     guard command == "plan" || command == "run" || command == "music-video"
     else { throw usage() }
+    let environment = ProcessInfo.processInfo.environment
+    let cacheRoot = environment["MIOH_H3_COREAI_CACHE_ROOT"]?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    let cachePolicy = environment["MIOH_H3_COREAI_CACHE_POLICY"]?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    print(
+      "Core AI cache: \((cacheRoot?.isEmpty == false ? cacheRoot : nil) ?? "system default")"
+        + " / policy: \((cachePolicy?.isEmpty == false ? cachePolicy : nil) ?? "default")"
+        + " / OS: \(ProcessInfo.processInfo.operatingSystemVersionString)"
+    )
     let job = try loadJob(options)
     if command == "music-video" {
       try await runMusicVideo(manifestURL: manifestURL, baseJob: job)
