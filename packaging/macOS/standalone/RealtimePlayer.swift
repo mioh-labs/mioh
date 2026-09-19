@@ -260,6 +260,39 @@ enum RealtimeStreamingEvent: Sendable {
 
 typealias RealtimeStreamingEventConsumer = @MainActor (RealtimeStreamingEvent) -> Void
 
+/// Worker stderr can arrive in very small chunks while Core AI is running.
+/// Sending every chunk to MainActor makes `MiohRunner` rebuild its published
+/// log repeatedly and can starve AppKit window-drag events. Coalesce only the
+/// diagnostic stream; playback/control events still arrive immediately.
+private final class RealtimeLogBatcher: @unchecked Sendable {
+  private let lock = NSLock()
+  private var pending = ""
+  private var flushScheduled = false
+
+  func append(
+    _ text: String,
+    deliver: @escaping @MainActor @Sendable (String) -> Void
+  ) {
+    guard !text.isEmpty else { return }
+    lock.lock()
+    pending += text
+    let shouldSchedule = !flushScheduled
+    flushScheduled = true
+    lock.unlock()
+    guard shouldSchedule else { return }
+
+    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.1) {
+      self.lock.lock()
+      let batch = self.pending
+      self.pending.removeAll(keepingCapacity: true)
+      self.flushScheduled = false
+      self.lock.unlock()
+      guard !batch.isEmpty else { return }
+      Task { @MainActor in deliver(batch) }
+    }
+  }
+}
+
 private struct PreparedSourcePlayerItem {
   let item: AVPlayerItem
   let duration: Double
@@ -961,6 +994,7 @@ final class RealtimePlayerController: ObservableObject {
   @Published var vrDetectionDetail = ""
 
   let sourcePlayer = AVPlayer()
+  private let realtimeLogBatcher = RealtimeLogBatcher()
   let restoredPlayer = AVQueuePlayer()
   let startupSegmentCount = 3
   let rebufferSegmentCount = 2
@@ -1349,7 +1383,10 @@ final class RealtimePlayerController: ObservableObject {
         errorPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
           let data = handle.availableData
           guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-          Task { @MainActor in self?.runner?.appendExternalLog(text) }
+          guard let self else { return }
+          self.realtimeLogBatcher.append(text) { [weak self] batch in
+            self?.runner?.appendExternalLog(batch)
+          }
         }
         process.terminationHandler = { [weak self, inputPipe, outputPipe, errorPipe] completed in
           Task { @MainActor in
@@ -1684,8 +1721,11 @@ final class RealtimePlayerController: ObservableObject {
             avFoundationCapture: activeAVFoundationCapture,
             allowsVariantFallback: requestedHLSQuality == .automatic,
             playbackPreparer: self.hlsPlaybackPreparer,
-            log: { text in
-              Task { @MainActor in runner.appendExternalLog(text) }
+            log: { [weak self, weak runner] text in
+              guard let self, let runner else { return }
+              self.realtimeLogBatcher.append(text) { [weak runner] batch in
+                runner?.appendExternalLog(batch)
+              }
             }
           )
           createdProducer.updateOutputBufferLimits(
@@ -4358,18 +4398,25 @@ final class RealtimePlayerController: ObservableObject {
   }
 }
 
+private final class StableRealtimeAVPlayerView: AVPlayerView {
+  override var intrinsicContentSize: NSSize {
+    NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric)
+  }
+
+}
+
 private struct RealtimePlayerLayerView: NSViewRepresentable {
   let player: AVPlayer
 
-  func makeNSView(context: Context) -> AVPlayerView {
-    let view = AVPlayerView()
+  func makeNSView(context: Context) -> StableRealtimeAVPlayerView {
+    let view = StableRealtimeAVPlayerView()
     view.controlsStyle = .none
     view.videoGravity = .resizeAspect
     view.player = player
     return view
   }
 
-  func updateNSView(_ view: AVPlayerView, context: Context) {
+  func updateNSView(_ view: StableRealtimeAVPlayerView, context: Context) {
     if view.player !== player {
       view.player = player
     }
@@ -4386,17 +4433,9 @@ private struct RealtimeVideoSurface: View {
       Color.black
       if runner.previewProjectionMode == "通常" {
         if controller.prefersSourceVideoLayer {
-          if showsSystemControls {
-            VideoPlayer(player: controller.sourcePlayer)
-          } else {
-            RealtimePlayerLayerView(player: controller.sourcePlayer)
-          }
+          RealtimePlayerLayerView(player: controller.sourcePlayer)
         } else {
-          if showsSystemControls {
-            VideoPlayer(player: controller.restoredPlayer)
-          } else {
-            RealtimePlayerLayerView(player: controller.restoredPlayer)
-          }
+          RealtimePlayerLayerView(player: controller.restoredPlayer)
         }
       } else {
         VRPreviewSceneView(

@@ -36,6 +36,11 @@ enum H3BackendKind: String, Codable, Sendable {
   case coreML = "coreml"
 }
 
+enum H3AudioConditioningMode: String, Codable, Sendable {
+  case backgroundMusic = "background-music"
+  case lipSync = "lip-sync"
+}
+
 enum H3ScalarType: String, Codable, Sendable {
   case bfloat16
   case float16
@@ -595,11 +600,6 @@ struct H3PipelineManifest: Codable, Sendable {
 struct H3NativeJob: Codable, Sendable {
   let input: String?
   let inputImages: [String]?
-  let inputImageSubjects: [Int]?
-  let referenceEditMode: H3ReferenceEditMode?
-  let referenceEditTargetDescription: String?
-  let referenceEditTargetIndex: Int?
-  let physicalReferenceMask: Bool?
   let output: String
   let prompt: String
   let cacheDirectory: String
@@ -615,6 +615,7 @@ struct H3NativeJob: Codable, Sendable {
   let outputTrimStartSeconds: Double?
   let outputDurationSeconds: Double?
   let preserveSourceAudioWhenDecoderIsUnavailable: Bool?
+  var audioConditioningMode: H3AudioConditioningMode? = nil
   var musicVideoCutPointsSeconds: [Double]? = nil
   var musicVideoContinuationMode: H3MusicVideoContinuationMode? = nil
   var musicVideoLastFrameDirectory: String? = nil
@@ -630,6 +631,9 @@ struct H3NativeJob: Codable, Sendable {
   var resolvedOutputWidth: Int { outputWidth ?? width }
   var resolvedOutputHeight: Int { outputHeight ?? height }
   var resolvedAudioStartSeconds: Double { audioStartSeconds ?? 0 }
+  var resolvedAudioConditioningMode: H3AudioConditioningMode {
+    audioConditioningMode ?? .backgroundMusic
+  }
   var resolvedOutputTrimStartSeconds: Double { outputTrimStartSeconds ?? 0 }
   var resolvedOutputDurationSeconds: Double {
     outputDurationSeconds ?? durationSeconds
@@ -643,32 +647,6 @@ struct H3NativeJob: Codable, Sendable {
     let images = inputImages?.filter {
       !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     } ?? []
-    if let inputImageSubjects {
-      guard inputImageSubjects.count == images.count,
-        inputImageSubjects.allSatisfy({
-          (1...H3Geometry.identityVisionBlocks).contains($0)
-        })
-      else {
-        throw H3NativeError.invalidJob(
-          "inputImageSubjects must match inputImages and use Subject numbers 1...\(H3Geometry.identityVisionBlocks)"
-        )
-      }
-    }
-    if (referenceEditMode ?? .none) != .none {
-      guard conditioningMode == .ref2va else {
-        throw H3NativeError.invalidJob("reference edit modes require Ref2VA")
-      }
-      guard video?.isEmpty == false, !images.isEmpty else {
-        throw H3NativeError.invalidJob(
-          "reference edit modes require one source video and at least one image"
-        )
-      }
-      if let referenceEditTargetIndex, referenceEditTargetIndex < 0 {
-        throw H3NativeError.invalidJob(
-          "referenceEditTargetIndex must be non-negative"
-        )
-      }
-    }
     switch conditioningMode {
     case .ref2va:
       if allowsLatentOnlyContinuation {
@@ -678,24 +656,25 @@ struct H3NativeJob: Codable, Sendable {
           )
         }
       } else {
-        guard video?.isEmpty == false || !images.isEmpty else {
+        guard (video?.isEmpty == false) != !images.isEmpty else {
           throw H3NativeError.invalidJob(
-            "select an input video, one or more input images, or both"
+            "select exactly one input video or one or more input images"
           )
         }
         if let video, !video.isEmpty {
           guard FileManager.default.fileExists(atPath: video) else {
             throw H3NativeError.missingAsset(video)
           }
-        }
-        guard images.count <= H3Geometry.identityVisionBlocks else {
-          throw H3NativeError.invalidJob(
-            "at most \(H3Geometry.identityVisionBlocks) identity images are supported"
-          )
-        }
-        for image in images {
-          guard FileManager.default.fileExists(atPath: image) else {
-            throw H3NativeError.missingAsset(image)
+        } else {
+          guard images.count <= H3Geometry.identityVisionBlocks else {
+            throw H3NativeError.invalidJob(
+              "at most \(H3Geometry.identityVisionBlocks) identity images are supported"
+            )
+          }
+          for image in images {
+            guard FileManager.default.fileExists(atPath: image) else {
+              throw H3NativeError.missingAsset(image)
+            }
           }
         }
       }
@@ -714,13 +693,13 @@ struct H3NativeJob: Codable, Sendable {
     let audio = audioInput?.trimmingCharacters(in: .whitespacesAndNewlines)
     if let audio, !audio.isEmpty {
       let acceptsExternalAudio = conditioningMode == .ref2va
-        ? ((!images.isEmpty || video?.isEmpty == false)
+        ? ((!images.isEmpty && video?.isEmpty != false)
           || allowsLatentOnlyContinuation)
         : ((1...2).contains(images.count) && video?.isEmpty != false)
       guard acceptsExternalAudio
       else {
         throw H3NativeError.invalidJob(
-          "external lip-sync audio requires Ref2VA images, an exact continuation latent, or an FL2VA first frame"
+          "external audio conditioning requires Ref2VA images, an exact continuation latent, or an FL2VA first frame"
         )
       }
       guard FileManager.default.fileExists(atPath: audio) else {
@@ -731,7 +710,7 @@ struct H3NativeJob: Codable, Sendable {
       }
       guard durationSeconds <= H3Geometry.audioConditioningSeconds else {
         throw H3NativeError.invalidJob(
-          "external lip-sync audio supports shots up to 10 seconds"
+          "external audio conditioning supports shots up to 10 seconds"
         )
       }
     }
@@ -1113,8 +1092,10 @@ struct H3FlatTimelinePromptEntry: Sendable, Equatable {
 
 struct H3FlatTimelinePromptPlan: Sendable, Equatable {
   let prefixThroughDetailedDescription: String
+  let promptPrefix: String
   let detailedPreamble: String
   let suffix: String
+  let continuationBlendFrames: Int?
   let entries: [H3FlatTimelinePromptEntry]
 
   func compiledPrompt(
@@ -1130,6 +1111,7 @@ struct H3FlatTimelinePromptPlan: Sendable, Equatable {
     return [
       prefixThroughDetailedDescription,
       directive,
+      promptPrefix,
       detailedPreamble,
       entryBodyOverride ?? entries[entryIndex].body,
       suffix,
@@ -1137,6 +1119,48 @@ struct H3FlatTimelinePromptPlan: Sendable, Equatable {
     .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
     .filter { !$0.isEmpty }
     .joined(separator: "\n\n")
+  }
+}
+
+private struct H3ChainPromptShot: Decodable {
+  let id: String?
+  let prompt: String
+  let length: Int?
+  let frames: Int?
+  let start: Double?
+  let end: Double?
+  let transition: String?
+  let anchorMode: String?
+  let contextLength: Int?
+
+  private enum CodingKeys: String, CodingKey {
+    case id
+    case prompt
+    case length
+    case frames
+    case start
+    case end
+    case transition
+    case anchorMode = "anchor_mode"
+    case contextLength = "context_length"
+  }
+}
+
+private struct H3ChainPromptDocument: Decodable {
+  let promptPrefix: String?
+  let globalContinuity: String?
+  let shots: [H3ChainPromptShot]
+  let fps: Double?
+  let seamTaperFrames: Int?
+  let overlapBlendFrames: Int?
+
+  private enum CodingKeys: String, CodingKey {
+    case promptPrefix = "prompt_prefix"
+    case globalContinuity = "global_continuity"
+    case shots
+    case fps
+    case seamTaperFrames = "seam_taper_frames"
+    case overlapBlendFrames = "overlap_blend_frames"
   }
 }
 
@@ -1165,6 +1189,7 @@ enum H3FlatTimelinePrompt {
   }
 
   static func parse(_ prompt: String) throws -> H3FlatTimelinePromptPlan? {
+    if let chain = try parseChainJSON(prompt) { return chain }
     let fullRange = NSRange(prompt.startIndex..<prompt.endIndex, in: prompt)
     let detailsExpression = try NSRegularExpression(
       pattern: #"^[\t ]*detailed_description:[^\r\n]*(?:\r?\n|$)"#,
@@ -1192,7 +1217,7 @@ enum H3FlatTimelinePrompt {
     )
     let body = substring(prompt, range: bodyRange)
     let markerExpression = try NSRegularExpression(
-      pattern: #"^[\t ]*\[([0-9]+(?:\.[0-9]+)?)\s*-\s*([0-9]+(?:\.[0-9]+)?)s?\s+(cut|continue)\][\t ]*$"#,
+      pattern: #"^[\t ]*\[([0-9]+(?:\.[0-9]+)?)\s*-\s*([0-9]+(?:\.[0-9]+)?)s?\s+(cut|continue)\][\t ]*(.*)$"#,
       options: [.anchorsMatchLines, .caseInsensitive]
     )
     let bodyFullRange = NSRange(body.startIndex..<body.endIndex, in: body)
@@ -1203,10 +1228,11 @@ enum H3FlatTimelinePrompt {
       prompt,
       range: NSRange(location: 0, length: NSMaxRange(details.range))
     )
-    let preamble = substring(
+    let rawPreamble = substring(
       body,
       range: NSRange(location: 0, length: matches[0].range.location)
     ).trimmingCharacters(in: .whitespacesAndNewlines)
+    let splitPreamble = splitPromptPrefix(rawPreamble)
     let suffix = suffixStart < fullRange.length
       ? substring(
         prompt,
@@ -1231,17 +1257,24 @@ enum H3FlatTimelinePrompt {
       else {
         throw H3NativeError.invalidJob("invalid flat timeline marker")
       }
+      let inlineContent = match.range(at: 4).location == NSNotFound
+        ? ""
+        : substring(body, range: match.range(at: 4))
+          .trimmingCharacters(in: .whitespacesAndNewlines)
       let contentStart = NSMaxRange(match.range)
       let contentEnd = index + 1 < matches.count
         ? matches[index + 1].range.location
         : bodyFullRange.length
-      let content = substring(
+      let followingContent = substring(
         body,
         range: NSRange(
           location: contentStart,
           length: max(0, contentEnd - contentStart)
         )
       ).trimmingCharacters(in: .whitespacesAndNewlines)
+      let content = [inlineContent, followingContent]
+        .filter { !$0.isEmpty }
+        .joined(separator: "\n")
       guard start >= 0, end > start, !content.isEmpty else {
         throw H3NativeError.invalidJob(
           "flat timeline entries need increasing times and non-empty text"
@@ -1272,10 +1305,144 @@ enum H3FlatTimelinePrompt {
     }
     return H3FlatTimelinePromptPlan(
       prefixThroughDetailedDescription: prefix,
-      detailedPreamble: preamble,
+      promptPrefix: splitPreamble.promptPrefix,
+      detailedPreamble: splitPreamble.remainingPreamble,
       suffix: suffix,
+      continuationBlendFrames: nil,
       entries: entries
     )
+  }
+
+  private static func parseChainJSON(_ prompt: String) throws
+    -> H3FlatTimelinePromptPlan?
+  {
+    let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard trimmed.first == "{" else { return nil }
+    let data = Data(trimmed.utf8)
+    let decoder = JSONDecoder()
+    let document: H3ChainPromptDocument
+    do {
+      document = try decoder.decode(H3ChainPromptDocument.self, from: data)
+    } catch {
+      return nil
+    }
+    guard !document.shots.isEmpty else {
+      throw H3NativeError.invalidJob("H3 chain JSON needs at least one shot")
+    }
+    let frameRate = document.fps ?? Double(H3Geometry.framesPerSecond)
+    guard frameRate > 0 else {
+      throw H3NativeError.invalidJob("H3 chain JSON fps must be positive")
+    }
+    let promptPrefix = (document.promptPrefix ?? document.globalContinuity ?? "")
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    let requestedBlendFrames = document.seamTaperFrames
+      ?? document.overlapBlendFrames
+    if let requestedBlendFrames,
+      requestedBlendFrames < 0
+        || requestedBlendFrames > H3VideoConditioning.partContinuationPixelFrames
+    {
+      throw H3NativeError.invalidJob(
+        "H3 chain JSON seam taper frames must be 0...\(H3VideoConditioning.partContinuationPixelFrames)"
+      )
+    }
+    var entries: [H3FlatTimelinePromptEntry] = []
+    entries.reserveCapacity(document.shots.count)
+    var cursor = 0.0
+    for (index, shot) in document.shots.enumerated() {
+      let transition = H3MusicVideoTransition(
+        rawValue: (shot.transition ?? (index == 0 ? "cut" : "continue"))
+          .lowercased()
+      ) ?? (index == 0 ? .cut : .continue)
+      if let anchorMode = shot.anchorMode,
+        anchorMode.lowercased() != "head"
+      {
+        throw H3NativeError.invalidJob(
+          "H3 chain JSON only supports head-anchored continuation in mioh"
+        )
+      }
+      if let contextLength = shot.contextLength,
+        contextLength != H3VideoConditioning.partContinuationPixelFrames
+      {
+        throw H3NativeError.invalidJob(
+          "H3 chain JSON context_length must be \(H3VideoConditioning.partContinuationPixelFrames) for mioh latent continuation"
+        )
+      }
+      let start = shot.start ?? cursor
+      let end: Double
+      if let explicitEnd = shot.end {
+        end = explicitEnd
+      } else if let frames = shot.frames ?? shot.length {
+        end = start + Double(frames) / frameRate
+      } else {
+        throw H3NativeError.invalidJob(
+          "H3 chain JSON shot \(index + 1) needs length, frames, or end"
+        )
+      }
+      let body = shot.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard start >= 0, end > start, !body.isEmpty else {
+        throw H3NativeError.invalidJob(
+          "H3 chain JSON shots need increasing times and non-empty prompts"
+        )
+      }
+      if let previous = entries.last,
+        abs(previous.endSeconds - start) > 1.0 / frameRate + 1e-6
+      {
+        throw H3NativeError.invalidJob(
+          "H3 chain JSON must be contiguous at shot \(index + 1)"
+        )
+      }
+      entries.append(
+        H3FlatTimelinePromptEntry(
+          startSeconds: start,
+          endSeconds: end,
+          transition: transition,
+          body: body
+        )
+      )
+      cursor = end
+    }
+    guard entries.first?.transition == .cut else {
+      throw H3NativeError.invalidJob(
+        "the first H3 chain JSON shot must use cut"
+      )
+    }
+    return H3FlatTimelinePromptPlan(
+      prefixThroughDetailedDescription: "detailed_description:",
+      promptPrefix: promptPrefix,
+      detailedPreamble: "",
+      suffix: "",
+      continuationBlendFrames: requestedBlendFrames,
+      entries: entries
+    )
+  }
+
+  private static func splitPromptPrefix(_ preamble: String)
+    -> (promptPrefix: String, remainingPreamble: String)
+  {
+    let trimmed = preamble.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return ("", "") }
+    guard let expression = try? NSRegularExpression(
+      pattern: #"(?im)^[\t ]*(?:GLOBAL CONTINUITY|PROMPT_PREFIX|prompt_prefix)\s*:"#,
+      options: []
+    ) else {
+      return (trimmed, "")
+    }
+    let range = NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)
+    guard let match = expression.firstMatch(in: trimmed, range: range) else {
+      return (trimmed, "")
+    }
+    let before = substring(
+      trimmed,
+      range: NSRange(location: 0, length: match.range.location)
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    let prefix = substring(
+      trimmed,
+      range: NSRange(
+        location: match.range.location,
+        length: range.length - match.range.location
+      )
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    return (prefix, before)
   }
 
   private static func substring(_ text: String, range: NSRange) -> String {

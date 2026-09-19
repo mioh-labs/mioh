@@ -18,6 +18,9 @@ from typing import Any
 
 DEFAULT_API_URL = "http://127.0.0.1:18080/v1"
 DEFAULT_SKILL_DIR = Path.home() / ".codex" / "skills" / "h3-prompt-writing"
+DEFAULT_MIOH_MV_GUIDE = (
+    Path(__file__).resolve().parents[2] / "docs" / "mioh_h3_music_video_prompting.md"
+)
 BASE_MODES = {"t2va", "i2va", "fl2va", "l2va"}
 ALL_MODES = ("auto", "t2va", "i2va", "fl2va", "l2va", "ref2va")
 
@@ -44,6 +47,13 @@ def load_h3_system_prompt(skill_dir: Path, mode: str) -> str:
         guides.append(("base-en.txt", _read_required(skill_dir / "references" / "base-en.txt")))
     if normalized_mode == "ref2va" or normalized_mode == "auto":
         guides.append(("ref-en.txt", _read_required(skill_dir / "references" / "ref-en.txt")))
+    if DEFAULT_MIOH_MV_GUIDE.is_file():
+        guides.append(
+            (
+                "mioh_h3_music_video_prompting.md",
+                _read_required(DEFAULT_MIOH_MV_GUIDE),
+            )
+        )
 
     guide_text = "\n\n".join(
         f"<reference name=\"{name}\">\n{contents}\n</reference>"
@@ -53,6 +63,31 @@ def load_h3_system_prompt(skill_dir: Path, mode: str) -> str:
 Follow it exactly. The user supplies an H3 mode, duration, request, and optional
 ordered reference images. Select the matching guide, preserve its exact field
 names and section order, and ensure all shot timing fits the requested duration.
+When the user asks for a mioh upscaler music-video or flat-timeline prompt,
+also follow the mioh-specific music-video guide, especially its continuation
+rules: continuation text describes intent and next development, not a restart of
+the opening pose or action. For long prompts, use a two-layer structure: put
+stable identity/style/music/continuity rules in a global continuity block, then
+write each flat-timeline entry with only the local action, camera, prop state,
+emotion, and next development for that exact time range.
+For every long music-video flat-timeline entry, write local production-note
+axes in this order: LOCATION, FRAMING, ACTION, CAMERA, optional
+LIGHTING / COLOR, and optional CONTINUATION NOTE. Make each interval visibly
+different by changing concrete location, shot size, subject blocking, camera
+path, foreground/background geometry, lighting source, or action endpoint. Do
+not let a repeated global mood phrase, city name, or character summary stand in
+for interval-specific composition.
+When reference images define a specific <Subject N>, keep that identity scoped
+only to that subject and only as face identity. Do not treat <Picture N> as a
+storyboard, first frame, pose, outfit, body, background, lighting, camera-angle,
+crop, mood, or composition reference unless the user explicitly says so. Do not
+reproduce the reference photo itself; regenerate clothes, body blocking, pose,
+environment, framing, lighting, and camera from the prompt text. Do not invent
+additional subject labels for unreferenced people, and do not write close-up
+face shots of unreferenced performers unless the user explicitly asks. Prefer
+silhouettes, back views, side profiles, motion-blurred crowds, distant bodies,
+hands, feet, or clearly unrelated faces for all people who are not backed by
+supplied references.
 Return only the finished H3 prompt as plain text. Do not add Markdown fences,
 analysis, prefaces, explanations, or follow-up questions.
 

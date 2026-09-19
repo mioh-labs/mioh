@@ -66,10 +66,12 @@ enum H3MusicVideoBoundary {
 
   static func blendFrames(
     transition: H3MusicVideoTransition,
-    preRollFrames: Int
+    preRollFrames: Int,
+    overrideFrames: Int? = nil
   ) -> Int {
     guard transition == .continue else { return 0 }
-    return min(continuationBlendFrames, max(0, preRollFrames))
+    let requested = overrideFrames ?? continuationBlendFrames
+    return min(max(0, requested), max(0, preRollFrames))
   }
 }
 

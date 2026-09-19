@@ -55,17 +55,9 @@ def load_mapping(
     with safe_open(str(checkpoint), framework="pt", device="cpu") as handle:
         keys = set(handle.keys())
         quant_key = f"{prefix}.comfy_quant"
-        if quant_key in keys:
-            config = json.loads(bytes(handle.get_tensor(quant_key).tolist()))
-        else:
-            metadata = handle.metadata() or {}
-            quant_metadata = metadata.get("_quantization_metadata")
-            if quant_metadata is None:
-                raise KeyError(f"{prefix} is not an INT8 ConvRot layer")
-            layers = json.loads(quant_metadata).get("layers", {})
-            config = layers.get(prefix)
-        if config is None:
+        if quant_key not in keys:
             raise KeyError(f"{prefix} is not an INT8 ConvRot layer")
+        config = json.loads(bytes(handle.get_tensor(quant_key).tolist()))
         if config.get("format") != "int8_tensorwise" or not config.get("convrot"):
             raise ValueError(f"unexpected quantization config: {config}")
         weight = handle.get_tensor(f"{prefix}.weight")

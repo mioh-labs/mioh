@@ -262,51 +262,106 @@ private enum H3CoreAIModelLoader {
     preferredCompute: String?
   ) async throws -> AIModel {
     let options = try specializationOptions(preferredCompute)
+    let cachePolicy = try cachePolicy()
     // Reuse Core AI's outer CPU/GPU specialization across block unloads, but
     // leave it purgeable under storage pressure. `.persistent` disables all
     // purge conditions and allowed the H3 cache to grow to tens of GiB.
+    // macOS 27.2 fixes a Core AI bug where this policy could be ignored, so keep
+    // the safe default in production and allow explicit A/B validation through
+    // MIOH_H3_COREAI_CACHE_POLICY without changing manifests or model assets.
     // This does not cache or suppress MPSGraph's separate internal ANE probe.
     return try await AIModel.specialize(
       contentsOf: assetURL,
       options: options,
       cache: .default,
-      cachePolicy: .default
+      cachePolicy: cachePolicy
     )
+  }
+
+  private static func cachePolicy() throws -> AIModelCache.Policy {
+    let rawValue = ProcessInfo.processInfo.environment[
+      "MIOH_H3_COREAI_CACHE_POLICY"
+    ]?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased()
+    switch rawValue {
+    case nil, "", "default", "safe":
+      return .default
+    case "persistent":
+      return AIModelCache.Policy.persistent
+    case "storage-pressure", "storage_pressure", "storagepressure":
+      return AIModelCache.Policy(purgeConditions: [.storagePressure])
+    case "source-change", "source_changed", "source-asset":
+      return AIModelCache.Policy(purgeConditions: [.sourceAssetChangedOrDeleted])
+    case "none", "no-purge", "nopurge":
+      return AIModelCache.Policy(purgeConditions: [])
+    default:
+      throw H3NativeError.invalidArguments(
+        "MIOH_H3_COREAI_CACHE_POLICY must be default, persistent, storage-pressure, source-change, or none"
+      )
+    }
   }
 
   private static func specializationOptions(
     _ preferredCompute: String?
   ) throws -> SpecializationOptions {
+    let options: SpecializationOptions
     switch preferredCompute?.lowercased() {
     case nil, "", "default", "all":
-      return .default
+      options = .default
     case "gpu":
       let allowed = ComputeUnitKind.availableKinds.intersection([.cpu, .gpu])
       guard allowed.contains(.gpu) else {
         throw H3NativeError.inference("Core AI GPU is unavailable")
       }
-      let options = h3SpecializationOptions(
+      let gpuOptions = h3SpecializationOptions(
         allowed,
         .gpu,
         SpecializationOptions.self
       )
-      guard options.allowedComputeUnitKinds == allowed,
-        options.preferredComputeUnitKind == .gpu
+      guard gpuOptions.allowedComputeUnitKinds == allowed,
+        gpuOptions.preferredComputeUnitKind == .gpu
       else {
         throw H3NativeError.inference(
           "Core AI failed to restrict MiniMax H3 to CPU and GPU"
         )
       }
-      return options
+      options = gpuOptions
     case "ane", "neuralengine", "neural_engine":
-      return SpecializationOptions(preferredComputeUnitKind: .neuralEngine)
+      options = SpecializationOptions(preferredComputeUnitKind: .neuralEngine)
     case "cpu":
-      return .cpuOnly
+      options = .cpuOnly
     default:
       throw H3NativeError.invalidManifest(
         "unsupported Core AI preferred compute \(preferredCompute ?? "")"
       )
     }
+    return try applyingRuntimeSpecializationOverrides(to: options)
+  }
+
+  private static func applyingRuntimeSpecializationOverrides(
+    to options: SpecializationOptions
+  ) throws -> SpecializationOptions {
+    var result = options
+    let reshapePreference = ProcessInfo.processInfo.environment[
+      "MIOH_H3_COREAI_EXPECT_FREQUENT_RESHAPES"
+    ]?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased()
+    switch reshapePreference {
+    case nil, "", "0", "false", "no", "default":
+      break
+    case "1", "true", "yes":
+      // macOS 27.2 exposes this public flag. H3 generation normally runs
+      // fixed-shape graphs, so leave it disabled unless an OS/Core AI
+      // revalidation explicitly asks to test dynamic-shape specialization.
+      result.expectFrequentReshapes = true
+    default:
+      throw H3NativeError.invalidArguments(
+        "MIOH_H3_COREAI_EXPECT_FREQUENT_RESHAPES must be 0 or 1"
+      )
+    }
+    return result
   }
 }
 

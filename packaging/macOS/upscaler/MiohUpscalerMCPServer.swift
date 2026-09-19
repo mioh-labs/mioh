@@ -64,7 +64,6 @@ private final class MCPJobManager: @unchecked Sendable {
     executable: URL,
     arguments: [String],
     output: String,
-    environment: [String: String]? = nil,
     cleanupDirectories: [URL] = []
   ) throws -> MCPJobSnapshot {
     let id = UUID().uuidString.lowercased()
@@ -79,7 +78,6 @@ private final class MCPJobManager: @unchecked Sendable {
     let stderr = Pipe()
     process.executableURL = executable
     process.arguments = arguments
-    process.environment = environment
     process.standardInput = FileHandle.nullDevice
     process.standardOutput = stdout
     process.standardError = stderr
@@ -366,7 +364,7 @@ private final class MiohMCPServer {
         "hybrid-av", "latent-prefix", "first", "first-last-provided",
         "first-last-generated",
       ],
-      "reference_edit_modes": ["none", "face_swap", "body_swap"],
+      "audio_modes": ["background_music", "lip_sync"],
       "tools": toolDefinitions().compactMap { $0["name"] },
     ]
   }
@@ -385,38 +383,24 @@ private final class MiohMCPServer {
     if let audioPath, !FileManager.default.fileExists(atPath: audioPath) {
       throw MCPServerError.missingFile("audio input not found: \(audioPath)")
     }
+    let audioMode = values["audio_mode"] as? String ?? "background_music"
+    guard audioMode == "background_music" || audioMode == "lip_sync" else {
+      throw MCPServerError.invalidArguments(
+        "audio_mode must be background_music or lip_sync"
+      )
+    }
+    let lyricsText = try resolvedLyricsText(values: values)
     let referenceScope = values["reference_scope"] as? String ?? "whole_image"
     guard referenceScope == "whole_image" || referenceScope == "face_only" else {
       throw MCPServerError.invalidArguments(
         "reference_scope must be whole_image or face_only"
       )
     }
-    let videoInputPaths = inputPaths.filter { !isImage($0) }
-    let imageInputPaths = inputPaths.filter(isImage)
-    guard videoInputPaths.count <= 1,
-      videoInputPaths.count + imageInputPaths.count == inputPaths.count,
-      imageInputPaths.count <= 8
-    else {
-      throw MCPServerError.invalidArguments(
-        "input_files may contain one video plus up to eight images"
-      )
-    }
-    let runtimeVideoPath = videoInputPaths.first
-    var runtimeImagePaths = imageInputPaths
-    var runtimeImageSubjects = (values["input_image_subjects"] as? [Int]) ?? []
-    if !runtimeImageSubjects.isEmpty {
-      guard runtimeImageSubjects.count == imageInputPaths.count,
-        runtimeImageSubjects.allSatisfy({ (1...8).contains($0) })
-      else {
-        throw MCPServerError.invalidArguments(
-          "input_image_subjects must match image input_files and use Subject numbers 1...8"
-        )
-      }
-    }
+    var runtimeInputPaths = inputPaths
     var runtimePrompt = prompt
     var cleanupDirectories: [URL] = []
-    if referenceScope == "face_only", !imageInputPaths.isEmpty {
-      guard imageInputPaths.count <= 8 else {
+    if referenceScope == "face_only", !inputPaths.isEmpty {
+      guard inputPaths.allSatisfy(isImage) else {
         throw MCPServerError.invalidArguments(
           "face_only requires one to eight reference images"
         )
@@ -429,7 +413,7 @@ private final class MiohMCPServer {
       do {
         let references = try MiniMaxH3FaceReferenceProcessor
           .prepareAutomationReferences(
-            in: imageInputPaths.map { URL(fileURLWithPath: $0) },
+            in: inputPaths.map { URL(fileURLWithPath: $0) },
             destinationDirectory: directory
           )
         guard !references.isEmpty else {
@@ -437,8 +421,7 @@ private final class MiohMCPServer {
             "face_only could not detect a face in the selected images"
           )
         }
-        runtimeImagePaths = references.map(\.cropURL.path)
-        runtimeImageSubjects = references.map(\.subjectIndex)
+        runtimeInputPaths = references.map(\.cropURL.path)
         runtimePrompt = MiniMaxH3FaceReferenceProcessor.faceOnlyPrompt(
           prompt,
           references: references
@@ -449,33 +432,12 @@ private final class MiohMCPServer {
         throw error
       }
     }
-    let swapModeValue = values["swap_mode"] as? String ?? "none"
-    let referenceEditMode: H3ReferenceEditMode
-    switch swapModeValue {
-    case "none":
-      referenceEditMode = .none
-    case "face_swap", "face-swap":
-      referenceEditMode = .faceSwap
-    case "body_swap", "body-swap":
-      referenceEditMode = .bodySwap
-    default:
-      throw MCPServerError.invalidArguments(
-        "swap_mode must be none, face_swap, or body_swap"
+    if !lyricsText.isEmpty {
+      runtimePrompt = promptWithLyrics(
+        runtimePrompt,
+        lyrics: lyricsText,
+        audioMode: audioMode
       )
-    }
-    if referenceEditMode != .none {
-      guard runtimeVideoPath != nil, !runtimeImagePaths.isEmpty else {
-        throw MCPServerError.invalidArguments(
-          "swap_mode requires one source video and at least one reference image"
-        )
-      }
-      runtimePrompt =
-        referenceEditMode.promptPrefix(
-          hasVideo: true,
-          hasImages: true,
-          hasAudio: audioPath != nil,
-          targetDescription: values["swap_target"] as? String ?? ""
-        ) + "\n\nuser_prompt:\n" + runtimePrompt
     }
     let musicVideo = values["music_video"] as? Bool ?? false
     let continuationMode = values["continuation_mode"] as? String ?? "hybrid-av"
@@ -518,7 +480,7 @@ private final class MiohMCPServer {
     }
     let manifest = try resolvedManifest(
       explicit: values["manifest"] as? String,
-      promptOnly: runtimeVideoPath == nil && runtimeImagePaths.isEmpty
+      promptOnly: runtimeInputPaths.isEmpty
     )
     let runner = resourcesURL.appendingPathComponent(
       "bin/mioh-minimax-h3-native"
@@ -554,8 +516,8 @@ private final class MiohMCPServer {
       musicVideo ? "music-video" : "run",
       "--manifest", manifest,
       "--output", output,
-      // Preserve the caller's wording, adding only the explicit reference-edit
-      // contract requested through swap_mode.
+      // Intentionally pass the exact MCP argument. Codex-authored H3 prompt
+      // structure must not be summarized, wrapped, or rewritten here.
       "--prompt", runtimePrompt,
       "--cache", caches.path,
       "--backend", "coreai",
@@ -587,39 +549,23 @@ private final class MiohMCPServer {
       arguments += [
         "--audio-input", URL(fileURLWithPath: audioPath).standardizedFileURL.path,
         "--audio-start", posix(audioStart),
+        "--audio-conditioning-mode",
+        audioMode == "lip_sync" ? "lip-sync" : "background-music",
       ]
     }
-    if let runtimeVideoPath {
-      arguments += ["--input", runtimeVideoPath]
-    }
-    if referenceEditMode != .none {
-      arguments += [
-        "--reference-edit-mode", referenceEditMode.rawValue,
-        "--physical-reference-mask", "1",
-      ]
-      let target = (values["swap_target"] as? String ?? "")
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-      if !target.isEmpty {
-        arguments += ["--reference-edit-target", target]
-      }
-      if let targetIndex = values["swap_target_index"] as? Int {
-        guard targetIndex >= 0 else {
+    if !runtimeInputPaths.isEmpty {
+      if runtimeInputPaths.count == 1, !isImage(runtimeInputPaths[0]) {
+        arguments += ["--input", runtimeInputPaths[0]]
+      } else {
+        guard runtimeInputPaths.count <= 8,
+          runtimeInputPaths.allSatisfy(isImage)
+        else {
           throw MCPServerError.invalidArguments(
-            "swap_target_index must be non-negative"
+            "input_files must be one video or up to eight images"
           )
         }
-        arguments += ["--reference-edit-target-index", String(targetIndex)]
-      }
-    }
-    if !runtimeImagePaths.isEmpty {
-      let data = try JSONEncoder().encode(runtimeImagePaths)
-      arguments += ["--input-images-json", String(decoding: data, as: UTF8.self)]
-      if !runtimeImageSubjects.isEmpty {
-        let subjectsData = try JSONEncoder().encode(runtimeImageSubjects)
-        arguments += [
-          "--input-image-subjects-json",
-          String(decoding: subjectsData, as: UTF8.self),
-        ]
+        let data = try JSONEncoder().encode(runtimeInputPaths)
+        arguments += ["--input-images-json", String(decoding: data, as: UTF8.self)]
       }
     }
     let snapshot = try manager.launch(
@@ -773,6 +719,42 @@ private final class MiohMCPServer {
     return nil
   }
 
+  private func resolvedLyricsText(values: [String: Any]) throws -> String {
+    var parts: [String] = []
+    if let text = values["lyrics_text"] as? String {
+      let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !trimmed.isEmpty { parts.append(trimmed) }
+    }
+    if let path = values["lyrics_file"] as? String,
+      !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    {
+      let url = URL(fileURLWithPath: path).standardizedFileURL
+      guard FileManager.default.fileExists(atPath: url.path) else {
+        throw MCPServerError.missingFile("lyrics file not found: \(url.path)")
+      }
+      let text = try String(contentsOf: url, encoding: .utf8)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      if !text.isEmpty { parts.append(text) }
+    }
+    return parts.joined(separator: "\n\n")
+  }
+
+  private func promptWithLyrics(
+    _ prompt: String,
+    lyrics: String,
+    audioMode: String
+  ) -> String {
+    let directive = audioMode == "lip_sync"
+      ? "Use timed lyric lines as lip-sync and expression timing guidance when an interval explicitly calls for singing or visible vocal performance. Keep the exact language of lyric snippets."
+      : "Treat these lyrics as song meaning, emotional timing, imagery, and section guidance only. Do not generate lip-sync, singing mouth shapes, visible speech, karaoke subtitles, lyric cards, or on-screen text unless the interval body explicitly asks for visible text."
+    return prompt + """
+
+      LYRICS / SONG MEANING:
+      \(directive)
+      \(lyrics)
+      """
+  }
+
   private func isImage(_ path: String) -> Bool {
     ["png", "jpg", "jpeg", "heic", "heif", "tif", "tiff", "webp"]
       .contains(URL(fileURLWithPath: path).pathExtension.lowercased())
@@ -827,33 +809,29 @@ private final class MiohMCPServer {
       tool("mioh_capabilities", "利用可能なmioh機能とモデル状態を返します。", [:]),
       tool(
         "mioh_start_video_generation",
-        "MiniMax H3動画生成を開始します。swap_mode指定時だけRef2VA用プロンプトを自動補強します。",
+        "MiniMax H3動画生成を開始します。promptは一文字も変更せずランナーへ渡します。",
         [
           "prompt": property("string", "H3へそのまま渡す完全なプロンプト"),
           "output": property("string", "新規MP4の絶対パス"),
-          "input_files": arrayProperty("string", "参照動画1本と参照画像最大8枚を同時指定できます"),
-          "input_image_subjects": arrayProperty(
-            "integer",
-            "画像input_filesに対応するSubject番号。例: [1,1,2]"
-          ),
+          "input_files": arrayProperty("string", "参照動画1本または参照画像最大8枚"),
           "reference_scope": enumProperty(
             ["whole_image", "face_only"],
             "画像全体、またはUIと同じVision顔クロップを使用"
           ),
-          "swap_mode": enumProperty(
-            ["none", "face_swap", "body_swap"],
-            "動画+画像入力時にFace SwapまたはBody Swap用Ref2VA指示を自動追加"
-          ),
-          "swap_target": property(
-            "string",
-            "複数人動画で置換対象を指定するマスク説明。例: 左の男性、赤い服の人物"
-          ),
-          "swap_target_index": property(
-            "integer",
-            "検出人物候補の0始まり番号。指定時はswap_targetの左右指定より優先"
-          ),
           "audio_input": property("string", "音源の絶対パス"),
           "audio_start_seconds": property("number", "音源の開始位置"),
+          "audio_mode": enumProperty(
+            ["background_music", "lip_sync"],
+            "音源をBGM参照として使い口パクしないか、リップシンク条件として使うか"
+          ),
+          "lyrics_text": property(
+            "string",
+            "歌詞または曲の意味。BGMでは感情・構成参照、lip_syncでは歌唱タイミング参照"
+          ),
+          "lyrics_file": property(
+            "string",
+            "UTF-8歌詞テキストまたはLRCファイルの絶対パス"
+          ),
           "music_video": property("boolean", "音源全体を解析する長尺MVモード"),
           "continuation_mode": enumProperty(
             [

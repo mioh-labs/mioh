@@ -12,6 +12,29 @@ fileprivate enum MiniMaxH3MusicVideoContinuationMode: String, CaseIterable {
   case firstAndGeneratedLast = "first-last-generated"
 }
 
+fileprivate enum MiniMaxH3AudioConditioningMode: String, CaseIterable {
+  case backgroundMusic = "background-music"
+  case lipSync = "lip-sync"
+
+  var label: String {
+    switch self {
+    case .backgroundMusic:
+      return "BGM参照（口パクしない）"
+    case .lipSync:
+      return "リップシンク"
+    }
+  }
+
+  var helpText: String {
+    switch self {
+    case .backgroundMusic:
+      return "音源はテンポ・曲構成・雰囲気の参照と完成動画のBGMに使います。人物の口は歌詞や声に同期させません。"
+    case .lipSync:
+      return "音源を声・歌唱のタイミング条件として使い、人物の口や表情を音声に合わせます。"
+    }
+  }
+}
+
 private struct MiniMaxH3UIProgressEvent: Decodable {
   let stage: String
   let state: String
@@ -81,6 +104,90 @@ fileprivate struct MiniMaxH3MusicCutPoint: Identifiable, Equatable {
   }
 }
 
+enum MiniMaxH3AIPromptProvider: String, CaseIterable, Identifiable {
+  case openAICompatible = "openai-compatible"
+  case ollama = "ollama"
+  case lmStudio = "lm-studio"
+  case custom = "custom"
+
+  var id: String { rawValue }
+
+  var label: String {
+    switch self {
+    case .openAICompatible:
+      return "OpenAI互換 / Gemma"
+    case .ollama:
+      return "Ollama"
+    case .lmStudio:
+      return "LM Studio"
+    case .custom:
+      return "カスタム"
+    }
+  }
+
+  var defaultBaseURL: String {
+    switch self {
+    case .openAICompatible:
+      return "http://127.0.0.1:18080/v1"
+    case .ollama:
+      return "http://127.0.0.1:11434/v1"
+    case .lmStudio:
+      return "http://127.0.0.1:1234/v1"
+    case .custom:
+      return "http://127.0.0.1:18080/v1"
+    }
+  }
+}
+
+private struct MiniMaxH3AIChatRequest: Encodable {
+  struct Message: Encodable {
+    let role: String
+    let content: String
+  }
+
+  let model: String
+  let temperature: Double
+  let maxTokens: Int
+  let messages: [Message]
+
+  private enum CodingKeys: String, CodingKey {
+    case model
+    case temperature
+    case maxTokens = "max_tokens"
+    case messages
+  }
+}
+
+private struct MiniMaxH3AIModelsResponse: Decodable {
+  struct Model: Decodable {
+    let id: String?
+    let model: String?
+    let name: String?
+  }
+
+  let data: [Model]?
+  let models: [Model]?
+}
+
+private struct MiniMaxH3AIChatResponse: Decodable {
+  struct Choice: Decodable {
+    struct Message: Decodable {
+      let content: String?
+    }
+
+    let text: String?
+    let message: Message?
+  }
+
+  struct Message: Decodable {
+    let content: String?
+  }
+
+  let choices: [Choice]?
+  let message: Message?
+  let response: String?
+}
+
 @MainActor
 final class MiniMaxH3Controller: ObservableObject {
   private static let maximumIdentityImages = 8
@@ -93,13 +200,13 @@ final class MiniMaxH3Controller: ObservableObject {
     "com.okatti.lada.coreai.10erosMaxH3ManifestPath"
 
   @Published var prompt = "モザイクを除去して最高品質の動画を生成する。"
-  @Published fileprivate var promptAssistantProvider:
-    MiniMaxH3PromptAssistantProvider = .llamaCpp
-  @Published var promptAssistantEndpoint = "http://127.0.0.1:18080"
-  @Published var promptAssistantModel = "gemma-4"
-  @Published var promptAssistantInstruction = ""
-  @Published var promptAssistantOutput = ""
-  @Published private(set) var isGeneratingPrompt = false
+  @Published var aiPromptProvider: MiniMaxH3AIPromptProvider = .openAICompatible
+  @Published var aiPromptRequest = ""
+  @Published var aiGeneratedPrompt = ""
+  @Published var aiPromptAPIURL = "http://127.0.0.1:18080/v1"
+  @Published var aiPromptAPIKey = ""
+  @Published var aiPromptModel = "auto"
+  @Published private(set) var isGeneratingAIPrompt = false
   @Published var backend = "coreai"
   @Published var resolutionProfileID = "864x480" {
     didSet {
@@ -128,15 +235,18 @@ final class MiniMaxH3Controller: ObservableObject {
         forKey: Self.manifestPathDefaultsKey
       )
       refreshConditioningMode()
-      refreshQwenSequenceLength()
     }
   }
   @Published private(set) var supportsPromptOnly = false
-  @Published private(set) var qwenSequenceLength = 4152
   @Published private(set) var inputURLs: [URL] = []
   @Published private(set) var audioInputURL: URL?
+  @Published fileprivate var audioConditioningMode:
+    MiniMaxH3AudioConditioningMode =
+    .backgroundMusic
   @Published var audioStartSeconds = 0.0
   @Published private(set) var audioDurationSeconds: Double?
+  @Published var lyricsText = ""
+  @Published var lyricsSearchQuery = ""
   @Published var musicVideoMode = false
   @Published fileprivate var musicVideoContinuationMode:
     MiniMaxH3MusicVideoContinuationMode =
@@ -147,11 +257,6 @@ final class MiniMaxH3Controller: ObservableObject {
   @Published private(set) var selectedMusicCutPointID: UUID?
   @Published private(set) var musicPreviewSeconds: Double?
   @Published private(set) var usesUpscalerInput = true
-  @Published fileprivate var referenceEditMode: H3ReferenceEditMode = .none
-  @Published var referenceEditTargetDescription = ""
-  @Published private(set) var videoMaskCandidates: [MiniMaxH3VideoMaskCandidate] = []
-  @Published private(set) var selectedVideoMaskCandidateID: String?
-  @Published private(set) var isDetectingVideoMaskCandidates = false
   @Published var imageReferenceScope = MiniMaxH3ImageReferenceScope.wholeImage
   @Published private(set) var faceReferences: [MiniMaxH3FaceReference] = []
   @Published private(set) var isDetectingFaces = false
@@ -173,9 +278,6 @@ final class MiniMaxH3Controller: ObservableObject {
   private var audioPreviewURL: URL?
   private var audioPreviewStopTask: Task<Void, Never>?
   private var lastAudioPreviewSeconds: Double?
-  private var videoMaskCandidateTask: Task<Void, Never>?
-  private var videoMaskCandidateDirectory: URL?
-  private var promptAssistantTask: Task<Void, Never>?
 
   fileprivate static let resolutionProfiles = MiniMaxH3ResolutionProfile.supported
 
@@ -199,7 +301,6 @@ final class MiniMaxH3Controller: ObservableObject {
     ) ?? ""
     manifestPath = Self.resolvePipelineManifestPath(savedManifestPath)
     refreshConditioningMode()
-    refreshQwenSequenceLength()
   }
 
   var supportsRuntime: Bool {
@@ -226,27 +327,16 @@ final class MiniMaxH3Controller: ObservableObject {
     !inputURLs.isEmpty && inputURLs.allSatisfy(Self.isImage)
   }
 
-  var inputImageURLs: [URL] {
-    inputURLs.filter(Self.isImage)
-  }
-
-  var inputVideoURL: URL? {
-    inputURLs.first(where: Self.isMovie)
-  }
-
   var inputSummary: String {
     if supportsPromptOnly { return "なし（プロンプトのみ）" }
     if inputURLs.isEmpty { return "未指定" }
-    let imageURLs = inputImageURLs
-    if !imageURLs.isEmpty {
+    if isImageSequence {
       if imageReferenceScope == .faceOnly {
         if isDetectingFaces { return "Subject候補の顔を検出中" }
-        let prefix = inputVideoURL == nil ? "" : "動画 + "
-        return "\(prefix)顔参照 \(selectedFaceReferences.count)件（検出\(faceReferences.count)件）"
+        return "顔参照 \(selectedFaceReferences.count)件（検出\(faceReferences.count)件）"
       }
-      if inputVideoURL == nil, imageURLs.count == 1 { return imageURLs[0].path }
-      let prefix = inputVideoURL == nil ? "" : "動画 + "
-      return "\(prefix)Subject参照画像 \(imageURLs.count)枚（先頭画像が基準）"
+      if inputURLs.count == 1 { return inputURLs[0].path }
+      return "Subject参照画像 \(inputURLs.count)枚（先頭画像が基準）"
     }
     return inputURLs[0].path
   }
@@ -261,14 +351,8 @@ final class MiniMaxH3Controller: ObservableObject {
       let runnerURL,
       FileManager.default.isExecutableFile(atPath: runnerURL.path)
     else { return false }
-    if referenceEditMode != .none {
-      guard inputVideoURL != nil, !inputImageURLs.isEmpty,
-        !isDetectingVideoMaskCandidates
-      else { return false }
-    }
     if audioInputURL != nil {
-      guard (!inputImageURLs.isEmpty || inputVideoURL != nil),
-        duration <= Self.maximumAudioConditioningDuration
+      guard isImageSequence, duration <= Self.maximumAudioConditioningDuration
       else { return false }
       guard let audioDurationSeconds,
         audioDurationSeconds - audioStartSeconds > 0
@@ -299,74 +383,6 @@ final class MiniMaxH3Controller: ObservableObject {
     return true
   }
 
-  func generatePromptWithLocalAI() {
-    guard !isRunning, !isGeneratingPrompt else { return }
-    promptAssistantTask?.cancel()
-    isGeneratingPrompt = true
-    status = "ローカルAIでH3プロンプトを生成中"
-    let instruction = promptAssistantInstruction
-    let provider = promptAssistantProvider
-    let endpoint = promptAssistantEndpoint
-    let model = promptAssistantModel
-    let context = MiniMaxH3PromptAssistantContext(
-      promptOnly: supportsPromptOnly,
-      hasVideo: inputVideoURL != nil,
-      imageCount: inputImageURLs.count,
-      hasAudio: audioInputURL != nil,
-      faceOnly: imageReferenceScope == .faceOnly,
-      referenceEditMode: referenceEditMode,
-      durationSeconds: duration,
-      qwenSequenceLength: qwenSequenceLength
-    )
-    promptAssistantTask = Task { [weak self] in
-      do {
-        let generated = try await MiniMaxH3PromptAssistant.generatePrompt(
-          instruction: instruction,
-          provider: provider,
-          endpoint: endpoint,
-          model: model,
-          context: context
-        )
-        guard !Task.isCancelled else { return }
-        await MainActor.run {
-          guard let self else { return }
-          self.promptAssistantOutput = generated
-          self.isGeneratingPrompt = false
-          self.status = "H3プロンプトを生成しました"
-        }
-      } catch {
-        guard !Task.isCancelled else { return }
-        await MainActor.run {
-          guard let self else { return }
-          self.isGeneratingPrompt = false
-          self.status = "H3プロンプト生成に失敗しました"
-          self.appendLog("promptAssistant: \(error.localizedDescription)\n")
-        }
-      }
-    }
-  }
-
-  func applyGeneratedPrompt() {
-    guard !isRunning else { return }
-    let generated = promptAssistantOutput.trimmingCharacters(
-      in: .whitespacesAndNewlines
-    )
-    guard !generated.isEmpty else { return }
-    prompt = generated
-    status = "生成したH3プロンプトを反映しました"
-  }
-
-  func setReferenceEditMode(_ mode: H3ReferenceEditMode, enabled: Bool) {
-    guard !isRunning else { return }
-    referenceEditMode = enabled ? mode : .none
-    if referenceEditMode != .none, supportsPromptOnly {
-      selectGenerationMode(promptOnly: false)
-    }
-    if referenceEditMode != .none {
-      detectVideoMaskCandidates()
-    }
-  }
-
   var audioInputSummary: String {
     audioInputURL?.path ?? "未指定"
   }
@@ -394,7 +410,7 @@ final class MiniMaxH3Controller: ObservableObject {
     guard !isRunning, isImageSequence else { return }
     stopAudioPreview()
     let panel = NSOpenPanel()
-    panel.title = "リップシンク用の音源を選択"
+    panel.title = "H3で使う音源を選択"
     panel.canChooseFiles = true
     panel.canChooseDirectories = false
     panel.allowsMultipleSelection = false
@@ -420,7 +436,9 @@ final class MiniMaxH3Controller: ObservableObject {
           return
         }
         self.audioDurationSeconds = seconds
-        self.status = "外部音源をリップシンク条件に使用します"
+        self.status = self.audioConditioningMode == .lipSync
+          ? "外部音源をリップシンク条件に使用します"
+          : "外部音源をBGM参照として使用します"
       } catch {
         guard let self, self.audioInputURL == selectedURL else { return }
         self.status = "音源を読み込めません"
@@ -435,7 +453,9 @@ final class MiniMaxH3Controller: ObservableObject {
     audioInputURL = nil
     audioDurationSeconds = nil
     audioStartSeconds = 0
+    lyricsText = ""
     musicVideoMode = false
+    audioConditioningMode = .backgroundMusic
     musicCutPoints = []
     selectedMusicCutPointID = nil
     musicPreviewSeconds = nil
@@ -639,34 +659,28 @@ final class MiniMaxH3Controller: ObservableObject {
     panel.allowedContentTypes = [.movie, .image]
     guard panel.runModal() == .OK else { return }
     var urls = panel.urls.map(\.standardizedFileURL)
-    let imageURLs = urls.filter(Self.isImage)
-    let videoURLs = urls.filter(Self.isMovie)
-    if videoURLs.count > 1 || imageURLs.count + videoURLs.count != urls.count {
-      status = "動画は1本、画像は最大\(Self.maximumIdentityImages)枚まで同時選択できます"
+    let allImages = !urls.isEmpty && urls.allSatisfy(Self.isImage)
+    if urls.count > 1, !allImages {
+      status = "複数選択できるのは画像だけです"
       return
     }
-    if imageURLs.count > Self.maximumIdentityImages {
+    if allImages, urls.count > Self.maximumIdentityImages {
       status = "Subject参照画像は最大\(Self.maximumIdentityImages)枚です"
       return
     }
-    if !imageURLs.isEmpty {
-      let sortedImages = imageURLs.sorted {
+    if allImages {
+      urls.sort {
         $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent)
           == .orderedAscending
       }
-      urls = videoURLs + sortedImages
     }
     setInputURLs(urls, upscalerInput: false)
   }
 
   private func setInputURLs(_ urls: [URL], upscalerInput: Bool) {
     resetFaceReferences()
-    resetVideoMaskCandidates()
     inputURLs = urls
     usesUpscalerInput = upscalerInput
-    if inputVideoURL == nil || inputImageURLs.isEmpty {
-      referenceEditMode = .none
-    }
     guard let first = urls.first else { return }
     let suffix = urls.count > 1 ? "-\(urls.count)-images" : ""
     let proposed = first.deletingPathExtension().path
@@ -675,97 +689,27 @@ final class MiniMaxH3Controller: ObservableObject {
       outputPath = proposed
       automaticOutputPath = proposed
     }
-    if imageReferenceScope == .faceOnly, !inputImageURLs.isEmpty {
+    if imageReferenceScope == .faceOnly,
+      !urls.isEmpty,
+      urls.allSatisfy(Self.isImage)
+    {
       detectFaces()
     }
-    if referenceEditMode != .none {
-      detectVideoMaskCandidates()
-    }
-  }
-
-  func detectVideoMaskCandidates() {
-    guard !isRunning, referenceEditMode != .none,
-      let videoURL = inputVideoURL,
-      !inputImageURLs.isEmpty
-    else { return }
-    videoMaskCandidateTask?.cancel()
-    let directory = FileManager.default.temporaryDirectory
-      .appendingPathComponent(
-        "mioh-h3-video-mask-candidates-\(UUID().uuidString)",
-        isDirectory: true
-      )
-    videoMaskCandidateDirectory = directory
-    isDetectingVideoMaskCandidates = true
-    videoMaskCandidates = []
-    selectedVideoMaskCandidateID = nil
-    status = "動画内の人物候補を検出中"
-    videoMaskCandidateTask = Task { [weak self] in
-      do {
-        let candidates = try await MiniMaxH3ReferenceVideoMaskProcessor
-          .detectMaskCandidates(
-            sourceURL: videoURL,
-            destinationDirectory: directory
-          )
-        guard !Task.isCancelled else { return }
-        await MainActor.run {
-          guard let self, self.inputVideoURL == videoURL else { return }
-          self.videoMaskCandidates = candidates
-          self.selectedVideoMaskCandidateID = candidates.first?.id
-          self.isDetectingVideoMaskCandidates = false
-          self.status = candidates.isEmpty
-            ? "動画内の人物候補を検出できませんでした"
-            : "動画内の人物候補を\(candidates.count)件検出しました"
-        }
-      } catch {
-        guard !Task.isCancelled else { return }
-        await MainActor.run {
-          guard let self, self.inputVideoURL == videoURL else { return }
-          self.isDetectingVideoMaskCandidates = false
-          self.status = "動画内の人物候補検出に失敗しました"
-          self.appendLog("人物候補: \(error.localizedDescription)\n")
-        }
-      }
-    }
-  }
-
-  func selectVideoMaskCandidate(_ id: String) {
-    guard !isRunning else { return }
-    selectedVideoMaskCandidateID = id
-  }
-
-  private var selectedVideoMaskCandidate: MiniMaxH3VideoMaskCandidate? {
-    guard let selectedVideoMaskCandidateID else { return nil }
-    return videoMaskCandidates.first { $0.id == selectedVideoMaskCandidateID }
-  }
-
-  private var selectedVideoMaskCandidateIndex: Int? {
-    selectedVideoMaskCandidate?.index
   }
 
   private var validInputSelection: Bool {
     if supportsPromptOnly { return inputURLs.isEmpty }
     guard !inputURLs.isEmpty else { return false }
-    let imageURLs = inputImageURLs
-    let videoCount = inputVideoURL == nil ? 0 : 1
-    if !imageURLs.isEmpty, imageReferenceScope == .faceOnly {
+    if isImageSequence, imageReferenceScope == .faceOnly {
       let count = selectedFaceReferences.count
       return !isDetectingFaces && count > 0
         && count <= Self.maximumIdentityImages
     }
-    return videoCount + imageURLs.count == inputURLs.count
-      && videoCount <= 1
-      && imageURLs.count <= Self.maximumIdentityImages
-  }
-
-  private func promptWithReferenceEditInstructions(_ basePrompt: String) -> String {
-    let prefix = referenceEditMode.promptPrefix(
-      hasVideo: inputVideoURL != nil,
-      hasImages: !inputImageURLs.isEmpty,
-      hasAudio: audioInputURL != nil,
-      targetDescription: referenceEditTargetDescription
-    )
-    guard !prefix.isEmpty else { return basePrompt }
-    return prefix + "\n\nuser_prompt:\n" + basePrompt
+    if inputURLs.count == 1 {
+      return Self.isImage(inputURLs[0]) || Self.isMovie(inputURLs[0])
+    }
+    return inputURLs.count <= Self.maximumIdentityImages
+      && inputURLs.allSatisfy(Self.isImage)
   }
 
   var selectedFaceReferenceCount: Int {
@@ -784,7 +728,7 @@ final class MiniMaxH3Controller: ObservableObject {
   func selectImageReferenceScope(_ scope: MiniMaxH3ImageReferenceScope) {
     guard !isRunning, imageReferenceScope != scope else { return }
     imageReferenceScope = scope
-    if scope == .faceOnly, !inputImageURLs.isEmpty {
+    if scope == .faceOnly, isImageSequence {
       detectFaces()
     } else if scope == .wholeImage {
       resetFaceReferences()
@@ -792,9 +736,9 @@ final class MiniMaxH3Controller: ObservableObject {
   }
 
   func detectFaces() {
-    guard !isRunning, !inputImageURLs.isEmpty else { return }
+    guard !isRunning, isImageSequence else { return }
     resetFaceReferences()
-    let sourceURLs = inputImageURLs
+    let sourceURLs = inputURLs
     let directory = FileManager.default.temporaryDirectory
       .appendingPathComponent(
         "mioh-h3-face-references-\(UUID().uuidString)",
@@ -872,23 +816,82 @@ final class MiniMaxH3Controller: ObservableObject {
     faceReferenceDirectory = nil
   }
 
-  private func resetVideoMaskCandidates() {
-    videoMaskCandidateTask?.cancel()
-    videoMaskCandidateTask = nil
-    isDetectingVideoMaskCandidates = false
-    videoMaskCandidates = []
-    selectedVideoMaskCandidateID = nil
-    if let videoMaskCandidateDirectory {
-      try? FileManager.default.removeItem(at: videoMaskCandidateDirectory)
-    }
-    videoMaskCandidateDirectory = nil
-  }
-
   private func faceReferencePrompt(_ originalPrompt: String) -> String {
     MiniMaxH3FaceReferenceProcessor.faceOnlyPrompt(
       originalPrompt,
       references: selectedFaceReferences
     )
+  }
+
+  private func audioConditionedPrompt(_ originalPrompt: String) -> String {
+    guard audioInputURL != nil else { return originalPrompt }
+    switch audioConditioningMode {
+    case .lipSync:
+      return originalPrompt
+    case .backgroundMusic:
+      let directive = """
+
+        Audio reference directive: Use the supplied audio only as non-diegetic background music and music-video structure reference. Follow its tempo, energy, section changes, instrumentation, vocal mood, and emotional dynamics, but do not generate lip-sync, singing mouth shapes, dialogue performance, or visible speech from this audio. On-screen people must not sing to the vocals; their lips stay closed or move only naturally with breathing, expression, or non-vocal acting.
+        """
+      return originalPrompt + directive
+    }
+  }
+
+  func chooseLyricsFile() {
+    guard !isRunning else { return }
+    let panel = NSOpenPanel()
+    panel.title = "歌詞テキストを選択"
+    panel.canChooseFiles = true
+    panel.canChooseDirectories = false
+    panel.allowsMultipleSelection = false
+    panel.allowedContentTypes = [.plainText, .utf8PlainText, .text]
+    guard panel.runModal() == .OK, let url = panel.url else { return }
+    do {
+      lyricsText = try String(contentsOf: url, encoding: .utf8)
+      if lyricsSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        .isEmpty
+      {
+        lyricsSearchQuery = url.deletingPathExtension().lastPathComponent
+      }
+      status = "歌詞を読み込みました"
+    } catch {
+      status = "歌詞を読み込めません"
+      appendLog("歌詞: \(error.localizedDescription)\n")
+    }
+  }
+
+  func openLyricsSearch() {
+    let query = lyricsSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !query.isEmpty else {
+      status = "曲名やアーティスト名を入力してください"
+      return
+    }
+    var components = URLComponents(string: "https://www.google.com/search")
+    components?.queryItems = [
+      URLQueryItem(name: "q", value: "\(query) lyrics 歌詞")
+    ]
+    if let url = components?.url {
+      NSWorkspace.shared.open(url)
+      status = "歌詞検索をブラウザで開きました"
+    }
+  }
+
+  private func lyricsConditionedPrompt(_ originalPrompt: String) -> String {
+    let lyrics = lyricsText.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !lyrics.isEmpty else { return originalPrompt }
+    let directive: String
+    switch audioConditioningMode {
+    case .backgroundMusic:
+      directive = "Treat these lyrics as song meaning, emotional timing, imagery, and section guidance only. Do not generate lip-sync, singing mouth shapes, visible speech, karaoke subtitles, lyric cards, or on-screen text unless the interval body explicitly asks for visible text."
+    case .lipSync:
+      directive = "Use timed lyric lines as lip-sync and expression timing guidance when an interval explicitly calls for singing or visible vocal performance. Keep the exact language of lyric snippets."
+    }
+    return originalPrompt + """
+
+      LYRICS / SONG MEANING:
+      \(directive)
+      \(lyrics)
+      """
   }
 
   private static func isImage(_ url: URL) -> Bool {
@@ -932,17 +935,6 @@ final class MiniMaxH3Controller: ObservableObject {
     return identifier.localizedCaseInsensitiveContains("fl2va")
   }
 
-  private static func qwenSequenceLength(in path: String) -> Int? {
-    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-      let object = try? JSONSerialization.jsonObject(with: data),
-      let dictionary = object as? [String: Any],
-      let qwen = dictionary["qwenComposite"] as? [String: Any],
-      let sequenceLength = qwen["sequenceLength"] as? Int,
-      sequenceLength > 0
-    else { return nil }
-    return sequenceLength
-  }
-
   private func refreshConditioningMode() {
     let promptOnly = Self.isPromptOnlyManifest(manifestPath)
     guard supportsPromptOnly != promptOnly else { return }
@@ -953,10 +945,6 @@ final class MiniMaxH3Controller: ObservableObject {
       usesUpscalerInput = false
       ensurePromptOnlyOutputPath()
     }
-  }
-
-  private func refreshQwenSequenceLength() {
-    qwenSequenceLength = Self.qwenSequenceLength(in: effectiveManifestPath) ?? 4152
   }
 
   func selectGenerationMode(promptOnly: Bool) {
@@ -1024,19 +1012,6 @@ final class MiniMaxH3Controller: ObservableObject {
         status = "同じフォルダのパイプラインmanifest.jsonへ補正しました"
       }
     }
-  }
-
-  func applyModelSetupManifest(_ manifest: String) {
-    guard !isRunning,
-      !manifest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    else { return }
-    let resolved = Self.resolvePipelineManifestPath(manifest)
-    guard Self.isPipelineManifest(URL(fileURLWithPath: resolved)) else {
-      status = "MiniMax H3の自動設定manifestを確認できませんでした"
-      return
-    }
-    manifestPath = resolved
-    status = "MiniMax H3 manifestを自動設定しました"
   }
 
   func chooseMusicVideoLastFrameDirectory() {
@@ -1117,19 +1092,15 @@ final class MiniMaxH3Controller: ObservableObject {
     if manifestPath != resolvedManifestPath {
       manifestPath = resolvedManifestPath
     }
-    let runtimeImageURLs = !inputImageURLs.isEmpty
+    let runtimeImageURLs = isImageSequence
       && imageReferenceScope == .faceOnly
       ? selectedFaceReferences.map(\.cropURL)
-      : inputImageURLs
-    let runtimeImageSubjects = !inputImageURLs.isEmpty
+      : inputURLs
+    let baseRuntimePrompt = isImageSequence
       && imageReferenceScope == .faceOnly
-      ? selectedFaceReferences.map(\.subjectIndex)
-      : []
-    let baseRuntimePrompt = !inputImageURLs.isEmpty
-      && imageReferenceScope == .faceOnly
-      ? faceReferencePrompt(prompt)
-      : prompt
-    let runtimePrompt = promptWithReferenceEditInstructions(baseRuntimePrompt)
+      ? audioConditionedPrompt(faceReferencePrompt(prompt))
+      : audioConditionedPrompt(prompt)
+    let runtimePrompt = lyricsConditionedPrompt(baseRuntimePrompt)
     var arguments = [
       musicVideoMode ? "music-video" : "run",
       "--manifest", resolvedManifestPath,
@@ -1158,6 +1129,7 @@ final class MiniMaxH3Controller: ObservableObject {
       arguments += [
         "--audio-input", audioInputURL.path,
         "--audio-start", String(audioStartSeconds),
+        "--audio-conditioning-mode", audioConditioningMode.rawValue,
       ]
       if musicVideoMode, !usesAutomaticMusicCuts {
         do {
@@ -1175,45 +1147,20 @@ final class MiniMaxH3Controller: ObservableObject {
         }
       }
     }
-    if !runtimeImageURLs.isEmpty {
+    if isImageSequence {
       do {
         let data = try JSONEncoder().encode(runtimeImageURLs.map(\.path))
         arguments += [
           "--input-images-json",
           String(decoding: data, as: UTF8.self),
         ]
-        if !runtimeImageSubjects.isEmpty {
-          let subjectsData = try JSONEncoder().encode(runtimeImageSubjects)
-          arguments += [
-            "--input-image-subjects-json",
-            String(decoding: subjectsData, as: UTF8.self),
-          ]
-        }
       } catch {
         status = "画像入力の準備に失敗しました"
         appendLog("\(error.localizedDescription)\n")
         return
       }
-    }
-    if let video = inputVideoURL {
+    } else if let video = inputURLs.first {
       arguments += ["--input", video.path]
-    }
-    if referenceEditMode != .none {
-      arguments += [
-        "--reference-edit-mode", referenceEditMode.rawValue,
-        "--physical-reference-mask", "1",
-      ]
-      let target = referenceEditTargetDescription
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-      if !target.isEmpty {
-        arguments += ["--reference-edit-target", target]
-      }
-      if let selectedVideoMaskCandidateIndex {
-        arguments += [
-          "--reference-edit-target-index",
-          String(selectedVideoMaskCandidateIndex),
-        ]
-      }
     }
     task.arguments = arguments
     task.standardOutput = outputPipe
@@ -1369,6 +1316,640 @@ final class MiniMaxH3Controller: ObservableObject {
     log += text
     guard log.count > Self.maximumVisibleLogCharacters else { return }
     log = "…以前のログを省略…\n" + log.suffix(Self.retainedLogCharacters)
+  }
+
+  func generateAIPrompt() {
+    guard !isGeneratingAIPrompt else { return }
+    let request = aiPromptRequest.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !request.isEmpty else {
+      status = "AIへの指示を書いてください"
+      return
+    }
+    isGeneratingAIPrompt = true
+    status = "AIプロンプト生成中"
+    Task {
+      do {
+        let generated = try await requestAIPrompt(request)
+        aiGeneratedPrompt = generated
+        status = "AIプロンプトを生成しました"
+      } catch {
+        status = "AIプロンプト生成に失敗しました"
+        appendLog("AIプロンプト生成: \(error.localizedDescription)\n")
+      }
+      isGeneratingAIPrompt = false
+    }
+  }
+
+  func applyGeneratedAIPrompt() {
+    let generated = aiGeneratedPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !generated.isEmpty else {
+      status = "AI生成プロンプトが空です"
+      return
+    }
+    prompt = generated
+    status = "AI生成プロンプトをMiniMaxプロンプト欄へ反映しました"
+  }
+
+  func applyAIPromptProviderDefaults() {
+    aiPromptAPIURL = aiPromptProvider.defaultBaseURL
+  }
+
+  private func aiSubjectReferenceSummary() -> String {
+    guard imageReferenceScope == .faceOnly, !selectedFaceReferences.isEmpty
+    else {
+      return """
+        SUBJECT REFERENCES:
+        - none selected for AI prompt generation.
+        """
+    }
+    var pictureLabelsBySubject: [Int: [String]] = [:]
+    for (index, face) in selectedFaceReferences.enumerated() {
+      pictureLabelsBySubject[face.subjectIndex, default: []]
+        .append("<Picture \(index + 1)>")
+    }
+    let lines = pictureLabelsBySubject.keys.sorted().map { subject in
+      let pictures = pictureLabelsBySubject[subject, default: []]
+        .joined(separator: ", ")
+      return "  - <Subject \(subject)>: facial identity comes from \(pictures); use this exact subject label in subject_definitions and interval bodies."
+    }.joined(separator: "\n")
+    return """
+      SUBJECT REFERENCES:
+      \(lines)
+      - Use labels such as <Subject 1> as silent control metadata, not visible text.
+      - Do not replace <Subject 1> with generic names like protagonist, singer, man, woman, actor, or character when referring to the referenced person.
+      """
+  }
+
+  private func aiMusicAnalysisSummary(
+    targetDuration: Double,
+    shotLimitSeconds: Double
+  ) async -> String {
+    guard musicVideoMode else {
+      return "AUDIO ANALYSIS: not used because long music-video mode is off."
+    }
+    guard let audioInputURL else {
+      return "AUDIO ANALYSIS: unavailable because no audio file is selected."
+    }
+    guard targetDuration >= 2 else {
+      return "AUDIO ANALYSIS: unavailable because selected audio duration is too short."
+    }
+    do {
+      let samples = try await readAIPromptAnalysisAudio(
+        url: audioInputURL,
+        startSeconds: audioStartSeconds,
+        durationSeconds: targetDuration,
+        sampleRate: 8_000
+      )
+      let intervals = analyzedAIPromptIntervals(
+        samples: samples,
+        sampleRate: 8_000,
+        totalDuration: targetDuration,
+        shotLimitSeconds: shotLimitSeconds
+      )
+      let intervalLines = intervals.map { interval in
+        String(
+          format:
+            "  - [%.3f-%.3f %@] energy %.2f, boundary %.2f",
+          locale: Locale(identifier: "en_US_POSIX"),
+          interval.start,
+          interval.end,
+          interval.transition,
+          interval.energy,
+          interval.change
+        )
+      }
+      .joined(separator: "\n")
+      let sectionLines = summarizedAIPromptMusicSections(intervals)
+      return """
+        AUDIO ANALYSIS:
+        - analyzed_audio_file: \(audioInputURL.lastPathComponent)
+        - analyzed_start_seconds: \(String(format: "%.3f", audioStartSeconds))
+        - analyzed_total_seconds: \(String(format: "%.3f", targetDuration))
+        - analysis_mode: lightweight UI analysis of RMS energy, energy deltas, and local novelty\(usesAutomaticMusicCuts ? "" : " with user composition points preferred")
+        - Use the logical sections for story pacing, emotional arc, scene choice, and lyric emphasis.
+        - Use the suggested generation intervals exactly as bracket markers in the final prompt unless the user's instruction explicitly overrides them.
+        Logical music sections:
+        \(sectionLines)
+        Suggested generation intervals:
+        \(intervalLines)
+        """
+    } catch {
+      return """
+        AUDIO ANALYSIS:
+        - unavailable: \(error.localizedDescription)
+        - fallback_instruction: Still write the full target_total_seconds timeline. Use 8-10 second intervals, infer verse/pre-chorus/chorus/bridge/outro from lyrics, and include [start-end cut] or [start-end continue] on every marker.
+        """
+    }
+  }
+
+  private struct AIPromptMusicInterval {
+    let start: Double
+    let end: Double
+    let transition: String
+    let energy: Double
+    let change: Double
+  }
+
+  private func readAIPromptAnalysisAudio(
+    url: URL,
+    startSeconds: Double,
+    durationSeconds: Double,
+    sampleRate: Int
+  ) async throws -> [Float] {
+    let asset = AVURLAsset(url: url)
+    guard let track = try await asset.loadTracks(withMediaType: .audio).first else {
+      throw NSError(
+        domain: "AIPromptAudioAnalysis",
+        code: -1,
+        userInfo: [NSLocalizedDescriptionKey: "audio track not found"]
+      )
+    }
+    return try await Task.detached(priority: .userInitiated) {
+      let reader = try AVAssetReader(asset: asset)
+      reader.timeRange = CMTimeRange(
+        start: CMTime(seconds: startSeconds, preferredTimescale: 600),
+        duration: CMTime(seconds: durationSeconds, preferredTimescale: 600)
+      )
+      let output = AVAssetReaderTrackOutput(
+        track: track,
+        outputSettings: [
+          AVFormatIDKey: kAudioFormatLinearPCM,
+          AVSampleRateKey: sampleRate,
+          AVNumberOfChannelsKey: 2,
+          AVLinearPCMBitDepthKey: 32,
+          AVLinearPCMIsFloatKey: true,
+          AVLinearPCMIsBigEndianKey: false,
+          AVLinearPCMIsNonInterleaved: false,
+        ]
+      )
+      reader.add(output)
+      guard reader.startReading() else {
+        throw reader.error
+          ?? NSError(
+            domain: "AIPromptAudioAnalysis",
+            code: -2,
+            userInfo: [NSLocalizedDescriptionKey: "audio reader did not start"]
+          )
+      }
+      let maximumFrames = max(
+        1,
+        Int((durationSeconds * Double(sampleRate)).rounded())
+      )
+      var mono: [Float] = []
+      mono.reserveCapacity(maximumFrames)
+      while mono.count < maximumFrames,
+        let sampleBuffer = output.copyNextSampleBuffer()
+      {
+        guard let block = CMSampleBufferGetDataBuffer(sampleBuffer) else {
+          continue
+        }
+        let byteCount = CMBlockBufferGetDataLength(block)
+        guard byteCount > 0,
+          byteCount % MemoryLayout<Float>.stride == 0
+        else { continue }
+        var data = Data(count: byteCount)
+        let status = data.withUnsafeMutableBytes { raw in
+          CMBlockBufferCopyDataBytes(
+            block,
+            atOffset: 0,
+            dataLength: byteCount,
+            destination: raw.baseAddress!
+          )
+        }
+        guard status == noErr else { continue }
+        data.withUnsafeBytes { raw in
+          let values = raw.bindMemory(to: Float.self)
+          var index = 0
+          while index + 1 < values.count, mono.count < maximumFrames {
+            mono.append((values[index] + values[index + 1]) * 0.5)
+            index += 2
+          }
+        }
+      }
+      if mono.isEmpty {
+        throw NSError(
+          domain: "AIPromptAudioAnalysis",
+          code: -3,
+          userInfo: [NSLocalizedDescriptionKey: "no audio samples decoded"]
+        )
+      }
+      return mono
+    }.value
+  }
+
+  private func analyzedAIPromptIntervals(
+    samples: [Float],
+    sampleRate: Int,
+    totalDuration: Double,
+    shotLimitSeconds: Double
+  ) -> [AIPromptMusicInterval] {
+    let hopSeconds = 0.25
+    let hopSamples = max(1, Int((hopSeconds * Double(sampleRate)).rounded()))
+    let frameCount = max(1, samples.count / hopSamples)
+    var energies: [Double] = []
+    energies.reserveCapacity(frameCount)
+    for frameIndex in 0..<frameCount {
+      let start = frameIndex * hopSamples
+      let end = min(samples.count, start + hopSamples)
+      guard start < end else { continue }
+      var sum = 0.0
+      for sample in samples[start..<end] {
+        let value = Double(sample)
+        sum += value * value
+      }
+      energies.append(sqrt(sum / Double(end - start)))
+    }
+    guard !energies.isEmpty else {
+      return fallbackAIPromptIntervals(
+        totalDuration: totalDuration,
+        shotLimitSeconds: shotLimitSeconds
+      )
+    }
+    let maxEnergy = max(energies.max() ?? 0.0001, 0.0001)
+    let normalized = energies.map { min(1, $0 / maxEnergy) }
+    var novelty = [Double](repeating: 0, count: normalized.count)
+    for index in normalized.indices.dropFirst() {
+      novelty[index] = abs(normalized[index] - normalized[index - 1])
+        + max(0, normalized[index] - normalized[index - 1]) * 0.5
+    }
+
+    let manualCuts = usesAutomaticMusicCuts
+      ? []
+      : musicCutPoints.map(\.seconds)
+    var boundaries: [Double]
+    if manualCuts.isEmpty {
+      boundaries = [0]
+      var cursor = 0.0
+      while totalDuration - cursor > shotLimitSeconds + 0.5 {
+        let ideal = cursor + min(shotLimitSeconds, max(6.0, shotLimitSeconds * 0.9))
+        let snapped = strongestAIPromptBoundary(
+          near: ideal,
+          novelty: novelty,
+          hopSeconds: hopSeconds,
+          minimum: cursor + 2,
+          maximum: min(totalDuration - 2, cursor + shotLimitSeconds)
+        )
+        if snapped <= cursor + 1.0 { break }
+        boundaries.append(snapped)
+        cursor = snapped
+      }
+      if boundaries.last ?? 0 < totalDuration {
+        boundaries.append(totalDuration)
+      }
+    } else {
+      boundaries = ([0] + manualCuts + [totalDuration])
+        .filter { $0 >= 0 && $0 <= totalDuration }
+        .sorted()
+    }
+
+    var intervals: [AIPromptMusicInterval] = []
+    for index in 0..<(boundaries.count - 1) {
+      let start = boundaries[index]
+      let end = boundaries[index + 1]
+      guard end - start >= 0.5 else { continue }
+      intervals.append(
+        AIPromptMusicInterval(
+          start: start,
+          end: end,
+          transition: index == 0 || noveltyAt(start, novelty: novelty, hopSeconds: hopSeconds) > 0.22
+            ? "cut"
+            : "continue",
+          energy: averageValue(normalized, from: start, to: end, hopSeconds: hopSeconds),
+          change: noveltyAt(start, novelty: novelty, hopSeconds: hopSeconds)
+        )
+      )
+    }
+    if intervals.isEmpty {
+      return fallbackAIPromptIntervals(
+        totalDuration: totalDuration,
+        shotLimitSeconds: shotLimitSeconds
+      )
+    }
+    return intervals
+  }
+
+  private func fallbackAIPromptIntervals(
+    totalDuration: Double,
+    shotLimitSeconds: Double
+  ) -> [AIPromptMusicInterval] {
+    var intervals: [AIPromptMusicInterval] = []
+    var start = 0.0
+    var index = 0
+    while start < totalDuration - 0.1 {
+      let end = min(totalDuration, start + shotLimitSeconds)
+      intervals.append(
+        AIPromptMusicInterval(
+          start: start,
+          end: end,
+          transition: index == 0 ? "cut" : "continue",
+          energy: 0.5,
+          change: 0
+        )
+      )
+      start = end
+      index += 1
+    }
+    return intervals
+  }
+
+  private func strongestAIPromptBoundary(
+    near ideal: Double,
+    novelty: [Double],
+    hopSeconds: Double,
+    minimum: Double,
+    maximum: Double
+  ) -> Double {
+    guard minimum < maximum else { return ideal }
+    let startIndex = max(0, Int((minimum / hopSeconds).rounded(.down)))
+    let endIndex = min(
+      novelty.count - 1,
+      Int((maximum / hopSeconds).rounded(.up))
+    )
+    guard startIndex <= endIndex else {
+      return min(max(ideal, minimum), maximum)
+    }
+    var bestIndex = startIndex
+    var bestScore = -Double.infinity
+    for index in startIndex...endIndex {
+      let time = Double(index) * hopSeconds
+      let distancePenalty = abs(time - ideal) / max(0.001, maximum - minimum)
+      let score = novelty[index] - distancePenalty * 0.25
+      if score > bestScore {
+        bestScore = score
+        bestIndex = index
+      }
+    }
+    return min(max(Double(bestIndex) * hopSeconds, minimum), maximum)
+  }
+
+  private func noveltyAt(
+    _ seconds: Double,
+    novelty: [Double],
+    hopSeconds: Double
+  ) -> Double {
+    guard !novelty.isEmpty else { return 0 }
+    let index = min(
+      novelty.count - 1,
+      max(0, Int((seconds / hopSeconds).rounded()))
+    )
+    return novelty[index]
+  }
+
+  private func averageValue(
+    _ values: [Double],
+    from start: Double,
+    to end: Double,
+    hopSeconds: Double
+  ) -> Double {
+    guard !values.isEmpty, end > start else { return 0.5 }
+    let startIndex = min(
+      values.count - 1,
+      max(0, Int((start / hopSeconds).rounded(.down)))
+    )
+    let endIndex = min(
+      values.count - 1,
+      max(startIndex, Int((end / hopSeconds).rounded(.up)))
+    )
+    let slice = values[startIndex...endIndex]
+    return slice.reduce(0, +) / Double(slice.count)
+  }
+
+  private func summarizedAIPromptMusicSections(
+    _ intervals: [AIPromptMusicInterval]
+  ) -> String {
+    guard !intervals.isEmpty else { return "  - none" }
+    var sections: [String] = []
+    var start = intervals[0].start
+    var energyValues: [Double] = []
+    for (index, interval) in intervals.enumerated() {
+      energyValues.append(interval.energy)
+      let shouldClose = index == intervals.count - 1
+        || intervals[index + 1].transition == "cut"
+        || energyValues.count >= 4
+      if shouldClose {
+        let averageEnergy = energyValues.reduce(0, +) / Double(energyValues.count)
+        sections.append(
+          String(
+            format: "  - section %02d: %.3f-%.3f sec, average energy %.2f, %@",
+            locale: Locale(identifier: "en_US_POSIX"),
+            sections.count + 1,
+            start,
+            interval.end,
+            averageEnergy,
+            averageEnergy >= 0.67
+              ? "high intensity"
+              : averageEnergy <= 0.33
+                ? "quiet / restrained"
+                : "moderate flow"
+          )
+        )
+        if index + 1 < intervals.count {
+          start = intervals[index + 1].start
+          energyValues = []
+        }
+      }
+    }
+    return sections.joined(separator: "\n")
+  }
+
+  private func requestAIPrompt(_ request: String) async throws -> String {
+    let baseURLString = aiPromptAPIURL.trimmingCharacters(in: .whitespacesAndNewlines)
+      .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    guard let baseURL = URL(string: baseURLString), !baseURLString.isEmpty else {
+      throw CocoaError(.fileReadInvalidFileName)
+    }
+    let model = try await resolvedAIModel(baseURL: baseURL)
+    let targetAudioDuration = max(
+      0,
+      (audioDurationSeconds ?? duration) - audioStartSeconds
+    )
+    let formattedTargetAudioDuration = String(
+      format: "%.3f",
+      musicVideoMode ? targetAudioDuration : duration
+    )
+    let shotLimitSeconds = outputWidth == 1920 && outputHeight == 1080
+      ? 6.0
+      : min(10.0, max(2.0, duration))
+    let formattedShotLimit = String(format: "%.3f", shotLimitSeconds)
+    let audioAnalysisSummary = await aiMusicAnalysisSummary(
+      targetDuration: targetAudioDuration,
+      shotLimitSeconds: shotLimitSeconds
+    )
+    let subjectReferenceSummary = aiSubjectReferenceSummary()
+    let timelineInstruction: String
+    if musicVideoMode {
+      let manualCuts = musicCutPoints.map {
+        String(format: "%.3f", $0.seconds)
+      }
+      .joined(separator: ", ")
+      timelineInstruction = """
+        - long_music_video: true
+        - target_total_seconds: \(formattedTargetAudioDuration)
+        - shot_duration_limit_seconds: \(formattedShotLimit)
+        - timeline_requirement: Write a full-song timeline from 0.000 to \(formattedTargetAudioDuration). Do not stop at \(formattedShotLimit) seconds; that value is only the maximum duration of one generated shot.
+        - marker_requirement: Every interval marker must include transition kind: [start-end cut] or [start-end continue]. Plain markers like [0.000-3.000] are invalid.
+        - first_marker: [0.000-... cut]
+        - continuation_rule: Use continue for intervals that physically continue from the previous interval; use cut only for intentional scene/composition changes.
+        - last_marker_requirement: The final marker must end exactly at \(formattedTargetAudioDuration) or the full song will be truncated.
+        - manual_cut_points_seconds: \(manualCuts.isEmpty ? "none / app may auto-detect cuts from audio" : manualCuts)
+        """
+    } else {
+      timelineInstruction = """
+        - long_music_video: false
+        - target_total_seconds: \(formattedShotLimit)
+        - timeline_requirement: Write one short prompt or a short timeline that ends at \(formattedShotLimit).
+        """
+    }
+    var userText = """
+      AIへの指示:
+      \(request)
+
+      Current H3 mode context:
+      - music_video: \(musicVideoMode ? "true" : "false")
+      - audio_mode: \(audioConditioningMode.rawValue)
+      - continuation_mode: \(musicVideoContinuationMode.rawValue)
+      - resolution: \(outputWidth)x\(outputHeight)
+      - duration_or_shot_limit_seconds: \(duration)
+      \(timelineInstruction)
+
+      \(subjectReferenceSummary)
+
+      \(audioAnalysisSummary)
+      """
+    let lyrics = lyricsText.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !lyrics.isEmpty {
+      userText += """
+
+        Lyrics / song meaning supplied by the user:
+        \(lyrics)
+        """
+    }
+    let system = """
+      You write MiniMax H3 prompts for mioh upscaler. Return only the finished prompt, no Markdown fences and no explanation.
+
+      For long music videos, use this structure:
+      subject_definitions:
+      detailed_description:
+      GLOBAL CONTINUITY:
+      [0.000-... cut]
+      [..-.. continue]
+      overall_soundscape:
+      non_diegetic_music:
+
+      Visual medium rules:
+      - Default to live-action, photorealistic, camera-shot video when the user supplies real face/image references or does not explicitly request animation.
+      - Choose anime, manga, 2D animation, cartoon, illustration, cel-shading, or animated-film style only when the user's AI instruction asks for that medium or the references are already in that medium.
+      - If the user asks for a music video without specifying medium, follow the supplied reference medium and use cinematic live-action MV language for real photos: real camera, practical lighting, lens, natural skin texture, real clothing fabric, believable city locations.
+      - Preserve the medium of the supplied references. Real-person face references imply a photoreal live-action person unless the user explicitly asks for an animated reinterpretation.
+
+      Subject reference rules:
+      - If SUBJECT REFERENCES are supplied, subject_definitions must define those labels exactly, for example <Subject 1>.
+      - Use <Subject 1>, <Subject 2>, etc. in interval bodies whenever the referenced person appears.
+      - Do not rename referenced subjects to protagonist, singer, actor, man, woman, boy, girl, or character unless the label also remains present.
+      - Reference labels are silent control metadata; never render them as on-screen text.
+      - Do not invent extra <Subject N> labels for people who do not have supplied subject references.
+      - Reference images apply only to their exact <Subject N>. Other performers, friends, crowds, dancers, reflections, posters, and background people must not inherit or resemble the referenced face.
+      - In face-reference mode, <Picture N> means face identity source only. Do not use it as a storyboard image, first frame, pose reference, outfit reference, body reference, background reference, lighting reference, camera-angle reference, crop reference, or composition anchor.
+      - Do not write prompts that reproduce the reference photo itself. The referenced subject's clothes, body blocking, pose, environment, framing, lighting, photo mood, and camera angle must come from the interval text, not from the reference picture.
+      - When only <Subject 1> is supplied, write other people as unreferenced performers with distinct faces, or keep them as silhouettes, back views, side profiles, motion-blurred crowd, hands, feet, or distant bodies unless the user explicitly needs their face.
+      - Avoid close-up face shots of unreferenced people in face-reference mode. If another face must appear near camera, state that it is visually unrelated to the reference pictures and has different facial structure, hairline, eyes, nose, and mouth.
+
+      Critical timeline rules:
+      - When long_music_video is true, the prompt must cover the entire target_total_seconds. Do not produce only a 10-second demo unless target_total_seconds is 10.
+      - shot_duration_limit_seconds is the maximum length of a single generated shot, not the full music video length.
+      - If AUDIO ANALYSIS is supplied, follow its suggested interval table and musical-energy notes. Decide scene cuts, continuation, camera intensity, emotion, and lyric emphasis from that analysis.
+      - Every bracket marker must include the transition word: [start-end cut] or [start-end continue]. Plain markers such as [0.000-3.000] are invalid for mioh.
+      - Put the interval body on the lines after the marker. Avoid "[start-end cut] body text" on the same line when possible.
+      - The first interval should be cut. Later intervals should usually be continue unless the user asks for a clear scene/composition change.
+      - The final interval must end at target_total_seconds.
+
+      Use GLOBAL CONTINUITY for stable identity, wardrobe, visual style, music rules, and no-restart/no-duplicate rules. Each flat timeline entry must describe only its local action, camera, prop state, emotion, and next development. Continue entries must not replay the opening action; they continue from the previous physical state.
+
+      Composition discipline for every long music-video interval:
+      - Write each interval body as local production notes with these axes in this order: LOCATION, FRAMING, ACTION, CAMERA, optional LIGHTING / COLOR, and optional CONTINUATION NOTE.
+      - LOCATION must name the exact place for this interval and may state what previous location should not be visible.
+      - FRAMING must specify shot size, lens feel, subject placement, foreground/background geometry, and whether it is wide, medium, close-up, profile, overhead, handheld, etc.
+      - ACTION must state what each visible <Subject N> does now, how lyric emotion changes, and what physical state is reached by the interval end.
+      - CAMERA must specify motion, speed, screen direction, focus behavior, and whether the camera holds, tracks, circles, pushes in, or cuts away.
+      - If several intervals share the same city or character, vary at least three local axes: location, framing, blocking, camera path, foreground objects, background geometry, lighting source, or action endpoint.
+      - Do not rely on repeated global mood phrases such as Tokyo neon, cinematic city, actors, rainy night, or emotional connection as the main body of multiple intervals.
+
+      If lyrics are supplied and audio mode is background-music, treat lyrics as meaning, emotion, imagery, and section guidance only. Do not create lip-sync, visible singing mouth shapes, karaoke subtitles, lyric cards, or on-screen text unless explicitly requested. If audio mode is lip-sync, timed lyric lines may guide singing and expression timing.
+      """
+    let payload = MiniMaxH3AIChatRequest(
+      model: model,
+      temperature: 0.2,
+      maxTokens: 6000,
+      messages: [
+        .init(role: "system", content: system),
+        .init(role: "user", content: userText),
+      ]
+    )
+    var request = URLRequest(url: baseURL.appendingPathComponent("chat/completions"))
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    let apiKey = aiPromptAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !apiKey.isEmpty {
+      request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+    }
+    request.httpBody = try JSONEncoder().encode(payload)
+    let (data, response) = try await URLSession.shared.data(for: request)
+    if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+      let body = String(decoding: data, as: UTF8.self)
+      throw NSError(
+        domain: "AIPrompt",
+        code: http.statusCode,
+        userInfo: [NSLocalizedDescriptionKey: body]
+      )
+    }
+    let decoded = try JSONDecoder().decode(MiniMaxH3AIChatResponse.self, from: data)
+    let text = (
+      decoded.choices?.first?.message?.content
+        ?? decoded.choices?.first?.text
+        ?? decoded.message?.content
+        ?? decoded.response
+        ?? ""
+    )
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !text.isEmpty else {
+      throw NSError(
+        domain: "AIPrompt",
+        code: -1,
+        userInfo: [NSLocalizedDescriptionKey: "AI returned an empty prompt"]
+      )
+    }
+    return text
+  }
+
+  private func resolvedAIModel(baseURL: URL) async throws -> String {
+    let selected = aiPromptModel.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !selected.isEmpty, selected != "auto" { return selected }
+    var request = URLRequest(url: baseURL.appendingPathComponent("models"))
+    let apiKey = aiPromptAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !apiKey.isEmpty {
+      request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+    }
+    let (data, response) = try await URLSession.shared.data(for: request)
+    if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+      let body = String(decoding: data, as: UTF8.self)
+      throw NSError(
+        domain: "AIPrompt",
+        code: http.statusCode,
+        userInfo: [NSLocalizedDescriptionKey: body]
+      )
+    }
+    let decoded = try JSONDecoder().decode(MiniMaxH3AIModelsResponse.self, from: data)
+    let models = decoded.data ?? decoded.models ?? []
+    if let value = models.compactMap({ $0.id ?? $0.model ?? $0.name }).first,
+      !value.isEmpty
+    {
+      return value
+    }
+    throw NSError(
+      domain: "AIPrompt",
+      code: -1,
+      userInfo: [NSLocalizedDescriptionKey: "AI server reported no model"]
+    )
   }
 }
 
@@ -1560,21 +2141,6 @@ private struct MiniMaxH3MusicCutTimeline: View {
 struct MiniMaxH3GenerationView: View {
   @ObservedObject var controller: MiniMaxH3Controller
   let upscalerInputURL: URL?
-  let presentModelSetup: () -> Void
-
-  private var faceSwapBinding: Binding<Bool> {
-    Binding(
-      get: { controller.referenceEditMode == .faceSwap },
-      set: { controller.setReferenceEditMode(.faceSwap, enabled: $0) }
-    )
-  }
-
-  private var bodySwapBinding: Binding<Bool> {
-    Binding(
-      get: { controller.referenceEditMode == .bodySwap },
-      set: { controller.setReferenceEditMode(.bodySwap, enabled: $0) }
-    )
-  }
 
   var body: some View {
     Form {
@@ -1613,7 +2179,7 @@ struct MiniMaxH3GenerationView: View {
             }
           }
         }
-        if !controller.inputImageURLs.isEmpty {
+        if controller.isImageSequence {
           LabeledContent("画像の参照範囲") {
             Picker(
               "",
@@ -1681,70 +2247,9 @@ struct MiniMaxH3GenerationView: View {
               .foregroundStyle(.secondary)
           }
         }
-        if controller.inputVideoURL != nil, !controller.inputImageURLs.isEmpty {
-          LabeledContent("動画編集") {
-            HStack(spacing: 18) {
-              Toggle("Face Swap", isOn: faceSwapBinding)
-              .toggleStyle(.checkbox)
-              Toggle("Body Swap", isOn: bodySwapBinding)
-              .toggleStyle(.checkbox)
-            }
-            .disabled(controller.isRunning)
-          }
-          VStack(alignment: .leading, spacing: 6) {
-            Text("マスク指定")
-              .font(.caption)
-              .foregroundStyle(.secondary)
-            TextField(
-              "例: 左の男性、赤い服の人物、中央の人物",
-              text: $controller.referenceEditTargetDescription
-            )
-            .textFieldStyle(.roundedBorder)
-            .frame(maxWidth: .infinity)
-            .disabled(controller.isRunning || controller.referenceEditMode == .none)
-          }
-          if controller.referenceEditMode != .none {
-            LabeledContent("検出人物") {
-              HStack(spacing: 10) {
-                if controller.isDetectingVideoMaskCandidates {
-                  ProgressView().controlSize(.small)
-                  Text("検出中")
-                } else if controller.videoMaskCandidates.isEmpty {
-                  Text("未検出")
-                    .foregroundStyle(.secondary)
-                  Button("再検出", action: controller.detectVideoMaskCandidates)
-                    .disabled(controller.isRunning)
-                } else {
-                  Text("\(controller.videoMaskCandidates.count)件")
-                    .monospacedDigit()
-                  Button("再検出", action: controller.detectVideoMaskCandidates)
-                    .disabled(controller.isRunning)
-                }
-              }
-            }
-            if !controller.videoMaskCandidates.isEmpty {
-              ScrollView(.horizontal) {
-                HStack(alignment: .top, spacing: 10) {
-                  ForEach(controller.videoMaskCandidates) { candidate in
-                    MiniMaxH3VideoMaskCandidateView(
-                      controller: controller,
-                      candidate: candidate
-                    )
-                  }
-                }
-                .padding(.vertical, 2)
-              }
-            }
-          }
-          Text(
-            "選択すると<Video 1>を元動画、<Picture 1>/<Subject 1>を置換先として扱うRef2VA用プロンプトを実行時に自動追加します。複数人の動画ではマスク指定に置換対象を書いてください。"
-          )
-            .font(.caption)
-            .foregroundStyle(.secondary)
-        }
-        if controller.inputImageURLs.count > 1 {
-          DisclosureGroup("選択した画像（\(controller.inputImageURLs.count)枚）") {
-            ForEach(controller.inputImageURLs, id: \.path) { url in
+        if controller.isImageSequence, controller.inputURLs.count > 1 {
+          DisclosureGroup("選択した画像（\(controller.inputURLs.count)枚）") {
+            ForEach(controller.inputURLs, id: \.path) { url in
               Text(url.path)
                 .font(.caption.monospaced())
                 .textSelection(.enabled)
@@ -1753,7 +2258,7 @@ struct MiniMaxH3GenerationView: View {
           }
         }
         if controller.isImageSequence {
-          LabeledContent("リップシンク音源") {
+          LabeledContent("音源") {
             HStack {
               Text(controller.audioInputSummary)
                 .lineLimit(1)
@@ -1766,6 +2271,18 @@ struct MiniMaxH3GenerationView: View {
             }
           }
           if controller.audioInputURL != nil {
+            LabeledContent("音源の使い方") {
+              Picker("", selection: $controller.audioConditioningMode) {
+                ForEach(MiniMaxH3AudioConditioningMode.allCases, id: \.self) {
+                  mode in
+                  Text(mode.label).tag(mode)
+                }
+              }
+              .labelsHidden()
+              .pickerStyle(.segmented)
+              .frame(width: 330)
+              .disabled(controller.isRunning)
+            }
             LabeledContent("音源開始位置") {
               HStack {
                 TextField(
@@ -1780,10 +2297,52 @@ struct MiniMaxH3GenerationView: View {
               }
             }
             Text(
-              "元音源を音声latentとして生成中も固定し、完成動画にも同じ音源をそのまま使用します。1ショットは最大10秒です。"
+              controller.audioConditioningMode.helpText
+                + " 元音源を音声latentとして生成中も固定し、完成動画にも同じ音源をそのまま使用します。1ショットは最大10秒です。"
             )
               .font(.caption)
               .foregroundStyle(.secondary)
+            DisclosureGroup("歌詞・曲の意味") {
+              VStack(alignment: .leading, spacing: 8) {
+                LabeledContent("検索") {
+                  HStack {
+                    TextField(
+                      "曲名 アーティスト",
+                      text: $controller.lyricsSearchQuery
+                    )
+                    .disabled(controller.isRunning)
+                    Button("ブラウザで検索", action: controller.openLyricsSearch)
+                      .disabled(controller.isRunning)
+                  }
+                }
+                HStack {
+                  Button("歌詞ファイルを読み込む", action: controller.chooseLyricsFile)
+                    .disabled(controller.isRunning)
+                  if !controller.lyricsText.isEmpty {
+                    Button("歌詞をクリア") {
+                      controller.lyricsText = ""
+                    }
+                    .disabled(controller.isRunning)
+                  }
+                }
+                TextEditor(text: $controller.lyricsText)
+                  .font(.system(.caption, design: .monospaced))
+                  .frame(minHeight: 120)
+                  .disabled(controller.isRunning)
+                  .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                      .stroke(.separator.opacity(0.35))
+                  )
+                Text(
+                  controller.audioConditioningMode == .lipSync
+                    ? "タイムコード付き歌詞（LRC形式など）を貼ると、歌唱や表情タイミングの参考としてプロンプトに渡します。"
+                    : "BGM参照では、貼り付けた歌詞は意味・感情・曲構成の参考として渡し、口パクや字幕は明示しない限り生成しません。検索はブラウザを開くだけで、自動取得はしません。"
+                )
+                  .font(.caption)
+                  .foregroundStyle(.secondary)
+              }
+              .padding(.vertical, 4)
+            }
             Toggle("長尺Music Videoとして音源の最後まで連続生成", isOn: $controller.musicVideoMode)
               .disabled(controller.isRunning)
             if controller.musicVideoMode {
@@ -1974,8 +2533,6 @@ struct MiniMaxH3GenerationView: View {
               Image(systemName: "folder")
             }
             .buttonStyle(.borderless)
-            Button("モデル自動設定…", action: presentModelSetup)
-              .disabled(controller.isRunning)
           }
         }
         if !controller.supportsRuntime {
@@ -1986,75 +2543,93 @@ struct MiniMaxH3GenerationView: View {
             .foregroundStyle(.orange)
         }
       }
-      Section("ローカルAIプロンプト生成") {
-        LabeledContent("AI") {
-          HStack(spacing: 10) {
-            Picker("", selection: $controller.promptAssistantProvider) {
-              ForEach(MiniMaxH3PromptAssistantProvider.allCases) { provider in
-                Text(provider.label).tag(provider)
-              }
-            }
-            .labelsHidden()
-            .frame(width: 130)
-            TextField("URL", text: $controller.promptAssistantEndpoint)
-              .textFieldStyle(.roundedBorder)
-            TextField("モデル", text: $controller.promptAssistantModel)
-              .textFieldStyle(.roundedBorder)
-              .frame(width: 130)
-          }
-        }
+      Section("AIプロンプト生成") {
         VStack(alignment: .leading, spacing: 6) {
-          Text("日本語の指示")
+          Text("AIへの指示")
             .font(.caption)
             .foregroundStyle(.secondary)
-          TextEditor(text: $controller.promptAssistantInstruction)
-            .font(.body)
-            .frame(minHeight: 54, maxHeight: 96)
-            .overlay(
-              RoundedRectangle(cornerRadius: 6)
-                .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
-            )
-        }
-        HStack {
-          Button {
-            controller.generatePromptWithLocalAI()
-          } label: {
-            if controller.isGeneratingPrompt {
-              ProgressView().controlSize(.small)
-              Text("生成中")
-            } else {
-              Text("H3プロンプトを生成")
-            }
-          }
-          .disabled(
-            controller.isGeneratingPrompt || controller.isRunning
-              || controller.promptAssistantInstruction
-                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-          )
-          Button("下のプロンプトに反映") {
-            controller.applyGeneratedPrompt()
-          }
-          .disabled(
-            controller.isRunning
-              || controller.promptAssistantOutput
-                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-          )
-          Spacer()
-        }
-        VStack(alignment: .leading, spacing: 6) {
-          Text("生成されたH3プロンプト")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-          TextEditor(text: $controller.promptAssistantOutput)
+          TextEditor(text: $controller.aiPromptRequest)
             .font(.body)
             .frame(minHeight: 72, maxHeight: 140)
             .overlay(
               RoundedRectangle(cornerRadius: 6)
-                .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
+                .stroke(.separator.opacity(0.35))
+            )
+        }
+        VStack(alignment: .leading, spacing: 8) {
+          HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+              Text("AI種別")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+              Picker("", selection: $controller.aiPromptProvider) {
+                ForEach(MiniMaxH3AIPromptProvider.allCases) { provider in
+                  Text(provider.label).tag(provider)
+                }
+              }
+              .labelsHidden()
+              .frame(width: 180)
+              .onChange(of: controller.aiPromptProvider) { _, _ in
+                controller.applyAIPromptProviderDefaults()
+              }
+            }
+            VStack(alignment: .leading, spacing: 4) {
+              Text("モデル")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+              TextField("auto", text: $controller.aiPromptModel)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 120)
+            }
+            Spacer(minLength: 8)
+            Button(
+              controller.isGeneratingAIPrompt ? "生成中…" : "AIプロンプト生成",
+              action: controller.generateAIPrompt
+            )
+            .disabled(controller.isGeneratingAIPrompt || controller.isRunning)
+            .padding(.top, 18)
+          }
+          VStack(alignment: .leading, spacing: 4) {
+            Text("API URL")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+            TextField("", text: $controller.aiPromptAPIURL)
+              .textFieldStyle(.roundedBorder)
+          }
+          VStack(alignment: .leading, spacing: 4) {
+            Text("APIキー")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+            SecureField("必要な場合のみ", text: $controller.aiPromptAPIKey)
+              .textFieldStyle(.roundedBorder)
+            Text("ローカルAIでは通常空欄でOK")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+          }
+        }
+        VStack(alignment: .leading, spacing: 6) {
+          HStack {
+            Text("AI生成プロンプト")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+            Spacer()
+            Button("MiniMaxプロンプトへ反映", action: controller.applyGeneratedAIPrompt)
+              .disabled(
+                controller.aiGeneratedPrompt
+                  .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                  || controller.isRunning
+              )
+          }
+          TextEditor(text: $controller.aiGeneratedPrompt)
+            .font(.body)
+            .frame(minHeight: 96, maxHeight: 180)
+            .overlay(
+              RoundedRectangle(cornerRadius: 6)
+                .stroke(.separator.opacity(0.35))
             )
         }
         Text(
-          "llama.cpp server は通常 http://127.0.0.1:18080/v1/chat/completions を使います。生成結果を確認してから反映してください。"
+          "OpenAI互換APIとして、ローカルGemma / Ollama / LM Studio / カスタムURLにSwiftから直接送信します。歌詞・曲の意味欄に入力があれば、AIプロンプト生成にも自動で含めます。"
         )
           .font(.caption)
           .foregroundStyle(.secondary)
@@ -2065,7 +2640,7 @@ struct MiniMaxH3GenerationView: View {
           .frame(minHeight: 64, maxHeight: 120)
         Text(
           controller.supportsPromptOnly
-            ? "自由入力（最大\(controller.qwenSequenceLength) Qwenトークン。超過分は末尾を省略）"
+            ? "自由入力（最大4152 Qwenトークン。超過分は末尾を省略）"
             : "自由入力（参照画像・動画の視覚トークンを除く範囲を使用。超過分は末尾を省略）"
         )
           .font(.caption)
@@ -2114,7 +2689,7 @@ struct MiniMaxH3GenerationView: View {
         Text(
           controller.audioInputURL == nil
             ? "1080pは6秒固定、その他は2〜15秒。高解像度ほど処理時間とメモリ使用量が増えます"
-            : "リップシンク時は1ショット2〜10秒（1080pは6秒固定）です"
+            : "音源使用時は1ショット2〜10秒（1080pは6秒固定）です"
         )
           .font(.caption)
           .foregroundStyle(.secondary)
@@ -2164,53 +2739,6 @@ struct MiniMaxH3GenerationView: View {
     .onChange(of: controller.audioStartSeconds) { _, _ in
       controller.audioStartDidChange()
     }
-  }
-}
-
-private struct MiniMaxH3VideoMaskCandidateView: View {
-  @ObservedObject var controller: MiniMaxH3Controller
-  let candidate: MiniMaxH3VideoMaskCandidate
-
-  private var selected: Bool {
-    controller.selectedVideoMaskCandidateID == candidate.id
-  }
-
-  var body: some View {
-    Button {
-      controller.selectVideoMaskCandidate(candidate.id)
-    } label: {
-      VStack(spacing: 6) {
-        if let preview = NSImage(contentsOf: candidate.previewURL) {
-          Image(nsImage: preview)
-            .resizable()
-            .scaledToFill()
-            .frame(width: 86, height: 86)
-            .clipShape(RoundedRectangle(cornerRadius: 6))
-            .overlay(
-              RoundedRectangle(cornerRadius: 6)
-                .stroke(selected ? Color.accentColor : .secondary.opacity(0.35), lineWidth: selected ? 3 : 1)
-            )
-        } else {
-          RoundedRectangle(cornerRadius: 6)
-            .fill(Color.secondary.opacity(0.12))
-            .frame(width: 86, height: 86)
-            .overlay(Image(systemName: "person.crop.rectangle"))
-        }
-        HStack(spacing: 4) {
-          Image(systemName: selected ? "checkmark.circle.fill" : "circle")
-            .foregroundStyle(selected ? Color.accentColor : Color.secondary)
-          Text(candidate.label)
-        }
-        .font(.caption)
-        Text("信頼度 \(Int((candidate.confidence * 100).rounded()))%")
-          .font(.caption2)
-          .foregroundStyle(.secondary)
-      }
-      .frame(width: 100)
-      .contentShape(Rectangle())
-    }
-    .buttonStyle(.plain)
-    .disabled(controller.isRunning)
   }
 }
 

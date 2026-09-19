@@ -42,5 +42,19 @@ python scripts/prompting/write-minimax-h3-with-gemma.py \
 `H3_PROMPT_SKILL_DIR` で指定できます。APIは `--api-url` または
 `GEMMA_API_URL` で変更できます。
 
+## mioh upscalerの長尺MVプロンプト
+
+Gemmaへ渡すシステムプロンプトには、通常のH3 skillに加えて
+`docs/mioh_h3_music_video_prompting.md` も自動で含めます。
+
+miohの`music-video`では、`.continue` intervalが前の生成latentや最終フレームを
+実際の現在状態として受け取ります。そのため、AIプロンプト生成では
+「同じ本文を再開始の指示として読ませる」のではなく、継続部分では
+現在の姿勢・カメラ・小道具状態から次へ進むように書きます。
+
+長い`cut` entryも内部的に`.continue`へ分割される場合があるため、手紙を書く、
+ペンを持つ、ドアを開ける、スマホを見るなど反復しやすい行為は
+「冒頭動作を繰り返さない」ことをentry内に明記してください。
+
 Gemmaへ送る実際のシステムプロンプトだけを確認する場合は
 `--print-system-prompt` を付けます。この場合、API呼び出しは行いません。

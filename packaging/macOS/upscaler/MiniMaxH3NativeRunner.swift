@@ -78,7 +78,6 @@ private final class H3ProgressReporter: @unchecked Sendable {
 private struct H3ExecutionPlan: Codable {
   let input: String
   let inputImages: [String]?
-  let orderedReferences: [H3ExecutionReference]
   let output: String
   let backend: String
   let sourceDuration: Double
@@ -95,13 +94,6 @@ private struct H3ExecutionPlan: Codable {
   let qwenFrames: Int
   let sigmas: [Float]
   let cacheDirectory: String
-}
-
-private struct H3ExecutionReference: Codable {
-  let tag: String
-  let kind: String
-  let path: String
-  let subjectTag: String?
 }
 
 private struct H3PartPreparationDescriptor: Codable {
@@ -152,12 +144,10 @@ private final class H3NativePipeline {
   private let reporter: H3ProgressReporter
   private let sourceURL: URL?
   private let sourceImageURLs: [URL]
-  private let sourceImageSubjectIndices: [Int?]
   private let continuationStateOverride: H3TemporalContinuationState?
   private let temporalLatentOutputURL: URL?
   private let continuationFrameOutputURL: URL?
   private let audioSourceURL: URL?
-  private let orderedReferences: [H3ExecutionReference]
   private let outputURL: URL
   private let visualSourceDigest: Data
   private let sourceImageDigests: [Data]
@@ -237,21 +227,13 @@ private final class H3NativePipeline {
     self.reporter = reporter
     if let input = job.input, !input.isEmpty {
       sourceURL = URL(fileURLWithPath: input).standardizedFileURL
+      sourceImageURLs = []
     } else {
       sourceURL = nil
+      sourceImageURLs = (job.inputImages ?? []).map {
+        URL(fileURLWithPath: $0).standardizedFileURL
+      }
     }
-    sourceImageURLs = (job.inputImages ?? []).map {
-      URL(fileURLWithPath: $0).standardizedFileURL
-    }
-    if let subjects = job.inputImageSubjects {
-      sourceImageSubjectIndices = subjects.map(Optional.some)
-    } else {
-      sourceImageSubjectIndices = Array(repeating: nil, count: sourceImageURLs.count)
-    }
-    effectivePrompt = Self.promptWithSubjectBindings(
-      decodedManifest.fixedPrompt ?? job.prompt,
-      subjectIndices: sourceImageSubjectIndices
-    )
     self.continuationStateOverride = continuationStateOverride
     self.temporalLatentOutputURL = temporalLatentOutputURL?.standardizedFileURL
     self.continuationFrameOutputURL = continuationFrameOutputURL.map {
@@ -280,6 +262,11 @@ private final class H3NativePipeline {
     audioSourceURL = job.audioInput.flatMap { path in
       path.isEmpty ? nil : URL(fileURLWithPath: path).standardizedFileURL
     }
+    effectivePrompt = Self.audioConditionedPrompt(
+      decodedManifest.fixedPrompt ?? job.prompt,
+      mode: job.resolvedAudioConditioningMode,
+      hasExternalAudio: audioSourceURL != nil
+    )
     if let audioSourceURL {
       let audioDuration = try await H3NativeMedia.probeDuration(audioSourceURL)
       guard job.resolvedAudioStartSeconds < audioDuration else {
@@ -288,37 +275,6 @@ private final class H3NativePipeline {
         )
       }
     }
-    let subjectIndices = sourceImageSubjectIndices
-    var ordered: [H3ExecutionReference] = sourceImageURLs.enumerated().map {
-      index, url in
-      H3ExecutionReference(
-        tag: "Picture \(index + 1)",
-        kind: "image",
-        path: url.path,
-        subjectTag: subjectIndices[index].map { "Subject \($0)" }
-      )
-    }
-    if let sourceURL {
-      ordered.append(
-        H3ExecutionReference(
-          tag: "Video 1",
-          kind: "video",
-          path: sourceURL.path,
-          subjectTag: nil
-        )
-      )
-    }
-    if let audioSourceURL {
-      ordered.append(
-        H3ExecutionReference(
-          tag: "Audio 1",
-          kind: "audio",
-          path: audioSourceURL.path,
-          subjectTag: nil
-        )
-      )
-    }
-    orderedReferences = ordered
     outputURL = URL(fileURLWithPath: job.output).standardizedFileURL
     cache = try H3StageCache(
       directory: URL(fileURLWithPath: job.cacheDirectory).standardizedFileURL
@@ -328,7 +284,7 @@ private final class H3NativePipeline {
     } else {
       let visualParts: [Data]
       if let sourceURL {
-        visualParts = sourceImageDigests + [try H3StageCache.fileDigest(sourceURL)]
+        visualParts = [try H3StageCache.fileDigest(sourceURL)]
       } else {
         visualParts = sourceImageDigests
       }
@@ -347,32 +303,18 @@ private final class H3NativePipeline {
     conditioningSourceDigest = conditioningSourceDigestOverride ?? sourceDigest
   }
 
-  /// Make an explicit image-to-Subject contract available to Qwen/DiT when
-  /// callers provide whole-image references (face-only mode already emits its
-  /// own richer subject_definitions block).  The labels are descriptive only;
-  /// they do not alter the user's shot direction.
-  private static func promptWithSubjectBindings(
+  private static func audioConditionedPrompt(
     _ prompt: String,
-    subjectIndices: [Int?]
+    mode: H3AudioConditioningMode,
+    hasExternalAudio: Bool
   ) -> String {
-    let bindings = Dictionary(grouping: subjectIndices.enumerated().compactMap {
-      index, subject -> (Int, Int)? in
-      guard let subject else { return nil }
-      return (subject, index + 1)
-    }, by: { $0.0 })
-      .sorted { $0.key < $1.key }
-      .map { subject, entries in
-        let pictures = entries.map { "<Picture \($0.1)>" }.joined(separator: ", ")
-        return "<Subject \(subject)> is visually defined by \(pictures). Preserve this subject's identity when referenced."
-      }
-      .joined(separator: "\n")
-    guard !bindings.isEmpty else { return prompt }
-    let block = "reference_bindings:\n\(bindings)"
-    if prompt.range(of: "reference_bindings:", options: .caseInsensitive) != nil
-      || prompt.range(of: "subject_definitions:", options: .caseInsensitive) != nil {
-      return prompt + "\n\n" + block
-    }
-    return block + "\n\n" + prompt
+    guard hasExternalAudio, mode == .backgroundMusic,
+      !prompt.localizedCaseInsensitiveContains("Audio reference directive:")
+    else { return prompt }
+    return prompt + """
+
+      Audio reference directive: Use the supplied audio only as non-diegetic background music and music-video structure reference. Follow its tempo, energy, section changes, instrumentation, vocal mood, and emotional dynamics, but do not generate lip-sync, singing mouth shapes, dialogue performance, or visible speech from this audio. On-screen people must not sing to the vocals; their lips stay closed or move only naturally with breathing, expression, or non-vocal acting.
+      """
   }
 
   func plan() async throws -> H3ExecutionPlan {
@@ -401,22 +343,6 @@ private final class H3NativePipeline {
     {
       referenceFrames = 0
       qwenFrames = 0
-    } else if sourceURL != nil, !sourceImageURLs.isEmpty {
-      let available = max(
-        5,
-        Int((min(source.duration, job.durationSeconds) * 24).rounded(.down))
-      )
-      referenceFrames = try H3Geometry.referenceFrameCount(
-        available: available,
-        output: generationFrames
-      )
-      let maximumBlocks = manifest.qwenComposite?.visionBlockBatch ?? 10
-      let videoBlocks = max(1, maximumBlocks - sourceImageURLs.count)
-      qwenFrames = sourceImageURLs.count * 2
-        + H3Geometry.qwenVideoSampleIndices(
-          frameCount: referenceFrames,
-          maximumBlocks: videoBlocks
-        ).count
     } else if !sourceImageURLs.isEmpty {
       // A still image is a one-frame DiT reference and one paired Qwen vision
       // block. It must not inherit the ten-second video-reference geometry.
@@ -440,7 +366,6 @@ private final class H3NativePipeline {
     return H3ExecutionPlan(
       input: sourceURL?.path ?? sourceImageURLs.first?.path ?? "",
       inputImages: sourceImageURLs.isEmpty ? nil : sourceImageURLs.map(\.path),
-      orderedReferences: orderedReferences,
       output: outputURL.path,
       backend: job.backend?.rawValue
         ?? stages.values.first?.backend.rawValue
@@ -501,7 +426,7 @@ private final class H3NativePipeline {
         throw H3NativeError.missingTensor("textEncoder context/tokenTags")
       }
       if isLatentOnlyContinuation {
-        guard let exactAudio = media["audio"] else {
+        guard let encoderAudio = media["audio"] else {
           throw H3NativeError.missingTensor(
             "latent-only continuation audio condition"
           )
@@ -511,12 +436,14 @@ private final class H3NativePipeline {
           upstream: [
             conditioningSourceDigest,
             Data("audio-driven:\(job.resolvedAudioStartSeconds)".utf8),
+            Data("audio-encoder-input:10s@32000".utf8),
+            Data("audio-grid:\(plan.audioLatentShape[3])".utf8),
           ]
         )
         let audioCondition = try await cachedStage(
           "audioEncoder",
           key: audioKey,
-          inputs: ["audio": exactAudio],
+          inputs: ["audio": encoderAudio],
           progress: 0.34
         )
         guard let encoded = audioCondition["referenceAudioLatent"] else {
@@ -526,7 +453,7 @@ private final class H3NativePipeline {
           encoded,
           to: plan.audioLatentShape
         )
-        exactOutputAudio = exactAudio
+        exactOutputAudio = media["outputAudio"] ?? encoderAudio
         let continuationState = continuationStateOverride
         var upstreamKeys = [audioKey]
         if let continuationState {
@@ -624,49 +551,9 @@ private final class H3NativePipeline {
           )
           imageKeys.append(imageKey)
         }
-        var referenceVideoLatent: H3Tensor?
-        var referenceAudioLatent: H3Tensor?
-        var mixedReferenceKeys = imageKeys
-        if sourceURL != nil {
-          guard let referenceVideo = media["video"],
-            let referenceAudio = media["audio"]
-          else {
-            throw H3NativeError.missingTensor("decoded reference video/audio")
-          }
-          let videoKey = try stageKey(
-            "videoEncoder",
-            upstream: [
-              visualSourceDigest,
-              Data(Self.referenceMediaPreprocessingVersion.utf8),
-              Data("\(plan.referenceFrames)x\(job.width)x\(job.height)".utf8),
-            ]
-          )
-          referenceVideoLatent = try await encodeReferenceVideo(
-            referenceVideo,
-            key: videoKey
-          )
-          let audioKey = try stageKey(
-            "audioEncoder",
-            upstream: [
-              conditioningSourceDigest,
-              Data("\(job.durationSeconds)@32000".utf8),
-            ]
-          )
-          let audioCondition = try await cachedStage(
-            "audioEncoder",
-            key: audioKey,
-            inputs: ["audio": referenceAudio],
-            progress: 0.34
-          )
-          guard let encoded = audioCondition["referenceAudioLatent"] else {
-            throw H3NativeError.missingTensor("audioEncoder.referenceAudioLatent")
-          }
-          referenceAudioLatent = encoded
-          mixedReferenceKeys += [videoKey, audioKey]
-        }
         let continuationState = continuationStateOverride
         if let continuationStateOverride {
-          mixedReferenceKeys.append(
+          imageKeys.append(
             H3StageCache.key(parts: [
               continuationStateOverride.video.bytes,
               continuationStateOverride.audio?.bytes ?? Data(),
@@ -678,19 +565,21 @@ private final class H3NativePipeline {
           )
         }
         var targetAudioLatent: H3Tensor?
-        var imageKeysWithAudio = mixedReferenceKeys
-        if let exactAudio = media["audio"], sourceURL == nil || audioSourceURL != nil {
+        var imageKeysWithAudio = imageKeys
+        if let encoderAudio = media["audio"] {
           let audioKey = try stageKey(
             "audioEncoder",
             upstream: [
               conditioningSourceDigest,
               Data("audio-driven:\(job.resolvedAudioStartSeconds)".utf8),
+              Data("audio-encoder-input:10s@32000".utf8),
+              Data("audio-grid:\(plan.audioLatentShape[3])".utf8),
             ]
           )
           let audioCondition = try await cachedStage(
             "audioEncoder",
             key: audioKey,
-            inputs: ["audio": exactAudio],
+            inputs: ["audio": encoderAudio],
             progress: 0.34
           )
           guard let encoded = audioCondition["referenceAudioLatent"] else {
@@ -700,15 +589,15 @@ private final class H3NativePipeline {
             encoded,
             to: plan.audioLatentShape
           )
-          exactOutputAudio = exactAudio
+          exactOutputAudio = media["outputAudio"] ?? encoderAudio
           imageKeysWithAudio.append(audioKey)
         }
         denoised = try await denoise(
           plan: plan,
           context: context,
           tokenTags: tokenTags,
-          referenceVideoLatent: referenceVideoLatent,
-          referenceAudioLatent: referenceAudioLatent,
+          referenceVideoLatent: nil,
+          referenceAudioLatent: nil,
           referenceImageLatents: imageLatents,
           continuationState: continuationState,
           targetAudioLatent: targetAudioLatent,
@@ -752,18 +641,20 @@ private final class H3NativePipeline {
         upstreamKeys.append(imageKey)
       }
       var targetAudioLatent: H3Tensor?
-      if let exactAudio = media["audio"] {
+      if let encoderAudio = media["audio"] {
         let audioKey = try stageKey(
           "audioEncoder",
           upstream: [
             conditioningSourceDigest,
             Data("audio-driven:\(job.resolvedAudioStartSeconds)".utf8),
+            Data("audio-encoder-input:10s@32000".utf8),
+            Data("audio-grid:\(plan.audioLatentShape[3])".utf8),
           ]
         )
         let audioCondition = try await cachedStage(
           "audioEncoder",
           key: audioKey,
-          inputs: ["audio": exactAudio],
+          inputs: ["audio": encoderAudio],
           progress: 0.34
         )
         guard let encoded = audioCondition["referenceAudioLatent"] else {
@@ -773,7 +664,7 @@ private final class H3NativePipeline {
           encoded,
           to: plan.audioLatentShape
         )
-        exactOutputAudio = exactAudio
+        exactOutputAudio = media["outputAudio"] ?? encoderAudio
         upstreamKeys.append(audioKey)
       }
       denoised = try await denoise(
@@ -897,36 +788,13 @@ private final class H3NativePipeline {
     reporter.emit("complete", "completed", 1.0, outputURL.path)
   }
 
-  func denoiserPreparationDescriptor(
-    progressBase: Double = 0,
-    progressScale: Double = 1,
-    messagePrefix: String = ""
-  ) -> H3PartPreparationDescriptor {
-    H3PartPreparationDescriptor(
-      job: job,
-      conditioningMode: conditioningMode,
-      visualSourceDigest: visualSourceDigest,
-      sourceDigest: sourceDigest,
-      conditioningSourceDigest: conditioningSourceDigest,
-      sourceImageDigests: sourceImageDigests,
-      continuationLatentPath: nil,
-      temporalLatentOutputPath: temporalLatentOutputURL?.path,
-      continuationFrameOutputPath: continuationFrameOutputURL?.path,
-      reusableVisionBlockCount: reusableVisionBlockCount,
-      denoiserImageReferenceCount: denoiserImageReferenceCount,
-      progressBase: progressBase,
-      progressScale: progressScale,
-      messagePrefix: messagePrefix
-    )
-  }
-
   private func decodedMedia(plan: H3ExecutionPlan) async throws
     -> [String: H3Tensor]
   {
     let key = H3StageCache.key(parts: [
       conditioningSourceDigest,
       Data(
-        "media-v12-av-continuation:\(continuationStateOverride == nil ? "none" : "exact"):\(plan.referenceFrames):\(job.width):\(job.height):\(job.durationSeconds):\(job.resolvedAudioStartSeconds):physical-mask-\(job.physicalReferenceMask == true ? "on" : "off"):\(job.referenceEditMode?.rawValue ?? "none"):\(job.referenceEditTargetDescription ?? ""):\(job.referenceEditTargetIndex.map(String.init) ?? "none")"
+        "media-v14-fixed-encoder-audio-plus-exact-output:\(continuationStateOverride == nil ? "none" : "exact"):\(plan.referenceFrames):\(plan.audioLatentShape[3]):\(job.width):\(job.height):\(job.durationSeconds):\(job.resolvedAudioStartSeconds)"
           .utf8
       ),
     ])
@@ -936,53 +804,41 @@ private final class H3NativePipeline {
     }
     reporter.emit("media", "started", 0.06, "Decoding at 24fps with AVFoundation")
     let result: [String: H3Tensor]
+    let exactAudioSampleFrames = try H3NativeMedia.exactAudioGridSampleFrames(
+      latentFrames: plan.audioLatentShape[3]
+    )
+    let audioEncoderSampleFrames = Int(
+      (H3Geometry.audioConditioningSeconds * 32_000).rounded()
+    )
     if let sourceURL {
-      let visualReferenceURL = try await physicalMaskedSourceURLIfNeeded(
-        originalURL: sourceURL
-      )
       async let video = H3NativeMedia.decodeReferenceVideo(
-        url: visualReferenceURL,
+        url: sourceURL,
         width: job.width,
         height: job.height,
         frameCount: plan.referenceFrames
       )
       async let visionVideo = H3NativeMedia.decodeReferenceVideo(
-        url: visualReferenceURL,
+        url: sourceURL,
         width: H3Geometry.qwenVisionWidth,
         height: H3Geometry.qwenVisionHeight,
         frameCount: plan.referenceFrames
       )
       async let audio = H3NativeMedia.decodeReferenceAudio(
         url: sourceURL,
-        durationSeconds: job.durationSeconds
+        durationSeconds: H3Geometry.audioConditioningSeconds,
+        exactSampleFrames: audioEncoderSampleFrames
       )
-      let decodedVideo = try await video
-      let decodedVisionVideo = try await visionVideo
-      let decodedAudio = try await audio
-      var media = [
-        "video": decodedVideo,
-        "visionVideo": decodedVisionVideo,
-        "audio": decodedAudio,
+      async let outputAudio = H3NativeMedia.decodeReferenceAudio(
+        url: sourceURL,
+        durationSeconds: job.resolvedOutputDurationSeconds,
+        exactSampleFrames: exactAudioSampleFrames
+      )
+      result = try await [
+        "video": video,
+        "visionVideo": visionVideo,
+        "audio": audio,
+        "outputAudio": outputAudio,
       ]
-      if !sourceImageURLs.isEmpty {
-        let visionImages = try H3NativeMedia.decodeIdentityReferenceImages(
-          urls: sourceImageURLs,
-          width: H3Geometry.qwenVisionWidth,
-          height: H3Geometry.qwenVisionHeight
-        )
-        media["visionVideo"] = try Self.concatenateNCTHWTime([
-          visionImages,
-          decodedVisionVideo,
-        ])
-        for index in sourceImageURLs.indices {
-          media["image\(index)"] = try H3NativeMedia.decodeReferenceImage(
-            url: sourceImageURLs[index],
-            width: job.width,
-            height: job.height
-          )
-        }
-      }
-      result = media
     } else {
       var images: [String: H3Tensor] = [:]
       if !sourceImageURLs.isEmpty {
@@ -1004,7 +860,15 @@ private final class H3NativePipeline {
         images["audio"] = try await H3NativeMedia.decodeReferenceAudio(
           url: audioSourceURL,
           durationSeconds: H3Geometry.audioConditioningSeconds,
-          startSeconds: job.resolvedAudioStartSeconds
+          startSeconds: job.resolvedAudioStartSeconds,
+          exactSampleFrames: audioEncoderSampleFrames
+        )
+        images["outputAudio"] = try await H3NativeMedia.decodeReferenceAudio(
+          url: audioSourceURL,
+          durationSeconds: Double(plan.audioLatentShape[3])
+            / Double(H3Geometry.audioLatentFramesPerSecond),
+          startSeconds: job.resolvedAudioStartSeconds,
+          exactSampleFrames: exactAudioSampleFrames
         )
       }
       result = images
@@ -1012,94 +876,6 @@ private final class H3NativePipeline {
     try cache.store(stage: "media", key: key, tensors: result)
     reporter.emit("media", "completed", 0.16, "Prepared native reference tensors")
     return result
-  }
-
-  private func physicalMaskedSourceURLIfNeeded(originalURL: URL) async throws
-    -> URL
-  {
-    guard job.physicalReferenceMask == true,
-      (job.referenceEditMode ?? .none) != .none
-    else { return originalURL }
-    let target = job.referenceEditTargetDescription?
-      .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    reporter.emit(
-      "media",
-      "running",
-      0.07,
-      target.isEmpty
-        ? "Preparing physical person mask for reference video"
-        : "Preparing physical person mask: \(target)"
-    )
-    let key = H3StageCache.key(parts: [
-      visualSourceDigest,
-      Data("physical-reference-mask-v1".utf8),
-      Data((job.referenceEditMode?.rawValue ?? "none").utf8),
-      Data(target.utf8),
-      Data((job.referenceEditTargetIndex.map(String.init) ?? "none").utf8),
-      Data("\(job.durationSeconds)".utf8),
-    ])
-    let directory = URL(fileURLWithPath: job.cacheDirectory)
-      .standardizedFileURL
-      .appendingPathComponent("reference-video-masks", isDirectory: true)
-    let output = directory.appendingPathComponent("\(key).mp4")
-    if FileManager.default.fileExists(atPath: output.path) {
-      return output
-    }
-    return try await MiniMaxH3ReferenceVideoMaskProcessor
-      .createMaskedReferenceVideo(
-        sourceURL: originalURL,
-        targetDescription: target,
-        targetIndex: job.referenceEditTargetIndex,
-        durationSeconds: job.durationSeconds,
-        outputURL: output
-      )
-  }
-
-  private static func concatenateNCTHWTime(_ tensors: [H3Tensor]) throws
-    -> H3Tensor
-  {
-    guard let first = tensors.first else {
-      throw H3NativeError.invalidTensor("cannot concatenate an empty tensor list")
-    }
-    guard first.shape.count == 5, first.shape[0] == 1 else {
-      throw H3NativeError.invalidTensor(
-        "Qwen visual tensors must be NCTHW, got \(first.shape)"
-      )
-    }
-    let channels = first.shape[1]
-    let height = first.shape[3]
-    let width = first.shape[4]
-    var totalFrames = 0
-    let values = try tensors.map { tensor -> [Float] in
-      guard tensor.shape.count == 5,
-        tensor.shape[0] == 1,
-        tensor.shape[1] == channels,
-        tensor.shape[3] == height,
-        tensor.shape[4] == width
-      else {
-        throw H3NativeError.invalidTensor(
-          "cannot concatenate mismatched NCTHW tensors: \(tensors.map(\.shape))"
-        )
-      }
-      totalFrames += tensor.shape[2]
-      return try tensor.floatValues()
-    }
-    let plane = height * width
-    var output: [Float] = []
-    output.reserveCapacity(channels * totalFrames * plane)
-    for channel in 0..<channels {
-      for (tensor, tensorValues) in zip(tensors, values) {
-        let frames = tensor.shape[2]
-        let start = channel * frames * plane
-        output.append(
-          contentsOf: tensorValues[start..<(start + frames * plane)]
-        )
-      }
-    }
-    return try H3Tensor(
-      float32: output,
-      shape: [1, channels, totalFrames, height, width]
-    )
   }
 
   private func textCondition(
@@ -1540,23 +1316,6 @@ private final class H3NativePipeline {
             targetVideoShape: plan.videoLatentShape,
             targetAudioShape: plan.audioLatentShape
           )
-        } else if let referenceVideoLatent,
-          let referenceAudioLatent,
-          let referenceImageLatents,
-          !referenceImageLatents.isEmpty
-        {
-          prepared = try await composite.prepareVideoWithImages(
-            context: context,
-            tokenTags: tokenTags,
-            referenceVideoLatent: referenceVideoLatent,
-            referenceAudioLatent: referenceAudioLatent,
-            referenceImageLatents: referenceImageLatents,
-            targetVideoShape: plan.videoLatentShape,
-            targetAudioShape: plan.audioLatentShape,
-            seed: job.seed,
-            visualConditionNoiseAug: manifest.visualConditionNoiseAug ?? 0.999,
-            audioConditionNoiseAug: manifest.audioConditionNoiseAug ?? 1.0
-          )
         } else if let referenceImageLatents, !referenceImageLatents.isEmpty {
           prepared = try await composite.prepareImages(
             context: context,
@@ -1832,26 +1591,10 @@ private final class H3NativePipeline {
     // Native-composite sampling already performs ModelSamplingAV's single
     // process_latent_out rescale before caching. Applying the shift ratio here
     // again attenuated generated audio by another 4x (about 12 dB).
-    let generated = try H3Tensor(float32: values, shape: shape)
-    let input: H3Tensor
-    if let expectedShape = stages["audioDecoder"]?
-      .inputConstraints?["audioLatent"]?.shape,
-      expectedShape.count == shape.count,
-      expectedShape.allSatisfy({ $0 > 0 }),
-      expectedShape != shape
-    {
-      // The H3 audio decoder is exported with a fixed latent input window
-      // (currently 405 ticks), while shorter prompt/FL2VA clips generate only
-      // the visible-duration latent (for example 8s -> 320 ticks). Pad/crop at
-      // the decoder boundary; movie writing still trims to the requested
-      // output duration.
-      input = try H3NativeMedia.fitAudioLatent(generated, to: expectedShape)
-    } else {
-      input = generated
-    }
+    let input = try H3Tensor(float32: values, shape: shape)
     let key = try stageKey(
       "audioDecoder",
-      upstream: [input.bytes, Data(input.shape.description.utf8)]
+      upstream: [input.bytes, Data(shape.description.utf8)]
     )
     let outputs = try await cachedStage(
       "audioDecoder",
@@ -2073,6 +1816,13 @@ private final class H3DenoisePrepareWorker {
 @main
 struct MiniMaxH3NativeRunner {
   static func main() async {
+    // The private switch is restricted to the short-lived DiT child. Qwen and
+    // VAE work in the parent with normal MPSGraph specialization handling.
+    if CommandLine.arguments.dropFirst().first == "prepare-part" {
+      setenv("MPSGRAPH_DISABLE_ANEC_MODULE_VALIDATION", "1", 1)
+    } else {
+      unsetenv("MPSGRAPH_DISABLE_ANEC_MODULE_VALIDATION")
+    }
     do {
       try await execute()
     } catch {
@@ -2115,7 +1865,7 @@ struct MiniMaxH3NativeRunner {
       encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
       print(String(data: try encoder.encode(await pipeline.plan()), encoding: .utf8)!)
     } else {
-      try await runSingleVideo(manifestURL: manifestURL, job: job)
+      try await pipeline.run()
     }
   }
 
@@ -2160,57 +1910,6 @@ struct MiniMaxH3NativeRunner {
       denoiserImageReferenceCount: descriptor.denoiserImageReferenceCount
     )
     try await pipeline.run(decodeOutput: false)
-  }
-
-  private static func runSingleVideo(
-    manifestURL: URL,
-    job: H3NativeJob
-  ) async throws {
-    let outputURL = URL(fileURLWithPath: job.output).standardizedFileURL
-    let workURL = outputURL
-      .deletingPathExtension()
-      .appendingPathExtension("mioh-h3-work")
-    try FileManager.default.createDirectory(
-      at: workURL,
-      withIntermediateDirectories: true
-    )
-
-    let conditioningReporter = H3ProgressReporter(
-      progressBase: 0,
-      progressScale: 0.48
-    )
-    let conditioningPipeline = try await H3NativePipeline(
-      manifestURL: manifestURL,
-      job: job,
-      reporter: conditioningReporter,
-      conditioningOnly: true
-    )
-    try await conditioningPipeline.run()
-
-    let descriptor = conditioningPipeline.denoiserPreparationDescriptor(
-      progressBase: 0,
-      progressScale: 0.82
-    )
-    let descriptorURL = workURL.appendingPathComponent(".prepare-single-run.json")
-    let descriptorEncoder = JSONEncoder()
-    descriptorEncoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-    try descriptorEncoder.encode(descriptor).write(
-      to: descriptorURL,
-      options: .atomic
-    )
-    let prepareWorker = H3DenoisePrepareWorker(
-      manifestURL: manifestURL,
-      descriptorURL: descriptorURL
-    )
-    try await prepareWorker.prepare()
-
-    let renderReporter = H3ProgressReporter()
-    let renderPipeline = try await H3NativePipeline(
-      manifestURL: manifestURL,
-      job: job,
-      reporter: renderReporter
-    )
-    try await renderPipeline.run()
   }
 
   private static func runMusicVideo(
@@ -2363,11 +2062,60 @@ struct MiniMaxH3NativeRunner {
     if let flatPromptPlan {
       var plannedIntervals: [H3MusicVideoInterval] = []
       var promptEntryIndices: [Int] = []
-      for (entryIndex, entry) in flatPromptPlan.entries.enumerated() {
-        let entryFrames = Int(
-          ((entry.endSeconds - entry.startSeconds)
-            * Double(H3Geometry.framesPerSecond)).rounded()
+      var entryFrameRanges = flatPromptPlan.entries.map { entry in
+        (
+          start: Int(
+            (entry.startSeconds * Double(H3Geometry.framesPerSecond)).rounded()
+          ),
+          end: Int(
+            (entry.endSeconds * Double(H3Geometry.framesPerSecond)).rounded()
+          )
         )
+      }
+      let minimumFlatEntryFrames = 2 * H3Geometry.framesPerSecond
+      if entryFrameRanges.count > 1 {
+        for entryIndex in 0..<(entryFrameRanges.count - 1) {
+          guard flatPromptPlan.entries[entryIndex + 1].transition == .continue
+          else { continue }
+          let payloadFrames = entryFrameRanges[entryIndex].end
+            - entryFrameRanges[entryIndex].start
+          let transition = flatPromptPlan.entries[entryIndex].transition
+          let preRollFrames = transition == .continue
+            ? continuationPreRollFrames
+            : H3MusicVideoBoundary.cutPreRollFrames(
+              intervalIndex: entryIndex,
+              payloadFrames: payloadFrames,
+              maximumFrames: maximumGenerationFrames,
+              suppliesContinuation: true
+            )
+          guard !H3Geometry.isAlignedFrameCount(payloadFrames + preRollFrames)
+          else { continue }
+          let nextPayloadFrames = entryFrameRanges[entryIndex + 1].end
+            - entryFrameRanges[entryIndex + 1].start
+          var bestDelta: Int?
+          for radius in 1...8 {
+            for delta in [-radius, radius] {
+              let adjustedPayload = payloadFrames + delta
+              let adjustedNextPayload = nextPayloadFrames - delta
+              guard adjustedPayload >= minimumFlatEntryFrames,
+                adjustedNextPayload >= minimumFlatEntryFrames,
+                adjustedPayload + preRollFrames <= maximumGenerationFrames,
+                H3Geometry.isAlignedFrameCount(adjustedPayload + preRollFrames)
+              else { continue }
+              bestDelta = delta
+              break
+            }
+            if bestDelta != nil { break }
+          }
+          if let bestDelta {
+            entryFrameRanges[entryIndex].end += bestDelta
+            entryFrameRanges[entryIndex + 1].start += bestDelta
+          }
+        }
+      }
+      for (entryIndex, entry) in flatPromptPlan.entries.enumerated() {
+        let entryStartFrame = entryFrameRanges[entryIndex].start
+        let entryFrames = entryFrameRanges[entryIndex].end - entryStartFrame
         var payloads = [entryFrames]
         if entryIndex > 0, entry.transition == .cut,
           entryFrames + H3MusicVideoBoundary.cutPreRollFrames
@@ -2399,8 +2147,9 @@ struct MiniMaxH3NativeRunner {
           }
         }
         var relativeStartFrames = 0
-        for partIndex in payloads.indices {
-          let payloadFrames = payloads[partIndex]
+        var partIndex = 0
+        while partIndex < payloads.count {
+          var payloadFrames = payloads[partIndex]
           let transition = partIndex == 0 ? entry.transition : .continue
           let continuesToNext = partIndex + 1 < payloads.count
             || (entryIndex + 1 < flatPromptPlan.entries.count
@@ -2414,8 +2163,79 @@ struct MiniMaxH3NativeRunner {
               maximumFrames: maximumGenerationFrames,
               suppliesContinuation: continuesToNext
             )
-          let generationFrames = payloadFrames + preRollFrames
-          guard payloadFrames >= 2 * H3Geometry.framesPerSecond,
+          var generationFrames = payloadFrames + preRollFrames
+          let minimumPayloadFrames = 2 * H3Geometry.framesPerSecond
+          if generationFrames > maximumGenerationFrames,
+            payloadFrames >= minimumPayloadFrames * 2
+          {
+            let capacity = maximumGenerationFrames - preRollFrames
+            var splitPayload = min(
+              capacity,
+              payloadFrames - minimumPayloadFrames
+            )
+            while splitPayload >= minimumPayloadFrames,
+              !H3Geometry.isAlignedFrameCount(splitPayload + preRollFrames)
+            {
+              splitPayload -= 1
+            }
+            while payloadFrames - splitPayload < minimumPayloadFrames,
+              splitPayload - 17 >= minimumPayloadFrames
+            {
+              splitPayload -= 17
+            }
+            if splitPayload >= minimumPayloadFrames,
+              payloadFrames - splitPayload >= minimumPayloadFrames,
+              splitPayload + preRollFrames <= maximumGenerationFrames,
+              H3Geometry.isAlignedFrameCount(splitPayload + preRollFrames)
+            {
+              payloads[partIndex] = splitPayload
+              payloads.insert(payloadFrames - splitPayload, at: partIndex + 1)
+              continue
+            }
+          }
+          if continuesToNext,
+            !H3Geometry.isAlignedFrameCount(generationFrames)
+          {
+            var bestDelta: Int?
+            let maximumDelta = max(
+              maximumGenerationFrames,
+              2 * H3Geometry.framesPerSecond
+            )
+            for radius in 1...maximumDelta {
+              for delta in [-radius, radius] {
+                let adjustedPayload = payloadFrames + delta
+                guard adjustedPayload >= minimumPayloadFrames,
+                  adjustedPayload + preRollFrames <= maximumGenerationFrames,
+                  H3Geometry.isAlignedFrameCount(adjustedPayload + preRollFrames)
+                else { continue }
+                if partIndex + 1 < payloads.count {
+                  guard payloads[partIndex + 1] - delta
+                    >= minimumPayloadFrames
+                  else { continue }
+                } else if entryIndex + 1 < entryFrameRanges.count {
+                  let nextFrames = entryFrameRanges[entryIndex + 1].end
+                    - entryFrameRanges[entryIndex + 1].start
+                  guard nextFrames - delta >= minimumPayloadFrames
+                  else { continue }
+                }
+                bestDelta = delta
+                break
+              }
+              if bestDelta != nil { break }
+            }
+            if let bestDelta {
+              payloadFrames += bestDelta
+              payloads[partIndex] = payloadFrames
+              if partIndex + 1 < payloads.count {
+                payloads[partIndex + 1] -= bestDelta
+              } else if entryIndex + 1 < entryFrameRanges.count {
+                entryFrameRanges[entryIndex].end += bestDelta
+                entryFrameRanges[entryIndex + 1].start += bestDelta
+              }
+              generationFrames = payloadFrames + preRollFrames
+            }
+          }
+          guard payloadFrames >= minimumPayloadFrames,
             Double(generationFrames) / Double(H3Geometry.framesPerSecond)
               <= maximumGenerationDuration + 1e-6
           else {
@@ -2435,7 +2255,8 @@ struct MiniMaxH3NativeRunner {
               index: intervalIndex,
               transition: transition,
               continuesToNext: continuesToNext,
-              startSeconds: entry.startSeconds
+              startSeconds: Double(entryStartFrame)
+                / Double(H3Geometry.framesPerSecond)
                 + Double(relativeStartFrames)
                   / Double(H3Geometry.framesPerSecond),
               durationSeconds: Double(payloadFrames)
@@ -2448,6 +2269,7 @@ struct MiniMaxH3NativeRunner {
           )
           promptEntryIndices.append(entryIndex)
           relativeStartFrames += payloadFrames
+          partIndex += 1
         }
       }
       intervals = plannedIntervals
@@ -2464,6 +2286,7 @@ struct MiniMaxH3NativeRunner {
       intervalPromptEntryIndices = nil
     }
     let intervalCount = intervals.count
+    let continuationBlendFramesOverride = flatPromptPlan?.continuationBlendFrames
     for interval in intervals {
       analysisReporter.emit(
         "musicAnalysis", "running", 0,
@@ -2594,7 +2417,8 @@ struct MiniMaxH3NativeRunner {
       let payloadFrames = Int((interval.durationSeconds * frameRate).rounded())
       let blendFrames = H3MusicVideoBoundary.blendFrames(
         transition: interval.transition,
-        preRollFrames: preRollFrames
+        preRollFrames: preRollFrames,
+        overrideFrames: continuationBlendFramesOverride
       )
       let movieTrimFrames = preRollFrames - blendFrames
       let movieFrameCount = payloadFrames + blendFrames
@@ -2614,6 +2438,7 @@ struct MiniMaxH3NativeRunner {
         audioStartSeconds: audioStart,
         durationSeconds: requestedDuration,
         continuationMode: continuationMode,
+        audioConditioningMode: baseJob.resolvedAudioConditioningMode,
         storyboardAnchored: storyboardAnchored
       )
       let intervalPrompt: String
@@ -2635,15 +2460,10 @@ struct MiniMaxH3NativeRunner {
           directive: directive
         )
       }
-    return H3NativeJob(
-      input: nil,
-      inputImages: inputImages.map(\.path),
-      inputImageSubjects: baseJob.inputImageSubjects,
-      referenceEditMode: nil,
-      referenceEditTargetDescription: nil,
-      referenceEditTargetIndex: nil,
-      physicalReferenceMask: nil,
-      output: outputURL.path,
+      return H3NativeJob(
+        input: nil,
+        inputImages: inputImages.map(\.path),
+        output: outputURL.path,
         prompt: intervalPrompt,
         cacheDirectory: baseJob.cacheDirectory,
         width: baseJob.width,
@@ -2662,6 +2482,7 @@ struct MiniMaxH3NativeRunner {
         outputDurationSeconds: Double(movieFrameCount) / frameRate,
         preserveSourceAudioWhenDecoderIsUnavailable:
           baseJob.preserveSourceAudioWhenDecoderIsUnavailable,
+        audioConditioningMode: baseJob.audioConditioningMode,
         musicVideoContinuationMode: continuationMode
       )
     }
@@ -3126,6 +2947,7 @@ struct MiniMaxH3NativeRunner {
     try assembleMusicVideo(
       intervalURLs: intervalURLs,
       intervals: intervals,
+      continuationBlendFramesOverride: continuationBlendFramesOverride,
       audioURL: audioURL,
       audioStartSeconds: baseJob.resolvedAudioStartSeconds,
       durationSeconds: availableDuration,
@@ -3185,6 +3007,7 @@ struct MiniMaxH3NativeRunner {
   private static func assembleMusicVideo(
     intervalURLs: [URL],
     intervals: [H3MusicVideoInterval],
+    continuationBlendFramesOverride: Int?,
     audioURL: URL,
     audioStartSeconds: Double,
     durationSeconds: Double,
@@ -3215,7 +3038,8 @@ struct MiniMaxH3NativeRunner {
         transition: interval.transition,
         preRollFrames: Int(
           (interval.preRollSeconds * Double(frameRate)).rounded()
-        )
+        ),
+        overrideFrames: continuationBlendFramesOverride
       )
     }
     if overlapFrames.allSatisfy({ $0 == 0 }) {
@@ -3312,11 +3136,13 @@ struct MiniMaxH3NativeRunner {
     audioStartSeconds: Double,
     durationSeconds: Double,
     continuationMode: H3MusicVideoContinuationMode,
+    audioConditioningMode: H3AudioConditioningMode,
     storyboardAnchored: Bool = false
   ) -> String {
     let start = posixNumber(audioStartSeconds)
     let end = posixNumber(audioStartSeconds + durationSeconds)
     let transitionDirective: String
+    let sceneDescriptionDirective: String
     if interval.transition == .continue {
       let carriedState: String
       switch continuationMode {
@@ -3332,16 +3158,29 @@ struct MiniMaxH3NativeRunner {
       transitionDirective = """
         CONTINUE FORWARD. \(carriedState) Treat it only as history immediately before this time range. Begin with the next motion phase: preserve pose velocity, gaze, facial emotion, fabric motion, camera velocity, lens, lighting, and background geometry. Do not restart, replay, re-establish, freeze, dissolve, or return to an earlier position. Generate only what physically follows.
         """
+      sceneDescriptionDirective = """
+        The concrete scene description below defines intent, mood, setting, constraints, and allowed next developments for this continuation; it is not a restart pose, repeated opening action, or instruction to replay the entry from the beginning. Treat the supplied continuation state as the real current body pose, camera position, object state, and motion.
+        """
     } else {
       transitionDirective = """
         SINGLE UNINTERRUPTED TAKE. The first output frame already occupies the location, composition, action phase, and fixed lighting described below. Maintain one continuous camera and one continuous physical setting for this entire interval; do not reset, re-establish, or transform into another composition or environment. No image or motion from an earlier time range is authoritative.
+        """
+      sceneDescriptionDirective = """
+        The concrete scene description below is authoritative for this time range.
         """
     }
     let storyboardDirective = storyboardAnchored
       ? "The final supplied visual reference is the interval-specific photoreal storyboard anchor. Its camera height, lens, framing, subject blocking, studio geometry, color palette, lighting, and opening action are authoritative. Begin directly from that photographed composition; do not reproduce a contact sheet, border, number, timecode, drawing, paper texture, or storyboard annotation."
       : ""
+    let audioDirective: String
+    switch audioConditioningMode {
+    case .lipSync:
+      audioDirective = "Preserve precise vocal timing from the supplied audio."
+    case .backgroundMusic:
+      audioDirective = "Use the supplied audio only as non-diegetic background music and rhythm/structure reference; do not generate lip-sync, singing mouth shapes, dialogue performance, or visible speech from the vocals."
+    }
     return """
-      PRIORITY ABSOLUTE-TIME DIRECTIVE: Render only source-audio time \(start)-\(end) seconds. \(transitionDirective) \(storyboardDirective) The concrete scene description below is authoritative for this time range. A time-of-day phrase defines stable lighting, not a time lapse. Show exactly one visible instance of each referenced subject. Never superimpose, overlap, ghost, double-expose, split-screen, or duplicate the subject. Preserve precise vocal timing from the supplied audio, and leave a clean moving boundary when forward continuation follows.
+      PRIORITY ABSOLUTE-TIME DIRECTIVE: Render only source-audio time \(start)-\(end) seconds. \(transitionDirective) \(storyboardDirective) \(sceneDescriptionDirective) A time-of-day phrase defines stable lighting, not a time lapse. Show exactly one visible instance of each referenced subject. Never superimpose, overlap, ghost, double-expose, split-screen, or duplicate the subject. \(audioDirective) Leave a clean moving boundary when forward continuation follows.
       """
   }
 
@@ -3380,15 +3219,6 @@ struct MiniMaxH3NativeRunner {
     } else {
       inputImages = nil
     }
-    let inputImageSubjects: [Int]?
-    if let encoded = options["input-image-subjects-json"] {
-      inputImageSubjects = try JSONDecoder().decode(
-        [Int].self,
-        from: Data(encoded.utf8)
-      )
-    } else {
-      inputImageSubjects = nil
-    }
     let musicVideoCutPoints: [Double]?
     if let encoded = options["music-video-cuts-json"] {
       musicVideoCutPoints = try JSONDecoder().decode(
@@ -3412,27 +3242,20 @@ struct MiniMaxH3NativeRunner {
     } else {
       continuationMode = nil
     }
-    let referenceEditMode: H3ReferenceEditMode?
-    if let rawMode = options["reference-edit-mode"] {
-      referenceEditMode = H3ReferenceEditMode(rawValue: rawMode)
-      guard referenceEditMode != nil else {
+    let audioConditioningMode: H3AudioConditioningMode?
+    if let rawMode = options["audio-conditioning-mode"] {
+      guard let parsed = H3AudioConditioningMode(rawValue: rawMode) else {
         throw H3NativeError.invalidArguments(
-          "reference-edit-mode must be none, face-swap, or body-swap"
+          "audio-conditioning-mode must be background-music or lip-sync"
         )
       }
+      audioConditioningMode = parsed
     } else {
-      referenceEditMode = nil
+      audioConditioningMode = nil
     }
     return H3NativeJob(
       input: options["input"],
       inputImages: inputImages,
-      inputImageSubjects: inputImageSubjects,
-      referenceEditMode: referenceEditMode,
-      referenceEditTargetDescription: options["reference-edit-target"],
-      referenceEditTargetIndex: options["reference-edit-target-index"]
-        .flatMap(Int.init),
-      physicalReferenceMask:
-        options["physical-reference-mask"].map { $0 != "0" && $0 != "false" },
       output: output,
       prompt: prompt,
       cacheDirectory: cache,
@@ -3448,6 +3271,7 @@ struct MiniMaxH3NativeRunner {
       outputTrimStartSeconds: options["output-trim-start"].flatMap(Double.init),
       outputDurationSeconds: options["output-duration"].flatMap(Double.init),
       preserveSourceAudioWhenDecoderIsUnavailable: false,
+      audioConditioningMode: audioConditioningMode,
       musicVideoCutPointsSeconds: musicVideoCutPoints,
       musicVideoContinuationMode: continuationMode,
       musicVideoLastFrameDirectory:
@@ -3476,17 +3300,13 @@ struct MiniMaxH3NativeRunner {
   private static func usage() -> H3NativeError {
     .invalidArguments(
       "usage: mioh-minimax-h3-native <validate|plan|run|music-video> --manifest <manifest.json> "
-        + "[--job <job.json> | (--input <video>)? (--input-images-json <json>)? "
-        + "[--input-image-subjects-json <json>] "
-        + "[--reference-edit-mode <none|face-swap|body-swap>] "
-        + "[--reference-edit-target <description>] "
-        + "[--reference-edit-target-index <index>] "
-        + "[--physical-reference-mask <0|1>] "
+        + "[--job <job.json> | (--input <video> | --input-images-json <json>) "
         + "--output <mp4> --prompt <text> "
         + "--cache <dir> --backend <coreai|coreml> "
         + "--width <multiple-of-32> --height <multiple-of-32> "
         + "[--output-width <pixels> --output-height <pixels>] "
         + "[--audio-input <music> --audio-start <seconds>] "
+        + "[--audio-conditioning-mode <background-music|lip-sync>] "
         + "[--music-video-cuts-json <seconds-json>] "
         + "[--music-video-continuation <hybrid-av|latent-prefix|first|first-last-provided|first-last-generated>] "
         + "[--music-video-last-frame-directory <directory>] "

@@ -189,10 +189,35 @@ enum H3NativeMedia {
       1,
       Int((durationSeconds * Double(sampleRate)).rounded())
     )
+    return try silentAudio(sampleFrames: sampleCount)
+  }
+
+  static func silentAudio(sampleFrames: Int) throws -> H3Tensor {
+    let sampleCount = max(1, sampleFrames)
     return try H3Tensor(
       float32: [Float](repeating: 0, count: 2 * sampleCount),
       shape: [1, 2, sampleCount]
     )
+  }
+
+  static func exactAudioGridSampleFrames(
+    latentFrames: Int,
+    sampleRate: Int = 32_000
+  ) throws -> Int {
+    guard latentFrames > 0 else {
+      throw H3NativeError.invalidJob(
+        "H3 audio grid needs at least one latent frame"
+      )
+    }
+    guard sampleRate > 0,
+      sampleRate % H3Geometry.audioLatentFramesPerSecond == 0
+    else {
+      throw H3NativeError.invalidJob(
+        "H3 audio grid requires an integral \(H3Geometry.audioLatentFramesPerSecond)Hz latent rate at \(sampleRate)Hz"
+      )
+    }
+    return latentFrames
+      * (sampleRate / H3Geometry.audioLatentFramesPerSecond)
   }
 
   static func decodeReferenceVideo(
@@ -268,14 +293,15 @@ enum H3NativeMedia {
     url: URL,
     durationSeconds: Double,
     startSeconds: Double = 0,
-    sampleRate: Int = 32_000
+    sampleRate: Int = 32_000,
+    exactSampleFrames: Int? = nil
   ) async throws -> H3Tensor {
     let asset = AVURLAsset(url: url)
     guard let track = try await asset.loadTracks(withMediaType: .audio).first else {
-      return try silentAudio(
-        durationSeconds: durationSeconds,
-        sampleRate: sampleRate
-      )
+      if let exactSampleFrames {
+        return try silentAudio(sampleFrames: exactSampleFrames)
+      }
+      return try silentAudio(durationSeconds: durationSeconds, sampleRate: sampleRate)
     }
     let reader = try AVAssetReader(asset: asset)
     let output = AVAssetReaderTrackOutput(
@@ -298,7 +324,11 @@ enum H3NativeMedia {
         "audio reader did not start: \(error.localizedDescription)"
       )
     }
-    let maximumFrames = max(1, Int((durationSeconds * Double(sampleRate)).rounded()))
+    let maximumFrames = max(
+      1,
+      exactSampleFrames
+        ?? Int((durationSeconds * Double(sampleRate)).rounded())
+    )
     var discardFrames = max(
       0,
       Int((startSeconds * Double(sampleRate)).rounded())
