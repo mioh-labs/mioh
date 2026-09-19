@@ -50,8 +50,8 @@ private struct UpscalerContentView: View {
     .onAppear {
       guard !checkedInitialModelSetup else { return }
       checkedInitialModelSetup = true
-      if !upscaler.selectedModelReady || !h3Generation.modelReady {
-        presentInitialModelSetup()
+      if !upscaler.selectedModelReady {
+        presentModelSetup()
       }
     }
     .onChange(of: upscaler.upscalerModel) { _, _ in
@@ -62,7 +62,6 @@ private struct UpscalerContentView: View {
     .sheet(isPresented: $showingModelSetup) {
       UpscalerModelSetupView(controller: modelSetup) {
         upscaler.applyModelSetupDestination(modelSetup.destinationPath)
-        h3Generation.applyModelSetupManifest(modelSetup.miniMaxH3ManifestPath)
       }
     }
   }
@@ -95,8 +94,7 @@ private struct UpscalerContentView: View {
       Divider()
       MiniMaxH3GenerationView(
         controller: h3Generation,
-        upscalerInputURL: upscaler.inputURL,
-        presentModelSetup: presentH3ModelSetup
+        upscalerInputURL: upscaler.inputURL
       )
       Divider()
       videoGenerationFooter
@@ -532,23 +530,6 @@ private struct UpscalerContentView: View {
     modelSetup.prepare(
       for: upscaler.selectedUpscaler,
       preferredPath: upscaler.selectedModelRootPath
-    )
-    showingModelSetup = true
-  }
-
-  private func presentInitialModelSetup() {
-    modelSetup.prepareInitial(
-      for: upscaler.selectedUpscaler,
-      preferredPath: upscaler.selectedModelRootPath,
-      h3ManifestPath: h3Generation.manifestPath,
-      h3Ready: h3Generation.modelReady
-    )
-    showingModelSetup = true
-  }
-
-  private func presentH3ModelSetup() {
-    modelSetup.prepareForMiniMaxH3(
-      preferredManifestPath: h3Generation.manifestPath
     )
     showingModelSetup = true
   }

@@ -57,16 +57,13 @@ iconutil -c icns "$ICONSET" -o "$RESOURCES/AppIcon.icns"
 xcrun swiftc \
   -O -parse-as-library -target arm64-apple-macosx27.0 \
   -framework AppKit -framework AVFoundation -framework AVKit -framework CoreMedia \
-  -framework CoreImage -framework CoreVideo -framework ImageIO -framework SwiftUI \
+  -framework CoreImage -framework ImageIO -framework SwiftUI \
   -framework UniformTypeIdentifiers -framework Vision \
   "$UPSCALER_DIR/UpscalerMediaProbe.swift" \
   "$UPSCALER_DIR/VideoUpscaleController.swift" \
   "$UPSCALER_DIR/UpscalerVideoPreview.swift" \
   "$UPSCALER_DIR/UpscalerModelSetup.swift" \
   "$UPSCALER_DIR/MiniMaxH3FaceReferences.swift" \
-  "$UPSCALER_DIR/MiniMaxH3ReferenceEditPrompt.swift" \
-  "$UPSCALER_DIR/MiniMaxH3ReferenceVideoMask.swift" \
-  "$UPSCALER_DIR/MiniMaxH3PromptAssistant.swift" \
   "$UPSCALER_DIR/MiniMaxH3VideoGenerationView.swift" \
   "$UPSCALER_DIR/UpscalerApp.swift" \
   -o "$CONTENTS/MacOS/mioh-upscaler"
@@ -88,15 +85,12 @@ xcrun swiftc \
   "$FLASHVSR_NATIVE_PIPELINE" "$FLASHVSR_NATIVE_RUNNER" \
   -o "$RESOURCES/bin/flashvsr-coreai-video"
 
-# MiniMax H3 / 10Eros-Max H3 belongs to mioh upscaler. The native Swift runner
-# is bundled here; the first-launch model setup also bundles the Python
-# exporters needed to download safetensors and convert them into external Core
-# AI assets in the folder selected by the user.
+# MiniMax H3 / 10Eros-Max H3 belongs to mioh upscaler. Only the native Swift
+# runner is bundled; model graphs, tokenizer and manifest remain external.
 xcrun swiftc \
   -O -parse-as-library -target arm64-apple-macosx27.0 \
   -framework AVFoundation -framework CoreAI -framework CoreImage \
-  -framework CoreMedia -framework CoreML -framework CoreVideo -framework Vision \
-  "$UPSCALER_DIR/MiniMaxH3ReferenceEditPrompt.swift" \
+  -framework CoreMedia -framework CoreML -framework CoreVideo \
   "$UPSCALER_DIR/MiniMaxH3NativeCore.swift" \
   "$UPSCALER_DIR/MiniMaxH3NativeModels.swift" \
   "$UPSCALER_DIR/MiniMaxH3SpatialTileBlender.swift" \
@@ -105,7 +99,6 @@ xcrun swiftc \
   "$UPSCALER_DIR/MiniMaxH3NativeQwenComposite.swift" \
   "$UPSCALER_DIR/TenErosMaxH3DenoiserComposite.swift" \
   "$UPSCALER_DIR/MiniMaxH3NativeMedia.swift" \
-  "$UPSCALER_DIR/MiniMaxH3ReferenceVideoMask.swift" \
   "$UPSCALER_DIR/MiniMaxH3MusicAnalysis.swift" \
   "$UPSCALER_DIR/MiniMaxH3NativeRunner.swift" \
   -o "$RESOURCES/bin/mioh-minimax-h3-native"
@@ -120,7 +113,6 @@ xcrun swiftc \
   "$UPSCALER_DIR/UpscalerMediaProbe.swift" \
   "$UPSCALER_DIR/VideoUpscaleController.swift" \
   "$UPSCALER_DIR/MiniMaxH3FaceReferences.swift" \
-  "$UPSCALER_DIR/MiniMaxH3ReferenceEditPrompt.swift" \
   "$UPSCALER_DIR/MiohUpscalerMCPServer.swift" \
   -o "$RESOURCES/bin/mioh-upscaler-mcp"
 
@@ -129,8 +121,7 @@ xcrun swiftc \
 MODEL_TOOLS="$RESOURCES/model-tools"
 FLASHVSR_CONVERTER_SOURCE="$FLASHVSR_SOURCE_DIR"
 mkdir -p "$MODEL_TOOLS/flashvsr/deployment/coreai" \
-  "$MODEL_TOOLS/flashvsr/src/models" \
-  "$MODEL_TOOLS/h3/scripts/apple"
+  "$MODEL_TOOLS/flashvsr/src/models"
 cp "$UPSCALER_DIR/model-tools/setup-upscaler-models.zsh" "$MODEL_TOOLS/"
 cp "$FLASHVSR_CONVERTER_SOURCE/deployment/__init__.py" \
   "$MODEL_TOOLS/flashvsr/deployment/__init__.py"
@@ -142,23 +133,6 @@ for source in __init__.py export_native.py full_model.py model.py; do
 done
 cp "$FLASHVSR_CONVERTER_SOURCE/src/models/TCDecoder.py" \
   "$MODEL_TOOLS/flashvsr/src/models/TCDecoder.py"
-for source in \
-  build_10eros_max_h3_manifest.py \
-  export_10eros_max_h3_dit_block.py \
-  export_10eros_max_h3_dit_components.py \
-  export_10eros_max_h3_dit_coreai.py \
-  export_minimax_h3_native.py \
-  export_minimax_h3_qwen_coreai.py \
-  export_minimax_h3_qwen_embedding.py \
-  export_minimax_h3_qwen_language_layer.py \
-  export_minimax_h3_qwen_vision.py \
-  pilot_10eros_max_h3_int8_convrot.py \
-  pilot_minimax_h3_fp8_scaled.py \
-  pilot_minimax_h3_qwen_nvfp4.py \
-  reference_10eros_max_h3_dit_sequence.py \
-  ten_eros_h3_coreai_kernels.py; do
-  cp "$ROOT/scripts/apple/$source" "$MODEL_TOOLS/h3/scripts/apple/$source"
-done
 chmod +x "$MODEL_TOOLS/setup-upscaler-models.zsh"
 
 mkdir -p "$FFMPEG_CACHE"

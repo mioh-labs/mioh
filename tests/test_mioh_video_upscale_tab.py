@@ -161,6 +161,7 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
             'case "mioh_stop_job"',
             '"--prompt", runtimePrompt',
             '"prompt_passthrough": "exact"',
+            '"audio_modes": ["background_music", "lip_sync"]',
         ):
             self.assertIn(contract, mcp)
 
@@ -395,10 +396,18 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
         self.assertIn("H3NativeMedia.writeReferenceImage(", runner)
         self.assertIn("H3FlatTimelinePrompt.parse(", runner)
         self.assertIn("flatPromptPlan.compiledPrompt(", runner)
+        self.assertIn("promptPrefix", H3_CORE.read_text())
+        self.assertIn("H3ChainPromptDocument", H3_CORE.read_text())
+        self.assertIn("context_length must be", H3_CORE.read_text())
+        self.assertIn("seam_taper_frames", H3_CORE.read_text())
+        self.assertIn("continuationBlendFramesOverride", runner)
         self.assertIn('format: "interval-%04d.mp4"', runner)
+        self.assertIn("entryFrameRanges", runner)
+        self.assertIn("bestDelta", runner)
+        self.assertIn("payloads.insert(payloadFrames - splitPayload", runner)
         self.assertNotIn('format: "shot-%04d-part-%02d.mp4"', runner)
         self.assertNotIn("continuationAnchor", runner)
-        self.assertNotIn("H3NativeMedia.silentAudio", runner)
+        self.assertNotIn("let unscaled = values.map { $0 / audioScale }", runner)
         self.assertEqual(
             runner.count("sampled.audio = sampled.audio.map { $0 / scale }"),
             1,
@@ -426,18 +435,60 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
         self.assertIn("outputHeight: job.resolvedOutputHeight", runner)
         self.assertIn("let cropY = (sourceHeight - outputHeight) / 2", media)
         for audio_contract in (
-            'LabeledContent("リップシンク音源")',
+            'LabeledContent("音源")',
+            'LabeledContent("音源の使い方")',
+            'DisclosureGroup("歌詞・曲の意味")',
+            "chooseLyricsFile",
+            "openLyricsSearch",
+            "lyricsConditionedPrompt",
+            'Section("AIプロンプト生成")',
+            "AIへの指示",
+            "AI生成プロンプト",
+            "MiniMaxプロンプトへ反映",
+            "MiniMaxH3AIPromptProvider",
+            "generateAIPrompt",
+            "applyGeneratedAIPrompt",
+            "API URL",
+            "target_total_seconds",
+            "shot_duration_limit_seconds",
+            "AUDIO ANALYSIS",
+            "readAIPromptAnalysisAudio",
+            "analyzedAIPromptIntervals",
+            "SUBJECT REFERENCES",
+            "aiSubjectReferenceSummary",
+            "Do not replace <Subject 1> with generic names",
+            "Do not invent extra <Subject N> labels",
+            "Other performers, friends, crowds, dancers, reflections, posters",
+            "face identity source only",
+            "Do not write prompts that reproduce the reference photo itself",
+            "Avoid close-up face shots of unreferenced people",
+            "Default to live-action, photorealistic",
+            "unless the user explicitly asks for an animated reinterpretation",
+            "Suggested generation intervals",
+            "Plain markers like [0.000-3.000] are invalid",
+            "Avoid \"[start-end cut] body text\"",
+            "Do not stop at",
+            "[start-end cut] or [start-end continue]",
+            "URLSession.shared.data",
+            "LYRICS / SONG MEANING:",
+            'case backgroundMusic = "background-music"',
+            'case lipSync = "lip-sync"',
             '"--audio-input", audioInputURL.path',
+            '"--audio-conditioning-mode", audioConditioningMode.rawValue',
             '"--music-video-cuts-json"',
             'musicVideoMode ? "music-video" : "run"',
             'Toggle("長尺Music Videoとして音源の最後まで連続生成"',
             'GroupBox("構図変更ポイント")',
             'MiniMaxH3MusicCutTimeline(',
             "元音源を音声latentとして生成中も固定",
+            "口パクしない",
         ):
             self.assertIn(audio_contract, view)
         for audio_contract in (
             'command == "music-video"',
+            "audio-conditioning-mode must be background-music or lip-sync",
+            "resolvedAudioConditioningMode",
+            "do not generate lip-sync",
             "H3AudioConditioning.samplerState(",
             "targetAudioLatent: targetAudioLatent",
             'appendingPathExtension("mioh-h3-work")',
@@ -451,8 +502,11 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
             '"music-video-flat-v15-continuum-extend-hybrid"',
             "H3MusicVideoSeed.value(",
             "CONTINUE FORWARD.",
-            "HARD CUT.",
+            "SINGLE UNINTERRUPTED TAKE.",
             "Generate only what physically follows",
+            "defines intent, mood, setting, constraints, and allowed next developments",
+            "it is not a restart pose, repeated opening action",
+            "Treat the supplied continuation state as the real current body pose",
             "composite.prepareKeyframes(",
             "exact preceding physical state",
             'appendingPathExtension("signature")',
@@ -460,6 +514,11 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
             "continuationLatentPath: continuationLatentURL?.path",
             "temporalLatentOutputPath: temporalLatentOutputURL?.path",
             "continuationStateOverride: continuationLatent",
+            "media-v14-fixed-encoder-audio-plus-exact-output",
+            "audio-encoder-input:10s@32000",
+            'media["outputAudio"]',
+            "audio-grid:\\(plan.audioLatentShape[3])",
+            "exactAudioGridSampleFrames(",
         ):
             self.assertIn(audio_contract, runner)
         for continuation_contract in (
@@ -487,6 +546,12 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
             '"first-last-provided"',
             '"first-last-generated"',
             '"music_video_continuation_modes"',
+            '"audio_mode"',
+            '"lyrics_text"',
+            '"lyrics_file"',
+            "resolvedLyricsText(",
+            "promptWithLyrics(",
+            '"--audio-conditioning-mode"',
             '"--music-video-continuation", continuationMode',
             '"--music-video-last-frame-directory"',
         ):
@@ -494,6 +559,8 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
         self.assertNotIn("not additional identity subjects", runner)
         self.assertNotIn("final four frames", runner)
         self.assertIn("static func fitAudioLatent(", media)
+        self.assertIn("static func exactAudioGridSampleFrames(", media)
+        self.assertIn("exactSampleFrames:", media)
         self.assertIn("variable-resolution manifest", runner)
         self.assertNotIn("10秒へ等間隔配置", view)
         self.assertNotIn("H3_NATIVE_ASSETS", build)
@@ -521,7 +588,8 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
         self.assertIn("foreground.clampedToExtent().cropped", media)
         self.assertIn("foreground.composited(over: background)", media)
         self.assertIn('"native-image-reference-v4-continuous-edge-extend"', runner)
-        self.assertIn('"media-v12-av-continuation:', runner)
+        self.assertIn('"media-v14-fixed-encoder-audio-plus-exact-output:', runner)
+        self.assertIn('"outputAudio": outputAudio', runner)
         self.assertIn('"qwen-presentation-v8-variable-duration"', runner)
         self.assertIn("Data(Self.referenceMediaPreprocessingVersion.utf8)", runner)
         self.assertNotIn(
@@ -599,7 +667,15 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
             "allowedComputeUnitKinds",
             "intersection([.cpu, .gpu])",
             '"Core AI failed to restrict MiniMax H3 to CPU and GPU"',
-            "cachePolicy: .default",
+            "let cachePolicy = try cachePolicy()",
+            "cachePolicy: cachePolicy",
+            '"MIOH_H3_COREAI_CACHE_POLICY"',
+            "AIModelCache.Policy.persistent",
+            "AIModelCache.Policy(purgeConditions: [.storagePressure])",
+            "AIModelCache.Policy(purgeConditions: [.sourceAssetChangedOrDeleted])",
+            "applyingRuntimeSpecializationOverrides(to: options)",
+            '"MIOH_H3_COREAI_EXPECT_FREQUENT_RESHAPES"',
+            "result.expectFrequentReshapes = true",
             'manifest.inputs["graphSalt"]',
             'semantic == "graphSalt"',
             "var scratch = NDArray(",
@@ -609,7 +685,7 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
             "await Task.yield()",
         ):
             self.assertIn(contract, models)
-        self.assertNotIn("cachePolicy: .persistent", models)
+        self.assertNotIn("cachePolicy: AIModelCache.Policy.persistent", models)
         self.assertNotIn("outputs.names.contains(entry.outputName)", models)
         runner = H3_RUNNER.read_text()
         runner_main = runner.split("static func main() async {", 1)[1].split(

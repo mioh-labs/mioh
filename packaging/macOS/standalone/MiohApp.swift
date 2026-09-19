@@ -109,6 +109,68 @@ struct NativeExportConfiguration: Codable, Sendable {
   let averageBitRate: Int?
   let bitrateMultiplier: Double
   let mp4FastStart: Bool
+
+  enum CodingKeys: String, CodingKey {
+    case mode
+    case input
+    case inputByteCount
+    case inputSHA256
+    case outputDirectory
+    case ffmpegTemporaryDirectory
+    case miohTemporaryDirectory
+    case outputFile
+    case ffmpeg
+    case detectionModel
+    case detectionBackend
+    case detectionInputSize
+    case detectionCandidateChannels
+    case detectionQueries
+    case detectionLogitClasses
+    case detectionMaxDet
+    case detectionComputeUnits
+    case restorationModels
+    case restorationRunner
+    case restorationFrameCount
+    case startNanoseconds
+    case decodeEndNanoseconds
+    case outputCoreStartNanoseconds
+    case outputCoreEndNanoseconds
+    case workerMode
+    case jobID
+    case attemptID
+    case generation
+    case splitMode
+    case segmentCount
+    case segmentSeconds
+    case bufferLimitSeconds
+    case temporalBatchFrames
+    case temporalOverlap
+    case ringCapacity
+    case nativeParallelWorkers
+    case confidenceThreshold
+    case iouThreshold
+    case contextFraction
+    case blendFeather
+    case sharpenStrength
+    case detailBoost
+    case textureMix
+    case smoothStrength
+    case effectUpscale
+    case roiEnhancerModel
+    case roiEnhancerStrength
+    case roiEnhancerScale
+    case detectionEmptyLookahead
+    case detectionMaskReuseSkipFrames
+    case detectFaceMosaics
+    case crossfade
+    case targetFPS
+    case targetFPSDenominator
+    case preFPSConversion
+    case videoCodec
+    case averageBitRate
+    case bitrateMultiplier
+    case mp4FastStart
+  }
 }
 
 private struct NativePreviewLaunchConfiguration: Encodable {
@@ -3683,6 +3745,52 @@ private enum WorkspaceTab: Hashable {
   case log
 }
 
+private struct MovableWindowConfigurator: NSViewRepresentable {
+  func makeNSView(context: Context) -> NSView {
+    let view = MovableWindowAttachmentView()
+    view.isHidden = true
+    return view
+  }
+
+  func updateNSView(_ nsView: NSView, context: Context) {
+    configure(nsView.window)
+  }
+
+  private func configure(_ window: NSWindow?) {
+    window?.isMovable = true
+    window?.isMovableByWindowBackground = true
+  }
+
+  private final class MovableWindowAttachmentView: NSView {
+    override func viewDidMoveToWindow() {
+      super.viewDidMoveToWindow()
+      window?.isMovable = true
+      window?.isMovableByWindowBackground = true
+    }
+  }
+}
+
+private struct WindowDragRegion: NSViewRepresentable {
+  func makeNSView(context: Context) -> NSView {
+    DragView()
+  }
+
+  func updateNSView(_ nsView: NSView, context: Context) {}
+
+  private final class DragView: NSView {
+    override var mouseDownCanMoveWindow: Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+      guard let window else {
+        super.mouseDown(with: event)
+        return
+      }
+      window.isMovable = true
+      window.performDrag(with: event)
+    }
+  }
+}
+
 struct ContentView: View {
   @StateObject private var runner = RestorationRunner()
   @StateObject private var player = RealtimePlayerController()
@@ -3739,6 +3847,7 @@ struct ContentView: View {
       footer
     }
     .frame(minWidth: 820, minHeight: 680)
+    .background(MovableWindowConfigurator().frame(width: 0, height: 0))
     .onAppear {
       InputPanelThumbnailCache.shared.prepare(initialURL: runner.inputURL)
       cluster.attach(runner: runner)
@@ -3807,6 +3916,7 @@ struct ContentView: View {
         .foregroundStyle(visibleStatus.contains("失敗") || visibleStatus == "エラー" ? .red : .secondary)
     }
     .padding(.horizontal, 20).frame(height: 66)
+    .background(WindowDragRegion())
   }
 
   private var basicTab: some View {

@@ -17,7 +17,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compiled-directory", type=Path, required=True)
     parser.add_argument("--architecture", default="h17s")
     parser.add_argument("--preferred-compute", default="gpu")
-    parser.add_argument("--sequence-length", type=int, default=4152)
     parser.add_argument(
         "--manifest-only",
         action="store_true",
@@ -27,14 +26,6 @@ def parse_args() -> argparse.Namespace:
         "--repeated-stages-only",
         action="store_true",
         help="Export only the weight-distinct vision/language layers; reuse static assets.",
-    )
-    parser.add_argument(
-        "--text-dynamic-only",
-        action="store_true",
-        help=(
-            "Export only sequence-length-dependent token/language stages; "
-            "reuse existing vision assets."
-        ),
     )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -76,8 +67,6 @@ def stage_manifest(
 
 def main() -> int:
     args = parse_args()
-    if args.sequence_length <= 0:
-        raise ValueError("--sequence-length must be positive")
     if not args.checkpoint.is_file():
         raise FileNotFoundError(args.checkpoint)
     scripts = Path(__file__).resolve().parent
@@ -86,16 +75,15 @@ def main() -> int:
     common = ["--checkpoint", str(args.checkpoint)]
     overwrite = ["--overwrite"] if args.overwrite else []
     jobs: list[tuple[str, list[str]]] = []
-    sequence_suffix = f"s{args.sequence_length}"
     jobs.append(
         (
-            f"qwen-token-embedding-{sequence_suffix}",
+            "qwen-token-embedding-s4152",
             [
                 sys.executable,
                 str(scripts / "export_minimax_h3_qwen_embedding.py"),
                 *common,
                 "--sequence-length",
-                str(args.sequence_length),
+                "4152",
             ],
         )
     )
@@ -168,7 +156,7 @@ def main() -> int:
     for index in range(50):
         jobs.append(
             (
-                f"qwen-language-layer{index:02d}-{sequence_suffix}-lut4-u1",
+                f"qwen-language-layer{index:02d}-s4152-lut4-u1",
                 [
                     sys.executable,
                     str(scripts / "export_minimax_h3_qwen_language_layer.py"),
@@ -176,7 +164,7 @@ def main() -> int:
                     "--layer",
                     str(index),
                     "--sequence-length",
-                    str(args.sequence_length),
+                    "4152",
                     "--skip-reference",
                 ],
             )
@@ -189,17 +177,8 @@ def main() -> int:
         repeated = stem.startswith("qwen-vision-block") or stem.startswith(
             "qwen-language-layer"
         )
-        text_dynamic = stem.startswith("qwen-token-embedding-") or stem.startswith(
-            "qwen-language-layer"
-        )
         should_build = not args.manifest_only and (
-            (
-                args.text_dynamic_only and text_dynamic
-            )
-            or (
-                not args.text_dynamic_only
-                and (not args.repeated_stages_only or repeated)
-            )
+            not args.repeated_stages_only or repeated
         )
         if should_build and (args.overwrite or not portable.exists()):
             run([*command, "--output", str(portable), *overwrite])
@@ -231,11 +210,11 @@ def main() -> int:
 
     relative = lambda stem: f"coreai/{stem}.{args.architecture}.aimodelc"
     embedding = stage_manifest(
-        relative(f"qwen-token-embedding-{sequence_suffix}"),
+        relative("qwen-token-embedding-s4152"),
         {"inputIDs": "input_ids"},
         {"tokenEmbeddings": "token_embeddings"},
-        {"inputIDs": ("int32", [1, args.sequence_length])},
-        {"tokenEmbeddings": ("float16", [1, args.sequence_length, 5120])},
+        {"inputIDs": ("int32", [1, 4152])},
+        {"tokenEmbeddings": ("float16", [1, 4152, 5120])},
         compute_units=args.preferred_compute,
     )
     patch = stage_manifest(
@@ -278,7 +257,7 @@ def main() -> int:
     )
     language_layers = [
         stage_manifest(
-            relative(f"qwen-language-layer{index:02d}-{sequence_suffix}-lut4-u1"),
+            relative(f"qwen-language-layer{index:02d}-s4152-lut4-u1"),
             {
                 "hiddenStates": "hidden_states",
                 "ropeCosine": "rope_cosine",
@@ -286,17 +265,17 @@ def main() -> int:
             },
             {"hiddenStatesOut": "hidden_states_out"},
             {
-                "hiddenStates": ("float16", [1, args.sequence_length, 5120]),
-                "ropeCosine": ("float16", [1, 1, args.sequence_length, 128]),
-                "ropeSine": ("float16", [1, 1, args.sequence_length, 128]),
+                "hiddenStates": ("float16", [1, 4152, 5120]),
+                "ropeCosine": ("float16", [1, 1, 4152, 128]),
+                "ropeSine": ("float16", [1, 1, 4152, 128]),
             },
-            {"hiddenStatesOut": ("float16", [1, args.sequence_length, 5120])},
+            {"hiddenStatesOut": ("float16", [1, 4152, 5120])},
             compute_units=args.preferred_compute,
         )
         for index in range(50)
     ]
     fragment = {
-        "sequenceLength": args.sequence_length,
+        "sequenceLength": 4152,
         "visionBlockBatch": 10,
         "visionPatchesPerBlock": 1620,
         "visualTokensPerBlock": 405,

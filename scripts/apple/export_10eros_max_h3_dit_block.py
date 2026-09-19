@@ -145,11 +145,6 @@ def load_linear(
     with safe_open(str(checkpoint), framework="pt", device="cpu") as handle:
         keys = set(handle.keys())
         quantized = f"{prefix}.comfy_quant" in keys
-        if not quantized:
-            metadata = handle.metadata() or {}
-            quant_metadata = metadata.get("_quantization_metadata")
-            if quant_metadata is not None:
-                quantized = prefix in json.loads(quant_metadata).get("layers", {})
         fp8_scaled = (
             f"{prefix}.weight_scale" in keys
             and handle.get_tensor(f"{prefix}.weight").dtype

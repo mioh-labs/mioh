@@ -53,7 +53,7 @@ struct MiniMaxH3FaceReferenceProbe {
         references: grouped
       )
       guard prompt.contains(
-        "<Subject 1> is the person whose facial identity comes from <Picture 1>, <Picture 2>."
+        "<Subject 1> is the person whose facial identity comes from <Picture 1>, <Picture 2>. The pictures are identity sources only, not frame, pose, outfit, body, lighting, background, or composition references."
       ),
         !prompt.contains("<Subject 2> is the person"),
         prompt.contains("Regenerate clothing, body pose, background"),
@@ -61,6 +61,11 @@ struct MiniMaxH3FaceReferenceProbe {
         prompt.contains("overall_soundscape:"),
         prompt.contains("non_diegetic_music:"),
         prompt.contains("Reference labels such as <Subject 1> and <Picture 1> are silent control metadata."),
+        prompt.contains("FACE IDENTITY ISOLATION:"),
+        prompt.contains("Do not reproduce the reference pictures themselves."),
+        prompt.contains("Do not copy their original clothing, body pose, body proportions, hand pose, camera angle, crop, background, room, lighting, color mood, photo texture, or composition"),
+        prompt.contains("Do not transfer, blend, copy, clone, or echo their facial identity onto any other person."),
+        prompt.contains("Unreferenced performers, friends, crowds, dancers, reflections, posters, and background people must have clearly different faces"),
         prompt.contains("Do not add narration, voice-over, dialogue, singing, or spoken reference labels unless the user explicitly requests speech."),
         !prompt.contains("user_request:"),
         prompt.contains("Two people walk through a new environment.")
@@ -107,6 +112,8 @@ struct MiniMaxH3FaceReferenceProbe {
         structuredPrompt.contains(
           "Its facial identity comes from <Picture 1>, <Picture 2>"
         ),
+        structuredPrompt.contains("Do not use those pictures as frame, pose, outfit, body, lighting, background, mood, or composition references."),
+        structuredPrompt.contains("FACE IDENTITY ISOLATION:"),
         structuredPrompt.contains("<Audio 1> is reused directly."),
         !structuredPrompt.contains("Follow this user direction")
       else {

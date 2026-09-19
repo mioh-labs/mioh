@@ -27,6 +27,21 @@ def test_auto_mode_loads_both_guides(tmp_path: Path) -> None:
     assert "reference guide" in prompt
 
 
+def test_system_prompt_loads_mioh_music_video_guide(tmp_path: Path) -> None:
+    _write_skill(tmp_path)
+    prompt = load_h3_system_prompt(tmp_path, "ref2va")
+    assert "mioh_h3_music_video_prompting.md" in prompt
+    assert "For continuation parts of this shot" in prompt
+    assert "not a restart of" in prompt
+    assert "the opening pose or action" in prompt
+    assert "two-layer structure" in prompt
+    assert "GLOBAL CONTINUITY" in prompt
+    assert "stable identity/style/music/continuity rules" in prompt
+    assert "LOCATION, FRAMING, ACTION, CAMERA" in prompt
+    assert "interval-specific composition" in prompt
+    assert "vary at least three" in prompt
+
+
 def test_user_content_labels_ordered_images(tmp_path: Path) -> None:
     first = tmp_path / "first.jpg"
     second = tmp_path / "second.png"

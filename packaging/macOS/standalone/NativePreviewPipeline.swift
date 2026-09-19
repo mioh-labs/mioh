@@ -134,6 +134,91 @@ private enum NativePreviewError: LocalizedError {
   }
 }
 
+private enum MiohCoreAIModelLoader {
+  static func load(_ modelURL: URL) async throws -> AIModel {
+    let options = try specializationOptions()
+    if modelURL.pathExtension.lowercased() == "aimodel" {
+      return try await AIModel.specialize(
+        contentsOf: modelURL,
+        options: options,
+        cache: .default,
+        cachePolicy: try cachePolicy()
+      )
+    }
+    return try await AIModel(contentsOf: modelURL, options: options)
+  }
+
+  private static func specializationOptions() throws -> SpecializationOptions {
+    let rawValue = ProcessInfo.processInfo.environment[
+      "MIOH_COREAI_PREFERRED_COMPUTE"
+    ]?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased()
+    let options: SpecializationOptions
+    switch rawValue {
+    case nil, "", "default", "all":
+      options = .default
+    case "gpu":
+      options = SpecializationOptions(preferredComputeUnitKind: .gpu)
+    case "ane", "neuralengine", "neural_engine":
+      options = SpecializationOptions(preferredComputeUnitKind: .neuralEngine)
+    case "cpu":
+      options = .cpuOnly
+    default:
+      throw NativePreviewError.invalidConfiguration(
+        "MIOH_COREAI_PREFERRED_COMPUTE must be default, gpu, ane, or cpu"
+      )
+    }
+    return try applyingRuntimeSpecializationOverrides(to: options)
+  }
+
+  private static func applyingRuntimeSpecializationOverrides(
+    to options: SpecializationOptions
+  ) throws -> SpecializationOptions {
+    var result = options
+    let rawValue = ProcessInfo.processInfo.environment[
+      "MIOH_COREAI_EXPECT_FREQUENT_RESHAPES"
+    ]?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased()
+    switch rawValue {
+    case nil, "", "0", "false", "no", "default":
+      break
+    case "1", "true", "yes":
+      result.expectFrequentReshapes = true
+    default:
+      throw NativePreviewError.invalidConfiguration(
+        "MIOH_COREAI_EXPECT_FREQUENT_RESHAPES must be 0 or 1"
+      )
+    }
+    return result
+  }
+
+  private static func cachePolicy() throws -> AIModelCache.Policy {
+    let rawValue = ProcessInfo.processInfo.environment[
+      "MIOH_COREAI_CACHE_POLICY"
+    ]?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased()
+    switch rawValue {
+    case nil, "", "default", "safe":
+      return .default
+    case "persistent":
+      return AIModelCache.Policy.persistent
+    case "storage-pressure", "storage_pressure", "storagepressure":
+      return AIModelCache.Policy(purgeConditions: [.storagePressure])
+    case "source-change", "source_changed", "source-asset":
+      return AIModelCache.Policy(purgeConditions: [.sourceAssetChangedOrDeleted])
+    case "none", "no-purge", "nopurge":
+      return AIModelCache.Policy(purgeConditions: [])
+    default:
+      throw NativePreviewError.invalidConfiguration(
+        "MIOH_COREAI_CACHE_POLICY must be default, persistent, storage-pressure, source-change, or none"
+      )
+    }
+  }
+}
+
 private struct VideoDescription {
   let width: Int
   let height: Int
@@ -1239,7 +1324,7 @@ private final class CoreAIDetector: NativeDetecting {
       )
       function = nil
     } else {
-      let model = try await AIModel(contentsOf: modelURL)
+      let model = try await MiohCoreAIModelLoader.load(modelURL)
       guard let loadedFunction = try model.loadFunction(named: "main") else {
         throw NativePreviewError.detector("main function is missing")
       }
@@ -1329,7 +1414,7 @@ private final class CoreAIDetector: NativeDetecting {
       shape: [1, 3, detectorSize, detectorSize],
       scalarType: .float16
     )
-    var view = array.mutableView(as: Float16.self)
+    let view = array.mutableView(as: Float16.self)
     try view.withUnsafeMutablePointer { destination, _, _ in
       try normalizationScratch.withUnsafeMutableBytes { scratchBytes in
         guard let scratchBase = scratchBytes.baseAddress else {
@@ -1772,7 +1857,7 @@ private final class RFDETRDetector: NativeDetecting {
       )
       function = nil
     } else {
-      let model = try await AIModel(contentsOf: modelURL)
+      let model = try await MiohCoreAIModelLoader.load(modelURL)
       guard let loadedFunction = try model.loadFunction(named: "main") else {
         throw NativePreviewError.detector(
           "RF-DETR main function is missing"
@@ -2230,7 +2315,7 @@ private final class VariableRestorerBridge: NativeRestoring, @unchecked Sendable
         "invalid input count \(frames.count), expected \(expected)"
       )
     }
-    frames.withUnsafeBytes {
+    _ = frames.withUnsafeBytes {
       memcpy(mapping, $0.baseAddress!, $0.count)
     }
     var command = UInt16(frameCount).littleEndian
@@ -2387,7 +2472,7 @@ private final class FixedRestorerBridge: NativeRestoring, @unchecked Sendable {
         "invalid fixed restoration input \(actualCount)"
       )
     }
-    frames.withUnsafeBytes {
+    _ = frames.withUnsafeBytes {
       memcpy(mapping, $0.baseAddress!, $0.count)
     }
     if actualCount < frameCount {
@@ -2598,7 +2683,7 @@ private final class NativeROIEnhancer {
     if ["aimodel", "aimodelc"].contains(
       modelURL.pathExtension.lowercased()
     ) {
-      let model = try await AIModel(contentsOf: modelURL)
+      let model = try await MiohCoreAIModelLoader.load(modelURL)
       guard let loadedFunction = try model.loadFunction(named: "main") else {
         throw NativePreviewError.restorer(
           "ROI enhancer main function is missing"
@@ -2731,7 +2816,7 @@ private final class NativeROIEnhancer {
       shape: [1, 3, restorationSize, restorationSize],
       scalarType: .float16
     )
-    var inputView = input.mutableView(as: Float16.self)
+    let inputView = input.mutableView(as: Float16.self)
     _ = inputView.withUnsafeMutablePointer { destination, _, _ in
       restored.withUnsafeBytes { source in
         memcpy(

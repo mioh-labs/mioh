@@ -102,18 +102,20 @@ enum MiniMaxH3FaceReferenceProcessor {
     let definitions = subjectNumbers.map { subject in
       let pictures = pictureLabelsBySubject[subject, default: []]
         .joined(separator: ", ")
-      return "<Subject \(subject)> is the person whose facial identity comes from \(pictures)."
+      return "<Subject \(subject)> is the person whose facial identity comes from \(pictures). The pictures are identity sources only, not frame, pose, outfit, body, lighting, background, or composition references."
     }.joined(separator: "\n")
     let retention = subjectNumbers.map { subject in
       "<Subject \(subject)>: partially_preserved - preserve facial identity only."
     }.joined(separator: "\n")
     let subjects = subjectNumbers.map { "<Subject \($0)>" }
       .joined(separator: ", ")
+    let isolation = faceIdentityIsolationDirective(subjects: subjects)
     if isStructuredH3Prompt(originalPrompt) {
       return augmentStructuredH3Prompt(
         originalPrompt,
         pictureLabelsBySubject: pictureLabelsBySubject,
-        subjectNumbers: subjectNumbers
+        subjectNumbers: subjectNumbers,
+        isolationDirective: isolation
       )
     }
     return """
@@ -121,7 +123,7 @@ enum MiniMaxH3FaceReferenceProcessor {
       \(definitions)
 
       summary:
-      [reference generation] Generate the requested video with \(subjects) as visible facial-identity references. Use only each subject's facial structure, eyes, nose, mouth, hairline, and recognizable identity from the reference pictures. Regenerate clothing, body pose, background, framing, lighting, and camera angle from the requested scene.
+      [reference generation] Generate the requested video with \(subjects) as visible facial-identity references. Use only each subject's facial structure, eyes, nose, mouth, hairline, and recognizable identity from the reference pictures. Do not reproduce the reference pictures themselves. Regenerate clothing, body pose, body shape, hairstyle styling beyond identity, background, framing, lighting, camera angle, photo mood, and composition from the requested scene.
 
       retention_analysis:
       \(retention)
@@ -129,6 +131,7 @@ enum MiniMaxH3FaceReferenceProcessor {
       detailed_description:
       [Shot 1] Follow this user direction: \(originalPrompt)
       Use \(subjects) only as visible facial-identity references. Reference labels such as <Subject 1> and <Picture 1> are silent control metadata. Never speak, narrate, sing, subtitle, or render a reference label as visible text.
+      \(isolation)
 
       overall_soundscape:
       Generate only sounds explicitly requested in detailed_description. Do not add narration, voice-over, dialogue, singing, or spoken reference labels unless the user explicitly requests speech.
@@ -163,7 +166,8 @@ enum MiniMaxH3FaceReferenceProcessor {
   private static func augmentStructuredH3Prompt(
     _ prompt: String,
     pictureLabelsBySubject: [Int: [String]],
-    subjectNumbers: [Int]
+    subjectNumbers: [Int],
+    isolationDirective: String
   ) -> String {
     var lines = prompt.components(separatedBy: .newlines)
     guard let definitionsIndex = lines.firstIndex(where: {
@@ -187,13 +191,13 @@ enum MiniMaxH3FaceReferenceProcessor {
             .hasPrefix(prefix)
         })
       {
-        let binding = " Its facial identity comes from \(pictures); use those pictures only for facial structure, eyes, nose, mouth, hairline, and recognizable identity."
+        let binding = " Its facial identity comes from \(pictures); use those pictures only for facial structure, eyes, nose, mouth, hairline, and recognizable identity. Do not use those pictures as frame, pose, outfit, body, lighting, background, mood, or composition references."
         if !lines[lineIndex].contains("facial identity comes from") {
           lines[lineIndex] += binding
         }
       } else {
         missingBindings.append(
-          "\(prefix) is the person whose facial identity comes from \(pictures); use those pictures only for facial structure, eyes, nose, mouth, hairline, and recognizable identity."
+          "\(prefix) is the person whose facial identity comes from \(pictures); use those pictures only for facial structure, eyes, nose, mouth, hairline, and recognizable identity. Do not use those pictures as frame, pose, outfit, body, lighting, background, mood, or composition references."
         )
       }
     }
@@ -203,6 +207,7 @@ enum MiniMaxH3FaceReferenceProcessor {
 
     let metadataNotice =
       "Reference labels such as <Subject 1> and <Picture 1> are silent control metadata. Never speak, narrate, sing, subtitle, or render a reference label as visible text."
+    let identityNotice = isolationDirective
     if !lines.contains(where: { $0.contains("silent control metadata") }),
       let detailsIndex = lines.firstIndex(where: {
         $0.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -211,7 +216,25 @@ enum MiniMaxH3FaceReferenceProcessor {
     {
       lines.insert(metadataNotice, at: detailsIndex + 1)
     }
+    if !lines.contains(where: {
+      $0.contains("FACE IDENTITY ISOLATION")
+    }),
+      let detailsIndex = lines.firstIndex(where: {
+        $0.trimmingCharacters(in: .whitespacesAndNewlines)
+          .lowercased() == "detailed_description:"
+      })
+    {
+      let insertIndex = min(detailsIndex + 2, lines.count)
+      lines.insert(identityNotice, at: insertIndex)
+    }
     return lines.joined(separator: "\n")
+  }
+
+  private static func faceIdentityIsolationDirective(subjects: String) -> String {
+    """
+    FACE IDENTITY ISOLATION:
+    The reference pictures apply only to \(subjects), and only as face-identity sources. Do not reproduce the reference pictures themselves. Do not copy their original clothing, body pose, body proportions, hand pose, camera angle, crop, background, room, lighting, color mood, photo texture, or composition, even for \(subjects). Build every shot's outfit, body blocking, pose, environment, framing, lighting, and camera from the prompt text instead. Do not transfer, blend, copy, clone, or echo the referenced facial identity onto any other person. Unreferenced performers, friends, crowds, dancers, reflections, posters, and background people must have clearly different faces, hairlines, noses, mouths, eye shapes, age impression, and silhouette. If another person is shown near camera, explicitly keep that face unrelated to the reference pictures. Do not make multiple people share the same referenced face.
+    """
   }
 
   static func detectFaces(

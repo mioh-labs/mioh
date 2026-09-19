@@ -32,6 +32,97 @@ struct MiniMaxH3NativeHarness {
         "compiled model prompt contains one concrete time range and no marker"
       )
     }
+    let prefixPrompt = """
+      subject_definitions:
+      <Subject 1> is the same adult woman.
+
+      detailed_description:
+      GLOBAL CONTINUITY:
+      Keep the same wardrobe, face, lighting style, and non-lip-sync music-video rules.
+
+      [0.000-5.167 cut]
+      She begins beside the window.
+
+      [5.167-10.125 continue]
+      Continue from the unfinished turn without restarting the window pose.
+
+      overall_soundscape:
+      No added ambience.
+      """
+    let prefixPlan = try H3FlatTimelinePrompt.parse(prefixPrompt)
+    try expect(prefixPlan?.promptPrefix.contains("GLOBAL CONTINUITY:") == true,
+      "GLOBAL CONTINUITY is parsed as prompt_prefix")
+    let continuedPrefixPrompt = try prefixPlan!.compiledPrompt(
+      entryIndex: 1,
+      directive: "DIRECTIVE"
+    )
+    try expect(
+      continuedPrefixPrompt.contains("GLOBAL CONTINUITY:")
+        && continuedPrefixPrompt.contains("Continue from the unfinished turn")
+        && !continuedPrefixPrompt.contains("She begins beside the window."),
+      "prompt_prefix is preserved while continuation body stays isolated"
+    )
+    let inlineMarkerPrompt = """
+      subject_definitions:
+      <Subject 1> is the same photoreal adult.
+
+      detailed_description:
+      GLOBAL CONTINUITY:
+      Photoreal live-action MV with real camera motion and practical neon lighting.
+
+      [0.000-4.000 cut] She starts in a real neon street, already facing camera.
+      [4.000-8.000 continue] Continue her forward walk without replaying the entrance.
+
+      overall_soundscape:
+      Pop-rock chorus.
+      """
+    let inlinePlan = try H3FlatTimelinePrompt.parse(inlineMarkerPrompt)
+    try expect(inlinePlan?.entries.count == 2,
+      "inline marker bodies are parsed as flat timeline entries")
+    try expect(
+      inlinePlan?.entries.first?.body.contains("real neon street") == true
+        && inlinePlan?.entries.last?.body.contains("forward walk") == true,
+      "inline marker body text is preserved for each interval")
+    let chainJSON = """
+      {
+        "prompt_prefix": "GLOBAL CONTINUITY: same adult subject, same wardrobe, background music only.",
+        "fps": 24,
+        "seam_taper_frames": 8,
+        "shots": [
+          {
+            "id": "opening",
+            "transition": "cut",
+            "length": 124,
+            "prompt": "She stands by the table, already holding the letter.",
+            "anchor_mode": "head",
+            "context_length": 22
+          },
+          {
+            "id": "carry",
+            "transition": "continue",
+            "length": 119,
+            "prompt": "Continue the hand motion and fold the letter without restarting."
+          }
+        ]
+      }
+      """
+    let chainPlan = try H3FlatTimelinePrompt.parse(chainJSON)
+    try expect(chainPlan?.entries.count == 2, "H3 chain JSON converts to flat entries")
+    try expect(
+      chainPlan?.promptPrefix.contains("background music only") == true
+        && chainPlan?.continuationBlendFrames == 8
+        && chainPlan?.entries[1].transition == .continue
+        && abs((chainPlan?.entries.last?.endSeconds ?? 0) - 10.125) < 0.000_1,
+      "H3 chain JSON preserves prefix, taper, transition, and frame-derived timing"
+    )
+    try expect(
+      H3MusicVideoBoundary.blendFrames(
+        transition: .continue,
+        preRollFrames: H3VideoConditioning.partContinuationPixelFrames,
+        overrideFrames: chainPlan?.continuationBlendFrames
+      ) == 8,
+      "chain seam_taper_frames controls the continuation xfade window"
+    )
     try expect(H3Geometry.alignFrameCount(240) == 243, "240 frames align to 243")
     let referenceFrames = try H3Geometry.referenceFrameCount(available: 240, output: 243)
     try expect(

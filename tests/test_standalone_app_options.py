@@ -289,8 +289,8 @@ class StandaloneAppOptionTests(unittest.TestCase):
         )[1].split(
             "@MainActor\nprivate final class RealtimeDetachedVideoWindowController", 1
         )[0]
-        self.assertIn("VideoPlayer(player: controller.sourcePlayer)", surface)
-        self.assertIn("VideoPlayer(player: controller.restoredPlayer)", surface)
+        self.assertIn("RealtimePlayerLayerView(player: controller.sourcePlayer)", surface)
+        self.assertIn("RealtimePlayerLayerView(player: controller.restoredPlayer)", surface)
         self.assertIn("VRPreviewSceneView(", surface)
         self.assertIn("view.controlsStyle = .none", player)
         self.assertIn("showsSystemControls: false", player)
@@ -469,8 +469,8 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "showsSourceFrameWhilePreparingRestoration && !showsRestoredFrameWhileHLSBuffers",
             "controller.prefersSourceVideoLayer",
             "if controller.prefersSourceVideoLayer",
-            "VideoPlayer(player: controller.sourcePlayer)",
-            "VideoPlayer(player: controller.restoredPlayer)",
+            "RealtimePlayerLayerView(player: controller.sourcePlayer)",
+            "RealtimePlayerLayerView(player: controller.restoredPlayer)",
             "if showsRestoredFrameWhileHLSBuffers { return false }",
         ]:
             self.assertIn(contract, player)
@@ -1629,6 +1629,34 @@ class StandaloneAppOptionTests(unittest.TestCase):
         source = APP_SOURCE.read_text()
         self.assertIn("func nativePreviewInvocation(", source)
         self.assertIn('"bin/mioh-native-coreai-preview"', source)
+
+    def test_coreai_runners_expose_macos27_2_specialization_controls(self):
+        runner = COREAI_RUNNER_SOURCE.read_text()
+        pipeline = NATIVE_PIPELINE_SOURCE.read_text()
+        variable = (
+            ROOT
+            / "packaging"
+            / "macOS"
+            / "standalone"
+            / "VariableBasicVSRPPChunk6Runner.swift"
+        ).read_text()
+
+        for source in (runner, pipeline, variable):
+            self.assertIn("MiohCoreAIModelLoader", source)
+            self.assertIn('modelURL.pathExtension.lowercased() == "aimodel"', source)
+            self.assertIn("AIModel.specialize(", source)
+            self.assertIn("AIModel(contentsOf:", source)
+            self.assertIn("options: options", source)
+            self.assertIn('"MIOH_COREAI_CACHE_POLICY"', source)
+            self.assertIn("AIModelCache.Policy.persistent", source)
+            self.assertIn("AIModelCache.Policy(purgeConditions: [.storagePressure])", source)
+            self.assertIn(
+                "AIModelCache.Policy(purgeConditions: [.sourceAssetChangedOrDeleted])",
+                source,
+            )
+            self.assertIn('"MIOH_COREAI_PREFERRED_COMPUTE"', source)
+            self.assertIn('"MIOH_COREAI_EXPECT_FREQUENT_RESHAPES"', source)
+            self.assertIn("result.expectFrequentReshapes = true", source)
 
     def test_app_allows_loopback_video_streaming(self):
         info = INFO_PLIST.read_text()
