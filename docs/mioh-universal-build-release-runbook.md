@@ -137,11 +137,13 @@ Expected outputs:
 
 ```text
 build/macos-standalone-universal/mioh-universal.app
-build/macos-standalone-universal/mioh-universal-0.14.3-unsigned.dmg
+build/macos-standalone-universal/mioh-universal-0.14.3-013-unsigned.dmg
 ```
 
 The build is model-free by default. It ad-hoc signs the application, includes
-the packaged runtime and model tools, and creates these DMG-root links:
+the packaged Python 3.12 conversion runtime and model tools, and creates these
+DMG-root links. The build fails if the runtime or a required conversion script
+is missing:
 
 ```text
 download-mioh-models.zsh -> model-tools/download-mioh-models.zsh
@@ -181,7 +183,7 @@ cmp -s \
 Verify the disk image before publishing:
 
 ```zsh
-DMG=build/macos-standalone-universal/mioh-universal-0.14.3-unsigned.dmg
+DMG=build/macos-standalone-universal/mioh-universal-0.14.3-013-unsigned.dmg
 hdiutil verify "$DMG"
 shasum -a 256 "$DMG"
 ```
