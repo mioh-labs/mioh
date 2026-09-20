@@ -30,7 +30,6 @@ class StandaloneMPSDeformConvTests(unittest.TestCase):
         self.assertNotIn("VENDORED_MPS_DEFORM_CONV", script)
         self.assertNotIn("mps-deform-conv.txt", script)
         self.assertNotIn("verify_mps_deform_conv.py", script)
-        self.assertNotIn("$RESOURCES/runtime", script)
 
     def test_gui_uses_only_the_native_preview_backend(self):
         source = APP_SOURCE.read_text()

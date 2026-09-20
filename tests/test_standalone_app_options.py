@@ -977,7 +977,10 @@ class StandaloneAppOptionTests(unittest.TestCase):
             build_script,
         )
         self.assertIn("-iname '*rfdetr*' -delete", build_script)
-        self.assertNotIn("$RESOURCES/runtime", build_script)
+        self.assertIn(
+            '"$RESOURCES/runtime/lib/python3.12/site-packages/rfdetr"',
+            build_script,
+        )
         self.assertNotIn("calculate_frame_detection_queue_size", restorer)
         self.assertNotIn("pipeline_queue_depth", detector)
         self.assertIn("maxsize=8", detector)
@@ -1130,13 +1133,14 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertNotIn("variable-hq", script.lower())
         self.assertNotIn("VariableBasicVSRPPRunner.swift", script)
 
-    def test_no_distribution_bundles_a_python_runtime(self):
+    def test_universal_distribution_bundles_conversion_runtime(self):
         script = BUILD_SCRIPT.read_text()
 
-        self.assertNotIn("MIOH_BUNDLE_PYTHON_RUNTIME", script)
-        self.assertNotIn("$RESOURCES/runtime", script)
-        self.assertNotIn("process_video_parallel.py", script)
-        self.assertNotIn("mioh_preview_worker.py", script)
+        self.assertIn("MIOH_BUNDLE_PYTHON_RUNTIME", script)
+        self.assertIn('ditto "$PYTHON_SOURCE" "$RESOURCES/runtime"', script)
+        self.assertIn("$RESOURCES/runtime/bin/python3.12", script)
+        self.assertIn("Packaged conversion runtime OK", script)
+        self.assertIn("Portable build is missing required conversion resource", script)
 
     def test_build_time_python_is_required_only_for_universal_models(self):
         script = BUILD_SCRIPT.read_text()
@@ -1146,7 +1150,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
             script,
         )
         self.assertIn("Missing build-time Python:", script)
-        self.assertNotIn("Missing interpreter to bundle:", script)
+        self.assertIn("Missing interpreter to bundle:", script)
 
     def test_dedicated_build_uses_only_prebuilt_native_models_and_swift_verification(self):
         script = BUILD_SCRIPT.read_text()
@@ -1189,7 +1193,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn('COREAI_DISTRIBUTION="portable"', script)
         self.assertIn('build/macos-standalone-universal', script)
         self.assertIn('APP_BASENAME="mioh-universal"', script)
-        self.assertIn('DMG_BASENAME="mioh-universal-0.14.3-unsigned"', script)
+        self.assertIn('DMG_BASENAME="mioh-universal-0.14.3-013-unsigned"', script)
         self.assertIn('exec "$PACKAGE_DIR/build_app.sh"', script)
 
     def test_portable_swift_build_omits_architecture_override(self):
