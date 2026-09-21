@@ -189,24 +189,49 @@ struct H3Tensor: Sendable {
 
   func converted(to type: H3ScalarType) throws -> H3Tensor {
     guard scalarType != type else { return self }
-    let values = try floatValues()
-    switch type {
-    case .bfloat16:
-      let words = values.map { value -> UInt16 in
-        let bits = value.bitPattern
-        let roundingBias = UInt32(0x7FFF) + ((bits >> 16) & 1)
-        return UInt16(truncatingIfNeeded: (bits &+ roundingBias) >> 16)
-      }
-      return try H3Tensor(bfloat16Raw: words, shape: shape)
-    case .float16:
-      return try H3Tensor(float16: values.map(Float16.init), shape: shape)
-    case .float32:
-      return try H3Tensor(float32: values, shape: shape)
-    default:
+    guard scalarType == .bfloat16 || scalarType == .float16
+      || scalarType == .float32,
+      type == .bfloat16 || type == .float16 || type == .float32
+    else {
       throw H3NativeError.unsupported(
         "floating point tensor conversion to \(type.rawValue)"
       )
     }
+    var converted = Data(count: elementCount * type.byteCount)
+    bytes.withUnsafeBytes { sourceRaw in
+      converted.withUnsafeMutableBytes { destinationRaw in
+        for index in 0..<elementCount {
+          let value: Float
+          switch scalarType {
+          case .bfloat16:
+            value = Float(
+              bitPattern: UInt32(sourceRaw.bindMemory(to: UInt16.self)[index])
+                << 16
+            )
+          case .float16:
+            value = Float(sourceRaw.bindMemory(to: Float16.self)[index])
+          case .float32:
+            value = sourceRaw.bindMemory(to: Float.self)[index]
+          default:
+            preconditionFailure("validated floating-point source")
+          }
+          switch type {
+          case .bfloat16:
+            let bits = value.bitPattern
+            let roundingBias = UInt32(0x7FFF) + ((bits >> 16) & 1)
+            destinationRaw.bindMemory(to: UInt16.self)[index] =
+              UInt16(truncatingIfNeeded: (bits &+ roundingBias) >> 16)
+          case .float16:
+            destinationRaw.bindMemory(to: Float16.self)[index] = Float16(value)
+          case .float32:
+            destinationRaw.bindMemory(to: Float.self)[index] = value
+          default:
+            preconditionFailure("validated floating-point destination")
+          }
+        }
+      }
+    }
+    return try H3Tensor(shape: shape, scalarType: type, bytes: converted)
   }
 
   private static func checkedElementCount(_ shape: [Int]) throws -> Int {
@@ -536,7 +561,7 @@ struct H3PipelineManifest: Codable, Sendable {
       )
     }
     let samplerName = sampler ?? "res_multistep"
-    guard ["res_multistep", "er_sde"].contains(samplerName) else {
+    guard ["res_multistep", "er_sde", "euler"].contains(samplerName) else {
       throw H3NativeError.invalidManifest("unsupported sampler \(samplerName)")
     }
     if let samplerNoise, samplerNoise < 0 {
@@ -2057,7 +2082,7 @@ enum H3ResMultistep {
     }
   }
 
-  private static func requireMatchingShapes(
+  static func requireMatchingShapes(
     _ left: H3AVLatent, _ right: H3AVLatent
   ) throws {
     guard left.videoShape == right.videoShape,
@@ -2065,6 +2090,42 @@ enum H3ResMultistep {
     else {
       throw H3NativeError.invalidTensor("denoiser changed the AV latent shape")
     }
+  }
+}
+
+enum H3Euler {
+  typealias Denoiser = H3ResMultistep.Denoiser
+
+  static func sample(
+    initial: H3AVLatent,
+    sigmas: [Float],
+    denoise: Denoiser,
+    onStep: (@Sendable (Int, Float) -> Void)? = nil
+  ) async throws -> H3AVLatent {
+    guard sigmas.count >= 2, sigmas.last == 0 else {
+      throw H3NativeError.invalidManifest("euler needs sigmas ending in zero")
+    }
+    var current = initial
+    for index in 0..<(sigmas.count - 1) {
+      let sigma = sigmas[index]
+      let sigmaDown = sigmas[index + 1]
+      let denoised = try await denoise(current, sigma, index)
+      try H3ResMultistep.requireMatchingShapes(current, denoised)
+      current.video = H3ResMultistep.euler(
+        x: current.video,
+        denoised: denoised.video,
+        sigma: sigma,
+        sigmaDown: sigmaDown
+      )
+      current.audio = H3ResMultistep.euler(
+        x: current.audio,
+        denoised: denoised.audio,
+        sigma: sigma,
+        sigmaDown: sigmaDown
+      )
+      onStep?(index + 1, sigmaDown)
+    }
+    return current
   }
 }
 

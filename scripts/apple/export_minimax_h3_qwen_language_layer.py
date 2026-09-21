@@ -22,6 +22,7 @@ from pilot_minimax_h3_qwen_nvfp4 import (
     ExactNVFP4PalettizedLinear,
     load_exact_palettized_mapping,
 )
+from ten_eros_h3_coreai_kernels import MetalINT8ConvRotLinear
 
 
 HIDDEN_SIZE = 5120
@@ -69,13 +70,28 @@ class RMSNorm(torch.nn.Module):
 
 
 class QwenLanguageLayer(torch.nn.Module):
-    def __init__(self, checkpoint: Path, layer: int) -> None:
+    def __init__(self, checkpoint: Path, layer: int, metal_kernels=None) -> None:
         super().__init__()
         prefix = f"model.layers.{layer}"
 
-        def linear(name: str) -> ExactNVFP4PalettizedLinear:
+        def linear(name: str) -> torch.nn.Module:
+            tensor_prefix = f"{prefix}.{name}"
+            with safe_open(str(checkpoint), framework="pt", device="cpu") as handle:
+                weight = handle.get_tensor(f"{tensor_prefix}.weight")
+                if weight.dtype == torch.int8:
+                    if metal_kernels is None:
+                        raise TypeError("INT8 ConvRot Qwen requires Metal kernels")
+                    scale = handle.get_tensor(f"{tensor_prefix}.weight_scale")
+                    bias = (
+                        handle.get_tensor(f"{tensor_prefix}.bias")
+                        if f"{tensor_prefix}.bias" in handle.keys()
+                        else None
+                    )
+                    return MetalINT8ConvRotLinear(
+                        metal_kernels, weight, scale, bias, group_size=256
+                    )
             weight, scale, pre_quant, bias = load_exact_palettized_mapping(
-                checkpoint, f"{prefix}.{name}"
+                checkpoint, tensor_prefix
             )
             return ExactNVFP4PalettizedLinear(weight, scale, pre_quant, bias)
 
@@ -139,12 +155,14 @@ class QwenLanguageLayer(torch.nn.Module):
             is_causal=True,
         )
         attended = attended.transpose(1, 2).reshape(batch, sequence, -1)
-        hidden_states = residual + self.o_proj(attended)
+        hidden_states = residual + self.o_proj(attended).to(residual.dtype)
 
         residual = hidden_states
         normalized = self.post_attention_layernorm(hidden_states)
         gated = torch.nn.functional.silu(self.gate_proj(normalized))
-        hidden_states = self.down_proj(gated * self.up_proj(normalized))
+        hidden_states = self.down_proj(
+            gated * self.up_proj(normalized).to(gated.dtype)
+        ).to(residual.dtype)
         return residual + hidden_states
 
 
@@ -184,12 +202,15 @@ def export_coreai(
     cosine: torch.Tensor,
     sine: torch.Tensor,
     destination: Path,
+    custom_kernels: list | None = None,
 ) -> None:
     import coreai_torch
 
     exported = torch.export.export(model, (hidden_states, cosine, sine))
     exported = exported.run_decompositions(coreai_torch.get_decomp_table())
     converter = coreai_torch.TorchConverter()
+    if custom_kernels:
+        converter.register_custom_kernels(custom_kernels)
     converter.add_exported_program(
         exported,
         input_names=["hidden_states", "rope_cosine", "rope_sine"],
@@ -219,7 +240,24 @@ def main() -> int:
             shutil.rmtree(args.reference_directory)
         args.reference_directory.mkdir(parents=True, exist_ok=True)
 
-    model = QwenLanguageLayer(args.checkpoint, args.layer).eval()
+    custom_kernels = []
+    metal_kernels = None
+    with safe_open(str(args.checkpoint), framework="pt", device="cpu") as handle:
+        is_int8_convrot = (
+            handle.get_tensor(
+                f"model.layers.{args.layer}.self_attn.q_proj.weight"
+            ).dtype
+            == torch.int8
+        )
+    if is_int8_convrot:
+        import coreai_torch
+        from ten_eros_h3_coreai_kernels import build_int8_convrot_linear_kernels
+
+        metal_kernels = build_int8_convrot_linear_kernels(
+            coreai_torch, scalar_type="float16"
+        )
+        custom_kernels.extend(metal_kernels)
+    model = QwenLanguageLayer(args.checkpoint, args.layer, metal_kernels).eval()
     elements = args.sequence_length * HIDDEN_SIZE
     hidden_states = torch.sin(
         torch.arange(elements, dtype=torch.float32) * 0.001953125
@@ -255,7 +293,14 @@ def main() -> int:
     if not args.inputs_only:
         assert args.output is not None
         wrapped = CoreAIExportWrapper(model, args.layer + 1).eval()
-        export_coreai(wrapped, hidden_states, cosine, sine, args.output)
+        export_coreai(
+            wrapped,
+            hidden_states,
+            cosine,
+            sine,
+            args.output,
+            custom_kernels=custom_kernels,
+        )
         print(args.output)
     return 0
 

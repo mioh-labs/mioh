@@ -18,6 +18,8 @@ from safetensors import safe_open
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--lora", type=Path)
+    parser.add_argument("--lora-strength", type=float, default=1.0)
     parser.add_argument("--source-directory", type=Path, required=True)
     parser.add_argument("--compiled-directory", type=Path, required=True)
     parser.add_argument(
@@ -35,6 +37,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--architecture", default="h17s")
     parser.add_argument("--preferred-compute", default="gpu")
+    parser.add_argument(
+        "--source-assets",
+        action="store_true",
+        help="Keep .aimodel source assets when coreai-build is unavailable.",
+    )
     parser.add_argument("--dynamic-max-tokens", type=int, default=131_072)
     parser.add_argument(
         "--dynamic-sample-tokens",
@@ -57,6 +64,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--block-group-size", type=int, choices=range(1, 5), default=2)
     parser.add_argument("--block-scalar-type", choices=("bfloat16", "float16"), default="bfloat16")
+    parser.add_argument(
+        "--metal-fp8-scaled",
+        action="store_true",
+        help="Keep scaled E4M3 block weights compact with a Metal TensorOps kernel.",
+    )
+    parser.add_argument(
+        "--expand-fp8-scaled",
+        action="store_true",
+        help=(
+            "Expand scaled E4M3 block weights to dense BF16 instead of running "
+            "them through the Metal TensorOps kernel. Doubles weight storage; "
+            "this is the comparison path for --metal-fp8-scaled."
+        ),
+    )
     parser.add_argument(
         "--skip-components",
         action="store_true",
@@ -157,6 +178,8 @@ def main() -> int:
     args = parse_args()
     if not args.checkpoint.is_file():
         raise FileNotFoundError(args.checkpoint)
+    if args.lora is not None and not args.lora.is_file():
+        raise FileNotFoundError(args.lora)
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", args.asset_prefix):
         raise ValueError("--asset-prefix must contain lowercase letters, numbers, and hyphens")
     configuration_name = args.configuration_name or (
@@ -183,6 +206,20 @@ def main() -> int:
     script_directory = Path(__file__).resolve().parent
     overwrite = ["--overwrite"] if args.overwrite else []
     checkpoint_digest = file_sha256(args.checkpoint)
+    lora_digest = file_sha256(args.lora) if args.lora is not None else None
+    identity_digest = checkpoint_digest
+    if lora_digest is not None:
+        identity_digest = hashlib.sha256(
+            f"{checkpoint_digest}:{lora_digest}:{args.lora_strength}".encode()
+        ).hexdigest()
+    lora_arguments = (
+        [
+            "--lora", str(args.lora),
+            "--lora-strength", str(args.lora_strength),
+            "--lora-sha256", lora_digest,
+        ]
+        if args.lora is not None else []
+    )
 
     components = [
         ("text-refiner", f"{args.asset_prefix}-text-refiner-dynamic-bf16", 8192),
@@ -218,16 +255,18 @@ def main() -> int:
                     "--output",
                     str(source),
                     "--skip-reference",
+                    *lora_arguments,
                     *overwrite,
                 ]
             )
-        compile_asset(
-            source,
-            args.compiled_directory,
-            args.architecture,
-            args.preferred_compute,
-            args.overwrite,
-        )
+        if not args.source_assets:
+            compile_asset(
+                source,
+                args.compiled_directory,
+                args.architecture,
+                args.preferred_compute,
+                args.overwrite,
+            )
 
     scalar_suffix = "bf16" if args.block_scalar_type == "bfloat16" else "fp16"
     for layer, layer_count in groups:
@@ -244,7 +283,7 @@ def main() -> int:
         )
         source = args.source_directory / f"{stem}.aimodel"
         graph_identity = (
-            f"w{checkpoint_digest[:16]}_b{layer:02d}_{last:02d}"
+            f"w{identity_digest[:16]}_b{layer:02d}_{last:02d}"
         )
         print(f"[{completed}/{total}] DiT blocks {layer:02d}-{last:02d}", flush=True)
         if args.overwrite or not source.is_dir():
@@ -268,15 +307,18 @@ def main() -> int:
                     "--dynamic-max-tokens",
                     str(args.fixed_block_tokens or args.dynamic_max_tokens),
                     *(["--fixed-shape"] if args.fixed_block_tokens is not None else []),
+                    *(["--metal-fp8-scaled"] if args.metal_fp8_scaled else []),
+                    *(["--expand-fp8-scaled"] if args.expand_fp8_scaled else []),
                     "--output",
                     str(source),
                     "--graph-identity",
                     graph_identity,
                     "--skip-reference",
+                    *lora_arguments,
                     *overwrite,
                 ]
             )
-        if args.fixed_block_tokens is None:
+        if args.fixed_block_tokens is None and not args.source_assets:
             compile_asset(
                 source,
                 args.compiled_directory,
@@ -313,11 +355,21 @@ def main() -> int:
         "blockGroupSize": args.block_group_size,
         "scalarType": args.block_scalar_type,
         "architecture": args.architecture,
+        "metalFP8Scaled": args.metal_fp8_scaled,
+        "expandFP8Scaled": args.expand_fp8_scaled,
     }
+    if args.lora is not None:
+        metadata["lora"] = args.lora.name
+        metadata["loraSHA256"] = lora_digest
+        metadata["loraStrength"] = args.lora_strength
     (configuration / "metadata.json").write_text(
         json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
     )
-    relative = lambda stem: f"coreai/{stem}.{args.architecture}.aimodelc"
+    relative = lambda stem: (
+        f"coreai/{stem}.aimodel"
+        if args.source_assets
+        else f"coreai/{stem}.{args.architecture}.aimodelc"
+    )
     block_relative = lambda stem: (
         f"coreai/{stem}.aimodel"
         if args.fixed_block_tokens is not None
@@ -351,7 +403,7 @@ def main() -> int:
     for index, layer_count in groups:
         last = index + layer_count - 1
         graph_identity = (
-            f"w{checkpoint_digest[:16]}_b{index:02d}_{last:02d}"
+            f"w{identity_digest[:16]}_b{index:02d}_{last:02d}"
         )
         entrypoint_name = f"main_{graph_identity}"
         graph_salt_name = f"graph_identity_salt_{graph_identity}"

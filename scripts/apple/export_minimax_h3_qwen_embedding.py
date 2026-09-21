@@ -33,23 +33,34 @@ def remove_existing(path: Path, overwrite: bool) -> None:
 class QuantizedEmbedding(torch.nn.Module):
     def __init__(self, checkpoint: Path) -> None:
         super().__init__()
-        from coreai_torch._compression.custom_layers import WeightDequantizeModule
-
         with safe_open(str(checkpoint), framework="pt", device="cpu") as handle:
             weight = handle.get_tensor("model.embed_tokens.weight").contiguous()
-            scale = handle.get_tensor("model.embed_tokens.weight_scale").to(
-                torch.float16
-            ).contiguous()
-        if weight.dtype != torch.int8 or weight.shape != (151936, 5120):
+            scale = (
+                handle.get_tensor("model.embed_tokens.weight_scale")
+                if "model.embed_tokens.weight_scale" in handle.keys()
+                else None
+            )
+        if weight.shape != (151936, 5120):
             raise TypeError(f"unexpected Qwen embedding tensor {weight.shape} {weight.dtype}")
-        self.weight = WeightDequantizeModule(
-            quantized_data=weight,
-            scale=scale,
-            output_dtype=torch.float16,
-        )
+        if weight.dtype == torch.int8:
+            if scale is None:
+                raise TypeError("INT8 Qwen embedding is missing weight_scale")
+            from coreai_torch._compression.custom_layers import WeightDequantizeModule
+
+            self.weight = WeightDequantizeModule(
+                quantized_data=weight,
+                scale=scale.to(torch.float16).contiguous(),
+                output_dtype=torch.float16,
+            )
+        elif weight.dtype in (torch.bfloat16, torch.float16, torch.float32):
+            # Comfy-Org's INT8 ConvRot checkpoint intentionally leaves the
+            # token table unquantized.  Keep the established FP16 boundary.
+            self.register_buffer("dense_weight", weight.to(torch.float16))
+            self.weight = None
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.embedding(input_ids, self.weight())
+        weight = self.dense_weight if self.weight is None else self.weight()
+        return torch.nn.functional.embedding(input_ids, weight)
 
 
 def export_coreai(

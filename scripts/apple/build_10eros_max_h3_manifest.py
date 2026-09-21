@@ -22,6 +22,12 @@ def parse_args() -> argparse.Namespace:
         choices=("ref2va", "fl2va"),
         default="ref2va",
     )
+    parser.add_argument(
+        "--sampler", choices=("res_multistep", "er_sde", "euler")
+    )
+    parser.add_argument("--steps", type=int)
+    parser.add_argument("--video-shift", type=float, default=12.0)
+    parser.add_argument("--audio-shift", type=float, default=3.0)
     return parser.parse_args()
 
 
@@ -104,14 +110,14 @@ def main() -> int:
             {"audio": ("float32", [1, 2, 324000])},
         ),
     }
-    sigmas = (
-        simple_flow_sigmas(steps=20, shift=12.0)
-        if args.conditioning_mode == "fl2va"
-        # The current 10Eros-Max TURBO recipe specifies ER-SDE with the
-        # standard Simple scheduler at six steps.  Keep this derived from the
-        # flow shift instead of freezing the older hand-tuned seven-step list.
-        else simple_flow_sigmas(steps=6, shift=12.0)
+    default_steps = 20 if args.conditioning_mode == "fl2va" else 6
+    steps = args.steps or default_steps
+    if steps <= 0:
+        raise ValueError("--steps must be positive")
+    sampler = args.sampler or (
+        "res_multistep" if args.conditioning_mode == "fl2va" else "er_sde"
     )
+    sigmas = simple_flow_sigmas(steps=steps, shift=args.video_shift)
     manifest = {
         "schemaVersion": 1,
         "modelIdentifier": args.model_identifier,
@@ -122,19 +128,16 @@ def main() -> int:
             denoiser_path.read_text(encoding="utf-8")
         ),
         "stages": stages,
-        "sampler": (
-            "res_multistep"
-            if args.conditioning_mode == "fl2va"
-            else "er_sde"
-        ),
-        "samplerNoise": 1.0,
-        "samplerMaxStage": 3,
+        "sampler": sampler,
         "sigmas": sigmas,
-        "videoShift": 12.0,
-        "audioShift": 3.0,
+        "videoShift": args.video_shift,
+        "audioShift": args.audio_shift,
         "visualConditionNoiseAug": 0.999,
         "audioConditionNoiseAug": 1.0,
     }
+    if sampler == "er_sde":
+        manifest["samplerNoise"] = 1.0
+        manifest["samplerMaxStage"] = 3
     output = (args.output or (root / "manifest.json")).resolve()
     output.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
     print(output)

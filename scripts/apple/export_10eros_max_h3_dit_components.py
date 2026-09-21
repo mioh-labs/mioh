@@ -20,6 +20,7 @@ from export_10eros_max_h3_dit_block import (
     INNER,
     FFN,
     RMSNorm,
+    apply_lora,
     load_linear,
 )
 
@@ -44,6 +45,9 @@ def parse_args() -> argparse.Namespace:
         required=True,
     )
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--lora", type=Path)
+    parser.add_argument("--lora-strength", type=float, default=1.0)
+    parser.add_argument("--lora-sha256")
     parser.add_argument("--tokens", type=int, default=8)
     parser.add_argument("--dynamic-max-tokens", type=int, default=131_072)
     parser.add_argument("--output", type=Path, required=True)
@@ -64,7 +68,9 @@ def remove_existing(path: Path, overwrite: bool) -> None:
 
 
 class RefinerBlock(torch.nn.Module):
-    def __init__(self, checkpoint: Path, layer: int) -> None:
+    def __init__(
+        self, checkpoint: Path, layer: int, lora: Path | None, lora_strength: float
+    ) -> None:
         super().__init__()
         prefix = f"token_refiner.blocks.{layer}"
         with safe_open(str(checkpoint), framework="pt", device="cpu") as handle:
@@ -83,14 +89,28 @@ class RefinerBlock(torch.nn.Module):
         self.qkv = load_linear(
             checkpoint, f"{prefix}.attn.qkv_proj", torch.bfloat16
         )
+        self.qkv = apply_lora(
+            self.qkv, lora, f"{prefix}.attn.qkv_proj", lora_strength,
+            torch.bfloat16,
+        )
         self.out = load_linear(
             checkpoint, f"{prefix}.attn.out_proj", torch.bfloat16
+        )
+        self.out = apply_lora(
+            self.out, lora, f"{prefix}.attn.out_proj", lora_strength,
+            torch.bfloat16,
         )
         self.fc1 = load_linear(
             checkpoint, f"{prefix}.mlp.fc1", torch.bfloat16
         )
+        self.fc1 = apply_lora(
+            self.fc1, lora, f"{prefix}.mlp.fc1", lora_strength, torch.bfloat16
+        )
         self.fc2 = load_linear(
             checkpoint, f"{prefix}.mlp.fc2", torch.bfloat16
+        )
+        self.fc2 = apply_lora(
+            self.fc2, lora, f"{prefix}.mlp.fc2", lora_strength, torch.bfloat16
         )
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
@@ -113,13 +133,18 @@ class RefinerBlock(torch.nn.Module):
 
 
 class TextRefiner(torch.nn.Module):
-    def __init__(self, checkpoint: Path) -> None:
+    def __init__(
+        self, checkpoint: Path, lora: Path | None, lora_strength: float
+    ) -> None:
         super().__init__()
         self.condition = load_linear(
             checkpoint, "condition_proj", torch.bfloat16
         )
         self.blocks = torch.nn.ModuleList(
-            [RefinerBlock(checkpoint, 0), RefinerBlock(checkpoint, 1)]
+            [
+                RefinerBlock(checkpoint, 0, lora, lora_strength),
+                RefinerBlock(checkpoint, 1, lora, lora_strength),
+            ]
         )
         with safe_open(str(checkpoint), framework="pt", device="cpu") as handle:
             self.final_norm = RMSNorm(
@@ -175,10 +200,11 @@ class FinalHead(torch.nn.Module):
 
 
 def model_and_inputs(
-    stage: str, checkpoint: Path, tokens: int
+    stage: str, checkpoint: Path, tokens: int,
+    lora: Path | None = None, lora_strength: float = 1.0,
 ) -> tuple[torch.nn.Module, tuple[torch.Tensor, ...], list[str], list[str]]:
     if stage == "text-refiner":
-        model = TextRefiner(checkpoint).eval()
+        model = TextRefiner(checkpoint, lora, lora_strength).eval()
         input_value = torch.sin(
             torch.arange(tokens * TEXT_DIM, dtype=torch.float32) * 0.000244140625
         ).reshape(tokens, TEXT_DIM).to(torch.bfloat16)
@@ -241,6 +267,8 @@ def main() -> int:
     args = parse_args()
     if not args.checkpoint.is_file():
         raise FileNotFoundError(args.checkpoint)
+    if args.lora is not None and not args.lora.is_file():
+        raise FileNotFoundError(args.lora)
     if args.tokens <= 0 or args.dynamic_max_tokens < args.tokens:
         raise ValueError("invalid token bounds")
     remove_existing(args.output, args.overwrite)
@@ -249,7 +277,7 @@ def main() -> int:
             shutil.rmtree(args.reference_directory)
         args.reference_directory.mkdir(parents=True, exist_ok=True)
     model, inputs, input_names, output_names = model_and_inputs(
-        args.stage, args.checkpoint, args.tokens
+        args.stage, args.checkpoint, args.tokens, args.lora, args.lora_strength
     )
     reference = None
     if not args.skip_reference:

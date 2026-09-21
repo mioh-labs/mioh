@@ -143,10 +143,7 @@ enum H3NativeMedia {
     let pool = try makePixelBufferPool(width: width, height: height)
     let plane = width * height
     let frameCount = imageIndices.count
-    var values = [Float16](
-      repeating: 0,
-      count: 3 * plane * frameCount
-    )
+    var bytes = Data(count: 3 * plane * frameCount * MemoryLayout<Float16>.stride)
     var activeImageIndex = -1
     var activePixelBuffer: CVPixelBuffer?
     for frame in 0..<frameCount {
@@ -168,16 +165,17 @@ enum H3NativeMedia {
         )
         activeImageIndex = imageIndex
       }
-      try appendNCTHW(
-        activePixelBuffer!,
-        frame: frame,
-        frameCount: frameCount,
-        destination: &values
-      )
+      try bytes.withUnsafeMutableBytes { raw in
+        try appendNCTHW(
+          activePixelBuffer!, frame: frame, frameCount: frameCount,
+          destination: raw.bindMemory(to: Float16.self)
+        )
+      }
     }
     return try H3Tensor(
-      float16: values,
-      shape: [1, 3, frameCount, height, width]
+      shape: [1, 3, frameCount, height, width],
+      scalarType: .float16,
+      bytes: bytes
     )
   }
 
@@ -250,7 +248,9 @@ enum H3NativeMedia {
     let pool = try makePixelBufferPool(width: width, height: height)
     let plane = width * height
     let frameElements = 3 * plane
-    var values = [Float16](repeating: 0, count: frameElements * frameCount)
+    var bytes = Data(
+      count: frameElements * frameCount * MemoryLayout<Float16>.stride
+    )
     var firstTimestamp: Double?
     var selected = 0
     while selected < frameCount, let sample = try await provider.next() {
@@ -262,19 +262,17 @@ enum H3NativeMedia {
         let pixelSample = CMReadySampleBuffer<CVReadOnlyPixelBuffer>(sample)
       else { continue }
       let source = pixelSample.content.withUnsafeBuffer { $0 }
-      let rendered = try render(
-        source,
-        transform: transform,
-        width: width,
-        height: height,
-        pool: pool
-      )
-      try appendNCTHW(
-        rendered,
-        frame: selected,
-        frameCount: frameCount,
-        destination: &values
-      )
+      let rendered = try autoreleasepool {
+        try render(
+          source, transform: transform, width: width, height: height, pool: pool
+        )
+      }
+      try bytes.withUnsafeMutableBytes { raw in
+        try appendNCTHW(
+          rendered, frame: selected, frameCount: frameCount,
+          destination: raw.bindMemory(to: Float16.self)
+        )
+      }
       selected += 1
     }
     guard selected == frameCount, reader.status != .failed else {
@@ -284,8 +282,9 @@ enum H3NativeMedia {
       )
     }
     return try H3Tensor(
-      float16: values,
-      shape: [1, 3, frameCount, height, width]
+      shape: [1, 3, frameCount, height, width],
+      scalarType: .float16,
+      bytes: bytes
     )
   }
 
@@ -771,7 +770,7 @@ enum H3NativeMedia {
     _ pixelBuffer: CVPixelBuffer,
     frame: Int,
     frameCount: Int,
-    destination: inout [Float16]
+    destination: UnsafeMutableBufferPointer<Float16>
   ) throws {
     CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
     defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }

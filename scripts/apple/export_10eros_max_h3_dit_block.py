@@ -35,6 +35,9 @@ RMS_EPSILON = 1e-5
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--lora", type=Path)
+    parser.add_argument("--lora-strength", type=float, default=1.0)
+    parser.add_argument("--lora-sha256")
     parser.add_argument("--layer", type=int, required=True)
     parser.add_argument("--layer-count", type=int, default=1, choices=range(1, 5))
     parser.add_argument("--scalar-type", choices=("bfloat16", "float16"), default="bfloat16")
@@ -71,8 +74,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Keep scaled E4M3 checkpoint weights at one byte per value and "
-            "run their linears through an M5 Metal TensorOps kernel. "
-            "Currently requires --fixed-shape."
+            "run their linears through an M5 Metal TensorOps kernel."
         ),
     )
     parser.add_argument(
@@ -132,6 +134,42 @@ class DenseLinear(torch.nn.Module):
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         return torch.nn.functional.linear(value, self.weight, self.bias)
+
+
+class LoRALinear(torch.nn.Module):
+    """Adds a model-only LoRA branch without expanding the base INT8 weight."""
+
+    def __init__(self, base, down, up, strength, dtype) -> None:
+        super().__init__()
+        self.base = base
+        self.register_buffer("down", down.to(dtype).contiguous())
+        self.register_buffer("up", up.to(dtype).contiguous())
+        self.strength = float(strength)
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        delta = torch.nn.functional.linear(value, self.down)
+        delta = torch.nn.functional.linear(delta, self.up)
+        return self.base(value) + delta * self.strength
+
+
+def apply_lora(base, lora, prefix, strength, dtype) -> torch.nn.Module:
+    if lora is None:
+        return base
+    lora_prefix = f"diffusion_model.{prefix}"
+    down_key = f"{lora_prefix}.lora_A.weight"
+    up_key = f"{lora_prefix}.lora_B.weight"
+    with safe_open(str(lora), framework="pt", device="cpu") as handle:
+        keys = set(handle.keys())
+        if down_key not in keys or up_key not in keys:
+            raise KeyError(f"LoRA does not contain {lora_prefix}")
+        down = handle.get_tensor(down_key)
+        up = handle.get_tensor(up_key)
+        alpha_key = f"{lora_prefix}.alpha"
+        if alpha_key in keys:
+            rank = down.shape[0]
+            alpha = float(handle.get_tensor(alpha_key).item())
+            strength *= alpha / rank
+    return LoRALinear(base, down, up, strength, dtype)
 
 
 def load_linear(
@@ -217,6 +255,8 @@ class TenErosDiTBlock(torch.nn.Module):
         metal_int8_kernels=None,
         metal_fp8_kernel=None,
         expand_fp8_scaled: bool = False,
+        lora: Path | None = None,
+        lora_strength: float = 1.0,
     ) -> None:
         super().__init__()
         prefix = f"blocks.{layer}"
@@ -229,17 +269,29 @@ class TenErosDiTBlock(torch.nn.Module):
             checkpoint, f"{prefix}.attn.qkv_proj", dtype,
             metal_int8_kernels, metal_fp8_kernel, expand_fp8_scaled,
         )
+        self.qkv = apply_lora(
+            self.qkv, lora, f"{prefix}.attn.qkv_proj", lora_strength, dtype
+        )
         self.out = load_linear(
             checkpoint, f"{prefix}.attn.out_proj", dtype,
             metal_int8_kernels, metal_fp8_kernel, expand_fp8_scaled,
+        )
+        self.out = apply_lora(
+            self.out, lora, f"{prefix}.attn.out_proj", lora_strength, dtype
         )
         self.fc1 = load_linear(
             checkpoint, f"{prefix}.mlp.fc1", dtype,
             metal_int8_kernels, metal_fp8_kernel, expand_fp8_scaled,
         )
+        self.fc1 = apply_lora(
+            self.fc1, lora, f"{prefix}.mlp.fc1", lora_strength, dtype
+        )
         self.fc2 = load_linear(
             checkpoint, f"{prefix}.mlp.fc2", dtype,
             metal_int8_kernels, metal_fp8_kernel, expand_fp8_scaled,
+        )
+        self.fc2 = apply_lora(
+            self.fc2, lora, f"{prefix}.mlp.fc2", lora_strength, dtype
         )
         self.adaln = load_linear(checkpoint, f"{prefix}.adaln_proj.linear", dtype)
 
@@ -305,12 +357,14 @@ class TenErosDiTBlockGroup(torch.nn.Module):
         self, checkpoint: Path, first_layer: int, layer_count: int,
         dtype: torch.dtype, metal_int8_kernels=None, metal_fp8_kernel=None,
         expand_fp8_scaled: bool = False,
+        lora: Path | None = None, lora_strength: float = 1.0,
     ) -> None:
         super().__init__()
         self.blocks = torch.nn.ModuleList(
             TenErosDiTBlock(
                 checkpoint, layer, dtype,
                 metal_int8_kernels, metal_fp8_kernel, expand_fp8_scaled,
+                lora, lora_strength,
             )
             for layer in range(first_layer, first_layer + layer_count)
         )
@@ -463,18 +517,27 @@ def main() -> int:
         raise ValueError("invalid token bounds")
     if args.metal_int8_convrot and not args.fixed_shape:
         raise ValueError("--metal-int8-convrot currently requires --fixed-shape")
-    if args.metal_fp8_scaled and not args.fixed_shape:
-        raise ValueError("--metal-fp8-scaled currently requires --fixed-shape")
     if args.metal_int8_convrot and args.metal_fp8_scaled:
         raise ValueError("select only one Metal weight implementation")
     if args.metal_fp8_scaled and args.expand_fp8_scaled:
         raise ValueError("select only one scaled FP8 weight implementation")
     if not args.checkpoint.is_file():
         raise FileNotFoundError(args.checkpoint)
-    graph_identity = args.graph_identity or (
-        f"w{checkpoint_sha256(args.checkpoint)[:16]}_"
-        f"b{args.layer:02d}_{args.layer + args.layer_count - 1:02d}"
-    )
+    if args.lora is not None and not args.lora.is_file():
+        raise FileNotFoundError(args.lora)
+    if args.graph_identity is not None:
+        graph_identity = args.graph_identity
+    else:
+        identity_digest = checkpoint_sha256(args.checkpoint)
+        if args.lora is not None:
+            lora_digest = args.lora_sha256 or checkpoint_sha256(args.lora)
+            identity_digest = hashlib.sha256(
+                f"{identity_digest}:{lora_digest}:{args.lora_strength}".encode()
+            ).hexdigest()
+        graph_identity = (
+            f"w{identity_digest[:16]}_"
+            f"b{args.layer:02d}_{args.layer + args.layer_count - 1:02d}"
+        )
     if not re.fullmatch(r"[A-Za-z0-9_]+", graph_identity):
         raise ValueError(
             "--graph-identity must contain only letters, numbers, and underscores"
@@ -507,6 +570,7 @@ def main() -> int:
     group = TenErosDiTBlockGroup(
         args.checkpoint, args.layer, args.layer_count, dtype,
         metal_int8_kernels, metal_fp8_kernel, args.expand_fp8_scaled,
+        args.lora, args.lora_strength,
     ).eval()
     inputs = examples(args.tokens, dtype, salt_width)
     reference = None
@@ -537,6 +601,10 @@ def main() -> int:
         metadata["metalFP8ScaledNumerics"] = "dense-bfloat16-equivalent"
     if args.expand_fp8_scaled:
         metadata["expandedFP8Scaled"] = True
+    if args.lora is not None:
+        metadata["lora"] = args.lora.name
+        metadata["loraSHA256"] = args.lora_sha256 or checkpoint_sha256(args.lora)
+        metadata["loraStrength"] = args.lora_strength
     if reference is not None:
         metadata["referenceMean"] = float(reference.mean())
         metadata["referenceRMS"] = float(reference.square().mean().sqrt())
