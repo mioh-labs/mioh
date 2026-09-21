@@ -274,7 +274,17 @@ def bf16_linear_reference(
     return torch.matmul(rotated_hidden, weight).add(bias)
 
 
-def build_int8_convrot_linear_kernels(coreai_torch: Any) -> tuple[Any, Any]:
+def build_int8_convrot_linear_kernels(
+    coreai_torch: Any, *, scalar_type: str = "bfloat16"
+) -> tuple[Any, Any]:
+    if scalar_type not in {"bfloat16", "float16"}:
+        raise ValueError(f"unsupported ConvRot scalar type: {scalar_type}")
+    metal_scalar = "bfloat" if scalar_type == "bfloat16" else "half"
+    scalar_tag = "bf16" if scalar_type == "bfloat16" else "fp16"
+    rotation_source = CONVROT_METAL_SOURCE.replace("bfloat(", f"{metal_scalar}(")
+    linear_source = INT8_LINEAR_METAL_SOURCE.replace(
+        "bfloat(", f"{metal_scalar}("
+    )
     parameters = [
         coreai_torch.MetalParameter(
             "tgid", "uint3", "threadgroup_position_in_grid"
@@ -284,18 +294,18 @@ def build_int8_convrot_linear_kernels(coreai_torch: Any) -> tuple[Any, Any]:
         ),
     ]
     rotation = coreai_torch.TorchMetalKernel(
-        "ten_eros_convrot_bf16_v3",
+        f"ten_eros_convrot_{scalar_tag}_v3",
         input_names=["hidden_states"],
         result_names=["rotated_hidden"],
-        src=CONVROT_METAL_SOURCE,
+        src=rotation_source,
         torch_defn=convrot_reference,
         metal_params=parameters,
     )
     linear = coreai_torch.TorchMetalKernel(
-        "ten_eros_int8_linear_bf16_v4",
+        f"ten_eros_int8_linear_{scalar_tag}_v4",
         input_names=["rotated_hidden", "quantized_weight", "scale", "bias"],
         result_names=["projected"],
-        src=INT8_LINEAR_METAL_SOURCE,
+        src=linear_source,
         torch_defn=int8_linear_reference,
         metal_params=parameters,
     )

@@ -93,7 +93,11 @@ enum H3VideoVAEEncoder {
     guard inputType == .float16 || inputType == .float32 else {
       throw H3NativeError.invalidManifest("videoTile must use float16 or float32")
     }
-    let source = try video.float16Values()
+    guard video.scalarType == .float16 else {
+      throw H3NativeError.invalidTensor(
+        "video VAE input must be float16, got \(video.scalarType.rawValue)"
+      )
+    }
     var clipLatents = [[Float]]()
     clipLatents.reserveCapacity(clips)
     var completed = 0
@@ -105,7 +109,7 @@ enum H3VideoVAEEncoder {
         row.reserveCapacity(horizontal.starts.count)
         for x in horizontal.starts {
           let tileValues = extractTile(
-            source: source,
+            source: video.bytes,
             sourceFrames: frames,
             sourceHeight: height,
             sourceWidth: width,
@@ -180,7 +184,7 @@ enum H3VideoVAEEncoder {
   }
 
   private static func extractTile(
-    source: [Float16],
+    source: Data,
     sourceFrames: Int,
     sourceHeight: Int,
     sourceWidth: Int,
@@ -193,23 +197,30 @@ enum H3VideoVAEEncoder {
       repeating: 0,
       count: 3 * H3VideoVAETiling.clipFrames * tilePlane
     )
-    for channel in 0..<3 {
-      for localFrame in 0..<H3VideoVAETiling.clipFrames {
-        let frame = min(
-          sourceFrames - 1,
-          clip * H3VideoVAETiling.clipFrames + localFrame
-        )
-        let sourceBase = ((channel * sourceFrames + frame) * sourceHeight + y)
-          * sourceWidth + x
-        let destinationBase = (channel * H3VideoVAETiling.clipFrames + localFrame)
-          * tilePlane
-        for row in 0..<H3VideoVAETiling.tileSize {
-          let sourceStart = sourceBase + row * sourceWidth
-          let destinationStart = destinationBase + row * H3VideoVAETiling.tileSize
-          tile.replaceSubrange(
-            destinationStart..<(destinationStart + H3VideoVAETiling.tileSize),
-            with: source[sourceStart..<(sourceStart + H3VideoVAETiling.tileSize)]
+    source.withUnsafeBytes { raw in
+      let sourceValues = raw.bindMemory(to: Float16.self)
+      for channel in 0..<3 {
+        for localFrame in 0..<H3VideoVAETiling.clipFrames {
+          let frame = min(
+            sourceFrames - 1,
+            clip * H3VideoVAETiling.clipFrames + localFrame
           )
+          let sourceBase = ((channel * sourceFrames + frame) * sourceHeight + y)
+            * sourceWidth + x
+          let destinationBase =
+            (channel * H3VideoVAETiling.clipFrames + localFrame) * tilePlane
+          for row in 0..<H3VideoVAETiling.tileSize {
+            let sourceStart = sourceBase + row * sourceWidth
+            let destinationStart = destinationBase
+              + row * H3VideoVAETiling.tileSize
+            tile.withUnsafeMutableBufferPointer { destination in
+              destination.baseAddress!.advanced(by: destinationStart)
+                .update(
+                  from: sourceValues.baseAddress!.advanced(by: sourceStart),
+                  count: H3VideoVAETiling.tileSize
+                )
+            }
+          }
         }
       }
     }

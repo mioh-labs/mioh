@@ -317,6 +317,29 @@ private final class H3NativePipeline {
       """
   }
 
+  func preparationDescriptor(
+    progressBase: Double = 0,
+    progressScale: Double = 1,
+    messagePrefix: String = ""
+  ) -> H3PartPreparationDescriptor {
+    H3PartPreparationDescriptor(
+      job: job,
+      conditioningMode: conditioningMode,
+      visualSourceDigest: visualSourceDigest,
+      sourceDigest: sourceDigest,
+      conditioningSourceDigest: conditioningSourceDigest,
+      sourceImageDigests: sourceImageDigests,
+      continuationLatentPath: nil,
+      temporalLatentOutputPath: temporalLatentOutputURL?.path,
+      continuationFrameOutputPath: continuationFrameOutputURL?.path,
+      reusableVisionBlockCount: reusableVisionBlockCount,
+      denoiserImageReferenceCount: denoiserImageReferenceCount,
+      progressBase: progressBase,
+      progressScale: progressScale,
+      messagePrefix: messagePrefix
+    )
+  }
+
   func plan() async throws -> H3ExecutionPlan {
     let source: (duration: Double, width: Int, height: Int, hasAudio: Bool)
     if let sourceURL {
@@ -811,13 +834,13 @@ private final class H3NativePipeline {
       (H3Geometry.audioConditioningSeconds * 32_000).rounded()
     )
     if let sourceURL {
-      async let video = H3NativeMedia.decodeReferenceVideo(
+      let video = try await H3NativeMedia.decodeReferenceVideo(
         url: sourceURL,
         width: job.width,
         height: job.height,
         frameCount: plan.referenceFrames
       )
-      async let visionVideo = H3NativeMedia.decodeReferenceVideo(
+      let visionVideo = try await H3NativeMedia.decodeReferenceVideo(
         url: sourceURL,
         width: H3Geometry.qwenVisionWidth,
         height: H3Geometry.qwenVisionHeight,
@@ -1500,6 +1523,13 @@ private final class H3NativePipeline {
         denoise: denoise,
         onStep: reportStep
       )
+    case "euler":
+      sampled = try await H3Euler.sample(
+        initial: initial,
+        sigmas: manifest.sigmas,
+        denoise: denoise,
+        onStep: reportStep
+      )
     default:
       sampled = try await H3ResMultistep.sample(
         initial: initial,
@@ -1592,20 +1622,147 @@ private final class H3NativePipeline {
     // process_latent_out rescale before caching. Applying the shift ratio here
     // again attenuated generated audio by another 4x (about 12 dB).
     let input = try H3Tensor(float32: values, shape: shape)
+    guard let decoderShape = stages["audioDecoder"]?
+      .inputConstraints?["audioLatent"]?.shape,
+      decoderShape.count == 4,
+      decoderShape[0] == shape[0], decoderShape[1] == shape[1],
+      decoderShape[2] == shape[2], decoderShape[3] > 0,
+      let outputShape = stages["audioDecoder"]?
+        .outputConstraints?["audio"]?.shape,
+      outputShape.count == 3, outputShape[0] == 1,
+      outputShape[1] == 2, outputShape[2] > 0,
+      outputShape[2] % decoderShape[3] == 0
+    else {
+      throw H3NativeError.invalidManifest(
+        "audioDecoder needs fixed audioLatent/audio time constraints"
+      )
+    }
+    let sourceTicks = shape[3]
+    let decoderTicks = decoderShape[3]
+    let samplesPerTick = outputShape[2] / decoderTicks
+    if sourceTicks == decoderTicks {
+      return try await decodeAudioChunk(
+        input,
+        cacheLabel: "full",
+        progress: 0.93
+      )
+    }
+
+    // The released H3 audio VAE is compiled for 405 latent ticks (~10.125 s),
+    // while video generation can produce longer timelines (for example 603
+    // ticks for 15 s). Decode fixed-size windows with a small latent overlap,
+    // pad only the last window, then crossfade the decoded overlap. This keeps
+    // the complete generated soundtrack instead of truncating it to 405 ticks.
+    let overlapTicks = min(16, max(0, decoderTicks / 8))
+    let stepTicks = max(1, decoderTicks - overlapTicks)
+    var starts: [Int] = []
+    var start = 0
+    while start < sourceTicks {
+      starts.append(start)
+      if start + decoderTicks >= sourceTicks { break }
+      start += stepTicks
+    }
+    let totalSamples = sourceTicks * samplesPerTick
+    var mixed = [Float](repeating: 0, count: 2 * totalSamples)
+    var weights = [Float](repeating: 0, count: totalSamples)
+    for (chunkIndex, chunkStart) in starts.enumerated() {
+      let validTicks = min(decoderTicks, sourceTicks - chunkStart)
+      let chunk = try audioLatentWindow(
+        input,
+        startTick: chunkStart,
+        validTicks: validTicks,
+        decoderShape: decoderShape
+      )
+      let decoded = try await decodeAudioChunk(
+        chunk,
+        cacheLabel: "window-\(chunkIndex)-\(chunkStart)-\(validTicks)",
+        progress: 0.89 + 0.04 * Double(chunkIndex + 1) / Double(starts.count)
+      )
+      let decodedValues = try decoded.floatValues()
+      let validSamples = validTicks * samplesPerTick
+      let destinationStart = chunkStart * samplesPerTick
+      let previousEnd = chunkIndex == 0
+        ? destinationStart
+        : min(totalSamples, (starts[chunkIndex - 1] + decoderTicks) * samplesPerTick)
+      let nextStart = chunkIndex + 1 < starts.count
+        ? starts[chunkIndex + 1] * samplesPerTick
+        : destinationStart + validSamples
+      let leadingOverlap = max(0, previousEnd - destinationStart)
+      let trailingOverlap = max(
+        0,
+        destinationStart + validSamples - nextStart
+      )
+      for localSample in 0..<validSamples {
+        let globalSample = destinationStart + localSample
+        guard globalSample < totalSamples else { break }
+        var weight: Float = 1
+        if leadingOverlap > 0, localSample < leadingOverlap {
+          weight *= Float(localSample + 1) / Float(leadingOverlap + 1)
+        }
+        let samplesAfter = validSamples - localSample
+        if trailingOverlap > 0, samplesAfter <= trailingOverlap {
+          weight *= Float(samplesAfter) / Float(trailingOverlap + 1)
+        }
+        weights[globalSample] += weight
+        for channel in 0..<2 {
+          mixed[channel * totalSamples + globalSample] +=
+            decodedValues[channel * outputShape[2] + localSample] * weight
+        }
+      }
+    }
+    for sample in 0..<totalSamples {
+      let weight = max(weights[sample], Float.leastNonzeroMagnitude)
+      mixed[sample] /= weight
+      mixed[totalSamples + sample] /= weight
+    }
+    return try H3Tensor(float32: mixed, shape: [1, 2, totalSamples])
+  }
+
+  private func decodeAudioChunk(
+    _ input: H3Tensor,
+    cacheLabel: String,
+    progress: Double
+  ) async throws -> H3Tensor {
     let key = try stageKey(
       "audioDecoder",
-      upstream: [input.bytes, Data(shape.description.utf8)]
+      upstream: [
+        input.bytes,
+        Data(input.shape.description.utf8),
+        Data("fixed-window-crossfade-v1:\(cacheLabel)".utf8),
+      ]
     )
     let outputs = try await cachedStage(
       "audioDecoder",
       key: key,
       inputs: ["audioLatent": input],
-      progress: 0.93
+      progress: progress
     )
     guard let audio = outputs["audio"] else {
       throw H3NativeError.missingTensor("audioDecoder.audio")
     }
     return audio
+  }
+
+  private func audioLatentWindow(
+    _ input: H3Tensor,
+    startTick: Int,
+    validTicks: Int,
+    decoderShape: [Int]
+  ) throws -> H3Tensor {
+    let source = try input.floatValues()
+    let sourceTicks = input.shape[3]
+    let decoderTicks = decoderShape[3]
+    let rows = input.shape[0] * input.shape[1] * input.shape[2]
+    var window = [Float](repeating: 0, count: rows * decoderTicks)
+    for row in 0..<rows {
+      let sourceStart = row * sourceTicks + startTick
+      let destinationStart = row * decoderTicks
+      window.replaceSubrange(
+        destinationStart..<(destinationStart + validTicks),
+        with: source[sourceStart..<(sourceStart + validTicks)]
+      )
+    }
+    return try H3Tensor(float32: window, shape: decoderShape)
   }
 
   private func cachedStage(
@@ -1816,8 +1973,10 @@ private final class H3DenoisePrepareWorker {
 @main
 struct MiniMaxH3NativeRunner {
   static func main() async {
-    // The private switch is restricted to the short-lived DiT child. Qwen and
-    // VAE work in the parent with normal MPSGraph specialization handling.
+    // Keep the private switch out of the normal parent while Qwen and the VAE
+    // load cached MPSGraph specializations. The long-form DiT-only child can
+    // safely carry it for its entire lifetime; one-shot DiT scopes it around
+    // each block execution in H3CoreAIBlockSequence.
     if CommandLine.arguments.dropFirst().first == "prepare-part" {
       setenv("MPSGRAPH_DISABLE_ANEC_MODULE_VALIDATION", "1", 1)
     } else {
@@ -1869,14 +2028,53 @@ struct MiniMaxH3NativeRunner {
       try await runMusicVideo(manifestURL: manifestURL, baseJob: job)
       return
     }
-    let pipeline = try await H3NativePipeline(manifestURL: manifestURL, job: job)
     if command == "plan" {
+      let pipeline = try await H3NativePipeline(manifestURL: manifestURL, job: job)
       let encoder = JSONEncoder()
       encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
       print(String(data: try encoder.encode(await pipeline.plan()), encoding: .utf8)!)
     } else {
-      try await pipeline.run()
+      try await runSingleVideo(manifestURL: manifestURL, job: job)
     }
+  }
+
+  private static func runSingleVideo(
+    manifestURL: URL,
+    job: H3NativeJob
+  ) async throws {
+    // Match long-form generation: Qwen/reference/audio conditioning stays in
+    // the normal parent, the GPU-only DiT runs in a fresh child carrying the
+    // private MPSGraph ANE bypass, and the parent resumes only to decode/write
+    // the cached final latent.
+    let conditioningPipeline = try await H3NativePipeline(
+      manifestURL: manifestURL,
+      job: job,
+      conditioningOnly: true
+    )
+    try await conditioningPipeline.run()
+
+    let descriptorURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent(
+        "mioh-h3-single-\(getpid())-\(UUID().uuidString).json"
+      )
+    defer { try? FileManager.default.removeItem(at: descriptorURL) }
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+    try encoder.encode(
+      conditioningPipeline.preparationDescriptor()
+    ).write(to: descriptorURL, options: .atomic)
+
+    let prepareWorker = H3DenoisePrepareWorker(
+      manifestURL: manifestURL,
+      descriptorURL: descriptorURL
+    )
+    try await prepareWorker.prepare()
+
+    let renderPipeline = try await H3NativePipeline(
+      manifestURL: manifestURL,
+      job: job
+    )
+    try await renderPipeline.run()
   }
 
   private static func runPreparePart(

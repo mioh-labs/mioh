@@ -1875,9 +1875,10 @@ final class MiniMaxH3Controller: ObservableObject {
       0,
       (audioDurationSeconds ?? duration) - audioStartSeconds
     )
-    let formattedTargetAudioDuration = String(
+    let targetTotalDuration = musicVideoMode ? targetAudioDuration : duration
+    let formattedTargetDuration = String(
       format: "%.3f",
-      musicVideoMode ? targetAudioDuration : duration
+      targetTotalDuration
     )
     let shotLimitSeconds = outputWidth == 1920 && outputHeight == 1080
       ? 6.0
@@ -1896,20 +1897,22 @@ final class MiniMaxH3Controller: ObservableObject {
       .joined(separator: ", ")
       timelineInstruction = """
         - long_music_video: true
-        - target_total_seconds: \(formattedTargetAudioDuration)
+        - selected_generation_duration_seconds: \(String(format: "%.3f", duration))
+        - target_total_seconds: \(formattedTargetDuration)
         - shot_duration_limit_seconds: \(formattedShotLimit)
-        - timeline_requirement: Write a full-song timeline from 0.000 to \(formattedTargetAudioDuration). Do not stop at \(formattedShotLimit) seconds; that value is only the maximum duration of one generated shot.
+        - timeline_requirement: Write a full-song timeline from 0.000 to \(formattedTargetDuration). Do not stop at \(formattedShotLimit) seconds; that value is only the maximum duration of one generated shot.
         - marker_requirement: Every interval marker must include transition kind: [start-end cut] or [start-end continue]. Plain markers like [0.000-3.000] are invalid.
         - first_marker: [0.000-... cut]
         - continuation_rule: Use continue for intervals that physically continue from the previous interval; use cut only for intentional scene/composition changes.
-        - last_marker_requirement: The final marker must end exactly at \(formattedTargetAudioDuration) or the full song will be truncated.
+        - last_marker_requirement: The final marker must end exactly at \(formattedTargetDuration) or the full song will be truncated.
         - manual_cut_points_seconds: \(manualCuts.isEmpty ? "none / app may auto-detect cuts from audio" : manualCuts)
         """
     } else {
       timelineInstruction = """
         - long_music_video: false
-        - target_total_seconds: \(formattedShotLimit)
-        - timeline_requirement: Write one short prompt or a short timeline that ends at \(formattedShotLimit).
+        - selected_generation_duration_seconds: \(formattedTargetDuration)
+        - target_total_seconds: \(formattedTargetDuration)
+        - timeline_requirement: Write one prompt or timeline whose final described time is exactly \(formattedTargetDuration) seconds. The selected generation length is authoritative; do not shorten it to 10 seconds.
         """
     }
     var userText = """
@@ -1921,7 +1924,7 @@ final class MiniMaxH3Controller: ObservableObject {
       - audio_mode: \(audioConditioningMode.rawValue)
       - continuation_mode: \(musicVideoContinuationMode.rawValue)
       - resolution: \(outputWidth)x\(outputHeight)
-      - duration_or_shot_limit_seconds: \(duration)
+      - selected_generation_duration_seconds: \(formattedTargetDuration)
       \(timelineInstruction)
 
       \(subjectReferenceSummary)
@@ -2679,6 +2682,69 @@ struct MiniMaxH3GenerationView: View {
             .foregroundStyle(.orange)
         }
       }
+      Section("生成設定") {
+        LabeledContent("解像度") {
+          HStack(spacing: 10) {
+            Picker("", selection: $controller.resolutionProfileID) {
+              ForEach(MiniMaxH3Controller.resolutionProfiles) { profile in
+                Text(profile.label).tag(profile.id)
+              }
+            }
+            .labelsHidden()
+            .frame(width: 230)
+            Text("24fps固定")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+              .monospacedDigit()
+          }
+        }
+        LabeledContent("長さ") {
+          if controller.isDurationFixed {
+            Text("6.0秒（1080p固定）")
+              .monospacedDigit()
+          } else {
+            HStack(spacing: 10) {
+              Slider(
+                value: $controller.duration,
+                in: 2...controller.maximumShotDuration,
+                step: 0.5
+              )
+                .frame(width: 180)
+              TextField(
+                "",
+                value: $controller.duration,
+                format: .number.precision(.fractionLength(1))
+              )
+              .multilineTextAlignment(.trailing)
+              .frame(width: 54)
+              Text("秒")
+                .foregroundStyle(.secondary)
+            }
+          }
+        }
+        Text(
+          controller.audioInputURL == nil
+            ? "1080pは6秒固定、その他は2〜15秒。高解像度ほど処理時間とメモリ使用量が増えます"
+            : "音源使用時は1ショット2〜10秒（1080pは6秒固定）です"
+        )
+          .font(.caption)
+          .foregroundStyle(.secondary)
+        LabeledContent("Seed") {
+          TextField("", text: $controller.seed)
+            .multilineTextAlignment(.trailing)
+            .frame(width: 220)
+        }
+        LabeledContent("出力") {
+          HStack {
+            TextField("", text: $controller.outputPath)
+              .textFieldStyle(.roundedBorder)
+            Button(action: controller.chooseOutput) {
+              Image(systemName: "folder")
+            }
+            .buttonStyle(.borderless)
+          }
+        }
+      }
       Section("AIプロンプト生成") {
         VStack(alignment: .leading, spacing: 6) {
           Text("AIへの指示")
@@ -2781,69 +2847,6 @@ struct MiniMaxH3GenerationView: View {
         )
           .font(.caption)
           .foregroundStyle(.secondary)
-      }
-      Section("生成設定") {
-        LabeledContent("解像度") {
-          HStack(spacing: 10) {
-            Picker("", selection: $controller.resolutionProfileID) {
-              ForEach(MiniMaxH3Controller.resolutionProfiles) { profile in
-                Text(profile.label).tag(profile.id)
-              }
-            }
-            .labelsHidden()
-            .frame(width: 230)
-            Text("24fps固定")
-              .font(.caption)
-              .foregroundStyle(.secondary)
-              .monospacedDigit()
-          }
-        }
-        LabeledContent("長さ") {
-          if controller.isDurationFixed {
-            Text("6.0秒（1080p固定）")
-              .monospacedDigit()
-          } else {
-            HStack(spacing: 10) {
-              Slider(
-                value: $controller.duration,
-                in: 2...controller.maximumShotDuration,
-                step: 0.5
-              )
-                .frame(width: 180)
-              TextField(
-                "",
-                value: $controller.duration,
-                format: .number.precision(.fractionLength(1))
-              )
-              .multilineTextAlignment(.trailing)
-              .frame(width: 54)
-              Text("秒")
-                .foregroundStyle(.secondary)
-            }
-          }
-        }
-        Text(
-          controller.audioInputURL == nil
-            ? "1080pは6秒固定、その他は2〜15秒。高解像度ほど処理時間とメモリ使用量が増えます"
-            : "音源使用時は1ショット2〜10秒（1080pは6秒固定）です"
-        )
-          .font(.caption)
-          .foregroundStyle(.secondary)
-        LabeledContent("Seed") {
-          TextField("", text: $controller.seed)
-            .multilineTextAlignment(.trailing)
-            .frame(width: 220)
-        }
-        LabeledContent("出力") {
-          HStack {
-            TextField("", text: $controller.outputPath)
-              .textFieldStyle(.roundedBorder)
-            Button(action: controller.chooseOutput) {
-              Image(systemName: "folder")
-            }
-            .buttonStyle(.borderless)
-          }
-        }
       }
       Section("進捗") {
         ProgressView(value: controller.progress)

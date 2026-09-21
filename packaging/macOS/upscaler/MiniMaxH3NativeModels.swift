@@ -40,7 +40,7 @@ final class H3StageRunner: @unchecked Sendable {
     let assetURL = URL(
       fileURLWithPath: manifest.asset,
       relativeTo: baseDirectory
-    ).standardizedFileURL
+    ).standardizedFileURL.resolvingSymlinksInPath()
     guard FileManager.default.fileExists(atPath: assetURL.path) else {
       throw H3NativeError.missingAsset(assetURL.path)
     }
@@ -271,6 +271,23 @@ private enum H3CoreAIModelLoader {
     assetURL: URL,
     preferredCompute: String?
   ) async throws -> AIModel {
+    // Loading an already compiled H3 DiT h17s bundle directly was the
+    // known-good path before explicit specialization caching. On affected
+    // macOS 27 builds `AIModel.specialize` asks MPSGraph to try ANE even when
+    // Core AI is limited to CPU/GPU, then waits about twelve seconds per block
+    // before falling back. This happens in both one-shot `run` and the
+    // long-form `prepare-part` worker, so identify the GPU-only DiT asset
+    // itself instead of relying on the worker's environment. Keep cache-backed
+    // specialization for Qwen, VAE, audio, and every other Core AI stage.
+    let assetName = assetURL.lastPathComponent.lowercased()
+    if preferredCompute?.lowercased() == "gpu",
+      assetName.contains("dit-blocks")
+    {
+      return try await AIModel(
+        contentsOf: assetURL,
+        options: SpecializationOptions(preferredComputeUnitKind: .gpu)
+      )
+    }
     let options = try specializationOptions(preferredCompute)
     let cachePolicy = try cachePolicy()
     // Reuse Core AI's outer CPU/GPU specialization across block unloads, but
@@ -280,14 +297,12 @@ private enum H3CoreAIModelLoader {
     // an A/B validation switch; no public release note confirms that 27.2
     // changed purge-policy behaviour.
     // This does not cache or suppress MPSGraph's separate internal ANE probe.
-    let cache: AIModelCache
-    if #available(macOS 27.2, *),
-      let customRoot = customCacheRoot()
-    {
-      cache = h3AIModelCache(customRoot, AIModelCache.self)
-    } else {
-      cache = .default
-    }
+    // CoreAI 3605.5.4 corrupts the malloc free list while specializing some
+    // compiled Qwen vision bundles through a cache created with
+    // `usingRootDirectory:`. The same assets run correctly with `.default`.
+    // Keep the public custom-root plumbing out of H3 until Apple fixes that
+    // runtime path; correctness takes precedence over relocating this cache.
+    let cache: AIModelCache = .default
     return try await AIModel.specialize(
       contentsOf: assetURL,
       options: options,
@@ -437,7 +452,7 @@ final class H3CoreAIBlockSequence: @unchecked Sendable {
       let assetURL = URL(
         fileURLWithPath: manifest.asset,
         relativeTo: baseDirectory
-      ).standardizedFileURL
+      ).standardizedFileURL.resolvingSymlinksInPath()
       guard FileManager.default.fileExists(atPath: assetURL.path) else {
         throw H3NativeError.missingAsset(assetURL.path)
       }

@@ -1,15 +1,33 @@
 import Foundation
 
 final class H3QwenVisionFeatureMemoryCache: @unchecked Sendable {
+  private let maximumEntries: Int
   private let lock = NSLock()
   private var entries: [String: [String: H3Tensor]] = [:]
+  private var recency: [String] = []
+
+  init(maximumEntries: Int = 12) {
+    self.maximumEntries = max(1, maximumEntries)
+  }
 
   func features(for key: String) -> [String: H3Tensor]? {
-    lock.withLock { entries[key] }
+    lock.withLock {
+      guard let value = entries[key] else { return nil }
+      recency.removeAll(where: { $0 == key })
+      recency.append(key)
+      return value
+    }
   }
 
   func insert(_ features: [String: H3Tensor], for key: String) {
-    lock.withLock { entries[key] = features }
+    lock.withLock {
+      entries[key] = features
+      recency.removeAll(where: { $0 == key })
+      recency.append(key)
+      while recency.count > maximumEntries {
+        entries.removeValue(forKey: recency.removeFirst())
+      }
+    }
   }
 }
 
@@ -22,6 +40,14 @@ final class H3QwenCompositeEncoder: @unchecked Sendable {
   private let manifest: H3QwenCompositeManifest
   private let baseDirectory: URL
   private let onProgress: @Sendable (Double, String) -> Void
+  // Core AI 3605.5.4 on macOS 27.2 can corrupt the malloc free list when a
+  // compiled vision model is destroyed immediately before the next compiled
+  // model bundle is opened. Vision inference walks a fixed, small sequence of
+  // assets, so retain those runners for the encoder lifetime. Language layers
+  // intentionally keep their existing streaming lifetime because retaining
+  // all 50 large Qwen layers would consume excessive memory.
+  private let visionRunnerLock = NSLock()
+  private var retainedVisionRunners: [H3StageRunner] = []
 
   init(
     manifest: H3QwenCompositeManifest,
@@ -431,6 +457,9 @@ final class H3QwenCompositeEncoder: @unchecked Sendable {
       manifest: stage,
       baseDirectory: baseDirectory
     )
+    visionRunnerLock.withLock {
+      retainedVisionRunners.append(runner)
+    }
     let inputBytesPerBlock = input.bytes.count / logicalBatch
     guard inputBytesPerBlock * logicalBatch == input.bytes.count else {
       throw H3NativeError.invalidTensor("\(name) input is not batch-contiguous")

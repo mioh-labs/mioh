@@ -632,10 +632,25 @@ private final class MiohMCPServer {
     let base = (selected?.isEmpty == false ? selected! : defaultManifestPath())
     var url = URL(fileURLWithPath: base).standardizedFileURL
     if promptOnly, url.lastPathComponent == "manifest.json" {
-      let promptOnlyURL = url.deletingLastPathComponent()
+      // Older layouts kept the FL2VA variant beside the Ref2VA manifest.
+      let siblingURL = url.deletingLastPathComponent()
         .appendingPathComponent("manifest-fl2va.json")
-      if FileManager.default.fileExists(atPath: promptOnlyURL.path) {
-        url = promptOnlyURL
+      // Current builds ship one model family per directory, so the FL2VA
+      // counterpart is the sibling directory with "ref2va" swapped out.
+      let directory = url.deletingLastPathComponent()
+      let counterpartURL = directory.deletingLastPathComponent()
+        .appendingPathComponent(
+          directory.lastPathComponent.replacingOccurrences(
+            of: "ref2va", with: "fl2va"
+          )
+        )
+        .appendingPathComponent("manifest.json")
+      if FileManager.default.fileExists(atPath: siblingURL.path) {
+        url = siblingURL
+      } else if directory.lastPathComponent.contains("ref2va"),
+        FileManager.default.fileExists(atPath: counterpartURL.path)
+      {
+        url = counterpartURL
       }
     }
     guard FileManager.default.fileExists(atPath: url.path) else {
@@ -644,13 +659,20 @@ private final class MiohMCPServer {
     return url.path
   }
 
+  /// Ref2VA is the default conditioning mode, so the default manifest points at
+  /// the Ref2VA family. The FL2VA counterpart is selected by `resolvedManifest`
+  /// when a request carries no input images.
+  private static let defaultModelDirectory =
+    "minimax-h3-native-ref2va-turbo4-nofp8"
+
   private func defaultManifestPath() -> String {
-    let external =
-      "/Volumes/Project_HD/model_weights/minimax-h3-native/manifest.json"
+    let external = "/Volumes/Project_HD/model_weights/"
+      + Self.defaultModelDirectory + "/manifest.json"
     if FileManager.default.fileExists(atPath: external) { return external }
     return FileManager.default.homeDirectoryForCurrentUser
       .appendingPathComponent(
-        "Documents/lada/model_weights/minimax-h3-native/manifest.json"
+        "Documents/lada/model_weights/" + Self.defaultModelDirectory
+          + "/manifest.json"
       ).path
   }
 

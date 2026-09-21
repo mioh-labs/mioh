@@ -28,6 +28,8 @@ H3_DENOISER = UPSCALER / "TenErosMaxH3DenoiserComposite.swift"
 MCP_SERVER = UPSCALER / "MiohUpscalerMCPServer.swift"
 H3_DIT_EXPORT = ROOT / "scripts" / "apple" / "export_10eros_max_h3_dit_block.py"
 H3_DIT_DRIVER = ROOT / "scripts" / "apple" / "export_10eros_max_h3_dit_coreai.py"
+H3_LORA_COMBINER = ROOT / "scripts" / "apple" / "combine_minimax_h3_loras.py"
+H3_MANIFEST_BUILDER = ROOT / "scripts" / "apple" / "build_10eros_max_h3_manifest.py"
 VENDORED_FLASHVSR_RUNNER = (
     UPSCALER / "vendor" / "flashvsr" / "deployment" / "coreai"
     / "FlashVSRNativeVideoRunner.swift"
@@ -450,7 +452,9 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
             "applyGeneratedAIPrompt",
             "API URL",
             "target_total_seconds",
+            "selected_generation_duration_seconds",
             "shot_duration_limit_seconds",
+            "The selected generation length is authoritative",
             "AUDIO ANALYSIS",
             "readAIPromptAnalysisAudio",
             "analyzedAIPromptIntervals",
@@ -484,6 +488,9 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
             "口パクしない",
         ):
             self.assertIn(audio_contract, view)
+        generation_settings = view.index('Section("生成設定")')
+        ai_prompt_settings = view.index('Section("AIプロンプト生成")')
+        self.assertLess(generation_settings, ai_prompt_settings)
         for audio_contract in (
             'command == "music-video"',
             "audio-conditioning-mode must be background-music or lip-sync",
@@ -676,6 +683,9 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
             "applyingRuntimeSpecializationOverrides(to: options)",
             '"MIOH_H3_COREAI_EXPECT_FREQUENT_RESHAPES"',
             "result.expectFrequentReshapes = true",
+            'assetName.contains("dit-blocks")',
+            'preferredCompute?.lowercased() == "gpu"',
+            "SpecializationOptions(preferredComputeUnitKind: .gpu)",
             'manifest.inputs["graphSalt"]',
             'semantic == "graphSalt"',
             "var scratch = NDArray(",
@@ -687,6 +697,12 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
             self.assertIn(contract, models)
         self.assertNotIn("cachePolicy: AIModelCache.Policy.persistent", models)
         self.assertNotIn("outputs.names.contains(entry.outputName)", models)
+        direct_dit_load = models.split(
+            'if preferredCompute?.lowercased() == "gpu",', 1
+        )[1].split("let options = try specializationOptions", 1)[0]
+        self.assertIn('assetName.contains("dit-blocks")', direct_dit_load)
+        self.assertIn("return try await AIModel(", direct_dit_load)
+        self.assertNotIn("AIModel.specialize", direct_dit_load)
         runner = H3_RUNNER.read_text()
         runner_main = runner.split("static func main() async {", 1)[1].split(
             "private static func execute", 1
@@ -704,6 +720,23 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
         self.assertEqual(
             runner.count('unsetenv("MPSGRAPH_DISABLE_ANEC_MODULE_VALIDATION")'),
             1,
+        )
+        self.assertIn("private static func runSingleVideo(", runner)
+        single_run = runner.split("private static func runSingleVideo(", 1)[1].split(
+            "private static func runPreparePart", 1
+        )[0]
+        self.assertIn("conditioningOnly: true", single_run)
+        self.assertIn("conditioningPipeline.preparationDescriptor()", single_run)
+        self.assertIn("H3DenoisePrepareWorker(", single_run)
+        self.assertIn("try await prepareWorker.prepare()", single_run)
+        self.assertIn("let renderPipeline = try await H3NativePipeline(", single_run)
+        self.assertLess(
+            single_run.index("try await conditioningPipeline.run()"),
+            single_run.index("try await prepareWorker.prepare()"),
+        )
+        self.assertLess(
+            single_run.index("try await prepareWorker.prepare()"),
+            single_run.index("try await renderPipeline.run()"),
         )
         self.assertIn(
             'environment["MPSGRAPH_DISABLE_ANEC_MODULE_VALIDATION"] = "1"',
@@ -723,6 +756,16 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
         self.assertIn('"prepare-part", "--manifest"', runner)
         self.assertIn("H3DenoisePrepareWorker(", runner)
         self.assertIn("H3PrepareWorkerDiagnosticFilter", runner)
+        for contract in (
+            "let decoderTicks = decoderShape[3]",
+            "let samplesPerTick = outputShape[2] / decoderTicks",
+            "let overlapTicks = min(16",
+            "audioLatentWindow(",
+            "decodeAudioChunk(",
+            'Data("fixed-window-crossfade-v1:',
+            "weights[globalSample] += weight",
+        ):
+            self.assertIn(contract, runner)
         self.assertIn('"incompatible element type for ane"', runner)
         self.assertIn('"#aicode."', runner)
         self.assertEqual(runner.count('"-nostdin"'), 2)
@@ -740,9 +783,33 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
             '"--graph-identity"',
             "hidden_states = hidden_states + graph_identity_salt.sum()",
             "entrypoint_name=entrypoint_name",
-            'f"w{checkpoint_sha256(args.checkpoint)[:16]}_"',
+            'f"w{identity_digest[:16]}_"',
+            '"--lora"',
+            '"--lora-strength"',
+            "class LoRALinear",
+            'f"diffusion_model.{prefix}"',
+            "strength *= alpha / rank",
         ):
             self.assertIn(contract, exporter)
+        combiner = H3_LORA_COMBINER.read_text()
+        for contract in (
+            '"--component"',
+            "user_strength * alpha / tensor.shape[0]",
+            '"scale_baked_into_lora_B": "true"',
+        ):
+            self.assertIn(contract, combiner)
+        core = H3_CORE.read_text()
+        self.assertIn('["res_multistep", "er_sde", "euler"]', core)
+        self.assertIn("enum H3Euler", core)
+        self.assertIn('case "euler":', runner)
+        manifest_builder = H3_MANIFEST_BUILDER.read_text()
+        for contract in (
+            '"--sampler", choices=("res_multistep", "er_sde", "euler")',
+            'parser.add_argument("--steps", type=int)',
+            'simple_flow_sigmas(steps=steps, shift=args.video_shift)',
+            'if sampler == "er_sde":',
+        ):
+            self.assertIn(contract, manifest_builder)
         for contract in (
             "checkpointSHA256",
             'f"main_{graph_identity}"',
