@@ -16,7 +16,9 @@ from safetensors import safe_open
 
 from pilot_10eros_max_h3_int8_convrot import (
     ExactINT8ConvRotLinear,
+    hadamard,
     load_mapping as load_convrot_mapping,
+    quantization_config,
 )
 
 
@@ -85,6 +87,14 @@ def parse_args() -> argparse.Namespace:
             "path for validating --metal-fp8-scaled and doubles weight storage."
         ),
     )
+    parser.add_argument(
+        "--expand-int8-convrot",
+        action="store_true",
+        help=(
+            "Expand INT8 ConvRot weights to dense BF16 before Core AI export. "
+            "This uses more disk space but avoids AOT weight dequantization."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -136,6 +146,31 @@ class DenseLinear(torch.nn.Module):
         return torch.nn.functional.linear(value, self.weight, self.bias)
 
 
+class ExpandedINT8ConvRotLinear(torch.nn.Module):
+    """Dense equivalent of an INT8 ConvRot linear for reliable AOT assets."""
+
+    def __init__(
+        self, quantized_weight: torch.Tensor, scale: torch.Tensor,
+        bias: torch.Tensor | None, group_size: int, dtype: torch.dtype,
+    ) -> None:
+        super().__init__()
+        weight = quantized_weight.to(dtype) * scale.to(dtype)
+        self.register_buffer("weight", weight.contiguous())
+        self.register_buffer("rotation", hadamard(group_size, dtype))
+        self.register_buffer(
+            "bias", None if bias is None else bias.to(dtype).contiguous()
+        )
+        self.group_size = group_size
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        shape = hidden_states.shape
+        groups = shape[-1] // self.group_size
+        rotated = torch.matmul(
+            hidden_states.reshape(-1, groups, self.group_size), self.rotation
+        ).reshape(shape)
+        return torch.nn.functional.linear(rotated, self.weight, self.bias)
+
+
 class LoRALinear(torch.nn.Module):
     """Adds a model-only LoRA branch without expanding the base INT8 weight."""
 
@@ -179,10 +214,11 @@ def load_linear(
     metal_int8_kernels=None,
     metal_fp8_kernel=None,
     expand_fp8_scaled: bool = False,
+    expand_int8_convrot: bool = False,
 ) -> torch.nn.Module:
     with safe_open(str(checkpoint), framework="pt", device="cpu") as handle:
         keys = set(handle.keys())
-        quantized = f"{prefix}.comfy_quant" in keys
+        quantized = quantization_config(handle, prefix) is not None
         fp8_scaled = (
             f"{prefix}.weight_scale" in keys
             and handle.get_tensor(f"{prefix}.weight").dtype
@@ -228,6 +264,10 @@ def load_linear(
         return FP8ScaledLinear(metal_fp8_kernel, weight_bits, scale, deployed_bias)
     if quantized:
         weight, scale, bias, group_size = load_convrot_mapping(checkpoint, prefix)
+        if expand_int8_convrot:
+            return ExpandedINT8ConvRotLinear(
+                weight, scale, bias, group_size, dtype
+            )
         if metal_int8_kernels is not None:
             from ten_eros_h3_coreai_kernels import MetalINT8ConvRotLinear
 
@@ -255,6 +295,7 @@ class TenErosDiTBlock(torch.nn.Module):
         metal_int8_kernels=None,
         metal_fp8_kernel=None,
         expand_fp8_scaled: bool = False,
+        expand_int8_convrot: bool = False,
         lora: Path | None = None,
         lora_strength: float = 1.0,
     ) -> None:
@@ -268,6 +309,7 @@ class TenErosDiTBlock(torch.nn.Module):
         self.qkv = load_linear(
             checkpoint, f"{prefix}.attn.qkv_proj", dtype,
             metal_int8_kernels, metal_fp8_kernel, expand_fp8_scaled,
+            expand_int8_convrot,
         )
         self.qkv = apply_lora(
             self.qkv, lora, f"{prefix}.attn.qkv_proj", lora_strength, dtype
@@ -275,6 +317,7 @@ class TenErosDiTBlock(torch.nn.Module):
         self.out = load_linear(
             checkpoint, f"{prefix}.attn.out_proj", dtype,
             metal_int8_kernels, metal_fp8_kernel, expand_fp8_scaled,
+            expand_int8_convrot,
         )
         self.out = apply_lora(
             self.out, lora, f"{prefix}.attn.out_proj", lora_strength, dtype
@@ -282,6 +325,7 @@ class TenErosDiTBlock(torch.nn.Module):
         self.fc1 = load_linear(
             checkpoint, f"{prefix}.mlp.fc1", dtype,
             metal_int8_kernels, metal_fp8_kernel, expand_fp8_scaled,
+            expand_int8_convrot,
         )
         self.fc1 = apply_lora(
             self.fc1, lora, f"{prefix}.mlp.fc1", lora_strength, dtype
@@ -289,6 +333,7 @@ class TenErosDiTBlock(torch.nn.Module):
         self.fc2 = load_linear(
             checkpoint, f"{prefix}.mlp.fc2", dtype,
             metal_int8_kernels, metal_fp8_kernel, expand_fp8_scaled,
+            expand_int8_convrot,
         )
         self.fc2 = apply_lora(
             self.fc2, lora, f"{prefix}.mlp.fc2", lora_strength, dtype
@@ -357,6 +402,7 @@ class TenErosDiTBlockGroup(torch.nn.Module):
         self, checkpoint: Path, first_layer: int, layer_count: int,
         dtype: torch.dtype, metal_int8_kernels=None, metal_fp8_kernel=None,
         expand_fp8_scaled: bool = False,
+        expand_int8_convrot: bool = False,
         lora: Path | None = None, lora_strength: float = 1.0,
     ) -> None:
         super().__init__()
@@ -364,6 +410,7 @@ class TenErosDiTBlockGroup(torch.nn.Module):
             TenErosDiTBlock(
                 checkpoint, layer, dtype,
                 metal_int8_kernels, metal_fp8_kernel, expand_fp8_scaled,
+                expand_int8_convrot,
                 lora, lora_strength,
             )
             for layer in range(first_layer, first_layer + layer_count)
@@ -521,6 +568,8 @@ def main() -> int:
         raise ValueError("select only one Metal weight implementation")
     if args.metal_fp8_scaled and args.expand_fp8_scaled:
         raise ValueError("select only one scaled FP8 weight implementation")
+    if args.metal_int8_convrot and args.expand_int8_convrot:
+        raise ValueError("select only one INT8 ConvRot weight implementation")
     if not args.checkpoint.is_file():
         raise FileNotFoundError(args.checkpoint)
     if args.lora is not None and not args.lora.is_file():
@@ -570,6 +619,7 @@ def main() -> int:
     group = TenErosDiTBlockGroup(
         args.checkpoint, args.layer, args.layer_count, dtype,
         metal_int8_kernels, metal_fp8_kernel, args.expand_fp8_scaled,
+        args.expand_int8_convrot,
         args.lora, args.lora_strength,
     ).eval()
     inputs = examples(args.tokens, dtype, salt_width)
@@ -601,6 +651,8 @@ def main() -> int:
         metadata["metalFP8ScaledNumerics"] = "dense-bfloat16-equivalent"
     if args.expand_fp8_scaled:
         metadata["expandedFP8Scaled"] = True
+    if args.expand_int8_convrot:
+        metadata["expandedINT8ConvRot"] = True
     if args.lora is not None:
         metadata["lora"] = args.lora.name
         metadata["loraSHA256"] = args.lora_sha256 or checkpoint_sha256(args.lora)

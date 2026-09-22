@@ -198,8 +198,8 @@ final class MiniMaxH3Controller: ObservableObject {
     "com.okatti.mioh.upscaler.10erosMaxH3ManifestPath"
   private static let legacyManifestPathDefaultsKey =
     "com.okatti.lada.coreai.10erosMaxH3ManifestPath"
-  private static let coreAICacheRootDefaultsKey =
-    "com.okatti.mioh.upscaler.h3CoreAICacheRoot"
+  private static let retainGenerationCacheDefaultsKey =
+    "com.okatti.mioh.upscaler.h3RetainGenerationCache"
 
   @Published var prompt = "モザイクを除去して最高品質の動画を生成する。"
   @Published var aiPromptProvider: MiniMaxH3AIPromptProvider = .openAICompatible
@@ -239,16 +239,14 @@ final class MiniMaxH3Controller: ObservableObject {
       refreshConditioningMode()
     }
   }
-  @Published var coreAICacheRoot: String {
+  @Published var retainGenerationCache: Bool {
     didSet {
       UserDefaults.standard.set(
-        coreAICacheRoot,
-        forKey: Self.coreAICacheRootDefaultsKey
+        retainGenerationCache,
+        forKey: Self.retainGenerationCacheDefaultsKey
       )
-      refreshCoreAICacheSummary()
     }
   }
-  @Published private(set) var coreAICacheSummary = "システム標準"
   @Published private(set) var supportsPromptOnly = false
   @Published private(set) var inputURLs: [URL] = []
   @Published private(set) var audioInputURL: URL?
@@ -312,11 +310,11 @@ final class MiniMaxH3Controller: ObservableObject {
       forKey: Self.legacyManifestPathDefaultsKey
     ) ?? ""
     manifestPath = Self.resolvePipelineManifestPath(savedManifestPath)
-    coreAICacheRoot = UserDefaults.standard.string(
-      forKey: Self.coreAICacheRootDefaultsKey
-    ) ?? ""
+    let defaults = UserDefaults.standard
+    retainGenerationCache = defaults.object(
+      forKey: Self.retainGenerationCacheDefaultsKey
+    ) as? Bool ?? true
     refreshConditioningMode()
-    refreshCoreAICacheSummary()
   }
 
   var supportsRuntime: Bool {
@@ -1043,81 +1041,6 @@ final class MiniMaxH3Controller: ObservableObject {
     }
   }
 
-  func chooseCoreAICacheRoot() {
-    let panel = NSOpenPanel()
-    panel.title = "Core AIキャッシュ保存先を選択"
-    panel.canChooseFiles = false
-    panel.canChooseDirectories = true
-    panel.canCreateDirectories = true
-    panel.allowsMultipleSelection = false
-    if !coreAICacheRoot.isEmpty {
-      panel.directoryURL = URL(fileURLWithPath: coreAICacheRoot, isDirectory: true)
-    }
-    guard panel.runModal() == .OK, let url = panel.url else { return }
-    coreAICacheRoot = url.standardizedFileURL.path
-  }
-
-  func useSystemCoreAICache() {
-    coreAICacheRoot = ""
-  }
-
-  func clearCoreAICache() {
-    guard !isRunning, let directory = effectiveCoreAICacheDirectory else { return }
-    do {
-      if FileManager.default.fileExists(atPath: directory.path) {
-        try FileManager.default.removeItem(at: directory)
-      }
-      try FileManager.default.createDirectory(
-        at: directory,
-        withIntermediateDirectories: true
-      )
-      status = "Core AIキャッシュを削除しました"
-      refreshCoreAICacheSummary()
-    } catch {
-      status = "Core AIキャッシュを削除できませんでした"
-      appendLog("Core AI cache: \(error.localizedDescription)\n")
-    }
-  }
-
-  private var effectiveCoreAICacheDirectory: URL? {
-    let value = coreAICacheRoot.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !value.isEmpty else { return nil }
-    return URL(fileURLWithPath: value, isDirectory: true)
-      .standardizedFileURL
-      .appendingPathComponent("mioh-coreai-cache", isDirectory: true)
-  }
-
-  private func refreshCoreAICacheSummary() {
-    guard let directory = effectiveCoreAICacheDirectory else {
-      coreAICacheSummary = "システム標準"
-      return
-    }
-    coreAICacheSummary = "容量を確認中"
-    Task { [weak self] in
-      let bytes = await Task.detached(priority: .utility) {
-        Self.directoryByteCount(directory)
-      }.value
-      guard let self, self.effectiveCoreAICacheDirectory == directory else { return }
-      self.coreAICacheSummary = "\(directory.path) · \(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file))"
-    }
-  }
-
-  nonisolated private static func directoryByteCount(_ directory: URL) -> Int64 {
-    guard let enumerator = FileManager.default.enumerator(
-      at: directory,
-      includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
-      options: [.skipsHiddenFiles]
-    ) else { return 0 }
-    var total: Int64 = 0
-    for case let url as URL in enumerator {
-      guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
-        values.isRegularFile == true
-      else { continue }
-      total += Int64(values.fileSize ?? 0)
-    }
-    return total
-  }
-
   func chooseOutput() {
     let panel = NSSavePanel()
     panel.title = "H3生成動画の保存先"
@@ -1126,6 +1049,43 @@ final class MiniMaxH3Controller: ObservableObject {
     if panel.runModal() == .OK, let url = panel.url {
       outputPath = url.standardizedFileURL.path
       automaticOutputPath = ""
+    }
+  }
+
+  private static func availableOutputURL(
+    for requestedURL: URL,
+    fileManager: FileManager = .default
+  ) -> URL {
+    let requested = requestedURL.standardizedFileURL
+    guard fileManager.fileExists(atPath: requested.path) else { return requested }
+
+    let directory = requested.deletingLastPathComponent()
+    let pathExtension = requested.pathExtension
+    var stem = requested.deletingPathExtension().lastPathComponent
+    var sequence = 2
+    let expression = try? NSRegularExpression(
+      pattern: #"^(.*) \(([0-9]+)\)$"#
+    )
+    let fullRange = NSRange(stem.startIndex..<stem.endIndex, in: stem)
+    if let match = expression?.firstMatch(in: stem, range: fullRange),
+      match.numberOfRanges == 3,
+      let baseRange = Range(match.range(at: 1), in: stem),
+      let numberRange = Range(match.range(at: 2), in: stem),
+      let existingSequence = Int(stem[numberRange])
+    {
+      stem = String(stem[baseRange])
+      sequence = max(2, existingSequence + 1)
+    }
+
+    while true {
+      var candidate = directory.appendingPathComponent("\(stem) (\(sequence))")
+      if !pathExtension.isEmpty {
+        candidate.appendPathExtension(pathExtension)
+      }
+      if !fileManager.fileExists(atPath: candidate.path) {
+        return candidate
+      }
+      sequence += 1
     }
   }
 
@@ -1147,6 +1107,14 @@ final class MiniMaxH3Controller: ObservableObject {
         status = "H3設定を確認してください"
       }
       return
+    }
+    let wasAutomaticOutput = outputPath == automaticOutputPath
+    let availableOutput = Self.availableOutputURL(
+      for: URL(fileURLWithPath: outputPath)
+    )
+    outputPath = availableOutput.path
+    if wasAutomaticOutput {
+      automaticOutputPath = availableOutput.path
     }
     let cachesRoot = FileManager.default.urls(
       for: .cachesDirectory,
@@ -1255,21 +1223,7 @@ final class MiniMaxH3Controller: ObservableObject {
     }
     task.arguments = arguments
     var environment = ProcessInfo.processInfo.environment
-    if let coreAICacheDirectory = effectiveCoreAICacheDirectory {
-      do {
-        try FileManager.default.createDirectory(
-          at: coreAICacheDirectory,
-          withIntermediateDirectories: true
-        )
-        environment["MIOH_H3_COREAI_CACHE_ROOT"] = coreAICacheDirectory.path
-      } catch {
-        status = "Core AIキャッシュ作成失敗"
-        appendLog("\(error.localizedDescription)\n")
-        return
-      }
-    } else {
-      environment.removeValue(forKey: "MIOH_H3_COREAI_CACHE_ROOT")
-    }
+    environment.removeValue(forKey: "MIOH_H3_COREAI_CACHE_ROOT")
     task.environment = environment
     task.standardOutput = outputPipe
     task.standardError = errorPipe
@@ -1294,7 +1248,32 @@ final class MiniMaxH3Controller: ObservableObject {
         self.isRunning = false
         if completed.terminationStatus == 0 {
           self.progress = 1
-          self.status = "MiniMax H3生成完了"
+          if self.retainGenerationCache {
+            self.status = "MiniMax H3生成完了"
+          } else {
+            self.status = "生成完了・中間キャッシュを削除中"
+            Task {
+              do {
+                try await Task.detached(priority: .utility) {
+                  let manager = FileManager.default
+                  if manager.fileExists(atPath: cache.path) {
+                    try manager.removeItem(at: cache)
+                  }
+                  try manager.createDirectory(
+                    at: cache,
+                    withIntermediateDirectories: true
+                  )
+                }.value
+                self.status = "MiniMax H3生成完了・中間キャッシュ削除済み"
+                self.appendLog("Generation cache removed: \(cache.path)\n")
+              } catch {
+                self.status = "生成完了・中間キャッシュ削除失敗"
+                self.appendLog(
+                  "Generation cache cleanup failed: \(error.localizedDescription)\n"
+                )
+              }
+            }
+          }
         } else if self.status == "停止中" {
           self.status = "停止"
         } else {
@@ -1306,9 +1285,10 @@ final class MiniMaxH3Controller: ObservableObject {
       progress = 0
       status = "MiniMax H3準備中"
       log = "Swift / \(backend == "coreai" ? "Core AI" : "Core ML")\n"
+      appendLog("Core AI cache: system default\n")
       appendLog(
-        effectiveCoreAICacheDirectory.map { "Core AI cache: \($0.path)\n" }
-          ?? "Core AI cache: system default\n"
+        "Generation cache after completion: "
+          + (retainGenerationCache ? "keep\n" : "delete\n")
       )
       musicAnalysisSummary = musicVideoMode ? "音源解析を開始します" : ""
       if musicVideoMode {
@@ -2650,28 +2630,12 @@ struct MiniMaxH3GenerationView: View {
             .buttonStyle(.borderless)
           }
         }
-        LabeledContent("Core AIキャッシュ") {
-          VStack(alignment: .trailing, spacing: 6) {
-            HStack {
-              TextField("システム標準", text: $controller.coreAICacheRoot)
-                .textFieldStyle(.roundedBorder)
-              Button(action: controller.chooseCoreAICacheRoot) {
-                Image(systemName: "folder")
-              }
-              .buttonStyle(.borderless)
-              Button("標準", action: controller.useSystemCoreAICache)
-                .disabled(controller.coreAICacheRoot.isEmpty || controller.isRunning)
-              Button("削除", role: .destructive, action: controller.clearCoreAICache)
-                .disabled(controller.coreAICacheRoot.isEmpty || controller.isRunning)
-            }
-            Text(controller.coreAICacheSummary)
-              .font(.caption)
-              .foregroundStyle(.secondary)
-              .lineLimit(2)
-              .textSelection(.enabled)
-          }
-        }
-        Text("macOS 27.2以降では指定先にCore AI特殊化キャッシュを保存します。モデル本体と生成途中キャッシュは移動しません。")
+        Toggle(
+          "生成完了後も中間キャッシュを残す",
+          isOn: $controller.retainGenerationCache
+        )
+          .disabled(controller.isRunning)
+        Text("オフにすると生成成功後にデコード・中間テンソル等の生成キャッシュを削除します。失敗・停止時は再開のため残します。Core AI特殊化キャッシュはシステム標準の場所を使用します。")
           .font(.caption)
           .foregroundStyle(.secondary)
         if !controller.supportsRuntime {

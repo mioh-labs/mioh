@@ -79,6 +79,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--expand-int8-convrot",
+        action="store_true",
+        help=(
+            "Expand INT8 ConvRot weights to dense BF16 before export for "
+            "reliable coreai-build AOT compilation."
+        ),
+    )
+    parser.add_argument(
         "--skip-components",
         action="store_true",
         help="Reuse already-compiled non-block DiT assets and only export block groups.",
@@ -309,6 +317,7 @@ def main() -> int:
                     *(["--fixed-shape"] if args.fixed_block_tokens is not None else []),
                     *(["--metal-fp8-scaled"] if args.metal_fp8_scaled else []),
                     *(["--expand-fp8-scaled"] if args.expand_fp8_scaled else []),
+                    *(["--expand-int8-convrot"] if args.expand_int8_convrot else []),
                     "--output",
                     str(source),
                     "--graph-identity",
@@ -357,6 +366,7 @@ def main() -> int:
         "architecture": args.architecture,
         "metalFP8Scaled": args.metal_fp8_scaled,
         "expandFP8Scaled": args.expand_fp8_scaled,
+        "expandINT8ConvRot": args.expand_int8_convrot,
     }
     if args.lora is not None:
         metadata["lora"] = args.lora.name
