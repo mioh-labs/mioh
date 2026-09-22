@@ -98,6 +98,7 @@ struct NativeExportConfiguration: Codable, Sendable {
   let roiEnhancerModel: String?
   let roiEnhancerStrength: Float
   let roiEnhancerScale: Int
+  let roiExpertMode: Bool
   let detectionEmptyLookahead: Int
   let detectionMaskReuseSkipFrames: Int
   let detectFaceMosaics: Bool
@@ -159,6 +160,7 @@ struct NativeExportConfiguration: Codable, Sendable {
     case roiEnhancerModel
     case roiEnhancerStrength
     case roiEnhancerScale
+    case roiExpertMode
     case detectionEmptyLookahead
     case detectionMaskReuseSkipFrames
     case detectFaceMosaics
@@ -212,6 +214,7 @@ private struct NativePreviewLaunchConfiguration: Encodable {
   let roiEnhancerModel: String?
   let roiEnhancerStrength: Float
   let roiEnhancerScale: Int
+  let roiExpertMode: Bool
   let detectionEmptyLookahead: Int
   let detectionMaskReuseSkipFrames: Int
   let detectFaceMosaics: Bool
@@ -689,6 +692,7 @@ struct MiohUserDefaultsSnapshot: Codable {
   var roiEnhancerScale: Int
   var roiEnhancerStrength: Double
   var roiEnhancerTile: Int
+  var roiExpertMode: Bool?
 
   var detectionModel: String
   var customDetectionModel: String
@@ -774,6 +778,7 @@ struct MiohUserDefaultsSnapshot: Codable {
       roiEnhancerScale: 4,
       roiEnhancerStrength: 0.0,
       roiEnhancerTile: 0,
+      roiExpertMode: false,
       detectionModel: "v2-coreml",
       customDetectionModel: "",
       detectionEmptyLookahead: 10,
@@ -881,6 +886,7 @@ final class RestorationRunner: ObservableObject {
   @Published var roiEnhancerScale = 4
   @Published var roiEnhancerStrength = 0.0
   @Published var roiEnhancerTile = 0
+  @Published var roiExpertMode = false
 
   @Published var detectionModel: String
   @Published var customDetectionModel = ""
@@ -1760,6 +1766,7 @@ final class RestorationRunner: ObservableObject {
       roiEnhancerModel: nativeEnhancer?.url.path,
       roiEnhancerStrength: nativeEnhancer == nil ? 0 : Float(roiEnhancerStrength),
       roiEnhancerScale: nativeEnhancer?.scale ?? max(1, roiEnhancerScale),
+      roiExpertMode: roiExpertMode,
       detectionEmptyLookahead: max(0, detectionEmptyLookahead),
       detectionMaskReuseSkipFrames: min(
         max(detectionMaskReuseSkipFrames, 0),
@@ -2233,6 +2240,7 @@ final class RestorationRunner: ObservableObject {
         ? 0 : request.options.roiEnhancerStrength,
       roiEnhancerScale: enhancer?.scale
         ?? max(1, request.options.roiEnhancerScale),
+      roiExpertMode: false,
       detectionEmptyLookahead: request.options.detectionEmptyLookahead,
       detectionMaskReuseSkipFrames:
         request.options.detectionMaskReuseSkipFrames ?? 0,
@@ -3007,6 +3015,7 @@ final class RestorationRunner: ObservableObject {
       roiEnhancerScale: roiEnhancerScale,
       roiEnhancerStrength: roiEnhancerStrength,
       roiEnhancerTile: roiEnhancerTile,
+      roiExpertMode: roiExpertMode,
       detectionModel: detectionModel,
       customDetectionModel: customDetectionModel,
       detectionEmptyLookahead: detectionEmptyLookahead,
@@ -3106,6 +3115,7 @@ final class RestorationRunner: ObservableObject {
     roiEnhancerScale = min(max(snapshot.roiEnhancerScale, 1), 8)
     roiEnhancerStrength = min(max(snapshot.roiEnhancerStrength, 0), 1)
     roiEnhancerTile = min(max(snapshot.roiEnhancerTile, 0), 1024)
+    roiExpertMode = snapshot.roiExpertMode ?? false
 
     detectionModel = detectionModels.contains(snapshot.detectionModel) ? snapshot.detectionModel : "v2-coreml"
     customDetectionModel = snapshot.customDetectionModel
@@ -3303,6 +3313,7 @@ final class RestorationRunner: ObservableObject {
       roiEnhancerModel: nativeEnhancer?.url.path,
       roiEnhancerStrength: nativeEnhancer == nil ? 0 : Float(effectiveEnhancerStrength),
       roiEnhancerScale: nativeEnhancer?.scale ?? max(1, roiEnhancerScale),
+      roiExpertMode: roiExpertMode,
       detectionEmptyLookahead: max(0, detectionEmptyLookahead),
       detectionMaskReuseSkipFrames: min(
         max(detectionMaskReuseSkipFrames, 0),
@@ -4029,6 +4040,12 @@ struct ContentView: View {
         LabeledContent("エフェクト倍率") { Stepper(value: $runner.effectUpscale, in: 1...4) { Text("\(runner.effectUpscale)x") } }
       }
       Section("ROIエンハンサー") {
+        Toggle("エキスパートROI復元", isOn: $runner.roiExpertMode)
+        if runner.roiExpertMode {
+          Text("マルチスケール二重復元・原寸ROI高周波・近隣フレーム融合を一括で有効にします。処理時間は通常より増加します。")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
         Picker("方式", selection: Binding(
           get: { runner.roiEnhancer },
           set: { runner.selectROIEnhancer($0) }
