@@ -80,6 +80,7 @@ private struct NativePreviewConfiguration: Decodable {
   let roiEnhancerModel: String?
   let roiEnhancerStrength: Float?
   let roiEnhancerScale: Int?
+  let roiExpertMode: Bool?
   let detectionEmptyLookahead: Int?
   let detectionMaskReuseSkipFrames: Int?
   let detectFaceMosaics: Bool?
@@ -2642,6 +2643,16 @@ private struct NativeEnhancerFrame {
   let strength: Float
 }
 
+/// Optional second restoration lane used only by Expert ROI mode. Each frame
+/// gets its own maximum-resolution geometry; the normal scene-wide result is
+/// retained as the stable structural base.
+private struct NativeExpertROIContext {
+  /// Final expert result after normalized 4x temporal/detail processing and
+  /// area reduction back to the restoration grid.
+  let processed: [Float16]
+  let geometries: [NativeClipGeometry]
+}
+
 /// Fixed-shape ROI enhancer used by the all-Swift pipeline. Core AI models
 /// consume/produce planar FP16 directly. The enhancer output remains at its
 /// native 2x/4x resolution until composition; only one high-resolution frame
@@ -3216,6 +3227,7 @@ private final class NativeFrameProcessor: @unchecked Sendable {
   private let sourceHeight: Int
   private let restorer: any NativeRestoring
   private let roiEnhancer: NativeROIEnhancer?
+  private let roiExpertMode: Bool
   private let blendFeather: Float
   private let effects: NativeRestoreEffects
   private let detectionEmptyLookahead: Int
@@ -3239,6 +3251,7 @@ private final class NativeFrameProcessor: @unchecked Sendable {
     height: Int,
     restorer: any NativeRestoring,
     roiEnhancer: NativeROIEnhancer?,
+    roiExpertMode: Bool,
     blendFeather: Float,
     effects: NativeRestoreEffects,
     outputBufferLimit: Int,
@@ -3248,6 +3261,7 @@ private final class NativeFrameProcessor: @unchecked Sendable {
     sourceHeight = height
     self.restorer = restorer
     self.roiEnhancer = roiEnhancer
+    self.roiExpertMode = roiExpertMode
     self.blendFeather = max(0, blendFeather)
     self.effects = effects
     self.outputBufferLimit = max(16, outputBufferLimit)
@@ -3329,7 +3343,10 @@ private final class NativeFrameProcessor: @unchecked Sendable {
     for scene in scenes.sorted(by: {
       ($0.frames.first?.batchIndex ?? 0) < ($1.frames.first?.batchIndex ?? 0)
     }) {
-      let (restored, originalInput, geometries, masks, compositePlans) =
+      let (
+        restored, originalInput, geometries, masks, compositePlans,
+        expertContext
+      ) =
         try await restore(scene)
       let restoredFrameElements =
         3 * restorationSize * restorationSize
@@ -3384,7 +3401,9 @@ private final class NativeFrameProcessor: @unchecked Sendable {
             geometry: geometries[index],
             hardMask: masks[index],
             plan: compositePlans[index],
-            enhancedFrame: enhancedFrame
+            enhancedFrame: enhancedFrame,
+            expertContext: expertContext,
+            expertFrameIndex: index
           )
           compositionSeconds += Date().timeIntervalSince(compositionStart)
         }
@@ -3411,7 +3430,9 @@ private final class NativeFrameProcessor: @unchecked Sendable {
           geometry: geometries[index],
           hardMask: masks[index],
           plan: compositePlans[index],
-          enhancedFrame: nil
+          enhancedFrame: nil,
+          expertContext: expertContext,
+          expertFrameIndex: index
         )
       }
       for index in scene.frames.indices {
@@ -3524,7 +3545,7 @@ private final class NativeFrameProcessor: @unchecked Sendable {
     _ scene: NativeScene
   ) async throws -> (
     [Float16], [Float16]?, [NativeClipGeometry], [[Float]],
-    [NativeCompositePlan]
+    [NativeCompositePlan], NativeExpertROIContext?
   ) {
     let preparationStart = Date()
     let width = CVPixelBufferGetWidth(scene.frames[0].source)
@@ -3619,6 +3640,7 @@ private final class NativeFrameProcessor: @unchecked Sendable {
       }
     }
     let needsOriginalInput = roiEnhancer != nil || effects.isEnabled
+      || roiExpertMode
     let modelInput: [Float16]?
     let restorationBase: [Float16]
     let restorationElapsed: TimeInterval
@@ -3652,6 +3674,75 @@ private final class NativeFrameProcessor: @unchecked Sendable {
       modelInput = nil
     }
     restorationSeconds += restorationElapsed
+    let expertContext: NativeExpertROIContext?
+    if roiExpertMode {
+      // Normalize every crop independently so a distant/small ROI no longer
+      // inherits the scale of the largest zoomed-in box in the scene.
+      let detailGeometries = cropBoxes.map { cropBox in
+        let scale = min(
+          Float(restorationSize) / Float(max(1, cropBox.width)),
+          Float(restorationSize) / Float(max(1, cropBox.height))
+        )
+        let resizedWidth = max(1, min(
+          restorationSize, Int((Float(cropBox.width) * scale).rounded())
+        ))
+        let resizedHeight = max(1, min(
+          restorationSize, Int((Float(cropBox.height) * scale).rounded())
+        ))
+        return NativeClipGeometry(
+          cropBox: cropBox,
+          resizedWidth: resizedWidth,
+          resizedHeight: resizedHeight,
+          padTop: max(0, (restorationSize - resizedHeight) / 2),
+          padLeft: max(0, (restorationSize - resizedWidth) / 2)
+        )
+      }
+      let detailAxes = detailGeometries.map {
+        Self.makeModelInputAxes(
+          geometry: $0,
+          sourceWidth: width,
+          sourceHeight: height
+        )
+      }
+      var detailInput = [Float16](
+        repeating: 0,
+        count: scene.frames.count * frameElements
+      )
+      try detailInput.withUnsafeMutableBufferPointer { destination in
+        guard let base = destination.baseAddress else { return }
+        for index in scene.frames.indices {
+          try Self.writeModelInput(
+            source: scene.frames[index].source,
+            axes: detailAxes[index],
+            destination: UnsafeMutableBufferPointer(
+              start: base.advanced(by: index * frameElements),
+              count: frameElements
+            )
+          )
+        }
+      }
+      let detailRestored = try restorer.restore(
+        detailInput,
+        frameCount: scene.frames.count
+      )
+      let expertProcessed = Self.processExpertFourX(
+        restored: detailRestored,
+        original: detailInput,
+        geometries: detailGeometries,
+        cropMasks: scene.frames.indices.map { index in
+          frameMasks[index] ?? [Float](
+            repeating: 0,
+            count: cropBoxes[index].width * cropBoxes[index].height
+          )
+        }
+      )
+      expertContext = NativeExpertROIContext(
+        processed: expertProcessed,
+        geometries: detailGeometries
+      )
+    } else {
+      expertContext = nil
+    }
     var hardMasks: [[Float]] = []
     hardMasks.reserveCapacity(scene.frames.count)
     for index in scene.frames.indices {
@@ -3723,7 +3814,8 @@ private final class NativeFrameProcessor: @unchecked Sendable {
       roiEnhancer == nil ? nil : modelInput,
       geometries,
       hardMasks,
-      compositePlans
+      compositePlans,
+      expertContext
     )
   }
 
@@ -4261,6 +4353,271 @@ private final class NativeFrameProcessor: @unchecked Sendable {
     return maskedMix(base: restored, processed: reduced, mask: mask)
   }
 
+  /// Expert lane order:
+  /// second 256px restoration -> normalized 4x enlargement -> temporal
+  /// fusion -> bounded source-frequency recovery -> detail/sharpen -> area
+  /// reduction. The caller blends this reduced result with the normal lane.
+  private static func processExpertFourX(
+    restored: [Float16],
+    original: [Float16],
+    geometries: [NativeClipGeometry],
+    cropMasks: [[Float]]
+  ) -> [Float16] {
+    let frameCount = geometries.count
+    let sourcePlane = restorationSize * restorationSize
+    let sourceFrameElements = sourcePlane * 3
+    guard frameCount > 0,
+      restored.count == frameCount * sourceFrameElements,
+      original.count == restored.count,
+      cropMasks.count == frameCount
+    else { return restored }
+
+    let scale = 4
+    let width = restorationSize * scale
+    let height = restorationSize * scale
+    let plane = width * height
+    let frameElements = plane * 3
+
+    // Resample only the valid independently-normalized crop, not its padding.
+    // Every frame then occupies the same 4x coordinate system, which makes
+    // neighbouring-frame fusion meaningful even while ROI size changes.
+    func normalizedFrame(
+      _ values: [Float16], frame: Int
+    ) -> [Float] {
+      let geometry = geometries[frame]
+      let frameOffset = frame * sourceFrameElements
+      var output = [Float](repeating: 0, count: frameElements)
+      for y in 0..<height {
+        let ny = (Float(y) + 0.5) / Float(height)
+        let modelY = Float(geometry.padTop)
+          + ny * Float(geometry.resizedHeight) - 0.5
+        let clampedY = max(0, min(Float(restorationSize - 1), modelY))
+        let y0 = Int(floor(clampedY))
+        let y1 = min(restorationSize - 1, y0 + 1)
+        let fy = clampedY - Float(y0)
+        for x in 0..<width {
+          let nx = (Float(x) + 0.5) / Float(width)
+          let modelX = Float(geometry.padLeft)
+            + nx * Float(geometry.resizedWidth) - 0.5
+          let clampedX = max(0, min(Float(restorationSize - 1), modelX))
+          let x0 = Int(floor(clampedX))
+          let x1 = min(restorationSize - 1, x0 + 1)
+          let fx = clampedX - Float(x0)
+          let destination = y * width + x
+          for channel in 0..<3 {
+            let sourceOffset = frameOffset + channel * sourcePlane
+            let upper = Float(values[sourceOffset + y0 * restorationSize + x0])
+              * (1 - fx)
+              + Float(values[sourceOffset + y0 * restorationSize + x1]) * fx
+            let lower = Float(values[sourceOffset + y1 * restorationSize + x0])
+              * (1 - fx)
+              + Float(values[sourceOffset + y1 * restorationSize + x1]) * fx
+            output[channel * plane + destination] = upper * (1 - fy) + lower * fy
+          }
+        }
+      }
+      return output
+    }
+
+    var result = [Float16]()
+    result.reserveCapacity(restored.count)
+    var restoredCache: [Int: [Float]] = [:]
+    for frame in 0..<frameCount {
+      for needed in [frame - 1, frame, frame + 1]
+        where needed >= 0 && needed < frameCount
+      {
+        if restoredCache[needed] == nil {
+          restoredCache[needed] = normalizedFrame(restored, frame: needed)
+        }
+      }
+      let center = restoredCache[frame]!
+      var fused = center
+      var weights = [Float](repeating: 1, count: frameElements)
+      for neighbour in [frame - 1, frame + 1]
+        where neighbour >= 0 && neighbour < frameCount
+      {
+        guard let candidate = restoredCache[neighbour] else { continue }
+        for index in 0..<frameElements {
+          let delta = abs(candidate[index] - center[index])
+          if delta < 0.05 {
+            let weight: Float = 0.10 * (1 - delta / 0.05)
+            fused[index] += candidate[index] * weight
+            weights[index] += weight
+          }
+        }
+      }
+      for index in fused.indices {
+        fused[index] /= weights[index]
+      }
+
+      // Build a reference frequency profile from the unmasked surroundings.
+      // The source residual itself is never copied into the ROI: doing so can
+      // restore the mosaic grid. Only the amount missing from the restored
+      // image is inferred from the surrounding video's two frequency bands.
+      let source = normalizedFrame(original, frame: frame)
+      let geometry = geometries[frame]
+      let cropMask = cropMasks[frame]
+      let sourceMask = resizeMaskNearest(
+        cropMask,
+        sourceWidth: geometry.cropBox.width,
+        sourceHeight: geometry.cropBox.height,
+        destinationWidth: width,
+        destinationHeight: height
+      ).map { $0 > 0.5 ? Float(1) : Float(0) }
+      let softMask = gaussianSingle(
+        sourceMask,
+        width: width,
+        height: height,
+        sigma: 8
+      )
+      let sourceFineLow = gaussianPlanar(
+        source, width: width, height: height, sigma: 2
+      )
+      let sourceMidLow = gaussianPlanar(
+        sourceFineLow, width: width, height: height, sigma: 6
+      )
+      let restoredFineLow = gaussianPlanar(
+        fused, width: width, height: height, sigma: 2
+      )
+      let restoredMidLow = gaussianPlanar(
+        restoredFineLow, width: width, height: height, sigma: 6
+      )
+      var corrected = fused
+      let tileSize = 64
+      let tilesX = (width + tileSize - 1) / tileSize
+      let tilesY = (height + tileSize - 1) / tileSize
+      let tileCount = tilesX * tilesY
+      for channel in 0..<3 {
+        let offset = channel * plane
+        var sourceFineEnergy = [Float](repeating: 0, count: tileCount)
+        var sourceMidEnergy = [Float](repeating: 0, count: tileCount)
+        var restoredFineEnergy = [Float](repeating: 0, count: tileCount)
+        var restoredMidEnergy = [Float](repeating: 0, count: tileCount)
+        var outsideCount = [Float](repeating: 0, count: tileCount)
+        var insideCount = [Float](repeating: 0, count: tileCount)
+        for y in 0..<height {
+          let tileY = min(tilesY - 1, y / tileSize)
+          for x in 0..<width {
+            let pixel = y * width + x
+            let tile = tileY * tilesX + min(tilesX - 1, x / tileSize)
+            let index = offset + pixel
+            let sourceFine = source[index] - sourceFineLow[index]
+            let sourceMid = sourceFineLow[index] - sourceMidLow[index]
+            let restoredFine = fused[index] - restoredFineLow[index]
+            let restoredMid = restoredFineLow[index] - restoredMidLow[index]
+            if sourceMask[pixel] < 0.5 {
+              sourceFineEnergy[tile] += sourceFine * sourceFine
+              sourceMidEnergy[tile] += sourceMid * sourceMid
+              outsideCount[tile] += 1
+            } else {
+              restoredFineEnergy[tile] += restoredFine * restoredFine
+              restoredMidEnergy[tile] += restoredMid * restoredMid
+              insideCount[tile] += 1
+            }
+          }
+        }
+
+        var fineGains = [Float](repeating: 1, count: tileCount)
+        var midGains = [Float](repeating: 1, count: tileCount)
+        for tileY in 0..<tilesY {
+          for tileX in 0..<tilesX {
+            let tile = tileY * tilesX + tileX
+            guard insideCount[tile] >= 64 else { continue }
+            var reference: Int?
+            var bestDistance = Int.max
+            for candidateY in 0..<tilesY {
+              for candidateX in 0..<tilesX {
+                let candidate = candidateY * tilesX + candidateX
+                guard outsideCount[candidate] >= 64 else { continue }
+                let dx = candidateX - tileX
+                let dy = candidateY - tileY
+                let distance = dx * dx + dy * dy
+                if distance < bestDistance {
+                  bestDistance = distance
+                  reference = candidate
+                }
+              }
+            }
+            guard let reference else { continue }
+            let sourceFineRMS = sqrt(
+              sourceFineEnergy[reference] / outsideCount[reference]
+            )
+            let sourceMidRMS = sqrt(
+              sourceMidEnergy[reference] / outsideCount[reference]
+            )
+            let restoredFineRMS = sqrt(
+              restoredFineEnergy[tile] / insideCount[tile]
+            )
+            let restoredMidRMS = sqrt(
+              restoredMidEnergy[tile] / insideCount[tile]
+            )
+            fineGains[tile] = max(
+              1, min(1.8, sourceFineRMS / max(0.002, restoredFineRMS))
+            )
+            midGains[tile] = max(
+              1, min(1.5, sourceMidRMS / max(0.002, restoredMidRMS))
+            )
+          }
+        }
+
+        // Bilinear interpolation of the tile gains prevents visible 64px
+        // boundaries while still adapting to local lighting and texture.
+        for y in 0..<height {
+          let gridY = Float(y) / Float(tileSize) - 0.5
+          let y0 = max(0, min(tilesY - 1, Int(floor(gridY))))
+          let y1 = min(tilesY - 1, y0 + 1)
+          let fy = max(0, min(1, gridY - Float(y0)))
+          for x in 0..<width {
+            let pixel = y * width + x
+            guard sourceMask[pixel] > 0.5 else { continue }
+            let gridX = Float(x) / Float(tileSize) - 0.5
+            let x0 = max(0, min(tilesX - 1, Int(floor(gridX))))
+            let x1 = min(tilesX - 1, x0 + 1)
+            let fx = max(0, min(1, gridX - Float(x0)))
+            func interpolated(_ gains: [Float]) -> Float {
+              let upper = gains[y0 * tilesX + x0] * (1 - fx)
+                + gains[y0 * tilesX + x1] * fx
+              let lower = gains[y1 * tilesX + x0] * (1 - fx)
+                + gains[y1 * tilesX + x1] * fx
+              return upper * (1 - fy) + lower * fy
+            }
+            let index = offset + pixel
+            let fine = fused[index] - restoredFineLow[index]
+            let mid = restoredFineLow[index] - restoredMidLow[index]
+            let amount = max(0, min(1, softMask[pixel]))
+            corrected[index] = clamp01(
+              fused[index]
+                + fine * (interpolated(fineGains) - 1) * amount
+                + mid * (interpolated(midGains) - 1) * amount
+            )
+          }
+        }
+      }
+
+      // Retain the Expert lane's local detail treatment, but fixed
+      // sharpness is deliberately absent; the adaptive band correction above
+      // supplies only the energy missing relative to the surrounding video.
+      let detailed = adaptiveLumaContrast(
+        corrected,
+        width: width,
+        height: height,
+        strength: 0.30
+      )
+      let reduced = downsamplePlanarArea(
+        detailed,
+        sourceWidth: width,
+        sourceHeight: height,
+        scale: scale
+      )
+      result.append(contentsOf: reduced.map(Float16.init))
+
+      restoredCache = restoredCache.filter { key, _ in
+        key >= frame && key <= frame + 2
+      }
+    }
+    return result
+  }
+
   private static func maskedMix(
     base: [Float],
     processed: [Float],
@@ -4304,28 +4661,72 @@ private final class NativeFrameProcessor: @unchecked Sendable {
   ) -> [Float] {
     let kernel = gaussianKernel(sigma: sigma)
     let radius = kernel.count / 2
-    var horizontal = [Float](repeating: 0, count: input.count)
+    guard input.count == width * height, width > 0, height > 0 else {
+      return input
+    }
+
+    // Preserve the exact reflected-border separable Gaussian used before,
+    // but hand the multiply/accumulate loops to Accelerate. Transposition
+    // turns the vertical pass into the same contiguous row convolution and
+    // avoids the cache-hostile scalar column loop that dominated Expert ROI.
+    func convolveRows(
+      _ source: [Float], rowWidth: Int, rowCount: Int
+    ) -> [Float] {
+      let paddedWidth = rowWidth + radius * 2
+      var padded = [Float](
+        repeating: 0,
+        count: paddedWidth * rowCount
+      )
+      for row in 0..<rowCount {
+        let sourceOffset = row * rowWidth
+        let paddedOffset = row * paddedWidth
+        for x in 0..<paddedWidth {
+          let sourceX = reflected(x - radius, count: rowWidth)
+          padded[paddedOffset + x] = source[sourceOffset + sourceX]
+        }
+      }
+      var result = [Float](repeating: 0, count: rowWidth * rowCount)
+      padded.withUnsafeBufferPointer { paddedBuffer in
+        kernel.withUnsafeBufferPointer { kernelBuffer in
+          result.withUnsafeMutableBufferPointer { resultBuffer in
+            guard let paddedBase = paddedBuffer.baseAddress,
+              let kernelBase = kernelBuffer.baseAddress,
+              let resultBase = resultBuffer.baseAddress
+            else { return }
+            for row in 0..<rowCount {
+              vDSP_conv(
+                paddedBase.advanced(by: row * paddedWidth),
+                1,
+                kernelBase,
+                1,
+                resultBase.advanced(by: row * rowWidth),
+                1,
+                vDSP_Length(rowWidth),
+                vDSP_Length(kernel.count)
+              )
+            }
+          }
+        }
+      }
+      return result
+    }
+
+    let horizontal = convolveRows(input, rowWidth: width, rowCount: height)
+    var transposed = [Float](repeating: 0, count: input.count)
+    vDSP_mtrans(
+      horizontal, 1, &transposed, 1,
+      vDSP_Length(height), vDSP_Length(width)
+    )
+    let verticalTransposed = convolveRows(
+      transposed,
+      rowWidth: height,
+      rowCount: width
+    )
     var output = [Float](repeating: 0, count: input.count)
-    for y in 0..<height {
-      for x in 0..<width {
-        var value: Float = 0
-        for tap in kernel.indices {
-          let sourceX = reflected(x + tap - radius, count: width)
-          value += input[y * width + sourceX] * kernel[tap]
-        }
-        horizontal[y * width + x] = value
-      }
-    }
-    for y in 0..<height {
-      for x in 0..<width {
-        var value: Float = 0
-        for tap in kernel.indices {
-          let sourceY = reflected(y + tap - radius, count: height)
-          value += horizontal[sourceY * width + x] * kernel[tap]
-        }
-        output[y * width + x] = value
-      }
-    }
+    vDSP_mtrans(
+      verticalTransposed, 1, &output, 1,
+      vDSP_Length(width), vDSP_Length(height)
+    )
     return output
   }
 
@@ -4633,7 +5034,9 @@ private final class NativeFrameProcessor: @unchecked Sendable {
     geometry: NativeClipGeometry,
     hardMask: [Float],
     plan: NativeCompositePlan,
-    enhancedFrame: NativeEnhancerFrame?
+    enhancedFrame: NativeEnhancerFrame?,
+    expertContext: NativeExpertROIContext?,
+    expertFrameIndex: Int
   ) throws -> CVPixelBuffer {
     let output = try allocateOutputBuffer(context: "composite")
     CVPixelBufferLockBaseAddress(source, .readOnly)
@@ -4732,7 +5135,11 @@ private final class NativeFrameProcessor: @unchecked Sendable {
       }
     }
     let enhancerBlendMask = validEnhancer == nil
-      ? []
+      ? (expertContext == nil ? [] : Self.createEnhancerBlendMask(
+          hardMask,
+          width: cropWidth,
+          height: cropHeight
+        ))
       : Self.createEnhancerBlendMask(
         hardMask,
         width: cropWidth,
@@ -4799,7 +5206,39 @@ private final class NativeFrameProcessor: @unchecked Sendable {
         @inline(__always)
         func outputValue(_ channel: Int) -> Float {
           let channelOffset = channel * plane
-          let base = sample(restored, channelOffset)
+          var base = sample(restored, channelOffset)
+          if let expertContext,
+            expertContext.geometries.indices.contains(expertFrameIndex)
+          {
+            let frameElements = plane * 3
+            let nx = (Float(cropX) + 0.5) / Float(max(1, cropWidth))
+            let ny = (Float(cropY) + 0.5) / Float(max(1, cropHeight))
+            @inline(__always) func expertSample(_ x: Float, _ y: Float) -> Float {
+              let modelX = x * Float(restorationSize) - 0.5
+              let modelY = y * Float(restorationSize) - 0.5
+              let clampedX = max(0, min(Float(restorationSize - 1), modelX))
+              let clampedY = max(0, min(Float(restorationSize - 1), modelY))
+              let x0 = Int(floor(clampedX))
+              let y0 = Int(floor(clampedY))
+              let x1 = min(restorationSize - 1, x0 + 1)
+              let y1 = min(restorationSize - 1, y0 + 1)
+              let fx = clampedX - Float(x0)
+              let fy = clampedY - Float(y0)
+              let offset = expertFrameIndex * frameElements + channelOffset
+              let upper = Float(expertContext.processed[offset + y0 * restorationSize + x0])
+                * (1 - fx)
+                + Float(expertContext.processed[offset + y0 * restorationSize + x1]) * fx
+              let lower = Float(expertContext.processed[offset + y1 * restorationSize + x0])
+                * (1 - fx)
+                + Float(expertContext.processed[offset + y1 * restorationSize + x1]) * fx
+              return upper * (1 - fy) + lower * fy
+            }
+            let expert = expertSample(nx, ny)
+            let expertAmount = enhancerBlendMask.isEmpty
+              ? 1
+              : enhancerBlendMask[cropY * cropWidth + cropX]
+            base += (expert - base) * 0.75 * expertAmount
+          }
           guard enhancerAmount > 0,
             let validEnhancer,
             let enhancerBase,
@@ -5715,6 +6154,7 @@ private struct NativePreviewPipeline {
           height: video.height,
           restorer: restorer,
           roiEnhancer: roiEnhancer,
+          roiExpertMode: config.roiExpertMode ?? false,
           blendFeather: config.blendFeather ?? 1,
           effects: restoreEffects,
           outputBufferLimit: perProcessorOutputLimit,
