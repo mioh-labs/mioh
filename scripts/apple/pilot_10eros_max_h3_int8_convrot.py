@@ -49,15 +49,26 @@ def hadamard(size: int, dtype: torch.dtype = torch.float16) -> torch.Tensor:
     return (value / math.sqrt(size)).to(dtype).contiguous()
 
 
+def quantization_config(handle, prefix: str) -> dict | None:
+    """Read ConvRot metadata from either supported safetensors layout."""
+    quant_key = f"{prefix}.comfy_quant"
+    if quant_key in handle.keys():
+        return json.loads(bytes(handle.get_tensor(quant_key).tolist()))
+    metadata = handle.metadata() or {}
+    packed = metadata.get("_quantization_metadata")
+    if packed:
+        return json.loads(packed).get("layers", {}).get(prefix)
+    return None
+
+
 def load_mapping(
     checkpoint: Path, prefix: str
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, int]:
     with safe_open(str(checkpoint), framework="pt", device="cpu") as handle:
         keys = set(handle.keys())
-        quant_key = f"{prefix}.comfy_quant"
-        if quant_key not in keys:
+        config = quantization_config(handle, prefix)
+        if config is None:
             raise KeyError(f"{prefix} is not an INT8 ConvRot layer")
-        config = json.loads(bytes(handle.get_tensor(quant_key).tolist()))
         if config.get("format") != "int8_tensorwise" or not config.get("convrot"):
             raise ValueError(f"unexpected quantization config: {config}")
         weight = handle.get_tensor(f"{prefix}.weight")

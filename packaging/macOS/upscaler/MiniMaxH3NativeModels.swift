@@ -15,16 +15,6 @@ private func h3SpecializationOptions(
   _ type: SpecializationOptions.Type
 ) -> SpecializationOptions
 
-// Xcode 27.2 exports this public Core AI initializer in CoreAI.tbd, but the
-// SDK currently omits it from the generated Swift interface. Keep the bridge
-// availability-gated so binaries targeting 27.0 never resolve it on older OSes.
-@available(macOS 27.2, *)
-@_silgen_name("$s15CoreAIDelegates12AIModelCacheC18usingRootDirectoryAC10Foundation3URLV_tcfC")
-private func h3AIModelCache(
-  _ rootDirectory: URL,
-  _ type: AIModelCache.Type
-) -> AIModelCache
-
 protocol H3InferenceStage: AnyObject, Sendable {
   func predict(_ inputs: [String: H3Tensor]) async throws -> [String: H3Tensor]
 }
@@ -309,15 +299,6 @@ private enum H3CoreAIModelLoader {
       cache: cache,
       cachePolicy: cachePolicy
     )
-  }
-
-  private static func customCacheRoot() -> URL? {
-    let rawValue = ProcessInfo.processInfo.environment[
-      "MIOH_H3_COREAI_CACHE_ROOT"
-    ]?
-      .trimmingCharacters(in: .whitespacesAndNewlines)
-    guard let rawValue, !rawValue.isEmpty else { return nil }
-    return URL(fileURLWithPath: rawValue, isDirectory: true).standardizedFileURL
   }
 
   private static func cachePolicy() throws -> AIModelCache.Policy {

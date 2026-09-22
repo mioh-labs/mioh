@@ -154,6 +154,17 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
         self.assertIn('@Published private(set) var musicAnalysisSummary', h3_view)
         self.assertIn('LabeledContent("音源解析")', h3_view)
         self.assertIn('[musicAnalysis] queued:', h3_view)
+        self.assertIn("private static func availableOutputURL(", h3_view)
+        self.assertIn('"\\(stem) (\\(sequence))"', h3_view)
+        self.assertIn("let availableOutput = Self.availableOutputURL(", h3_view)
+        self.assertIn("生成完了後も中間キャッシュを残す", h3_view)
+        self.assertIn("Generation cache removed:", h3_view)
+        self.assertNotIn("Core AIキャッシュ保存先を選択", h3_view)
+        self.assertIn(
+            'environment.removeValue(forKey: "MIOH_H3_COREAI_CACHE_ROOT")',
+            h3_view,
+        )
+        self.assertNotIn("coreAICacheRoot", h3_view)
 
         mcp = MCP_SERVER.read_text()
         for contract in (
