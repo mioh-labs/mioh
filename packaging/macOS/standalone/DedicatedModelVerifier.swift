@@ -70,6 +70,7 @@ private struct DedicatedModelVerifier {
     "MewZoom-V1-4X-Unet_256.mlmodelc",
     "swinir-real-x4_256.mlmodelc",
     "4xNomosWebPhoto_RealPLKSR_256.mlmodelc",
+    "PiperSR_2x_256.mlmodelc",
   ])
 
   static func main() async {

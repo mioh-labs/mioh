@@ -246,6 +246,7 @@ struct IPadRealtimePreviewConfiguration: Sendable {
       roiEnhancerAssetSHA256: options.roiEnhancerAssetSHA256,
       roiEnhancerStrength: options.roiEnhancerStrength,
       roiEnhancerScale: options.roiEnhancerScale,
+      roiEnhancerPasses: options.roiEnhancerPasses,
       videoCodec: options.videoCodec,
       bitrateMultiplier: options.bitrateMultiplier,
       mp4FastStart: options.mp4FastStart,

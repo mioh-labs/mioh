@@ -1829,7 +1829,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn("private final class NativeROIEnhancer", pipeline)
         self.assertIn("try await roiEnhancer.enhanceFrame", pipeline)
         self.assertIn("enhancedFrame: enhancedFrame", pipeline)
-        self.assertIn("lowResolution: try Self.makeLowResolution", pipeline)
+        self.assertIn("lowResolution = try Self.makeLowResolution", pipeline)
         self.assertIn("enhancer legacy 256px output", pipeline)
         self.assertIn("base + (highEnhanced - lowEnhanced) * enhancerAmount", pipeline)
         self.assertIn("createEnhancerBlendMask", pipeline)
@@ -1840,6 +1840,32 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertNotIn('label: "enhancer reduced output"', pipeline)
         self.assertIn("CVPixelBufferPoolFlush(sourcePool", pipeline)
         self.assertNotIn('guard roiEnhancer == "none"', source)
+
+    def test_pipersr_replaces_roi_from_native_output(self):
+        pipeline = NATIVE_PIPELINE_SOURCE.read_text()
+
+        self.assertIn('== "PiperSR_2x_256"', pipeline)
+        self.assertIn("if directReplacement {", pipeline)
+        self.assertIn("lowResolution = Array(restored[offset..<(offset + frameElements)])", pipeline)
+        self.assertIn("if validEnhancer.directReplacement {", pipeline)
+        self.assertIn("base + (sampleEnhanced(channel) - base)", pipeline)
+        self.assertIn("* validEnhancer.strength * enhancerAmount", pipeline)
+
+    def test_pipersr_repeats_with_bounded_512_to_256_feedback(self):
+        source = APP_SOURCE.read_text()
+        pipeline = NATIVE_PIPELINE_SOURCE.read_text()
+
+        self.assertIn("@Published var roiEnhancerPasses = 1", source)
+        self.assertIn("Stepper(value: $runner.roiEnhancerPasses, in: 1...10)", source)
+        self.assertIn("roiEnhancerPasses: roiEnhancer == \"pipersr\"", source)
+        self.assertIn("let roiEnhancerPasses: Int?", pipeline)
+        self.assertIn("let passCount = replacesRestoration ? min(max(passes, 1), 10) : 1", pipeline)
+        self.assertIn("iterationCount = passCount", pipeline)
+        self.assertIn("for pass in 0..<iterationCount", pipeline)
+        self.assertIn("if pass + 1 < iterationCount", pipeline)
+        self.assertIn('label: "PiperSR feedback input"', pipeline)
+        self.assertIn("modelInput = feedback", pipeline)
+        self.assertIn("passes: config.roiEnhancerPasses ?? 1", pipeline)
 
     def test_universal_model_tools_keep_all_recovered_fixes(self):
         tools = ROOT / "packaging" / "macOS" / "standalone" / "model-tools"
@@ -1878,12 +1904,24 @@ class StandaloneAppOptionTests(unittest.TestCase):
             ROOT / "packaging" / "macOS" / "standalone" / "DedicatedModelVerifier.swift"
         ).read_text()
 
-        self.assertIn('let enhancerModels = ["none", "realesrgan", "mewzoom", "swinir", "spandrel"]', source)
+        self.assertIn('let enhancerModels = ["none", "realesrgan", "mewzoom", "swinir", "spandrel", "pipersr"]', source)
         self.assertIn('"nomos-webphoto-realplksr-x4-coreai"', source)
         self.assertIn('"nomos-webphoto-realplksr-x4-coreml"', source)
         self.assertIn("4xNomosWebPhoto_RealPLKSR_256.mlpackage", script)
         self.assertIn("4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel", script)
         self.assertIn('"4xNomosWebPhoto_RealPLKSR-256-fp16"', verifier)
+
+    def test_pipersr_uses_vendored_256_to_512_coreml_model(self):
+        source = APP_SOURCE.read_text()
+        script = BUILD_SCRIPT.read_text()
+        package = ROOT / "packaging/macOS/standalone/vendor/pipersr/PiperSR_2x_256.mlpackage"
+
+        self.assertIn('case "pipersr":', source)
+        self.assertIn('case "pipersr-coreml":', source)
+        self.assertIn('coreMLPrefixes = ["PiperSR_2x_256"]', source)
+        self.assertIn('PiperSR_2x_256.mlmodelc', script)
+        self.assertTrue((package / "Data/com.apple.CoreML/model.mlmodel").is_file())
+        self.assertTrue((package / "Data/com.apple.CoreML/weights/weight.bin").is_file())
 
     def test_roi_enhancer_model_picker_is_filtered_by_method(self):
         source = APP_SOURCE.read_text()

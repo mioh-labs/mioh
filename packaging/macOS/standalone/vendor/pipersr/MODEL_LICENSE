@@ -1,0 +1,20 @@
+PiperSR model weights by Ben Racicot / ModelPiper
+https://github.com/ModelPiper/PiperSR
+
+The PiperSR Core ML model weights are licensed under Creative Commons
+Attribution 4.0 International (CC BY 4.0):
+https://creativecommons.org/licenses/by/4.0/legalcode
+
+Attribution: "PiperSR by Ben Racicot / ModelPiper (https://modelpiper.com)".
+The model is compiled from its original .mlpackage to .mlmodelc for mioh;
+neither its graph nor its learned weights are modified.
+
+Vendored package: PiperSR_2x_256.mlpackage (256x256 -> 512x512), taken
+unmodified from Hugging Face ModelPiper/PiperSR-2x at revision
+8daecfccbbe023de6580e7eecbff3d44a51d0b13. SHA-256 checksums:
+  model.mlmodel: f83c7f57a6dfb7ddcf5e1df243b9dcdf7583cd3e777301817424188ad0e02e86
+  weight.bin:    470924d59790b031487863da4f0df0a394c05cb959455300e78484754841e060
+
+The publisher's source code is licensed separately under AGPL-3.0 and is not
+included in this integration. The original model license is available at:
+https://github.com/ModelPiper/PiperSR/blob/master/MODEL_LICENSE

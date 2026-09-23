@@ -323,6 +323,18 @@ for package in "${COREML_ENHANCER_ASSETS[@]}"; do
   ditto "$compiled_model" "$RESOURCES/models/$compiled_name"
 done
 
+# PiperSR_2x_256 is the publisher's own 256px→512px Core ML package
+# (Hugging Face ModelPiper/PiperSR-2x), vendored unmodified. It matches the
+# 256px ROI grid directly, so no graph conversion happens at build time.
+PIPERSR_VENDOR="$PACKAGE_DIR/vendor/pipersr"
+PIPERSR_SOURCE="$PIPERSR_VENDOR/PiperSR_2x_256.mlpackage"
+PIPERSR_COMPILED="$COMPILED_COREML_MODELS/PiperSR_2x_256.mlmodelc"
+if [[ ! -d "$PIPERSR_COMPILED" || "$PIPERSR_SOURCE" -nt "$PIPERSR_COMPILED" ]]; then
+  rm -rf "$PIPERSR_COMPILED"
+  xcrun coremlcompiler compile "$PIPERSR_SOURCE" "$COMPILED_COREML_MODELS"
+fi
+ditto "$PIPERSR_COMPILED" "$RESOURCES/models/PiperSR_2x_256.mlmodelc"
+
 COREAI_DETECTION_STEMS=(
   lada_mosaic_detection_model_v2
   lada_mosaic_detection_model_v3.1_fast
@@ -755,7 +767,6 @@ optional_assets = {
 }
 for model_id, source in optional_assets.items():
     add(model_id, source, required=False)
-
 payload = {
     "format_version": 1,
     "digest_algorithm": "sha256-tree-v1",
@@ -768,8 +779,48 @@ destination.write_text(
 PY
 fi
 
+# Both Dedicated and portable distributions use the same PiperSR source
+# package, so append its identity after their different manifest branches.
+if [[ "$MIOH_MODELESS_DISTRIBUTION" != 1 ]]; then
+  "$LADA_STANDALONE_PYTHON_ENV/bin/python" - \
+    "$CANONICAL_MODEL_MANIFEST" \
+    "$PACKAGE_DIR/vendor/pipersr/PiperSR_2x_256.mlpackage" <<'PY'
+import hashlib
+import json
+import sys
+import unicodedata
+from pathlib import Path
+
+destination = Path(sys.argv[1])
+source = Path(sys.argv[2])
+digest = hashlib.sha256()
+entries = []
+for candidate in source.rglob("*"):
+    if candidate.is_symlink():
+        raise SystemExit(f"PiperSR source contains symlink: {candidate}")
+    if candidate.is_file():
+        relative = unicodedata.normalize("NFC", candidate.relative_to(source).as_posix())
+        entries.append((relative, candidate))
+for relative, candidate in sorted(entries, key=lambda item: item[0].encode("utf-8")):
+    digest.update(relative.encode("utf-8"))
+    digest.update(b"\0")
+    with candidate.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    digest.update(b"\0")
+manifest = json.loads(destination.read_text(encoding="utf-8"))
+manifest["models"]["pipersr-coreml"] = {
+    "sha256": digest.hexdigest(),
+    "asset_type": "source-tree",
+    "source_assets": [source.name],
+}
+destination.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+fi
+
 cp "$ROOT/LICENSE.md" "$RESOURCES/LICENSE.md"
 ditto "$ROOT/LICENSES" "$RESOURCES/LICENSES"
+cp "$PACKAGE_DIR/vendor/pipersr/MODEL_LICENSE" "$RESOURCES/LICENSES/PiperSR-MODEL-LICENSE.txt"
 
 if [[ -n "${MIOH_PREBUILT_APP_ICON:-}" ]]; then
   ditto "$MIOH_PREBUILT_APP_ICON" "$RESOURCES/AppIcon.icns"

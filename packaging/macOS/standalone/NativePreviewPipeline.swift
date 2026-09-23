@@ -80,6 +80,7 @@ private struct NativePreviewConfiguration: Decodable {
   let roiEnhancerModel: String?
   let roiEnhancerStrength: Float?
   let roiEnhancerScale: Int?
+  let roiEnhancerPasses: Int?
   let roiExpertMode: Bool?
   let detectionEmptyLookahead: Int?
   let detectionMaskReuseSkipFrames: Int?
@@ -2641,6 +2642,7 @@ private struct NativeEnhancerFrame {
   let output: NativeEnhancerOutput
   let lowResolution: [Float16]
   let strength: Float
+  let directReplacement: Bool
 }
 
 /// Optional second restoration lane used only by Expert ROI mode. Each frame
@@ -2667,6 +2669,8 @@ private final class NativeROIEnhancer {
   private var inputHeight: Int
   private let scale: Int
   private let strength: Float
+  private let directReplacement: Bool
+  private let iterationCount: Int
   private let imageContext = CIContext(options: [
     .workingColorSpace: NSNull(),
     .outputColorSpace: NSNull(),
@@ -2677,9 +2681,14 @@ private final class NativeROIEnhancer {
   private var modelOutputPool: CVPixelBufferPool?
   private var legacyOutputPool: CVPixelBufferPool?
 
-  init(modelURL: URL, scale: Int, strength: Float) async throws {
+  init(modelURL: URL, scale: Int, strength: Float, passes: Int) async throws {
     self.scale = max(1, min(8, scale))
     self.strength = max(0, min(1, strength))
+    let replacesRestoration = modelURL.deletingPathExtension()
+      .lastPathComponent == "PiperSR_2x_256"
+    let passCount = replacesRestoration ? min(max(passes, 1), 10) : 1
+    directReplacement = replacesRestoration
+    iterationCount = passCount
     inputWidth = restorationSize
     inputHeight = restorationSize
     inputName = nil
@@ -2694,6 +2703,13 @@ private final class NativeROIEnhancer {
     if ["aimodel", "aimodelc"].contains(
       modelURL.pathExtension.lowercased()
     ) {
+      // Repeated passes are implemented only for Core ML image models.
+      // Refuse instead of silently running a single pass.
+      guard passCount == 1 else {
+        throw NativePreviewError.invalidConfiguration(
+          "ROI enhancer passes > 1 require the Core ML PiperSR model"
+        )
+      }
       let model = try await MiohCoreAIModelLoader.load(modelURL)
       guard let loadedFunction = try model.loadFunction(named: "main") else {
         throw NativePreviewError.restorer(
@@ -2803,16 +2819,26 @@ private final class NativeROIEnhancer {
     } else {
       output = try enhanceCoreML(restored: restored, offset: offset)
     }
-    return NativeEnhancerFrame(
-      output: output,
-      lowResolution: try Self.makeLowResolution(
+    // PiperSR is an alternative ROI restoration, not a residual detail pass.
+    // Keep the first restoration only as the blend base; sample PiperSR's
+    // native 512px output directly when the ROI is placed into the frame.
+    let lowResolution: [Float16]
+    if directReplacement {
+      lowResolution = Array(restored[offset..<(offset + frameElements)])
+    } else {
+      lowResolution = try Self.makeLowResolution(
         output: output,
         restored: restored,
         offset: offset,
         mask: mask,
         strength: strength
-      ),
-      strength: strength
+      )
+    }
+    return NativeEnhancerFrame(
+      output: output,
+      lowResolution: lowResolution,
+      strength: strength,
+      directReplacement: directReplacement
     )
   }
 
@@ -2908,7 +2934,7 @@ private final class NativeROIEnhancer {
         offset: offset,
         to: source
       )
-      let modelInput: CVPixelBuffer
+      var modelInput: CVPixelBuffer
       if let modelInputPool {
         modelInput = try Self.allocate(
           from: modelInputPool,
@@ -2929,15 +2955,57 @@ private final class NativeROIEnhancer {
       } else {
         modelInput = source
       }
-      let provider = try MLDictionaryFeatureProvider(dictionary: [
-        inputName: MLFeatureValue(pixelBuffer: modelInput)
-      ])
-      let prediction = try model.prediction(from: provider)
-      guard let enhanced = prediction.featureValue(
-        for: outputName
-      )?.imageBufferValue else {
+      var enhanced: CVPixelBuffer?
+      for pass in 0..<iterationCount {
+        let output = try autoreleasepool { () throws -> CVPixelBuffer in
+          let provider = try MLDictionaryFeatureProvider(dictionary: [
+            inputName: MLFeatureValue(pixelBuffer: modelInput)
+          ])
+          let prediction = try model.prediction(from: provider)
+          guard let output = prediction.featureValue(
+            for: outputName
+          )?.imageBufferValue else {
+            throw NativePreviewError.restorer(
+              "Core ML ROI enhancer image output is missing"
+            )
+          }
+          return output
+        }
+        enhanced = output
+        if pass + 1 < iterationCount {
+          let outputWidth = CVPixelBufferGetWidth(output)
+          let outputHeight = CVPixelBufferGetHeight(output)
+          guard outputWidth > 0, outputHeight > 0 else {
+            throw NativePreviewError.restorer(
+              "PiperSR feedback image dimensions are invalid"
+            )
+          }
+          // PiperSR is fixed at 256→512. Keep each pass on that contract:
+          // 512→256 feedback, then the final 512px output goes to composition.
+          // Feed back at the model's own input size. The 256px source pool is
+          // only correct when that size is the restoration grid.
+          let feedback = try Self.allocate(
+            from: modelInputPool ?? sourcePool,
+            label: "PiperSR feedback input"
+          )
+          let feedbackImage = CIImage(cvPixelBuffer: output).transformed(
+            by: CGAffineTransform(
+              scaleX: CGFloat(inputWidth) / CGFloat(outputWidth),
+              y: CGFloat(inputHeight) / CGFloat(outputHeight)
+            )
+          )
+          imageContext.render(
+            feedbackImage,
+            to: feedback,
+            bounds: CGRect(x: 0, y: 0, width: inputWidth, height: inputHeight),
+            colorSpace: nil
+          )
+          modelInput = feedback
+        }
+      }
+      guard let enhanced else {
         throw NativePreviewError.restorer(
-          "Core ML ROI enhancer image output is missing"
+          "Core ML ROI enhancer produced no image"
         )
       }
       let outputWidth = CVPixelBufferGetWidth(enhanced)
@@ -5244,6 +5312,16 @@ private final class NativeFrameProcessor: @unchecked Sendable {
             let enhancerBase,
             let restorationBase
           else { return base }
+          if validEnhancer.directReplacement {
+            return max(
+              0,
+              min(
+                1,
+                base + (sampleEnhanced(channel) - base)
+                  * validEnhancer.strength * enhancerAmount
+              )
+            )
+          }
           let lowEnhanced = sample(enhancerBase, channelOffset)
           let unenhanced = sample(restorationBase, channelOffset)
           let highEnhanced = unenhanced
@@ -6143,7 +6221,8 @@ private struct NativePreviewPipeline {
         roiEnhancer = try await NativeROIEnhancer(
           modelURL: URL(fileURLWithPath: modelPath),
           scale: config.roiEnhancerScale ?? 4,
-          strength: config.roiEnhancerStrength ?? 0
+          strength: config.roiEnhancerStrength ?? 0,
+          passes: config.roiEnhancerPasses ?? 1
         )
       } else {
         roiEnhancer = nil

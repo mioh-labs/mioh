@@ -98,6 +98,7 @@ struct NativeExportConfiguration: Codable, Sendable {
   let roiEnhancerModel: String?
   let roiEnhancerStrength: Float
   let roiEnhancerScale: Int
+  let roiEnhancerPasses: Int
   let roiExpertMode: Bool
   let detectionEmptyLookahead: Int
   let detectionMaskReuseSkipFrames: Int
@@ -160,6 +161,7 @@ struct NativeExportConfiguration: Codable, Sendable {
     case roiEnhancerModel
     case roiEnhancerStrength
     case roiEnhancerScale
+    case roiEnhancerPasses
     case roiExpertMode
     case detectionEmptyLookahead
     case detectionMaskReuseSkipFrames
@@ -214,6 +216,7 @@ private struct NativePreviewLaunchConfiguration: Encodable {
   let roiEnhancerModel: String?
   let roiEnhancerStrength: Float
   let roiEnhancerScale: Int
+  let roiEnhancerPasses: Int
   let roiExpertMode: Bool
   let detectionEmptyLookahead: Int
   let detectionMaskReuseSkipFrames: Int
@@ -692,6 +695,7 @@ struct MiohUserDefaultsSnapshot: Codable {
   var roiEnhancerScale: Int
   var roiEnhancerStrength: Double
   var roiEnhancerTile: Int
+  var roiEnhancerPasses: Int?
   var roiExpertMode: Bool?
 
   var detectionModel: String
@@ -778,6 +782,7 @@ struct MiohUserDefaultsSnapshot: Codable {
       roiEnhancerScale: 4,
       roiEnhancerStrength: 0.0,
       roiEnhancerTile: 0,
+      roiEnhancerPasses: 1,
       roiExpertMode: false,
       detectionModel: "v2-coreml",
       customDetectionModel: "",
@@ -886,6 +891,7 @@ final class RestorationRunner: ObservableObject {
   @Published var roiEnhancerScale = 4
   @Published var roiEnhancerStrength = 0.0
   @Published var roiEnhancerTile = 0
+  @Published var roiEnhancerPasses = 1
   @Published var roiExpertMode = false
 
   @Published var detectionModel: String
@@ -1100,7 +1106,7 @@ final class RestorationRunner: ObservableObject {
       }
     }
   }
-  let enhancerModels = ["none", "realesrgan", "mewzoom", "swinir", "spandrel"]
+  let enhancerModels = ["none", "realesrgan", "mewzoom", "swinir", "spandrel", "pipersr"]
   private let knownROIEnhancerModelNames: Set<String> = [
     "realesrgan-x2", "realesrgan-x2-coreai",
     "realesrgan-x4", "realesrgan-x4-coreml", "realesrgan-x4-coreai",
@@ -1111,6 +1117,7 @@ final class RestorationRunner: ObservableObject {
     "nomos-webphoto-realplksr-x4-coreml",
     "nomos-webphoto-realplksr-x4-coreai",
     "nomos-uni-span-x4", "nomos-uni-compact-x2",
+    "pipersr-coreml",
   ]
 
   var roiEnhancerModelOptions: [ROIEnhancerModelOption] {
@@ -1126,6 +1133,14 @@ final class RestorationRunner: ObservableObject {
   ) -> [ROIEnhancerModelOption] {
     var options: [ROIEnhancerModelOption]
     switch enhancer {
+    case "pipersr":
+      options = [
+        ROIEnhancerModelOption(
+          name: "pipersr-coreml",
+          label: "PiperSR 256 — Core ML / ANE (2x)",
+          scale: 2
+        ),
+      ]
     case "realesrgan":
       options = [
         ROIEnhancerModelOption(
@@ -1766,6 +1781,8 @@ final class RestorationRunner: ObservableObject {
       roiEnhancerModel: nativeEnhancer?.url.path,
       roiEnhancerStrength: nativeEnhancer == nil ? 0 : Float(roiEnhancerStrength),
       roiEnhancerScale: nativeEnhancer?.scale ?? max(1, roiEnhancerScale),
+      roiEnhancerPasses: roiEnhancer == "pipersr"
+        ? min(max(roiEnhancerPasses, 1), 10) : 1,
       roiExpertMode: roiExpertMode,
       detectionEmptyLookahead: max(0, detectionEmptyLookahead),
       detectionMaskReuseSkipFrames: min(
@@ -1904,6 +1921,15 @@ final class RestorationRunner: ObservableObject {
     } else {
       enhancerDigest = nil
     }
+    // Hoisted with explicit types: inline ternaries in an initializer this wide
+    // push the expression past the type checker's budget.
+    let enhancerStrength: Float = enhancerIdentifier == nil
+      ? 0 : Float(roiEnhancerStrength)
+    let enhancerPasses: Int? = roiEnhancer == "pipersr"
+      ? min(max(roiEnhancerPasses, 1), 10) : 1
+    let codec: String = encodingPreset.hasPrefix("h264") ? "h264" : "hevc"
+    let clampedEffectUpscale: Int = max(1, min(4, effectUpscale))
+    let enhancerScale: Int = max(1, min(8, roiEnhancerScale))
     return RemoteClusterRestorationOptions(
       restorationModelIdentifier: restorationModel,
       restorationAssetSHA256: restorationDigest,
@@ -1923,13 +1949,13 @@ final class RestorationRunner: ObservableObject {
       detailBoost: Float(detailBoost),
       textureMix: Float(textureMix),
       smoothStrength: Float(smoothStrength),
-      effectUpscale: max(1, min(4, effectUpscale)),
+      effectUpscale: clampedEffectUpscale,
       roiEnhancerModelIdentifier: enhancerIdentifier,
       roiEnhancerAssetSHA256: enhancerDigest,
-      roiEnhancerStrength: enhancerIdentifier == nil
-        ? 0 : Float(roiEnhancerStrength),
-      roiEnhancerScale: max(1, min(8, roiEnhancerScale)),
-      videoCodec: encodingPreset.hasPrefix("h264") ? "h264" : "hevc",
+      roiEnhancerStrength: enhancerStrength,
+      roiEnhancerScale: enhancerScale,
+      roiEnhancerPasses: enhancerPasses,
+      videoCodec: codec,
       bitrateMultiplier: bitrateMultiplier,
       mp4FastStart: mp4FastStart,
       targetFPSNumerator: useFPS ? max(1, fps) : nil,
@@ -2240,6 +2266,8 @@ final class RestorationRunner: ObservableObject {
         ? 0 : request.options.roiEnhancerStrength,
       roiEnhancerScale: enhancer?.scale
         ?? max(1, request.options.roiEnhancerScale),
+      roiEnhancerPasses: request.options.roiEnhancerModelIdentifier == "pipersr-coreml"
+        ? min(max(request.options.roiEnhancerPasses ?? 1, 1), 10) : 1,
       roiExpertMode: false,
       detectionEmptyLookahead: request.options.detectionEmptyLookahead,
       detectionMaskReuseSkipFrames:
@@ -2795,6 +2823,10 @@ final class RestorationRunner: ObservableObject {
     let coreAIPrefixes: [String]
     let coreMLPrefixes: [String]
     switch trimmed {
+    case "pipersr-coreml":
+      scale = 2
+      coreAIPrefixes = []
+      coreMLPrefixes = ["PiperSR_2x_256"]
     case "realesrgan-x2-coreai":
       scale = 2
       coreAIPrefixes = ["RealESRGAN_x2plus-256-fp16"]
@@ -3015,6 +3047,7 @@ final class RestorationRunner: ObservableObject {
       roiEnhancerScale: roiEnhancerScale,
       roiEnhancerStrength: roiEnhancerStrength,
       roiEnhancerTile: roiEnhancerTile,
+      roiEnhancerPasses: roiEnhancerPasses,
       roiExpertMode: roiExpertMode,
       detectionModel: detectionModel,
       customDetectionModel: customDetectionModel,
@@ -3115,6 +3148,7 @@ final class RestorationRunner: ObservableObject {
     roiEnhancerScale = min(max(snapshot.roiEnhancerScale, 1), 8)
     roiEnhancerStrength = min(max(snapshot.roiEnhancerStrength, 0), 1)
     roiEnhancerTile = min(max(snapshot.roiEnhancerTile, 0), 1024)
+    roiEnhancerPasses = min(max(snapshot.roiEnhancerPasses ?? 1, 1), 10)
     roiExpertMode = snapshot.roiExpertMode ?? false
 
     detectionModel = detectionModels.contains(snapshot.detectionModel) ? snapshot.detectionModel : "v2-coreml"
@@ -3313,6 +3347,8 @@ final class RestorationRunner: ObservableObject {
       roiEnhancerModel: nativeEnhancer?.url.path,
       roiEnhancerStrength: nativeEnhancer == nil ? 0 : Float(effectiveEnhancerStrength),
       roiEnhancerScale: nativeEnhancer?.scale ?? max(1, roiEnhancerScale),
+      roiEnhancerPasses: roiEnhancer == "pipersr"
+        ? min(max(roiEnhancerPasses, 1), 10) : 1,
       roiExpertMode: roiExpertMode,
       detectionEmptyLookahead: max(0, detectionEmptyLookahead),
       detectionMaskReuseSkipFrames: min(
@@ -4053,6 +4089,11 @@ struct ContentView: View {
           ForEach(runner.enhancerModels, id: \.self) { Text($0).tag($0) }
         }
         if runner.roiEnhancer != "none" {
+          if runner.roiEnhancer == "pipersr" {
+            Text("PiperSR by Ben Racicot / ModelPiper。256px ROIを512pxへ復元し、その出力を直接貼り戻します（境界フェザーのみ維持）。単一フレーム型のため時間方向の復元は行いません。")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+          }
           LabeledContent("モデル") {
             HStack {
               Picker("", selection: Binding(
@@ -4074,6 +4115,16 @@ struct ContentView: View {
         LabeledContent("倍率") { Stepper(value: $runner.roiEnhancerScale, in: 1...8) { Text("\(runner.roiEnhancerScale)x") } }
           .disabled(runner.roiEnhancer == "none")
         doubleSliderField("強度", value: $runner.roiEnhancerStrength, range: 0...1, step: 0.05).disabled(runner.roiEnhancer == "none")
+        if runner.roiEnhancer == "pipersr" {
+          LabeledContent("PiperSR反復") {
+            Stepper(value: $runner.roiEnhancerPasses, in: 1...10) {
+              Text("\(runner.roiEnhancerPasses)回")
+            }
+          }
+          Text("2回目以降は512px出力を256pxへ縮小して再入力します。出力は常に512pxで、反復を増やすと処理時間と過強調の危険が増えます。")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
         integerSliderField("タイル", value: $runner.roiEnhancerTile, range: 0...1024, step: 32).disabled(runner.roiEnhancer == "none")
       }
     }.formStyle(.grouped)
