@@ -6,14 +6,28 @@ Attribution 4.0 International (CC BY 4.0):
 https://creativecommons.org/licenses/by/4.0/legalcode
 
 Attribution: "PiperSR by Ben Racicot / ModelPiper (https://modelpiper.com)".
-The model is compiled from its original .mlpackage to .mlmodelc for mioh;
-neither its graph nor its learned weights are modified.
+The original models are compiled from their .mlpackage files to .mlmodelc for
+mioh; their learned weights are not modified. The FP16 I/O derivative below
+changes only the graph interface.
 
 Vendored package: PiperSR_2x_256.mlpackage (256x256 -> 512x512), taken
 unmodified from Hugging Face ModelPiper/PiperSR-2x at revision
 8daecfccbbe023de6580e7eecbff3d44a51d0b13. SHA-256 checksums:
   model.mlmodel: f83c7f57a6dfb7ddcf5e1df243b9dcdf7583cd3e777301817424188ad0e02e86
   weight.bin:    470924d59790b031487863da4f0df0a394c05cb959455300e78484754841e060
+
+Vendored package: PiperSR_2x_video_720p.mlpackage (single-frame 2x model
+with enumerated video frame sizes), from the same revision. SHA-256 checksums:
+  model.mlmodel: 5db1b32bb9fb02a2feebb724a59b44b53dc2024e45aec1734482b7dd97d1b7a5
+  weight.bin:    cadece5739d80dd17aa96ac760455cee5c9318e097057e40c69111d84de68252
+
+Derived package: PiperSR_2x_video_720p_fp16.mlpackage, generated from the
+preceding package with coremltools 9.0. The model graph's public multiarray
+input and output were changed from Float32 to Float16. Learned weights are
+unchanged. The reproducible conversion is in
+scripts/apple/build_pipersr_video_fp16.py. SHA-256 checksums:
+  model.mlmodel: dad8cd27927f2aa47f1eb33a69d1498094b2772c10f8e564f582e52de6a90c05
+  weight.bin:    cadece5739d80dd17aa96ac760455cee5c9318e097057e40c69111d84de68252
 
 The publisher's source code is licensed separately under AGPL-3.0 and is not
 included in this integration. The original model license is available at:

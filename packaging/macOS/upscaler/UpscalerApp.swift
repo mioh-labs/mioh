@@ -297,6 +297,7 @@ private struct UpscalerContentView: View {
       Picker("モデル", selection: $upscaler.upscalerModel) {
         Text("FlashVSR Tiny（動画・時間整合）").tag("flashvsr")
         Text("AdcSR（軽量な1-step拡散）").tag("adcsr")
+        Text("PiperSR（軽量・ANE・2倍）").tag("pipersr")
       }
       .pickerStyle(.segmented)
       HStack {
@@ -307,7 +308,9 @@ private struct UpscalerContentView: View {
         )
         .foregroundStyle(upscaler.selectedModelReady ? .green : .orange)
         Spacer()
-        Button("モデルを自動設定…", action: presentModelSetup)
+        if upscaler.selectedUpscaler != .piperSR {
+          Button("モデルを自動設定…", action: presentModelSetup)
+        }
       }
       Picker("出力指定", selection: $upscaler.sizingMode) {
         Text("倍率").tag("multiple")
@@ -317,7 +320,9 @@ private struct UpscalerContentView: View {
       if upscaler.sizingMode == "multiple" {
         Picker("倍率", selection: $upscaler.scale) {
           Text("2倍").tag(2)
-          Text("4倍").tag(4)
+          if upscaler.selectedUpscaler != .piperSR {
+            Text("4倍").tag(4)
+          }
         }
         .pickerStyle(.segmented)
         if upscaler.selectedUpscaler == .adcSR, upscaler.scale == 2 {
@@ -327,11 +332,15 @@ private struct UpscalerContentView: View {
       } else {
         customSizeFields
       }
-      Picker("計算デバイス", selection: $upscaler.computeMode) {
-        Text(upscaler.selectedUpscaler == .adcSR ? "GPU優先（推奨）" : "Hybrid（推奨）")
-          .tag("hybrid")
-        Text("自動").tag("automatic")
-        Text("GPU").tag("gpu")
+      if upscaler.selectedUpscaler == .piperSR {
+        LabeledContent("計算デバイス") { Text("Core ML / ANE優先") }
+      } else {
+        Picker("計算デバイス", selection: $upscaler.computeMode) {
+          Text(upscaler.selectedUpscaler == .adcSR ? "GPU優先（推奨）" : "Hybrid（推奨）")
+            .tag("hybrid")
+          Text("自動").tag("automatic")
+          Text("GPU").tag("gpu")
+        }
       }
       if upscaler.selectedUpscaler == .adcSR {
         Toggle(
@@ -359,13 +368,16 @@ private struct UpscalerContentView: View {
         )
         Text("128pxタイルを16px以上重複させて均等配置し、低周波を入力へ固定したcosine blendで合成します。前フレームからは高周波残差だけをoptical flowで混合します。")
           .font(.caption).foregroundStyle(.secondary)
-      } else {
+      } else if upscaler.selectedUpscaler == .flashVSR {
         UpscalerPathSettingRow(
           title: "FlashVSR Core AIモデル（外部）",
           value: $upscaler.flashVSRRootPath,
           action: upscaler.chooseFlashVSRRoot
         )
         Text("85フレーム単位で共有デコードし、タイル処理・合成・書き込みの進捗を表示します。")
+          .font(.caption).foregroundStyle(.secondary)
+      } else {
+        Text("PiperSRはモデル同梱。対応解像度では全画面の動画向けCore ML版、それ以外は256pxタイル版を使います。各フレーム独立のため、時間方向の復元が必要ならFlashVSRを選んでください。")
           .font(.caption).foregroundStyle(.secondary)
       }
     }
@@ -428,7 +440,9 @@ private struct UpscalerContentView: View {
       }
       LabeledContent(
         upscaler.selectedUpscaler == .adcSR
-          ? "一時ディスク領域／フレーム" : "一時ディスク領域／セグメント"
+          ? "一時ディスク領域／フレーム"
+          : upscaler.selectedUpscaler == .piperSR
+            ? "合成メモリ目安／フレーム" : "一時ディスク領域／セグメント"
       ) { Text(upscaler.scratchSpaceText).monospacedDigit() }
       LabeledContent("実行方式") {
         Text(upscaler.runtimeText).foregroundStyle(.secondary)

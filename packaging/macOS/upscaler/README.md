@@ -9,6 +9,11 @@ Supported backends:
 - FlashVSR Tiny/Compact, with the shared 85-frame streaming decoder.
 - AdcSR x4 FP32 Core AI, with 128px tiles, 16px overlap, Metal feather
   composition, and optional optical-flow high-frequency stabilization.
+- PiperSR x2 Core ML, with an enumerated-shape full-frame path and overlapping
+  256px tiles for other sizes, including 1920×1080 → 3840×2160. Frames are
+  enhanced independently; it is not a temporal video-restoration model. The
+  full-frame path uses a derived FP16-I/O model, two reusable frame sessions,
+  Metal output conversion and overlapped frame scheduling.
 - MiniMax H3 / 10Eros-Max H3 native Swift generation. Ref2VA accepts a video
   or up to eight identity-reference images; the separate FL2VA profile generates
   video and audio from a prompt alone. Converted graphs, tokenizer and
@@ -25,7 +30,9 @@ Outputs:
 - `build/mioh-upscaler/mioh upscaler.app`
 - `build/mioh-upscaler/mioh-upscaler-0.14.3-unsigned.dmg`
 
-Model weights are never bundled. The default external locations are:
+FlashVSR, AdcSR and H3 weights remain external. The small CC BY 4.0 PiperSR
+models are bundled with attribution so the 2x option works without setup.
+The default external locations are:
 
 - `model_weights/FlashVSR-v1.1-coreai-grid16`
 - `model_weights/adcsr_x4_float32.aimodel`
@@ -81,7 +88,7 @@ codex mcp add mioh-upscaler -- \
 ```
 
 The server exposes capability inspection, MiniMax H3 video generation,
-FlashVSR/AdcSR upscaling, job status/list/stop, and app opening tools. The
+FlashVSR/AdcSR/PiperSR upscaling, job status/list/stop, and app opening tools. The
 `prompt` passed to `mioh_start_video_generation` is forwarded byte-for-byte to
 the native H3 runner without summarizing or rewriting it. Model weights remain
 external and are not exposed through MCP responses.

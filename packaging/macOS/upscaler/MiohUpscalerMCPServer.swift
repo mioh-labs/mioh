@@ -352,6 +352,7 @@ private final class MiohMCPServer {
     let h3 = bin.appendingPathComponent("mioh-minimax-h3-native")
     let flash = bin.appendingPathComponent("flashvsr-coreai-video")
     let adcsr = bin.appendingPathComponent("adcsr-coreai-video")
+    let pipersr = bin.appendingPathComponent("pipersr-coreml-video")
     return [
       "app": applicationURL().path,
       "native_swift": true,
@@ -359,6 +360,7 @@ private final class MiohMCPServer {
       "video_generation": FileManager.default.isExecutableFile(atPath: h3.path),
       "flashvsr": FileManager.default.isExecutableFile(atPath: flash.path),
       "adcsr": FileManager.default.isExecutableFile(atPath: adcsr.path),
+      "pipersr": FileManager.default.isExecutableFile(atPath: pipersr.path),
       "default_manifest": defaultManifestPath(),
       "music_video_continuation_modes": [
         "hybrid-av", "latent-prefix", "first", "first-last-provided",
@@ -583,8 +585,8 @@ private final class MiohMCPServer {
     let output = try requiredPath("output", in: values, mustExist: false)
     try validateNewOutput(output)
     let model = (values["model"] as? String ?? "flashvsr").lowercased()
-    guard model == "flashvsr" || model == "adcsr" else {
-      throw MCPServerError.invalidArguments("model must be flashvsr or adcsr")
+    guard model == "flashvsr" || model == "adcsr" || model == "pipersr" else {
+      throw MCPServerError.invalidArguments("model must be flashvsr, adcsr or pipersr")
     }
     let request = MCPUpscaleRequest(
       input: input,
@@ -607,6 +609,9 @@ private final class MiohMCPServer {
     )
     guard request.startSeconds >= 0, request.scale == 2 || request.scale == 4 else {
       throw MCPServerError.invalidArguments("invalid start_seconds or scale")
+    }
+    guard model != "pipersr" || request.scale == 2 else {
+      throw MCPServerError.invalidArguments("pipersr supports 2x only")
     }
     let requestDirectory = FileManager.default.temporaryDirectory
       .appendingPathComponent("mioh-upscaler-mcp", isDirectory: true)
@@ -886,7 +891,7 @@ private final class MiohMCPServer {
         [
           "input": property("string", "入力動画の絶対パス"),
           "output": property("string", "新規MP4の絶対パス"),
-          "model": enumProperty(["flashvsr", "adcsr"], "使用モデル"),
+          "model": enumProperty(["flashvsr", "adcsr", "pipersr"], "使用モデル"),
           "model_root": property("string", "モデル格納場所"),
           "start_seconds": property("number", "開始秒"),
           "end_seconds": property("number", "終了秒"),
@@ -990,7 +995,7 @@ private struct MiohUpscalerMCPMain {
     if let modelRoot = request.modelRoot {
       if request.model == "adcsr" {
         controller.adcSRRootPath = modelRoot
-      } else {
+      } else if request.model == "flashvsr" {
         controller.flashVSRRootPath = modelRoot
       }
     }

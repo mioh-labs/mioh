@@ -16,6 +16,7 @@ final class VideoUpscaleController: ObservableObject {
   enum UpscalerKind: String {
     case flashVSR = "flashvsr"
     case adcSR = "adcsr"
+    case piperSR = "pipersr"
   }
 
   @Published var inputURL: URL? {
@@ -46,6 +47,7 @@ final class VideoUpscaleController: ObservableObject {
   @Published var upscalerModel = UpscalerKind.flashVSR.rawValue {
     didSet {
       guard upscalerModel != oldValue else { return }
+      if selectedUpscaler == .piperSR { scale = 2 }
       UserDefaults.standard.set(upscalerModel, forKey: Self.modelDefaultsKey)
       if outputIsAutomatic { updateAutomaticOutputURL() }
     }
@@ -120,7 +122,11 @@ final class VideoUpscaleController: ObservableObject {
   }
 
   var selectedModelRootPath: String {
-    selectedUpscaler == .adcSR ? adcSRRootPath : flashVSRRootPath
+    switch selectedUpscaler {
+    case .adcSR: return adcSRRootPath
+    case .flashVSR: return flashVSRRootPath
+    case .piperSR: return ""
+    }
   }
 
   func applyModelSetupDestination(_ path: String) {
@@ -131,7 +137,11 @@ final class VideoUpscaleController: ObservableObject {
   }
 
   var modelTitle: String {
-    selectedUpscaler == .adcSR ? "AdcSR ×4" : "FlashVSR-v1.1 Tiny/Compact"
+    switch selectedUpscaler {
+    case .adcSR: return "AdcSR ×4"
+    case .flashVSR: return "FlashVSR-v1.1 Tiny/Compact"
+    case .piperSR: return "PiperSR ×2"
+    }
   }
 
   var durationSeconds: Double {
@@ -166,6 +176,9 @@ final class VideoUpscaleController: ObservableObject {
   }
 
   var customSizeError: String? {
+    if selectedUpscaler == .piperSR && sizingMode == "multiple" && scale != 2 {
+      return "PiperSRは2倍のみ対応です"
+    }
     guard sizingMode == "custom", let sourceInfo else { return nil }
     guard targetWidth > 0, targetHeight > 0 else {
       return "出力サイズを指定してください"
@@ -177,11 +190,15 @@ final class VideoUpscaleController: ObservableObject {
       Double(targetWidth) / Double(sourceInfo.width),
       Double(targetHeight) / Double(sourceInfo.height)
     )
+    if selectedUpscaler == .piperSR && ratio > 2.0 {
+      return "PiperSRの出力は入力の2倍までです"
+    }
     if ratio > 4.0 { return "指定できる最大倍率は4倍です" }
     return nil
   }
 
   var inferenceScale: Int {
+    if selectedUpscaler == .piperSR { return 2 }
     if selectedUpscaler == .adcSR { return 4 }
     guard sizingMode == "custom", let sourceInfo else { return scale }
     let ratio = max(
@@ -208,12 +225,16 @@ final class VideoUpscaleController: ObservableObject {
 
   var modelAvailabilityText: String {
     guard let installation = resolvedInstallation else {
-      return "\(modelTitle) Core AIモデルが見つかりません"
+      return "\(modelTitle) モデルが見つかりません"
     }
+    if selectedUpscaler == .piperSR { return "同梱 · Core ML / ANE" }
     return "外部 · \(nativeBundleSize(at: installation.modelDirectory))"
   }
 
   var runtimeText: String {
+    if selectedUpscaler == .piperSR {
+      return "PiperSR · Swift / Core ML / ANE · 各フレーム独立"
+    }
     if selectedUpscaler == .adcSR {
       let compute = computeMode == "hybrid" ? "GPU優先" : computeMode
       let temporal = adcSRTemporalStabilization
@@ -227,8 +248,15 @@ final class VideoUpscaleController: ObservableObject {
 
   var tileCountText: String {
     guard let sourceInfo else { return "—" }
-    let side = selectedUpscaler == .adcSR ? 128 : 256 / inferenceScale
-    let overlap = selectedUpscaler == .adcSR ? 16 : max(4, side / 8)
+    if selectedUpscaler == .piperSR,
+       [(640, 360), (854, 480), (1280, 720),
+        (360, 640), (480, 854), (720, 1280)].contains(where: {
+          $0.0 == sourceInfo.width && $0.1 == sourceInfo.height
+       }) { return "1（動画固定サイズ版）" }
+    let side = selectedUpscaler == .adcSR ? 128
+      : selectedUpscaler == .piperSR ? 256 : 256 / inferenceScale
+    let overlap = selectedUpscaler == .adcSR ? 16
+      : selectedUpscaler == .piperSR ? 32 : max(4, side / 8)
     let step = side - overlap
     func count(_ length: Int) -> Int {
       guard length > side else { return 1 }
@@ -239,6 +267,12 @@ final class VideoUpscaleController: ObservableObject {
 
   var scratchSpaceText: String {
     guard let sourceInfo else { return "—" }
+    if selectedUpscaler == .piperSR {
+      let pixels = Int64(sourceInfo.width) * Int64(sourceInfo.height) * 4
+      return ByteCountFormatter.string(
+        fromByteCount: pixels * 20, countStyle: .file
+      )
+    }
     if selectedUpscaler == .adcSR {
       // One mmap-backed RGBA32F frame. AdcSR is frame-independent, so there
       // is no reason to retain an 85-frame temporal segment.
@@ -382,7 +416,7 @@ final class VideoUpscaleController: ObservableObject {
       return
     }
     guard let installation = resolvedInstallation else {
-      fail("\(modelTitle) Core AIモデルまたはネイティブ実行ファイルが見つかりません")
+      fail("\(modelTitle) モデルまたはネイティブ実行ファイルが見つかりません")
       return
     }
     let ffmpeg = resources.appendingPathComponent("bin/ffmpeg")
@@ -429,7 +463,9 @@ final class VideoUpscaleController: ObservableObject {
           + "（\(Self.timecode(end - start))）\n"
       )
       appendLog(
-        "モデル: \(modelTitle) / \(computeMode) / \(inferenceScale)x推論\n"
+        "モデル: \(modelTitle) / "
+          + "\(selectedUpscaler == .piperSR ? "ANE" : computeMode) "
+          + "/ \(inferenceScale)x推論\n"
       )
       appendLog("出力サイズ: \(requestedOutputWidth)×\(requestedOutputHeight)\n")
       appendLog("実行: \(runtimeText)\n")
@@ -501,7 +537,24 @@ final class VideoUpscaleController: ObservableObject {
       return resolvedFlashVSRInstallation(resources: resources)
     case .adcSR:
       return resolvedAdcSRInstallation(resources: resources)
+    case .piperSR:
+      return resolvedPiperSRInstallation(resources: resources)
     }
+  }
+
+  private func resolvedPiperSRInstallation(resources: URL) -> Installation? {
+    let runner = resources.appendingPathComponent("bin/pipersr-coreml-video")
+    let models = resources.appendingPathComponent("pipersr-models", isDirectory: true)
+    guard FileManager.default.isExecutableFile(atPath: runner.path),
+      ["PiperSR_2x_256.mlmodelc", "PiperSR_2x_video_720p_fp16.mlmodelc"].allSatisfy({
+        FileManager.default.fileExists(
+          atPath: models.appendingPathComponent($0, isDirectory: true).path
+        )
+      }) else { return nil }
+    return Installation(
+      kind: .piperSR, runner: runner,
+      modelDirectory: models, resources: resources
+    )
   }
 
   private func resolvedFlashVSRInstallation(resources: URL) -> Installation? {
@@ -726,19 +779,25 @@ final class VideoUpscaleController: ObservableObject {
 
     let task = Process()
     task.executableURL = installation.runner
-    let filename = installation.kind == .adcSR
-      ? "adcsr-native.mp4" : "flashvsr-native.mp4"
+    let filename: String
+    switch installation.kind {
+    case .adcSR: filename = "adcsr-native.mp4"
+    case .flashVSR: filename = "flashvsr-native.mp4"
+    case .piperSR: filename = "pipersr-native.mp4"
+    }
     var arguments = [
       "--input", trimmedInputURL.path,
       "--output", resultsDirectory.appendingPathComponent(filename).path,
       "--models", installation.modelDirectory.path,
       "--output-width", String(requestedOutputWidth),
       "--output-height", String(requestedOutputHeight),
-      "--compute", computeMode,
     ]
+    if installation.kind != .piperSR {
+      arguments += ["--compute", computeMode]
+    }
     if installation.kind == .flashVSR {
       arguments += ["--scale", String(inferenceScale), "--seed", "0"]
-    } else {
+    } else if installation.kind == .adcSR {
       let strength = adcSRTemporalStabilization ? adcSRTemporalStrength : 0
       arguments += ["--temporal-strength", String(format: "%.3f", strength)]
     }
@@ -750,8 +809,12 @@ final class VideoUpscaleController: ObservableObject {
     guard let resultsDirectory, let installation = activeInstallation else {
       throw UpscaleControllerError.incompleteState
     }
-    let filename = installation.kind == .adcSR
-      ? "adcsr-native.mp4" : "flashvsr-native.mp4"
+    let filename: String
+    switch installation.kind {
+    case .adcSR: filename = "adcsr-native.mp4"
+    case .flashVSR: filename = "flashvsr-native.mp4"
+    case .piperSR: filename = "pipersr-native.mp4"
+    }
     let expected = resultsDirectory.appendingPathComponent(filename)
     guard FileManager.default.fileExists(atPath: expected.path) else {
       throw UpscaleControllerError.missingUpscalerOutput
