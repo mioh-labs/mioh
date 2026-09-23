@@ -184,6 +184,9 @@ struct RemoteClusterRestorationOptions: Codable, Hashable, Sendable {
   let roiEnhancerAssetSHA256: String?
   let roiEnhancerStrength: Float
   let roiEnhancerScale: Int
+  /// PiperSR only: how many times the 256→512 model is re-applied (1...10).
+  /// nil keeps the single-pass behaviour every other enhancer uses.
+  let roiEnhancerPasses: Int?
   let videoCodec: String
   let bitrateMultiplier: Double
   let mp4FastStart: Bool
@@ -205,6 +208,7 @@ struct RemoteClusterRestorationOptions: Codable, Hashable, Sendable {
       && textureMix.isFinite && smoothStrength.isFinite
       && effectUpscale >= 1 && roiEnhancerStrength.isFinite
       && roiEnhancerStrength >= 0 && roiEnhancerScale >= 1
+      && roiEnhancerPasses.map { (1...10).contains($0) } != false
       && ((roiEnhancerModelIdentifier == nil && roiEnhancerAssetSHA256 == nil)
         || (roiEnhancerModelIdentifier?.isEmpty == false
           && roiEnhancerAssetSHA256.map(Self.isSHA256) == true))

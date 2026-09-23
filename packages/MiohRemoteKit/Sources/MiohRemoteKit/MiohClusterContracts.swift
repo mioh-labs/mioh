@@ -233,6 +233,7 @@ public struct MiohClusterRestorationOptions: Codable, Hashable, Sendable {
   public let roiEnhancerAssetSHA256: String?
   public let roiEnhancerStrength: Float
   public let roiEnhancerScale: Int
+  public let roiEnhancerPasses: Int?
   public let videoCodec: String
   public let bitrateMultiplier: Double
   public let mp4FastStart: Bool
@@ -260,6 +261,7 @@ public struct MiohClusterRestorationOptions: Codable, Hashable, Sendable {
     roiEnhancerAssetSHA256: String? = nil,
     roiEnhancerStrength: Float = 0,
     roiEnhancerScale: Int = 1,
+    roiEnhancerPasses: Int? = nil,
     videoCodec: String,
     bitrateMultiplier: Double,
     mp4FastStart: Bool,
@@ -286,6 +288,7 @@ public struct MiohClusterRestorationOptions: Codable, Hashable, Sendable {
     self.roiEnhancerAssetSHA256 = roiEnhancerAssetSHA256
     self.roiEnhancerStrength = roiEnhancerStrength
     self.roiEnhancerScale = roiEnhancerScale
+    self.roiEnhancerPasses = roiEnhancerPasses
     self.videoCodec = videoCodec
     self.bitrateMultiplier = bitrateMultiplier
     self.mp4FastStart = mp4FastStart
@@ -306,6 +309,7 @@ public struct MiohClusterRestorationOptions: Codable, Hashable, Sendable {
       && textureMix.isFinite && smoothStrength.isFinite
       && effectUpscale >= 1 && roiEnhancerStrength.isFinite
       && roiEnhancerStrength >= 0 && roiEnhancerScale >= 1
+      && roiEnhancerPasses.map { (1...10).contains($0) } != false
       && ((roiEnhancerModelIdentifier == nil && roiEnhancerAssetSHA256 == nil)
         || (roiEnhancerModelIdentifier?.isEmpty == false
           && roiEnhancerAssetSHA256.map(Self.isSHA256) == true))
