@@ -479,12 +479,14 @@ class MacHLSResilienceContractTests(unittest.TestCase):
 
         worker_segment = self.source.split('case "segment":', 1)[1]
         worker_segment = worker_segment.split('case "progress":', 1)[0]
+        # The playable movie (restored video + source audio) is written before
+        # credit is taken, so the credit covers the file that is published.
+        movie = worker_segment.index("try await MacHLSAudio.writeMovie(")
         wait = worker_segment.index("try await waitForOutputCredit(")
-        copy = worker_segment.index("try await mediaFileWorker.copyReplacing(")
         retain = worker_segment.index("retainOutputCredit(")
         emit = worker_segment.index("emit(")
-        self.assertLess(wait, copy)
-        self.assertLess(copy, retain)
+        self.assertLess(movie, wait)
+        self.assertLess(wait, retain)
         self.assertLess(retain, emit)
 
         cancel = self.source.split("private func requestCancellation()", 1)[1]
@@ -632,7 +634,6 @@ class MacHLSResilienceContractTests(unittest.TestCase):
             "try await intervalAssemblyWorker.concatenate(",
             "try await intervalAssemblyWorker.validateDecodableVideo(",
             "await mediaFileWorker.byteCount(",
-            "try await mediaFileWorker.copyReplacing(",
             "private struct SendableProcess: @unchecked Sendable",
             "private func waitForProcessExit(",
             "timeoutSeconds: TimeInterval = 1",
@@ -648,12 +649,6 @@ class MacHLSResilienceContractTests(unittest.TestCase):
         self.assertNotIn(
             "FileManager.default.copyItem(at: workerURL, to: stableURL)",
             producer,
-        )
-        media_worker = self.source.split("private actor MediaFileWorker", 1)[1]
-        media_worker = media_worker.split("\n  private struct SendableProcess", 1)[0]
-        self.assertLess(
-            media_worker.index("FileManager.default.linkItem("),
-            media_worker.index("FileManager.default.copyItem("),
         )
 
 

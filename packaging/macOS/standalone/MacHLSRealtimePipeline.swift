@@ -20,8 +20,9 @@ enum MacHLSProductionEvent: Sendable {
   case ended(duration: Double)
 }
 
-/// Converts an authenticated HLS media playlist into the same rolling,
-/// restored MP4 segments consumed by the normal macOS realtime player.
+/// Converts an authenticated HLS media playlist into rolling restored movies
+/// for the macOS realtime player. Each movie carries the source audio of its
+/// own interval, so the player needs no second, synchronized source player.
 ///
 /// HLS segments are restored with temporal context from their neighbours. Live
 /// streams keep the old low-latency rolling 3-segment window; VOD streams batch
@@ -92,18 +93,6 @@ final class MacHLSRealtimeProducer {
         throw CocoaError(.fileReadUnknown)
       }
       return Int64(fileSize)
-    }
-
-    func copyReplacing(from source: URL, to destination: URL) throws {
-      try? FileManager.default.removeItem(at: destination)
-      do {
-        // Worker and playback directories normally share the session volume.
-        // A hard link lets the worker release its name without rewriting the
-        // finalized MP4; copy remains the cross-volume/filesystem fallback.
-        try FileManager.default.linkItem(at: source, to: destination)
-      } catch {
-        try FileManager.default.copyItem(at: source, to: destination)
-      }
     }
   }
 
@@ -523,7 +512,6 @@ final class MacHLSRealtimeProducer {
   private let resourceLoader: (any IPadHLSResourceLoading)?
   private let avFoundationCapture: MacHLSAVFoundationCapture?
   private let allowsVariantFallback: Bool
-  private let playbackPreparer: (any MacHLSPlaybackPreparing)?
 
   private var downloader: IPadHLSResourceDownloader?
   private var prefetchDownloader: IPadHLSResourceDownloader?
@@ -567,7 +555,6 @@ final class MacHLSRealtimeProducer {
     resourceLoader: (any IPadHLSResourceLoading)? = nil,
     avFoundationCapture: MacHLSAVFoundationCapture? = nil,
     allowsVariantFallback: Bool = true,
-    playbackPreparer: (any MacHLSPlaybackPreparing)? = nil,
     log: @escaping Logger
   ) {
     self.source = source
@@ -579,7 +566,6 @@ final class MacHLSRealtimeProducer {
     self.resourceLoader = resourceLoader
     self.avFoundationCapture = avFoundationCapture
     self.allowsVariantFallback = allowsVariantFallback
-    self.playbackPreparer = playbackPreparer
     self.log = log
   }
 
@@ -1568,6 +1554,9 @@ final class MacHLSRealtimeProducer {
           removeMaterializedSources(retired)
           restorationWindow.removeFirst(retirementCount)
           hasRestoredAnyWindow = true
+          if let oldestNeeded = restorationWindow.first?.timelineStart {
+            capture.audio.discard(before: oldestNeeded)
+          }
         }
       }
 
@@ -1641,7 +1630,6 @@ final class MacHLSRealtimeProducer {
     cancellationRequested = true
     resumeOutputCreditWaiters()
     avFoundationCapture?.cancel()
-    playbackPreparer?.cancel()
     downloader?.cancel()
     prefetchDownloader?.cancel()
     for downloader in prefetchDownloaders { downloader.cancel() }
@@ -2292,6 +2280,7 @@ final class MacHLSRealtimeProducer {
 
     let assemblyStartedAt = Date()
     var assembled: IPadHLSIntervalAssembler.Result
+    var assembledSources = sources
     var assembledCoreStartIndex: Int
     var assembledCoreEndIndex: Int
     do {
@@ -2352,6 +2341,7 @@ final class MacHLSRealtimeProducer {
         outputURL: assemblyURL,
         temporaryDirectory: sessionDirectory
       )
+      assembledSources = [coreSource]
       assembledCoreStartIndex = 0
       assembledCoreEndIndex = 0
       guard let coreOffset = assembled.sourceOffsets.first else {
@@ -2362,6 +2352,12 @@ final class MacHLSRealtimeProducer {
         near: coreOffset
       )
     }
+    let audio = await audioPlacements(
+      sources: assembledSources,
+      assembled: assembled,
+      coreStartIndex: assembledCoreStartIndex,
+      coreEndIndex: assembledCoreEndIndex
+    )
     let assemblyElapsed = Date().timeIntervalSince(assemblyStartedAt)
 
     guard assembled.sourceOffsets.indices.contains(assembledCoreStartIndex),
@@ -2412,10 +2408,51 @@ final class MacHLSRealtimeProducer {
       coreMediaEndSeconds: coreMediaEnd,
       coreTimelineStartSeconds: coreSource.timelineStart + requestedOffset,
       coreTimelineEndSeconds: coreEndSource.timelineEnd,
+      audio: audio,
       restoredDirectory: restoredDirectory,
       duration: duration,
       emit: emit
     )
+  }
+
+  /// Source audio for the cores of one worker input. Downloaded segments are
+  /// decoded with one source of left context so the decoder is already running
+  /// at the first core; the capture path already holds continuous PCM.
+  private func audioPlacements(
+    sources: [RestorationSource],
+    assembled: IPadHLSIntervalAssembler.Result,
+    coreStartIndex: Int,
+    coreEndIndex: Int
+  ) async -> [MacHLSAudio.Placement] {
+    let decodeStartIndex = avFoundationCapture == nil
+      ? max(0, coreStartIndex - 1)
+      : coreStartIndex
+    let decoded: [MacHLSAudio.SourcePCM]
+    if let avFoundationCapture {
+      decoded = (decodeStartIndex...coreEndIndex).map {
+        avFoundationCapture.audio.pcm(
+          from: sources[$0].timelineStart,
+          duration: assembled.sourceDurations[$0]
+        )
+      }
+    } else {
+      do {
+        decoded = try await MacHLSAudio.decode(
+          urls: sources[decodeStartIndex...coreEndIndex].map(\.localURL),
+          ffmpeg: resources.appendingPathComponent("bin/ffmpeg")
+        )
+      } catch {
+        log("HLS音声を取得できないため、この区間は無音で再生します: \(error.localizedDescription)\n")
+        decoded = Array(repeating: .silent, count: coreEndIndex - decodeStartIndex + 1)
+      }
+    }
+    return (coreStartIndex...coreEndIndex).map {
+      MacHLSAudio.Placement(
+        pcm: decoded[$0 - decodeStartIndex],
+        videoStart: assembled.sourceOffsets[$0],
+        videoDuration: assembled.sourceDurations[$0]
+      )
+    }
   }
 
   /// The portable assembler deliberately caps one operation at eight inputs to
@@ -2507,6 +2544,7 @@ final class MacHLSRealtimeProducer {
     coreMediaEndSeconds: Double,
     coreTimelineStartSeconds: Double,
     coreTimelineEndSeconds: Double,
+    audio: [MacHLSAudio.Placement],
     restoredDirectory: URL,
     duration: Double,
     emit: @escaping EventSink
@@ -2633,26 +2671,28 @@ final class MacHLSRealtimeProducer {
           let outputSequence = nextOutputSequence
           let workerURL = URL(fileURLWithPath: path)
           let stableURL = restoredDirectory.appendingPathComponent(
-            String(format: "hls-restored-%06d", outputSequence)
-              + (playbackPreparer == nil ? ".mp4" : ".mov"),
+            String(format: "hls-restored-%06d.mov", outputSequence),
             isDirectory: false
           )
-          if let playbackPreparer {
-            let audioStarted = Date()
-            try await playbackPreparer.movie(
-              videoURL: workerURL, start: mappedStart, end: mappedEnd, outputURL: stableURL
-            )
-            try checkCancellation()
-            if outputSequence < 3 || outputSequence.isMultiple(of: 30) {
-              log("HLS単一タイムライン: 区間\(outputSequence) 音声+映像統合 "
-                + "\(String(format: "%.3f", Date().timeIntervalSince(audioStarted)))秒\n")
-            }
-          }
+          // The output's audio covers exactly the input interval of its video.
+          let inputStart = mappedStart - coreTimelineStartSeconds + coreMediaStartSeconds
           let outputBytes: Int64
           do {
-            outputBytes = try await mediaFileWorker.byteCount(
-              at: playbackPreparer == nil ? workerURL : stableURL
+            try await MacHLSAudio.writeMovie(
+              videoURL: workerURL,
+              samples: MacHLSAudio.samples(
+                from: inputStart,
+                to: inputStart + (mappedEnd - mappedStart),
+                placements: audio
+              ),
+              duration: mappedEnd - mappedStart,
+              outputURL: stableURL,
+              ffmpeg: resources.appendingPathComponent("bin/ffmpeg")
             )
+            try checkCancellation()
+            outputBytes = try await mediaFileWorker.byteCount(at: stableURL)
+          } catch is CancellationError {
+            throw CancellationError()
           } catch {
             throw ProductionError.missingOutput(
               "\(workerURL.lastPathComponent): \(error.localizedDescription)"
@@ -2663,18 +2703,6 @@ final class MacHLSRealtimeProducer {
             seconds: mappedEnd - mappedStart,
             bytes: outputBytes
           )
-          do {
-            if playbackPreparer == nil {
-              try await mediaFileWorker.copyReplacing(
-                from: workerURL,
-                to: stableURL
-              )
-            }
-          } catch {
-            throw ProductionError.missingOutput(
-              "\(workerURL.lastPathComponent): \(error.localizedDescription)"
-            )
-          }
           // The native worker may now discard its rolling file. The separate
           // playback credit remains held until the controller acknowledges the
           // matching MacHLSProductionEvent.segment sequence.

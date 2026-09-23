@@ -37,8 +37,8 @@ struct MacHLSCaptureRatePolicy {
 /// Captures HLS through AVFoundation's media stack instead of issuing raw
 /// playlist/segment requests. Some CDNs accept Safari/AVPlayer HLS playback but
 /// reject URLSession or WKDownload requests for the same segment with HTTP 429.
-/// Keeping both the look-ahead decoder and audible player on one AVURLAsset
-/// avoids that transport split entirely.
+/// One player decodes both video frames and audio PCM, so no second player
+/// ever fetches the same stream.
 @MainActor
 final class MacHLSAVFoundationCapture {
   struct CapturedSegment: Sendable {
@@ -66,6 +66,7 @@ final class MacHLSAVFoundationCapture {
   }
 
   let asset: AVURLAsset
+  let audio = MacHLSPCMTimeline()
 
   private let outputDirectory: URL
   private let requestedStartSeconds: Double
@@ -79,6 +80,7 @@ final class MacHLSAVFoundationCapture {
   private var captureTask: Task<Void, Never>?
   private var captureItem: AVPlayerItem?
   private var videoOutput: AVPlayerItemVideoOutput?
+  private var audioOutput: AnyObject?
   private var endObserver: NSObjectProtocol?
   private var didReachEnd = false
   private var restoredBufferLeadSeconds = 0.0
@@ -110,10 +112,6 @@ final class MacHLSAVFoundationCapture {
     player.automaticallyWaitsToMinimizeStalling = true
     player.preventsDisplaySleepDuringVideoPlayback = false
     player.actionAtItemEnd = .pause
-  }
-
-  func makePlaybackItem() -> AVPlayerItem {
-    AVPlayerItem(asset: asset)
   }
 
   func setForwardBufferDuration(_ seconds: Double) {
@@ -161,8 +159,15 @@ final class MacHLSAVFoundationCapture {
     if let captureItem, let videoOutput {
       captureItem.remove(videoOutput)
     }
+    if #available(macOS 27.0, *),
+      let captureItem,
+      let audioOutput = audioOutput as? AVPlayerItemSampleBufferOutput
+    {
+      captureItem.remove(audioOutput)
+    }
     captureItem = nil
     videoOutput = nil
+    audioOutput = nil
     capturePlaybackStarted = false
     requestedCaptureRate = 1
   }
@@ -191,6 +196,19 @@ final class MacHLSAVFoundationCapture {
     )
     output.suppressesPlayerRendering = true
     item.add(output)
+    if #available(macOS 27.0, *) {
+      let configuration = AVPlayerItemSampleBufferOutputAudioConfiguration()
+      configuration.requestedAudioFormat = AVAudioFormat(
+        commonFormat: .pcmFormatInt16,
+        sampleRate: Double(MacHLSAudio.sampleRate),
+        channels: AVAudioChannelCount(MacHLSAudio.channels),
+        interleaved: true
+      )?.formatDescription
+      let audioOutput = AVPlayerItemSampleBufferOutput(configuration: configuration)
+      audioOutput.suppressesPlayerRendering = true
+      item.add(audioOutput)
+      self.audioOutput = audioOutput
+    }
     captureItem = item
     videoOutput = output
     didReachEnd = false
@@ -319,6 +337,14 @@ final class MacHLSAVFoundationCapture {
           }
         }
 
+        if let lastPTS {
+          // Keep audio a little ahead of the captured video, not the whole
+          // stream the output would otherwise decode in advance.
+          drainAudio(
+            through: Double(lastPTS) / 1_000_000_000 + 4,
+            timelineOffset: timelineOffset
+          )
+        }
         if !isLive, knownDuration > 0 {
           let sourceSeconds = player.currentTime().seconds - timelineOffset
           if sourceSeconds.isFinite,
@@ -360,12 +386,47 @@ final class MacHLSAVFoundationCapture {
           )
         }
       }
+      drainAudio(through: .infinity, timelineOffset: timelineOffset)
       yield(try await writer?.finish())
     } catch {
       writer?.discard()
       throw error
     }
     player.pause()
+  }
+
+  /// Moves decoded PCM onto the HLS timeline. Buffers decoded before the
+  /// start seek belong to another position and are ignored.
+  private func drainAudio(through limit: Double, timelineOffset: Double) {
+    guard #available(macOS 27.0, *),
+      let output = audioOutput as? AVPlayerItemSampleBufferOutput
+    else { return }
+    while audio.endSeconds < limit, let next = output.nextAvailableSampleBuffer() {
+      next.sampleBuffer.withUnsafeSampleBuffer { sample in
+        let start = CMSampleBufferGetOutputPresentationTimeStamp(sample).seconds
+          - timelineOffset
+        guard start.isFinite, start + 0.5 >= requestedStartSeconds else { return }
+        var blockBuffer: CMBlockBuffer?
+        var list = AudioBufferList()
+        guard CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+          sample,
+          bufferListSizeNeededOut: nil,
+          bufferListOut: &list,
+          bufferListSize: MemoryLayout<AudioBufferList>.size,
+          blockBufferAllocator: nil,
+          blockBufferMemoryAllocator: nil,
+          flags: 0,
+          blockBufferOut: &blockBuffer
+        ) == noErr, let data = list.mBuffers.mData else { return }
+        audio.append(
+          startSeconds: start,
+          interleaved: UnsafeBufferPointer(
+            start: data.assumingMemoryBound(to: Int16.self),
+            count: Int(list.mBuffers.mDataByteSize) / MemoryLayout<Int16>.size
+          )
+        )
+      }
+    }
   }
 
   private func updateCaptureRate() {

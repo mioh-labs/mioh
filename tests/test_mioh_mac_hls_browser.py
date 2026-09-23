@@ -1,7 +1,10 @@
+import functools
+import http.server
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -75,12 +78,11 @@ class MacHLSBrowserContractTests(unittest.TestCase):
                 ": source.mediaURL",
                 "let makeAVFoundationCapture: (URL) -> MacHLSAVFoundationCapture",
                 "url: url",
-                "makeAVFoundationCapture(\n            safariCompatiblePlaybackURL",
-                "if selectedResourceLoader != nil",
+                "capture = makeAVFoundationCapture(safariCompatiblePlaybackURL)",
+                "if useSafariCompatibleHLS, selectedResourceLoader == nil",
                 "resourceLoader: selectedResourceLoader",
                 "capture = makeAVFoundationCapture(localPlaybackURL)",
-                "sourceItem = capture.makePlaybackItem()",
-                "avFoundationCapture: activeAVFoundationCapture",
+                "avFoundationCapture: capture",
             ],
         )
 
@@ -111,7 +113,7 @@ class MacHLSBrowserContractTests(unittest.TestCase):
         self.assert_contracts(
             self.player,
             [
-                "let useSafariCompatibleHLS = runner.previewUseSafariCompatibleHLS",
+                "runner.previewUseSafariCompatibleHLS || hasSeparateAudio",
                 "let requestedHLSQuality = PreviewHLSQuality(",
                 "allowsVariantFallback: requestedHLSQuality == .automatic",
                 "if useSafariCompatibleHLS {",
@@ -344,7 +346,7 @@ class MacHLSBrowserContractTests(unittest.TestCase):
         self.assertIn("releaseHLSBrowserHandoffLease()", terminal_release)
         self.assertGreaterEqual(
             self.player.count("releaseHLSBrowserHandoffAfterTerminalEnd()"),
-            4,
+            3,
         )
 
     def test_browser_hls_transport_does_not_depend_on_relay_candidate_flags(self):
@@ -662,6 +664,8 @@ class MacHLSBrowserContractTests(unittest.TestCase):
                     str(directory_path / "module-cache"),
                     "-parse-as-library",
                     str(PACKAGE / capture_name),
+                    str(PACKAGE / "MacHLSAudio.swift"),
+                    str(ROOT / "apps" / "MiohRemote" / "MiohRemote" / "IPadMPEGTSRemuxer.swift"),
                     str(CAPTURE_RATE_HARNESS),
                     "-framework",
                     "AVFoundation",
@@ -718,7 +722,12 @@ class MacHLSBrowserContractTests(unittest.TestCase):
                     "lavfi",
                     "-i",
                     "testsrc2=size=320x180:rate=30:duration=8",
-                    "-an",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anoisesrc=color=pink:sample_rate=48000:duration=8",
+                    "-c:a",
+                    "aac",
                     "-c:v",
                     "libx264",
                     "-pix_fmt",
@@ -739,6 +748,8 @@ class MacHLSBrowserContractTests(unittest.TestCase):
                     str(root / "module-cache"),
                     "-parse-as-library",
                     str(PACKAGE / capture_name),
+                    str(PACKAGE / "MacHLSAudio.swift"),
+                    str(ROOT / "apps" / "MiohRemote" / "MiohRemote" / "IPadMPEGTSRemuxer.swift"),
                     str(ACCELERATED_CAPTURE_HARNESS),
                     "-framework",
                     "AVFoundation",
@@ -757,12 +768,40 @@ class MacHLSBrowserContractTests(unittest.TestCase):
                 f"Accelerated capture harness did not compile:\n"
                 f"{build.stdout}{build.stderr}",
             )
-            completed = subprocess.run(
-                [str(executable), str(source), str(output), "8"],
-                capture_output=True,
-                text=True,
-                timeout=30,
+            # AVPlayerItemSampleBufferOutput delivers audio for HLS items, which
+            # is all the Safari-compatible path ever captures, but not for a
+            # plain file asset. Serve the fixture as HLS like production.
+            hls = root / "hls"
+            hls.mkdir()
+            subprocess.run(
+                [
+                    ffmpeg, "-v", "error", "-i", str(source), "-c", "copy",
+                    "-f", "hls", "-hls_time", "2", "-hls_playlist_type", "vod",
+                    "-hls_segment_filename", str(hls / "seg%03d.ts"),
+                    str(hls / "index.m3u8"),
+                ],
+                check=True,
+                timeout=60,
             )
+            handler = functools.partial(
+                http.server.SimpleHTTPRequestHandler, directory=str(hls)
+            )
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                completed = subprocess.run(
+                    [
+                        str(executable),
+                        f"http://127.0.0.1:{server.server_address[1]}/index.m3u8",
+                        str(output),
+                        "8",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+            finally:
+                server.shutdown()
             self.assertEqual(
                 completed.returncode,
                 0,
@@ -797,28 +836,40 @@ class MacHLSBrowserContractTests(unittest.TestCase):
             completed.stdout,
         )
         self.assertIn("2.00倍で先読みを増やします", completed.stdout)
+        audio = dict(
+            item.split("=", 1)
+            for line in completed.stdout.splitlines()
+            if line.startswith("AUDIO\t")
+            for item in line.split("\t")[1:]
+        )
+        self.assertGreaterEqual(float(audio["end"]), 7.5, completed.stdout)
+        self.assertLess(
+            int(audio["silent_frames"]),
+            int(audio["frames"]) * 0.01,
+            f"captured audio has gaps: {audio}",
+        )
         self.assertGreaterEqual(
             frame_count,
             236,
             f"accelerated capture retained only {frame_count}/240 frames",
         )
 
-    def test_hls_clock_and_capture_share_one_avurlasset(self):
+    def test_hls_original_preview_and_capture_share_one_avurlasset(self):
         start_hls = self.player.split("func startHLS(", 1)[1]
         start_hls = start_hls.split("\n  private func ", 1)[0]
 
-        # Safari-compatible mode keeps its look-ahead decoder and audible
-        # clock on the capture object's single AVURLAsset. Browser-only CDNs
-        # feed that asset through the same WebKit-backed loopback proxy used by
-        # Remote; direct/public URLs retain the shortest AVFoundation path.
+        # Safari-compatible mode decodes video and audio with the capture
+        # object's single AVURLAsset; the silent before/after comparison reuses
+        # that asset. Browser-only CDNs feed it through the WebKit-backed
+        # loopback proxy; direct/public URLs keep the shortest path.
         self.assert_contracts(
             start_hls,
             [
-                "makeAVFoundationCapture(\n            safariCompatiblePlaybackURL",
-                "sourceItem = capture.makePlaybackItem()",
-                "avFoundationCapture: activeAVFoundationCapture",
-                "hlsMediaProxy = nil",
-                "let createdProxy = IPadAuthenticatedMediaProxy(",
+                "capture = makeAVFoundationCapture(safariCompatiblePlaybackURL)",
+                "self.hlsOriginalAsset = capture.asset",
+                "avFoundationCapture: capture",
+                "hlsMediaProxy = proxy",
+                "proxy = IPadAuthenticatedMediaProxy(",
                 "resourceLoader: selectedResourceLoader",
                 "try await proxy.start()",
                 "self.localHLSPlaybackURL(",
@@ -831,72 +882,14 @@ class MacHLSBrowserContractTests(unittest.TestCase):
             start_hls.index("capture = makeAVFoundationCapture(localPlaybackURL)"),
         )
 
-    def test_vod_hls_attaches_source_player_only_at_first_restored_segment(self):
-        start_hls = self.player.split("func startHLS(", 1)[1]
-        start_hls = start_hls.split("\n  private func ", 1)[0]
-        before_run, event_sink = start_hls.split(
-            "try await createdProducer.run", 1
-        )
-
-        # Construct the audible item from the shared AVURLAsset early, but a
-        # VOD item is attached only after the look-ahead AVPlayer has produced
-        # the first restored output. Live keeps eager attachment because its
-        # seekable window can slide while Core AI warms up.
-        self.assert_contracts(
-            before_run,
-            [
-                "let makeAVFoundationCapture: (URL) -> MacHLSAVFoundationCapture",
-                "sourceItem = capture.makePlaybackItem()",
-                "var sourceItemInstalled = false",
-                "if playlist.isLive {",
-                "installPreparedHLSSourceItem(",
-            ],
-        )
-        self.assertNotIn("sourcePlayer.replaceCurrentItem", before_run)
-
-        first_event = event_sink.split("} catch is CancellationError", 1)[0]
-        self.assert_contracts(
-            first_event,
-            [
-                "self.generation == startingGeneration",
-                "!Task.isCancelled",
-                "if !sourceItemInstalled",
-                "case .segment = event",
-                "sourceItemInstalled = self.installPreparedHLSSourceItem(",
-                "self.handleHLSProductionEvent(event",
-            ],
-        )
-        self.assertLess(
-            first_event.index("sourceItemInstalled = self.installPreparedHLSSourceItem("),
-            first_event.index("self.handleHLSProductionEvent(event"),
-        )
-
-        installer = self.player.split(
-            "private func installPreparedHLSSourceItem(", 1
-        )[1].split("\n  private func ", 1)[0]
-        self.assert_contracts(
-            installer,
-            [
-                "generation == expectedGeneration",
-                "hlsSource != nil",
-                "sourcePlayer.replaceCurrentItem(with: item)",
-                "installTimeObserver()",
-                "installHLSPlaybackObservers(",
-            ],
-        )
-        self.assertNotIn("sourcePlayer.play()", installer)
-
-    def test_vod_hls_source_buffer_caps_fast_mode_but_not_safari_compatible_mode(self):
+    def test_hls_buffer_limit_drives_capture_and_output_credit(self):
         start_hls = self.player.split("func startHLS(", 1)[1]
         start_hls = start_hls.split("\n  private func ", 1)[0]
         self.assert_contracts(
             start_hls,
             [
-                "playlist.isLive || useSafariCompatibleHLS",
-                "? max(2, runner.previewBufferLimit)",
-                ": min(6, max(2, runner.previewBufferLimit))",
                 "forwardBufferSeconds: runner.previewBufferLimit",
-                "hlsAVFoundationCapture = avFoundationCapture",
+                "self.hlsAVFoundationCapture = capture",
             ],
         )
 
@@ -905,9 +898,6 @@ class MacHLSBrowserContractTests(unittest.TestCase):
         self.assert_contracts(
             setter,
             [
-                "let sourceBufferSeconds = isLiveHLSInput || hlsAVFoundationCapture != nil",
-                "min(6, max(2, seconds))",
-                "preferredForwardBufferDuration = sourceBufferSeconds",
                 "hlsAVFoundationCapture?.setForwardBufferDuration(seconds)",
                 "hlsProducer?.updateOutputBufferLimits(hlsOutputBufferLimits(for: seconds))",
             ],
@@ -975,403 +965,10 @@ class MacHLSBrowserContractTests(unittest.TestCase):
             update_restored,
         )
 
-    def test_hls_source_item_observes_status_time_control_and_stalls(self):
-        installer = self.player.split(
-            "private func installPreparedHLSSourceItem(", 1
-        )[1].split("\n  private func ", 1)[0]
-        self.assert_contracts(
-            installer,
-            [
-                "installHLSPlaybackObservers(",
-                "item: item",
-                "generation: expectedGeneration",
-            ],
-        )
-        observers = self.player.split(
-            "func installHLSPlaybackObservers(", 1
-        )[1]
-        observers = observers.split("\n  private func ", 1)[0]
-
-        self.assert_contracts(
-            observers,
-            [
-                "sourceItemStatusObservation = item.observe(",
-                "\\.status",
-                "sourcePlayer.observe(",
-                "\\.timeControlStatus",
-                "AVPlayerItem.playbackStalledNotification",
-                "updateHLSPlaybackState(item:",
-            ],
-        )
-        self.assertIn("func updateHLSPlaybackState(", self.player)
-
-    def test_hls_audio_sync_pauses_restored_video_when_source_waits_like_remote(self):
-        self.assert_contracts(
-            self.player,
-            [
-                "private var hlsRestoredClockFallbackActive = false",
-                "func tickRestored(seconds restoredLocalSeconds: Double)",
-                "private var canStartHLSWithRestoredClockFallback: Bool",
-                "private var hlsRestoredHeldForSourceCatchup = false",
-                "private var hlsDriftCorrectionInFlight = false",
-                "let hlsDriftCorrectionGraceSeconds = 0.120",
-                "let hlsDriftToleranceSeconds = 0.120",
-                "let hlsDriftResumeToleranceSeconds = 0.050",
-                "let hlsDriftSeekToleranceSeconds = 0.100",
-                "let hlsClockObservationIntervalSeconds = 0.080",
-            ],
-        )
-        self.assertIn("private var restoredTimeObserver: Any?", self.player)
-        self.assertIn("restoredPlayer.addPeriodicTimeObserver(", self.player)
-        tick = self.player.split("private func tick(sourceSeconds:", 1)[1]
-        tick = tick.split("\n  private var ", 1)[0]
-        self.assertNotIn("sourcePlayer.timeControlStatus != .playing", self.player)
-        stalled_observer = self.player.split(
-            "AVPlayerItem.playbackStalledNotification", 1
-        )[1].split("hlsNotificationTokens.append(stalled)", 1)[0]
-        self.assertIn("self.updateHLSPlaybackState(item: item, generation: generation)", stalled_observer)
-        self.assertNotIn("absorbHLSSourceWaitWithRestoredBuffer", stalled_observer)
-
-        update_state = self.player.split(
-            "private func updateHLSPlaybackState(", 1
-        )[1].split("\n  private func ", 1)[0]
-        for contract in [
-            "case .waitingToPlayAtSpecifiedRate:",
-            "restoredPlayer.pause()",
-            "case .paused:",
-            "if !hlsRestoredHeldForSourceCatchup",
-        ]:
-            self.assertIn(contract, update_state)
-        self.assertNotIn("reanchorHLSClockToRestoredPlaybackIfNeeded", self.player)
-        self.assertNotIn("hlsDriftSeekCooldownSeconds", self.player)
-
-        resume = self.player.split("private func resumeIfBuffered(", 1)[1]
-        resume = resume.split("\n  private func ", 1)[0]
-        self.assertIn("if hlsSource != nil {", resume)
-        self.assertIn("canStartHLSWithRestoredClockFallback", resume)
-
-        start_players = self.player.split(
-            "private func startPlayersFromCurrentPosition()", 1
-        )[1].split("\n  private var ", 1)[0]
-        self.assertIn("shouldPreferRestoredHLSPlayback", start_players)
-        self.assertNotIn("hlsRestoredClockFallbackActive = true", start_players)
-        self.assertIn("beginSynchronizedHLSStart()", start_players)
-
-        synchronized_start = self.player.split(
-            "private func beginSynchronizedHLSStart()", 1
-        )[1].split("\n  private func ", 1)[0]
-        self.assert_contracts(
-            synchronized_start,
-            [
-                "sourcePlayer.preroll(atRate: 1.0)",
-                "restoredPlayer.preroll(atRate: 1.0)",
-                "hlsSynchronizedStartRevision",
-                "sourcePlayer.currentItem === sourceItem",
-                "restoredPlayer.currentItem === restoredItem",
-                "self.startHLSPlayersAtSharedHostTime()",
-            ],
-        )
-        shared_start = self.player.split(
-            "private func startHLSPlayersAtSharedHostTime()", 1
-        )[1].split("\n  private func ", 1)[0]
-        for player in ("sourcePlayer", "restoredPlayer"):
-            self.assertLess(
-                shared_start.index(f"{player}.automaticallyWaitsToMinimizeStalling = false"),
-                shared_start.index(f"{player}.setRate(1, time:"),
-            )
-        self.assertEqual(shared_start.count("atHostTime: hostTime)"), 2)
-        self.assertNotIn(".play()", shared_start)
-        self.assertIn("hlsSynchronizedStartRevision == revision", shared_start)
-        self.assertIn("updateHLSPlaybackState(item: item", shared_start)
-        self.assertIn("hlsSynchronizedStartInFlight { return }", update_state)
-        self.assertIn("hlsHostSynchronizedStartPendingUntil != 0 { return }", update_state)
-        self.assertIn("resumeIfBuffered()", update_state)
-
-    def test_terminal_hls_source_failure_keeps_the_restored_queue_playing(self):
-        observers = self.player.split(
-            "func installHLSPlaybackObservers(", 1
-        )[1].split("\n  private func ", 1)[0]
-        failed_to_end = observers.split(
-            "AVPlayerItem.failedToPlayToEndTimeNotification", 1
-        )[1].split("hlsNotificationTokens.append(failedToEnd)", 1)[0]
-        self.assertIn("degradeHLSSourcePlayback(", failed_to_end)
-        self.assertNotIn("self.fail(", failed_to_end)
-
-        update_state = self.player.split(
-            "private func updateHLSPlaybackState(", 1
-        )[1].split("\n  private func ", 1)[0]
-        failed_status = update_state.split("case .failed:", 1)[1].split(
-            "case .unknown:", 1
-        )[0]
-        self.assertIn("degradeHLSSourcePlayback(", failed_status)
-        self.assertNotIn("fail(", failed_status)
-
-        degrade = self.player.split(
-            "private func degradeHLSSourcePlayback(", 1
-        )[1].split("\n  private func ", 1)[0]
-        self.assert_contracts(
-            degrade,
-            [
-                "hlsRestoredClockFallbackActive = true",
-                "!hlsRestoredClockFallbackActive",
-                "showOriginal = false",
-                "sourcePlayer.pause()",
-                "sourcePlayer.volume = 0",
-                "restoredPlayer.play()",
-                "復元済み映像へ切り替えて継続します（音声なし）",
-            ],
-        )
-        self.assertNotIn("generationHasStarted = true", degrade)
-        self.assertNotIn("fail(", degrade)
-        # Degradation must not destroy the healthy producer or local queue.
-        self.assertNotIn("hlsProducer?.cancel()", degrade)
-        self.assertNotIn("clearRestoredQueue", degrade)
-        self.assertNotIn("state = .failed", degrade)
-        # AVFoundation may still be unwinding a resource callback. Keep its
-        # item and loopback server alive until the normal stop boundary.
-        self.assertNotIn("sourcePlayer.replaceCurrentItem(with: nil)", degrade)
-        self.assertNotIn("hlsMediaProxy?.stop()", degrade)
-
-        restored_clock = self.player.split(
-            "private var hlsShouldUseRestoredClock:", 1
-        )[1].split("\n  private func ", 1)[0]
-        self.assertIn("hlsRestoredClockFallbackActive", restored_clock)
-        self.assertIn("hlsSourceReachedEnd", restored_clock)
-
-        update_state = self.player.split(
-            "private func updateHLSPlaybackState(", 1
-        )[1].split("\n  private func ", 1)[0]
-        self.assertIn("!hlsRestoredClockFallbackActive", update_state)
-
-        discontinuity = self.player.split("case .discontinuity", 1)[1].split(
-            "case .segment", 1
-        )[0]
-        self.assert_contracts(
-            discontinuity,
-            [
-                "let sourcePlaybackUnavailable = hlsRestoredClockFallbackActive",
-                "let sourceRemainsReady = refreshedSourceItem?.status == .readyToPlay",
-                "hlsSourceReady = sourceRemainsReady",
-                "hlsRestoredClockFallbackActive = sourcePlaybackUnavailable",
-                "if let item = refreshedSourceItem",
-            ],
-        )
-
-        tick_restored = self.player.split(
-            "private func tickRestored(seconds restoredLocalSeconds: Double)", 1
-        )[1].split("\n  ///", 1)[0]
-        self.assertIn("itemSegments[ObjectIdentifier(currentItem)]", tick_restored)
-
-        self.assert_contracts(
-            self.player,
-            [
-                "var canShowOriginal: Bool",
-                ".disabled(!controller.canShowOriginal)",
-                "controller.showOriginal = $0 && controller.canShowOriginal",
-                "!hlsRestoredClockFallbackActive && !hlsSourceReachedEnd",
-            ],
-        )
-
-    def test_vod_hls_waits_for_source_clock_before_playing_to_preserve_audio_sync(self):
-        resume = self.player.split("private func resumeIfBuffered(", 1)[1]
-        resume = resume.split("\n  private func ", 1)[0]
-        self.assertIn("if hlsSource != nil {", resume)
-        self.assertIn("guard hlsSourceClockIsReadyForSynchronizedPlayback", resume)
-        self.assertIn("if state == .paused, generationHasStarted,", resume)
-        self.assertIn("restoredPlayer.currentItem != nil", resume)
-
-        preference = self.player.split(
-            "private var shouldPreferRestoredHLSPlayback:", 1
-        )[1].split("\n  private var ", 1)[0]
-        self.assertIn("canStartHLSWithRestoredClockFallback", preference)
-
-        update_state = self.player.split(
-            "private func updateHLSPlaybackState(", 1
-        )[1].split("\n  private func ", 1)[0]
-        self.assertNotIn("if shouldPreferRestoredHLSPlayback", update_state)
-        self.assertNotIn("復元済みキューの再生を続行します", update_state)
-
-    def test_hls_initial_seek_waits_for_ready_item_and_successful_completion(self):
-        self.assert_contracts(
-            self.player,
-            [
-                "func seekHLSClockWhenReady(",
-                "hlsSourceReady",
-                "hlsSourceSeekCompleted",
-                "hlsSourceTimeOffset",
-            ],
-        )
-        seek_clock = self.player.split("func seekHLSClockWhenReady(", 1)[1]
-        seek_clock = seek_clock.split("\n  private func ", 1)[0]
-        self.assert_contracts(
-            seek_clock,
-            [
-                "item.status == .readyToPlay",
-                "sourcePlayer.seek(",
-                "finished in",
-                "guard finished",
-                "hlsInitialSeekCompleted",
-                "hlsSourceSeekCompleted",
-                "retryOrDegradeHLSInitialSeek(",
-            ],
-        )
-        retry = self.player.split(
-            "private func retryOrDegradeHLSInitialSeek(", 1
-        )[1].split("\n  private func ", 1)[0]
-        self.assertIn("hlsMaximumInitialSeekAttempts", retry)
-        self.assertIn("degradeHLSSourcePlayback(", retry)
-        self.assertNotIn("self.fail(", seek_clock)
-
-        resume = self.player.split("private func resumeIfBuffered(", 1)[1]
-        resume = resume.split("\n  private func ", 1)[0]
-        self.assertIn("hlsSourceClockIsReadyForSynchronizedPlayback", resume)
-        clock_ready = self.player.split(
-            "private var hlsSourceClockIsReadyForSynchronizedPlayback:", 1
-        )[1].split("\n  private var ", 1)[0]
-        self.assertIn("hlsSourceReady", clock_ready)
-        self.assertIn("hlsSourceSeekCompleted", clock_ready)
-
-    def test_hls_seek_and_synchronized_preroll_have_bounded_watchdogs(self):
-        self.assert_contracts(
-            self.player,
-            [
-                "let hlsOperationWatchdogSeconds = 2.0",
-                "let hlsMaximumSynchronizedStartAttempts = 3",
-                "private var hlsInitialSeekWatchdogTask: Task<Void, Never>?",
-                "private var hlsSynchronizedStartWatchdogTask: Task<Void, Never>?",
-                "scheduleHLSInitialSeekWatchdog(",
-                "scheduleSynchronizedHLSStartWatchdog(",
-                "sourcePlayer.currentItem?.cancelPendingSeeks()",
-                "sourcePlayer.cancelPendingPrerolls()",
-                "restoredPlayer.cancelPendingPrerolls()",
-            ],
-        )
-
-        initial_watchdog = self.player.split(
-            "private func scheduleHLSInitialSeekWatchdog(", 1
-        )[1].split("\n  private func ", 1)[0]
-        self.assert_contracts(
-            initial_watchdog,
-            [
-                "Task.sleep(nanoseconds: timeoutNanoseconds)",
-                "self.generation == expectedGeneration",
-                "self.hlsSeekRevision == revision",
-                "self.hlsSeekInFlight",
-                "self.sourcePlayer.currentItem === item",
-                "retryOrDegradeHLSInitialSeek(",
-            ],
-        )
-
-        seek_retry = self.player.split(
-            "private func retryOrDegradeHLSInitialSeek(", 1
-        )[1].split("\n  private func ", 1)[0]
-        self.assertLess(
-            seek_retry.index("hlsSeekRevision &+= 1"),
-            seek_retry.index("item.cancelPendingSeeks()"),
-        )
-        self.assertIn("self.hlsSeekRevision == retryRevision", seek_retry)
-
-        synchronized_watchdog = self.player.split(
-            "private func scheduleSynchronizedHLSStartWatchdog(", 1
-        )[1].split("\n  private func ", 1)[0]
-        self.assert_contracts(
-            synchronized_watchdog,
-            [
-                "Task.sleep(nanoseconds: timeoutNanoseconds)",
-                "self.generation == expectedGeneration",
-                "self.hlsSynchronizedStartRevision == revision",
-                "self.hlsSynchronizedStartInFlight",
-                "self.sourcePlayer.currentItem === sourceItem",
-                "self.restoredPlayer.currentItem === restoredItem",
-                "finishSynchronizedHLSStartRetry(",
-            ],
-        )
-
-        synchronized_retry = self.player.split(
-            "private func finishSynchronizedHLSStartRetry(", 1
-        )[1].split("\n  private func ", 1)[0]
-        self.assert_contracts(
-            synchronized_retry,
-            [
-                "hlsSynchronizedStartWatchdogTask?.cancel()",
-                "hlsSynchronizedStartRevision &+= 1",
-                "hlsMaximumSynchronizedStartAttempts",
-                "degradeHLSSourcePlayback(",
-                "self.hlsSynchronizedStartRevision == retryRevision",
-            ],
-        )
-        self.assertLess(
-            synchronized_retry.index("hlsSynchronizedStartRevision &+= 1"),
-            synchronized_retry.index("sourcePlayer.cancelPendingPrerolls()"),
-        )
-
-    def test_live_hls_clock_is_mapped_to_remote_style_source_time_offset(self):
-        self.assertIn("hlsSourceTimeOffset", self.player)
-        tick = self.player.split("private func tick(sourceSeconds:", 1)[1]
-        tick = tick.split("\n  private func ", 1)[0]
-        self.assertIn("sourceSeconds - hlsSourceTimeOffset", tick)
-        self.assertIn("hlsDriftCorrectionGraceSeconds", tick)
-        self.assertIn("let drift = restoredAbsolute - playbackTimelineSeconds", tick)
-        self.assertIn("hlsRestoredHeldForSourceCatchup = true", tick)
-        self.assertIn("restoredPlayer.pause()", tick)
-        self.assertIn("hlsDriftCorrectionInFlight = true", tick)
-        self.assertNotIn("hlsSourceTimeOffset = sourceSeconds - restoredAbsolute", tick)
-        self.assertIn("currentRestoredItemIdentifier", tick)
-        self.assertIn("currentRestoredItemStartedAt", tick)
-        self.assertIn("itemSegments[ObjectIdentifier(currentItem)]", tick)
-
-        seek_clock = self.player.split("func seekHLSClockWhenReady(", 1)[1]
-        seek_clock = seek_clock.split("\n  private func ", 1)[0]
-        self.assert_contracts(
-            seek_clock,
-            [
-                "isLiveHLSInput",
-                "actualSourceTime - syntheticTarget",
-                "hlsSourceTimeOffset",
-                "requestedStartSeconds",
-            ],
-        )
-
-    def test_hls_forward_drift_skips_to_the_matching_queued_item_without_rewind(self):
-        tick = self.player.split("private func tick(sourceSeconds:", 1)[1]
-        tick = tick.split("\n  private var ", 1)[0]
-        self.assert_contracts(
-            tick,
-            [
-                "let availableItems = restoredPlayer.items()",
-                "playbackTimelineSeconds < segment.endSeconds",
-                "restoredPlayer.advanceToNextItem()",
-                "releaseConsumedSegments(through: targetSegment.sequence - 1)",
-                "sourcePlayer.pause()",
-                "HLS音声と復元映像を同期中",
-                "self.beginSynchronizedHLSStart()",
-                "復元映像がHLS音声へ追いつくのを待っています",
-                "hlsDriftResumeToleranceSeconds",
-            ],
-        )
-        self.assertNotIn("hlsSourceTimeOffset = sourceSeconds - restoredAbsolute", tick)
-
-    def test_hls_has_no_unreliable_audio_preflight_and_eof_degrades_nonfatally(self):
+    def test_hls_has_no_unreliable_audio_preflight(self):
         self.assertNotIn("validateHLSSourceAudio(", self.player)
         self.assertNotIn("loadTracks(withMediaType: .audio)", self.player)
         self.assertNotIn("元動画の音声を利用できないため", self.player)
-        self.assertIn(
-            "元動画側の再生を継続できないため、復元映像のみ再生中（音声なし）",
-            self.player,
-        )
-
-        eof = self.player.split(
-            "private func handleHLSSourceDidReachEnd(", 1
-        )[1].split("\n  private func ", 1)[0]
-        self.assert_contracts(
-            eof,
-            [
-                "if isLiveHLSInput || expectedEnd - sourceTimeline > tolerance",
-                "degradeHLSSourcePlayback(",
-                "hlsSourceReachedEnd = true",
-                "showOriginal = false",
-            ],
-        )
 
     def test_hls_output_credit_tracks_the_playback_queue_and_user_buffer_limit(self):
         self.assert_contracts(
@@ -1391,8 +988,6 @@ class MacHLSBrowserContractTests(unittest.TestCase):
             set_limit,
             [
                 "if hlsSource != nil",
-                "preferredForwardBufferDuration = sourceBufferSeconds",
-                "min(6, max(2, seconds))",
                 "hlsProducer?.updateOutputBufferLimits(",
             ],
         )
