@@ -26,6 +26,8 @@ H3_QWEN_COMPOSITE = UPSCALER / "MiniMaxH3NativeQwenComposite.swift"
 H3_MODELS = UPSCALER / "MiniMaxH3NativeModels.swift"
 H3_DENOISER = UPSCALER / "TenErosMaxH3DenoiserComposite.swift"
 MCP_SERVER = UPSCALER / "MiohUpscalerMCPServer.swift"
+PIPERSR_RUNNER = UPSCALER / "PiperSRNativeVideoRunner.swift"
+PIPERSR_VENDOR = STANDALONE / "vendor" / "pipersr"
 H3_DIT_EXPORT = ROOT / "scripts" / "apple" / "export_10eros_max_h3_dit_block.py"
 H3_DIT_DRIVER = ROOT / "scripts" / "apple" / "export_10eros_max_h3_dit_coreai.py"
 H3_LORA_COMBINER = ROOT / "scripts" / "apple" / "combine_minimax_h3_loras.py"
@@ -43,6 +45,34 @@ FLASHVSR_RUNNER = (
 
 
 class MiohUpscalerSeparationTests(unittest.TestCase):
+    def test_pipersr_supports_1080p_to_2160p_with_tiled_coreml(self):
+        app = UPSCALER_APP.read_text()
+        controller = CONTROLLER.read_text()
+        runner = PIPERSR_RUNNER.read_text()
+        build = UPSCALER_BUILD.read_text()
+        mcp = MCP_SERVER.read_text()
+        self.assertIn('Text("PiperSR（軽量・ANE・2倍）").tag("pipersr")', app)
+        self.assertIn('case piperSR = "pipersr"', controller)
+        self.assertIn('if installation.kind != .piperSR', controller)
+        self.assertIn('try startFinalMux(from: expected, audioMode: .copy)', controller)
+        self.assertIn('static let tileSide = 256', runner)
+        self.assertIn('static let overlap = 32', runner)
+        self.assertIn('let outputWidth = sourceWidth * 2', runner)
+        self.assertIn('inputPixelBufferReceiver(', runner)
+        self.assertIn('outputProvider(for:', runner)
+        self.assertIn('dataType: .float16', runner)
+        self.assertIn('private final class PiperSRMetalOutput', runner)
+        self.assertIn('piperSRToBGRA', runner)
+        self.assertIn('PiperSRFullFrameSession(width: width, height: height', runner)
+        self.assertIn('let current = try processor.predictFullFrame(', runner)
+        self.assertIn('PiperSRNativeVideoRunner.swift', build)
+        self.assertIn('-framework CoreVideo -framework Metal -framework VideoToolbox', build)
+        self.assertIn('pipersr-models', build)
+        self.assertIn('"pipersr": FileManager.default.isExecutableFile', mcp)
+        for name in ('PiperSR_2x_256', 'PiperSR_2x_video_720p',
+                     'PiperSR_2x_video_720p_fp16'):
+            self.assertTrue((PIPERSR_VENDOR / f'{name}.mlpackage').is_dir())
+
     def test_mioh_no_longer_exposes_or_bundles_upscaling(self):
         app = MIOH_APP.read_text()
         build = MIOH_BUILD.read_text()

@@ -10,6 +10,7 @@ CONTENTS="$APP/Contents"
 RESOURCES="$CONTENTS/Resources"
 
 VENDORED_FLASHVSR_SOURCE_DIR="$UPSCALER_DIR/vendor/flashvsr"
+PIPERSR_SOURCE_DIR="$ROOT/packaging/macOS/standalone/vendor/pipersr"
 if [[ -d "$VENDORED_FLASHVSR_SOURCE_DIR" ]]; then
   DEFAULT_FLASHVSR_SOURCE_DIR="$VENDORED_FLASHVSR_SOURCE_DIR"
 else
@@ -84,6 +85,27 @@ xcrun swiftc \
   -framework Metal -framework VideoToolbox \
   "$FLASHVSR_NATIVE_PIPELINE" "$FLASHVSR_NATIVE_RUNNER" \
   -o "$RESOURCES/bin/flashvsr-coreai-video"
+
+xcrun swiftc \
+  -O -parse-as-library -target arm64-apple-macosx27.0 \
+  -framework AVFoundation -framework CoreImage -framework CoreML \
+  -framework CoreVideo -framework Metal -framework VideoToolbox \
+  "$UPSCALER_DIR/PiperSRNativeVideoRunner.swift" \
+  -o "$RESOURCES/bin/pipersr-coreml-video"
+mkdir -p "$RESOURCES/pipersr-models" "$RESOURCES/licenses/pipersr"
+for model in PiperSR_2x_256 PiperSR_2x_video_720p PiperSR_2x_video_720p_fp16; do
+  source="$PIPERSR_SOURCE_DIR/$model.mlpackage"
+  if [[ ! -d "$source" ]]; then
+    print -u2 "Missing PiperSR Core ML package: $source"
+    exit 2
+  fi
+  xcrun coremlcompiler compile "$source" "$RESOURCES/pipersr-models" >/dev/null
+  if [[ ! -d "$RESOURCES/pipersr-models/$model.mlmodelc" ]]; then
+    print -u2 "Could not compile PiperSR model: $model"
+    exit 2
+  fi
+done
+cp "$PIPERSR_SOURCE_DIR/MODEL_LICENSE" "$RESOURCES/licenses/pipersr/MODEL_LICENSE"
 
 # MiniMax H3 / 10Eros-Max H3 belongs to mioh upscaler. Only the native Swift
 # runner is bundled; model graphs, tokenizer and manifest remain external.
@@ -176,6 +198,7 @@ cp "$FFMPEG_PACKAGE/manifest.json" \
 chmod +x "$CONTENTS/MacOS/mioh-upscaler" \
   "$RESOURCES/bin/adcsr-coreai-video" \
   "$RESOURCES/bin/flashvsr-coreai-video" \
+  "$RESOURCES/bin/pipersr-coreml-video" \
   "$RESOURCES/bin/mioh-minimax-h3-native" \
   "$RESOURCES/bin/mioh-upscaler-mcp" \
   "$RESOURCES/bin/ffmpeg" "$RESOURCES/bin/ffprobe"
