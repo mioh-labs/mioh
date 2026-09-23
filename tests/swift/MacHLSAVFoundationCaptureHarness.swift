@@ -15,7 +15,10 @@ struct MacHLSAVFoundationCaptureHarness {
         userInfo: [NSLocalizedDescriptionKey: "input output duration"]
       )
     }
-    let input = URL(fileURLWithPath: CommandLine.arguments[1])
+    let argument = CommandLine.arguments[1]
+    let input = argument.contains("://")
+      ? URL(string: argument)!
+      : URL(fileURLWithPath: argument)
     let output = URL(
       fileURLWithPath: CommandLine.arguments[2],
       isDirectory: true
@@ -55,6 +58,11 @@ struct MacHLSAVFoundationCaptureHarness {
         ]
       )
     }
+    // Audio comes from the same player, continuously, on the HLS timeline.
+    let covered = capture.audio.pcm(from: startSeconds + 0.5, duration: duration - startSeconds - 1)
+    let silentFrames = stride(from: 0, to: covered.samples.count, by: MacHLSAudio.channels)
+      .filter { covered.samples[$0] == 0 && covered.samples[$0 + 1] == 0 }.count
+    print("AUDIO\tend=\(capture.audio.endSeconds)\tsilent_frames=\(silentFrames)\tframes=\(covered.samples.count / MacHLSAudio.channels)")
     print("Mac HLS AVFoundation accelerated capture passed")
   }
 }

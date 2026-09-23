@@ -109,7 +109,7 @@ xcrun swiftc \
   "$PACKAGE_DIR/MiohApp.swift" \
   "$PACKAGE_DIR/MacMediaBrowser.swift" \
   "$PACKAGE_DIR/MacHLSAVFoundationCapture.swift" \
-  "$PACKAGE_DIR/MacHLSUnifiedPlayback.swift" \
+  "$PACKAGE_DIR/MacHLSAudio.swift" \
   "$PACKAGE_DIR/MacHLSRealtimePipeline.swift" \
   "$PACKAGE_DIR/RealtimePlayer.swift" \
   "$PACKAGE_DIR/RemoteControlServer.swift" \
