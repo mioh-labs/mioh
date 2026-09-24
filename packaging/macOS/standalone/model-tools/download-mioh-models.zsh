@@ -4,7 +4,6 @@ set -euo pipefail
 APP="/Applications/mioh-universal.app"
 FORCE=0
 MINIMAL=0
-MIOH_RELEASE_TAG="${MIOH_RELEASE_TAG:-v0.14.3-014}"
 typeset -a FAILURES
 FAILURES=()
 
@@ -142,13 +141,6 @@ fetch \
   "$(hf_lada lada_mosaic_detection_model_v4_accurate.pt)" \
   "$MODELS/lada_mosaic_detection_model_v4_accurate.pt" \
   "c244d7e49d8f88e264b8dc15f91fb21f5908ad8fb6f300b7bc88462d0801bc1f"
-# The VR checkpoint is not present in ladaapp/lada on Hugging Face. It is a
-# mioh release asset and must stay pinned to the release that publishes it.
-fetch \
-  "https://github.com/mioh-labs/mioh/releases/download/$MIOH_RELEASE_TAG/lada_mosaic_detection_model_vr_v2_accurate.pt" \
-  "$MODELS/lada_mosaic_detection_model_vr_v2_accurate.pt" \
-  "91fe7a48b0e9edf51361918c8a30f752c64511005e643343a7382d951f3fe0f8"
-
 fetch \
   "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth" \
   "$MODELS/RealESRGAN_x2plus.pth" \

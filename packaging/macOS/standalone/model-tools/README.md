@@ -34,6 +34,7 @@ Useful options:
 ./convert-mioh-models.zsh --app /Applications/mioh-universal.app --coreai-only
 ```
 
-`--minimal` downloads the standard restoration model, v2/v3.1/v4/VR detection
+`--minimal` downloads the standard restoration model, v2/v3.1/v4 detection
 models, and Real-ESRGAN x2/x4. Omit it to also download optional ROI enhancer
-models.
+models. The VR detection checkpoint is not distributed or downloaded by mioh;
+the converter only accepts an existing local copy if the user provides one.

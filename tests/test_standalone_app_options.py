@@ -1874,8 +1874,8 @@ class StandaloneAppOptionTests(unittest.TestCase):
         download = (tools / "download-mioh-models.zsh").read_text()
         convert = (tools / "convert-mioh-models.zsh").read_text()
 
-        self.assertIn("releases/download/$MIOH_RELEASE_TAG", download)
-        self.assertIn("91fe7a48b0e9edf51361918c8a30f752", download)
+        self.assertNotIn("MIOH_RELEASE_TAG", download)
+        self.assertNotIn("lada_mosaic_detection_model_vr_v2_accurate.pt", download)
         self.assertIn("v0.2.5.0/realesr-general-x4v3.pth", download)
         self.assertIn("network_swinir.py", download)
         self.assertIn("--retry-all-errors", download)

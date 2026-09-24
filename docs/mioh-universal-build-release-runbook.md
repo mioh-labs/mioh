@@ -68,9 +68,9 @@ Keep these rules when editing the downloader or converter:
    renames the file. It never resumes a partial file from an older URL.
 2. A failed model does not hide the remaining downloads. The script reports a
    complete failure list and exits non-zero at the end.
-3. The VR detector is a `mioh-labs/mioh` GitHub Release asset, not a
-   `ladaapp/lada` Hugging Face asset. Update `MIOH_RELEASE_TAG`, its URL, and
-   its SHA-256 together when publishing a new release.
+3. Do not distribute the VR detector checkpoint in GitHub Releases or add it
+   to the model downloader. The converter may process an existing local copy,
+   but the public release contains neither the checkpoint nor a download URL.
 4. Real-ESRGAN conversion must not require `basicsr` in the bundled runtime.
    It uses the vendored RRDBNet implementation.
 5. SwinIR conversion must not require `timm` in the bundled runtime. The
@@ -254,9 +254,8 @@ git commit -m "<concise description>"
 git push origin main
 ```
 
-The VR checkpoint referenced by the downloader must exist in the target
-release before publishing the DMG. Replace the verified DMG asset and then
-download it again for an end-to-end checksum check:
+The release must not contain a VR detector checkpoint. Replace the verified
+DMG asset and then download it again for an end-to-end checksum check:
 
 ```zsh
 gh release upload v0.14.3-014 \
@@ -320,8 +319,8 @@ Actual conversion checks used the Python runtime inside the Universal app:
 
 Failures found and corrected during this build:
 
-1. The VR detector URL incorrectly pointed to Hugging Face and returned 404.
-   It now points to the release asset and is checksum-pinned.
+1. At that time, the VR detector URL incorrectly pointed to Hugging Face and
+   returned 404. Later releases do not distribute the VR checkpoint at all.
 2. Real-ESRGAN conversion failed because the Universal runtime did not contain
    `basicsr`. The exporter now uses the vendored RRDBNet implementation.
 3. Real-ESRGAN `pixel_unshuffle` required an iOS 16-or-newer Core ML opset. The
