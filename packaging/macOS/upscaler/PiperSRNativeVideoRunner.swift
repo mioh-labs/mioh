@@ -30,6 +30,7 @@ private struct PiperSRArguments {
   let models: URL
   let outputWidth: Int
   let outputHeight: Int
+  let sharpness: Float
 
   static func parse() throws -> Self {
     let raw = Array(CommandLine.arguments.dropFirst())
@@ -47,17 +48,20 @@ private struct PiperSRArguments {
           let models = values["--models"],
           let width = Int(values["--output-width"] ?? ""),
           let height = Int(values["--output-height"] ?? ""),
+          let sharpness = Float(values["--sharpness"] ?? "0"),
+          sharpness.isFinite, (0...1).contains(sharpness),
           width > 0, height > 0, width.isMultiple(of: 2), height.isMultiple(of: 2)
     else {
       throw PiperSRError.invalid(
         "usage: pipersr-coreml-video --input in.mov --output out.mp4 "
-          + "--models directory --output-width W --output-height H"
+          + "--models directory --output-width W --output-height H "
+          + "[--sharpness 0...1]"
       )
     }
     return Self(
       input: URL(fileURLWithPath: input), output: URL(fileURLWithPath: output),
       models: URL(fileURLWithPath: models), outputWidth: width,
-      outputHeight: height
+      outputHeight: height, sharpness: sharpness
     )
   }
 }
@@ -143,6 +147,113 @@ private func piperBuffer(width: Int, height: Int) throws -> CVPixelBuffer {
     throw PiperSRError.media("ピクセルバッファを確保できません: \(result)")
   }
   return value
+}
+
+/// Single-frame luminance unsharp mask, gated by a Sobel edge measure. The
+/// same 3x3 samples serve the blur and the edge detector, so flat-area grain
+/// receives little or no sharpening without an additional image pass.
+private final class PiperSRSharpen {
+  private let cache: CVMetalTextureCache
+  private let queue: MTLCommandQueue
+  private let pipeline: MTLComputePipelineState
+  private let strength: Float
+
+  init(strength: Float) throws {
+    guard let device = MTLCreateSystemDefaultDevice(),
+          let queue = device.makeCommandQueue() else {
+      throw PiperSRError.model("PiperSRのシャープ処理を初期化できません")
+    }
+    var textureCache: CVMetalTextureCache?
+    let status = CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &textureCache)
+    guard status == kCVReturnSuccess, let textureCache else {
+      throw PiperSRError.model("PiperSRのMetalテクスチャを初期化できません: \(status)")
+    }
+    let source = """
+      #include <metal_stdlib>
+      using namespace metal;
+      kernel void piperLumaUnsharp(
+        texture2d<float, access::read> input [[texture(0)]],
+        texture2d<float, access::write> output [[texture(1)]],
+        constant float &strength [[buffer(0)]],
+        uint2 id [[thread_position_in_grid]]) {
+        uint width = input.get_width();
+        uint height = input.get_height();
+        if (id.x >= width || id.y >= height) return;
+        constexpr float weights[3] = {0.259f, 0.482f, 0.259f};
+        constexpr float3 lumaWeights = float3(0.299f, 0.587f, 0.114f);
+        float4 center = input.read(id);
+        float blurred = 0.0f;
+        float luminance[3][3];
+        for (int dy = -1; dy <= 1; ++dy) {
+          uint y = uint(clamp(int(id.y) + dy, 0, int(height) - 1));
+          for (int dx = -1; dx <= 1; ++dx) {
+            uint x = uint(clamp(int(id.x) + dx, 0, int(width) - 1));
+            float value = dot(input.read(uint2(x, y)).rgb, lumaWeights);
+            luminance[dy + 1][dx + 1] = value;
+            blurred += value * weights[dx + 1] * weights[dy + 1];
+          }
+        }
+        float gx = (luminance[0][2] + 2.0f * luminance[1][2] + luminance[2][2]
+                  - luminance[0][0] - 2.0f * luminance[1][0] - luminance[2][0]) * 0.125f;
+        float gy = (luminance[2][0] + 2.0f * luminance[2][1] + luminance[2][2]
+                  - luminance[0][0] - 2.0f * luminance[0][1] - luminance[0][2]) * 0.125f;
+        float edge = smoothstep(0.025f, 0.080f, length(float2(gx, gy)));
+        float detail = (luminance[1][1] - blurred) * strength * edge;
+        output.write(float4(clamp(center.rgb + detail, 0.0f, 1.0f), center.a), id);
+      }
+      """
+    let library = try device.makeLibrary(source: source, options: nil)
+    guard let function = library.makeFunction(name: "piperLumaUnsharp") else {
+      throw PiperSRError.model("PiperSRのシャープ処理関数が見つかりません")
+    }
+    self.cache = textureCache
+    self.queue = queue
+    self.pipeline = try device.makeComputePipelineState(function: function)
+    self.strength = strength
+  }
+
+  func apply(to input: CVPixelBuffer) throws -> CVPixelBuffer {
+    let width = CVPixelBufferGetWidth(input)
+    let height = CVPixelBufferGetHeight(input)
+    let output = try piperBuffer(width: width, height: height)
+    func texture(_ buffer: CVPixelBuffer) throws -> (CVMetalTexture, MTLTexture) {
+      var reference: CVMetalTexture?
+      let status = CVMetalTextureCacheCreateTextureFromImage(
+        kCFAllocatorDefault, cache, buffer, nil, .bgra8Unorm,
+        width, height, 0, &reference
+      )
+      guard status == kCVReturnSuccess, let reference,
+            let texture = CVMetalTextureGetTexture(reference) else {
+        throw PiperSRError.model("PiperSRのシャープ処理用テクスチャを作成できません: \(status)")
+      }
+      return (reference, texture)
+    }
+    let (inputReference, inputTexture) = try texture(input)
+    let (outputReference, outputTexture) = try texture(output)
+    guard let command = queue.makeCommandBuffer(),
+          let encoder = command.makeComputeCommandEncoder() else {
+      throw PiperSRError.model("PiperSRのシャープ処理を開始できません")
+    }
+    encoder.setComputePipelineState(pipeline)
+    encoder.setTexture(inputTexture, index: 0)
+    encoder.setTexture(outputTexture, index: 1)
+    var amount = strength
+    encoder.setBytes(&amount, length: MemoryLayout<Float>.size, index: 0)
+    encoder.dispatchThreads(
+      MTLSize(width: width, height: height, depth: 1),
+      threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1)
+    )
+    encoder.endEncoding()
+    command.commit()
+    command.waitUntilCompleted()
+    withExtendedLifetime((inputReference, outputReference)) {}
+    guard command.status == .completed else {
+      throw PiperSRError.model(
+        "PiperSRのシャープ処理に失敗しました: \(command.error?.localizedDescription ?? "不明なエラー")"
+      )
+    }
+    return output
+  }
 }
 
 private final class PiperSRMetalOutput {
@@ -633,7 +744,9 @@ private struct PiperSRNativeVideoRunner {
       let processor = try PiperSRProcessor(
         models: args.models, width: media.width, height: media.height
       )
+      let sharpener = args.sharpness > 0 ? try PiperSRSharpen(strength: args.sharpness) : nil
       print("PiperSR: \(media.width)x\(media.height), \(processor.modeName), \(processor.tileCount) tiles/frame")
+      print(String(format: "PiperSR sharpness: %.2f", args.sharpness))
       print("STAGE Core ML / ANEでアップスケール中")
       fflush(stdout)
       let reader = try PiperSRReader(media: media)
@@ -656,7 +769,8 @@ private struct PiperSRNativeVideoRunner {
           )
           if let pending {
             let result = try processor.finishFullFrame(pending)
-            try await writer.append(result, at: pending.time)
+            let adjusted = try sharpener?.apply(to: result) ?? result
+            try await writer.append(adjusted, at: pending.time)
           }
           pending = current
           slot = 1 - slot
@@ -670,7 +784,8 @@ private struct PiperSRNativeVideoRunner {
         }
         if let pending {
           let result = try processor.finishFullFrame(pending)
-          try await writer.append(result, at: pending.time)
+          let adjusted = try sharpener?.apply(to: result) ?? result
+          try await writer.append(adjusted, at: pending.time)
         }
       } else {
         while let (decoded, time) = try await reader.next() {
@@ -684,7 +799,8 @@ private struct PiperSRNativeVideoRunner {
           frame += 1
           print("FRAME \(frame)")
           fflush(stdout)
-          try await writer.append(result, at: time - firstTime!)
+          let adjusted = try sharpener?.apply(to: result) ?? result
+          try await writer.append(adjusted, at: time - firstTime!)
           if media.duration > 0 {
             let elapsed = max(0, CMTimeGetSeconds(time - firstTime!))
             print(String(format: "PROGRESS %.2f", min(99, elapsed / media.duration * 100)))

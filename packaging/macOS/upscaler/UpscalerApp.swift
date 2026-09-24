@@ -359,6 +359,18 @@ private struct UpscalerContentView: View {
         }
         .disabled(!upscaler.adcSRTemporalStabilization)
       }
+      if upscaler.selectedUpscaler == .piperSR {
+        LabeledContent("輪郭シャープ") {
+          HStack(spacing: 10) {
+            Slider(value: $upscaler.piperSRSharpness, in: 0...1, step: 0.05)
+              .frame(width: 190)
+            Text(String(format: "%.2f", upscaler.piperSRSharpness))
+              .monospacedDigit().frame(width: 42, alignment: .trailing)
+          }
+        }
+        Text("0で従来どおり。輪郭の輝度成分だけを強調し、平坦部の粒状感は抑えます。")
+          .font(.caption).foregroundStyle(.secondary)
+      }
       modelDetails
       if upscaler.selectedUpscaler == .adcSR {
         UpscalerPathSettingRow(
