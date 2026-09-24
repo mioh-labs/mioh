@@ -54,6 +54,12 @@ final class VideoUpscaleController: ObservableObject {
   }
   @Published var adcSRTemporalStabilization = true
   @Published var adcSRTemporalStrength = 0.12
+  @Published var piperSRSharpness = 0.0 {
+    didSet {
+      guard piperSRSharpness != oldValue else { return }
+      UserDefaults.standard.set(piperSRSharpness, forKey: Self.piperSRSharpnessDefaultsKey)
+    }
+  }
   @Published var targetWidth = 1920
   @Published var targetHeight = 1080
   @Published var preserveAspectRatio = true
@@ -78,6 +84,7 @@ final class VideoUpscaleController: ObservableObject {
   private static let rootDefaultsKey = "mioh.flashvsr.root"
   private static let adcSRRootDefaultsKey = "mioh.adcsr.root"
   private static let modelDefaultsKey = "mioh.upscaler.model"
+  private static let piperSRSharpnessDefaultsKey = "mioh.upscaler.pipersr.sharpness"
   private let resourceURLOverride: URL?
 
   private var process: Process?
@@ -106,6 +113,11 @@ final class VideoUpscaleController: ObservableObject {
     adcSRRootPath = UserDefaults.standard.string(
       forKey: Self.adcSRRootDefaultsKey
     ) ?? ""
+    if let saved = UserDefaults.standard.object(forKey: Self.piperSRSharpnessDefaultsKey) as? Double,
+      saved.isFinite
+    {
+      piperSRSharpness = min(1, max(0, saved))
+    }
     if let saved = UserDefaults.standard.string(forKey: Self.modelDefaultsKey),
       UpscalerKind(rawValue: saved) != nil
     {
@@ -800,6 +812,8 @@ final class VideoUpscaleController: ObservableObject {
     } else if installation.kind == .adcSR {
       let strength = adcSRTemporalStabilization ? adcSRTemporalStrength : 0
       arguments += ["--temporal-strength", String(format: "%.3f", strength)]
+    } else if installation.kind == .piperSR {
+      arguments += ["--sharpness", String(format: "%.2f", piperSRSharpness)]
     }
     task.arguments = arguments
     try launch(task, phase: .upscale)
