@@ -99,7 +99,8 @@ Regenerate the manual when its Markdown source changes:
 
 ```zsh
 cd /Users/okatti/Documents/lada
-uv run --with reportlab scripts/docs/build_mioh_manual_pdf.py
+uv run --no-project --python 3.12 --with reportlab \
+  scripts/docs/build_mioh_manual_pdf.py
 test -f output/pdf/mioh-user-manual-ja.pdf
 ```
 
@@ -137,7 +138,7 @@ Expected outputs:
 
 ```text
 build/macos-standalone-universal/mioh-universal.app
-build/macos-standalone-universal/mioh-universal-0.14.3-013-unsigned.dmg
+build/macos-standalone-universal/mioh-universal-0.14.3-014-unsigned.dmg
 ```
 
 The build is model-free by default. It ad-hoc signs the application, includes
@@ -151,14 +152,9 @@ convert-mioh-models.zsh  -> model-tools/convert-mioh-models.zsh
 Applications             -> /Applications
 ```
 
-For a release suffix such as `-002`, keep the application version at `0.14.3`
-and copy the verified DMG to the release asset name after the build:
-
-```zsh
-cp -p \
-  build/macos-standalone-universal/mioh-universal-0.14.3-unsigned.dmg \
-  build/macos-standalone-universal/mioh-universal-0.14.3-002-unsigned.dmg
-```
+The release suffix is already set by `build_universal_app.sh`. If a future
+release changes it, update that script and the manual together, rebuild, and
+verify the resulting DMG. Do not rename an older build to a new release suffix.
 
 ## Verify the built application and DMG
 
@@ -183,7 +179,7 @@ cmp -s \
 Verify the disk image before publishing:
 
 ```zsh
-DMG=build/macos-standalone-universal/mioh-universal-0.14.3-013-unsigned.dmg
+DMG=build/macos-standalone-universal/mioh-universal-0.14.3-014-unsigned.dmg
 hdiutil verify "$DMG"
 shasum -a 256 "$DMG"
 ```
@@ -227,9 +223,10 @@ git -C "$PUBLIC" status -sb
 git -C "$PUBLIC" diff --check
 ```
 
-Add other reviewed Universal source files explicitly when they changed. Tests,
-RF-DETR prototypes, private weights, generated evaluation output, and temporary
-directories are not copied to the public repository.
+Add other reviewed Universal source files and their regression tests explicitly
+when they changed. Private-only tests, RF-DETR prototypes, private weights,
+generated evaluation output, and temporary directories are not copied to the
+public repository.
 
 Synchronize the built application only within its ignored artifact directory:
 
@@ -238,8 +235,8 @@ rsync -a --delete \
   "$ROOT/build/macos-standalone-universal/mioh-universal.app/" \
   "$PUBLIC/build/macos-standalone-universal/mioh-universal.app/"
 rsync -a \
-  "$ROOT/build/macos-standalone-universal/mioh-universal-0.14.3-unsigned.dmg" \
-  "$PUBLIC/build/macos-standalone-universal/mioh-universal-0.14.3-002-unsigned.dmg"
+  "$ROOT/build/macos-standalone-universal/mioh-universal-0.14.3-014-unsigned.dmg" \
+  "$PUBLIC/build/macos-standalone-universal/mioh-universal-0.14.3-014-unsigned.dmg"
 ```
 
 Compare SHA-256 values after every artifact copy.
@@ -262,17 +259,17 @@ release before publishing the DMG. Replace the verified DMG asset and then
 download it again for an end-to-end checksum check:
 
 ```zsh
-gh release upload v0.14.3-002 \
-  build/macos-standalone-universal/mioh-universal-0.14.3-002-unsigned.dmg \
+gh release upload v0.14.3-014 \
+  build/macos-standalone-universal/mioh-universal-0.14.3-014-unsigned.dmg \
   --clobber
 
 VERIFY_DIR=$(mktemp -d /private/tmp/mioh-release-verify.XXXXXX)
-gh release download v0.14.3-002 \
-  --pattern 'mioh-universal-0.14.3-002-unsigned.dmg' \
+gh release download v0.14.3-014 \
+  --pattern 'mioh-universal-0.14.3-014-unsigned.dmg' \
   --dir "$VERIFY_DIR"
 shasum -a 256 \
-  build/macos-standalone-universal/mioh-universal-0.14.3-002-unsigned.dmg \
-  "$VERIFY_DIR/mioh-universal-0.14.3-002-unsigned.dmg"
+  build/macos-standalone-universal/mioh-universal-0.14.3-014-unsigned.dmg \
+  "$VERIFY_DIR/mioh-universal-0.14.3-014-unsigned.dmg"
 ```
 
 The two hashes must match. Merely seeing a successful upload message is not a

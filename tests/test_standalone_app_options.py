@@ -1193,7 +1193,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn('COREAI_DISTRIBUTION="portable"', script)
         self.assertIn('build/macos-standalone-universal', script)
         self.assertIn('APP_BASENAME="mioh-universal"', script)
-        self.assertIn('DMG_BASENAME="mioh-universal-0.14.3-013-unsigned"', script)
+        self.assertIn('DMG_BASENAME="mioh-universal-0.14.3-014-unsigned"', script)
         self.assertIn('exec "$PACKAGE_DIR/build_app.sh"', script)
 
     def test_portable_swift_build_omits_architecture_override(self):
@@ -1387,12 +1387,14 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "$runner.nativeParallelWorkers)",
             source,
         )
-        for lane in [1, 2, 3]:
-            self.assertIn(f'.tag({lane})', source)
+        self.assertIn(r'ForEach(1...10, id: \.self) { lane in', source)
+        self.assertIn('Text("\\(lane)レーン").tag(lane)', source)
+        self.assertIn('.pickerStyle(.menu)', source)
         self.assertIn(
-            "nativeParallelWorkers: min(max(nativeParallelWorkers, 1), 3)",
+            "nativeParallelWorkers: min(max(nativeParallelWorkers, 1), 10)",
             source,
         )
+        self.assertIn("max(snapshot.nativeParallelWorkers ?? 1, 1),\n      10", source)
         self.assertIn("nativeParallelWorkers: 1,", source)
         self.assertIn('executor = "process"', source)
         self.assertIn('mergeEncoder = "copy"', source)
@@ -1402,7 +1404,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "config.isExport && !config.isWorker", pipeline
         )
         self.assertIn(
-            "min(max(config.nativeParallelWorkers ?? 1, 1), 3)",
+            "min(max(config.nativeParallelWorkers ?? 1, 1), 10)",
             pipeline,
         )
         self.assertIn(
