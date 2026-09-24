@@ -34,5 +34,6 @@ Useful options:
 ./convert-mioh-models.zsh --app /Applications/mioh-universal.app --coreai-only
 ```
 
-`--minimal` downloads only the standard restoration model, v4 detection models,
-and Real-ESRGAN x2/x4. Omit it to also download optional ROI enhancer models.
+`--minimal` downloads the standard restoration model, v2/v3.1/v4/VR detection
+models, and Real-ESRGAN x2/x4. Omit it to also download optional ROI enhancer
+models.

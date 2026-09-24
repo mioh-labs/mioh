@@ -6180,7 +6180,7 @@ private struct NativePreviewPipeline {
       )
     }
     let nativeParallelWorkers = config.isExport && !config.isWorker
-      ? min(max(config.nativeParallelWorkers ?? 1, 1), 3)
+      ? min(max(config.nativeParallelWorkers ?? 1, 1), 10)
       : 1
     let restoreEffects = NativeRestoreEffects(
       sharpen: max(0, min(5, config.sharpenStrength ?? 0)),

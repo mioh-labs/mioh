@@ -56,6 +56,11 @@ def register_fonts() -> None:
 
 def inline_markup(text: str) -> str:
     escaped = html.escape(text.strip())
+    escaped = re.sub(
+        r"\[([^\]]+)\]\((https?://[^)]+)\)",
+        r'<link href="\2" color="#234E9B">\1</link>',
+        escaped,
+    )
     escaped = re.sub(r"`([^`]+)`", r'<font name="MiohGothic">\1</font>', escaped)
     escaped = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", escaped)
     return escaped.replace("  ", "<br/>")
@@ -233,8 +238,9 @@ def parse_markdown(source: str, available_width: float, style_map) -> list:
 
 
 class ManualDocument(BaseDocTemplate):
-    def __init__(self, filename: str, **kwargs):
+    def __init__(self, filename: str, *, version: str, **kwargs):
         super().__init__(filename, **kwargs)
+        self.version = version
         frame = Frame(self.leftMargin, self.bottomMargin, self.width, self.height,
                       leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0)
         self.addPageTemplates(PageTemplate(id="manual", frames=[frame], onPage=self.decorate_page))
@@ -249,12 +255,13 @@ class ManualDocument(BaseDocTemplate):
         canvas.line(18 * mm, A4[1] - 15 * mm, A4[0] - 18 * mm, A4[1] - 15 * mm)
         canvas.setFont("MiohGothic", 7.5)
         canvas.setFillColor(colors.HexColor("#687182"))
-        canvas.drawString(18 * mm, A4[1] - 11.5 * mm, "mioh ユーザーマニュアル 0.11.0")
+        canvas.drawString(18 * mm, A4[1] - 11.5 * mm,
+                          f"mioh ユーザーマニュアル {document.version}")
         canvas.drawRightString(A4[0] - 18 * mm, 11 * mm, str(document.page))
         canvas.restoreState()
 
 
-def cover(style_map) -> list:
+def cover(style_map, version: str, revision_date: str) -> list:
     result: list = [Spacer(1, 28 * mm)]
     if ICON.is_file():
         result.extend([Image(str(ICON), width=34 * mm, height=34 * mm), Spacer(1, 10 * mm)])
@@ -276,14 +283,14 @@ def cover(style_map) -> list:
         Paragraph("mioh", title),
         Paragraph("ユーザーマニュアル", title),
         Spacer(1, 7 * mm),
-        Paragraph("mioh-universal 0.11.0 / macOS", subtitle),
+        Paragraph(f"mioh-universal {version} / macOS", subtitle),
         Spacer(1, 22 * mm),
         Paragraph(
             "動画の選択から、分割、モザイク検出、復元、合成、エンコード、"
             "VR再生、エラーからの再開までを説明します。", note,
         ),
         Spacer(1, 25 * mm),
-        Paragraph("改訂日 2026年7月20日", subtitle),
+        Paragraph(f"改訂日 {revision_date}", subtitle),
         PageBreak(),
     ])
     return result
@@ -292,17 +299,24 @@ def cover(style_map) -> list:
 def build(source_path: Path, output_path: Path) -> None:
     register_fonts()
     style_map = styles()
+    source = source_path.read_text(encoding="utf-8")
+    version_match = re.search(r"^バージョン\s+([^\s]+)$", source, re.MULTILINE)
+    date_match = re.search(r"^改訂日:\s*(.+)$", source, re.MULTILINE)
+    if version_match is None or date_match is None:
+        raise ValueError("Manual source must declare バージョン and 改訂日")
+    version = version_match.group(1)
+    revision_date = date_match.group(1)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     document = ManualDocument(
-        str(output_path), pagesize=A4,
+        str(output_path), version=version, pagesize=A4,
         leftMargin=18 * mm, rightMargin=18 * mm,
         topMargin=21 * mm, bottomMargin=17 * mm,
         title="mioh ユーザーマニュアル",
         author="mioh",
-        subject="mioh-universal 0.11.0 for macOS",
+        subject=f"mioh-universal {version} for macOS",
     )
-    story = cover(style_map)
-    story.extend(parse_markdown(source_path.read_text(encoding="utf-8"), document.width, style_map))
+    story = cover(style_map, version, revision_date)
+    story.extend(parse_markdown(source, document.width, style_map))
     document.build(story)
     print(output_path)
 

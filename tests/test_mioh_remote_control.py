@@ -171,10 +171,10 @@ class MiohRemoteControlTests(unittest.TestCase):
         self.assertIn("func apply(defaults snapshot: MiohUserDefaultsSnapshot)", app)
         self.assertIn("selectedPreviewDetectionModel = previewDetectionModel", app)
         self.assertIn(
-            "(1...3).contains(value.nativeParallelWorkers ?? 1)", source
+            "(1...10).contains(value.nativeParallelWorkers ?? 1)", source
         )
         self.assertIn(
-            "['nativeParallelWorkers','ネイティブ並列数','number',1,3,1]",
+            "['nativeParallelWorkers','ネイティブ並列数','number',1,10,1]",
             source,
         )
         self.assertIn(

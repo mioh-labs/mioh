@@ -977,7 +977,7 @@ final class RemoteControlServer: ObservableObject {
     guard (value.restorationEngine == nil
         || value.restorationEngine == "native"),
       (1...16).contains(value.parallelWorkers),
-      (1...3).contains(value.nativeParallelWorkers ?? 1),
+      (1...10).contains(value.nativeParallelWorkers ?? 1),
       ["process", "thread"].contains(value.executor),
       allowedDevices.contains(value.device),
       (1...128).contains(value.segmentCount),
@@ -2469,7 +2469,7 @@ private enum RemoteControlHTML {
         ['実行',[['restorationEngine','実行エンジン','select','restorationEngines'],['device','デバイス','select','devices'],['fp16','FP16','bool'],['autoOptimize','自動最適化','bool'],['overwrite','既存結果を上書き','bool']]]
       ]],
       ['processing',[
-        ['並列処理',[['parallelWorkers','旧並列数','number',1,16,1],['nativeParallelWorkers','ネイティブ並列数','number',1,3,1],['executor','旧実行方式','select','executors']]],
+        ['並列処理',[['parallelWorkers','旧並列数','number',1,16,1],['nativeParallelWorkers','ネイティブ並列数','number',1,10,1],['executor','旧実行方式','select','executors']]],
         ['セグメント',[['noSplit','分割しない','bool'],['useSegmentCount','分割方法','boolSelect'],['segmentCount','分割数','number',1,128,1],['segmentDuration','長さ（秒）','number',10,3600,10],['mergeEncoder','結合エンコーダー','text'],['deleteSegments','処理済みセグメントを削除','bool'],['keepTemp','一時ファイルを保持','bool'],['forceSplit','強制的に再分割','bool']]]
       ]],
       ['restoration',[

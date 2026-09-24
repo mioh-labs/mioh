@@ -1770,7 +1770,7 @@ final class RestorationRunner: ObservableObject {
       temporalBatchFrames: clipFrames,
       temporalOverlap: overlap,
       ringCapacity: max(clipFrames + overlap + 8, 32),
-      nativeParallelWorkers: min(max(nativeParallelWorkers, 1), 3),
+      nativeParallelWorkers: min(max(nativeParallelWorkers, 1), 10),
       confidenceThreshold: detection.confidenceThreshold,
       blendFeather: Float(blendFeather),
       sharpenStrength: Float(sharpenStrength),
@@ -3092,7 +3092,7 @@ final class RestorationRunner: ObservableObject {
     executor = "process"
     nativeParallelWorkers = min(
       max(snapshot.nativeParallelWorkers ?? 1, 1),
-      3
+      10
     )
     useSegmentCount = snapshot.useSegmentCount
     segmentCount = min(max(snapshot.segmentCount, 1), 128)
@@ -4010,14 +4010,19 @@ struct ContentView: View {
           Text("Swiftネイティブ（段階並列）")
         }
         Picker("ネイティブ並列数", selection: $runner.nativeParallelWorkers) {
-          Text("1 — 標準").tag(1)
-          Text("2 — 高負荷").tag(2)
-          Text("3 — 最大").tag(3)
+          ForEach(1...10, id: \.self) { lane in
+            Text("\(lane)レーン").tag(lane)
+          }
         }
-        .pickerStyle(.segmented)
+        .pickerStyle(.menu)
         Text("連続する時間バッチを\(runner.nativeParallelWorkers)レーンで処理します")
           .font(.caption)
           .foregroundStyle(.secondary)
+        if runner.nativeParallelWorkers >= 4 {
+          Text("4〜10レーンでは復元モデルと中間フレームのメモリ使用量が増えます。スワップが増える場合は並列数を下げてください")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
       }
       Section("セグメント") {
         Toggle("分割しない", isOn: $runner.noSplit)

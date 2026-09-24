@@ -1,9 +1,9 @@
 # mioh ユーザーマニュアル
 
-バージョン 0.11.0
+バージョン 0.14.3-014
 
 対象: mioh-universal for macOS
-改訂日: 2026年7月20日
+改訂日: 2026年9月24日
 
 ## 1. miohについて
 
@@ -19,16 +19,96 @@ miohは、動画内のモザイク領域を検出し、復元モデルで処理�
 - 大きな動画では十分な空き容量を持つ高速な一時ディスクを推奨
 - 長時間処理中は電源へ接続し、ほかのGPU・MPS処理を控えることを推奨
 
-`mioh-universal`にはMacに依存しないCore AIソースモデルが入っています。macOS 27では実行するMacに合わせてモデルが準備されます。macOS 26ではMPS版BasicVSR++とCore ML検出モデルを使用します。
+`mioh-universal`の配布DMGにはモデルの重みを同梱していません。アプリをインストールした後、同梱ツールで重みをダウンロード・変換します。macOS 27以降ではCore AIモデルも作成できます。macOS 26ではMPS版BasicVSR++とCore MLモデルを使用します。「Universal」はこのモデル導入方式の名称であり、Intel Mac対応を意味しません。
 
 ## 2. インストールと起動
 
-1. `mioh-universal-0.11.0-unsigned.dmg`を開きます。
+1. [miohのv0.14.3-014リリース](https://github.com/mioh-labs/mioh/releases/tag/v0.14.3-014)から`mioh-universal-0.14.3-014-unsigned.dmg`を入手します。
 2. `mioh-universal.app`を`Applications`へドラッグします。
-3. Applicationsフォルダからmiohを起動します。
-4. macOSが初回起動を確認した場合は、システム設定の「プライバシーとセキュリティ」で起動を許可します。
+3. 次節のモデルダウンロードと変換を完了します。
+4. Applicationsフォルダからmiohを起動します。
+5. macOSが初回起動を確認した場合は、入手元を確認してからシステム設定の「プライバシーとセキュリティ」で起動を許可します。
 
-この配布物は未署名ビルドです。入手元を確認したうえで使用してください。
+この配布物はApple Developer IDによる公証済み配布物ではなく、ビルド時にアドホック署名されています。入手元を確認したうえで使用してください。
+
+### 2.1 モデルのダウンロードとインストール
+
+ターミナルで次を順番に実行します。DMGを取り外した後でも、アプリに同梱されたスクリプトを実行できます。アプリを起動している場合は終了してから作業してください。
+
+```zsh
+APP=/Applications/mioh-universal.app
+TOOLS="$APP/Contents/Resources/model-tools"
+zsh "$TOOLS/download-mioh-models.zsh" --app "$APP"
+zsh "$TOOLS/convert-mioh-models.zsh" --app "$APP"
+```
+
+ダウンロードした重みと変換後のモデルは、どちらも`mioh-universal.app/Contents/Resources/models`に保存されます。ダウンロードは個々のSHA-256を照合し、失敗した項目を最後に一覧表示します。失敗した場合はネットワーク・空き容量・エラー内容を確認して、同じコマンドを再実行してください。正常な既存ファイルは再ダウンロードされません。
+
+標準の復元モデル、検出モデル、Real-ESRGAN x2/x4のみを取得する場合は、ダウンロードコマンドに`--minimal`を追加します。通常実行では、SwinIRやNomosなどの追加ROIエンハンサーも取得します。追加モデルも使いたい場合は`--minimal`を指定しないでください。
+
+macOS 26では変換コマンドが自動的にCore MLのみを作成します。macOS 27以降ではCore MLとCore AIの両方を作成します。目的を限定する場合は、変換コマンドに`--coreml-only`または`--coreai-only`を付けられます。Core AIの標準出力は持ち運べる`.aimodel`で、実行前に`.aimodelc`へコンパイルすることは必須ではありません。
+
+変換に使うPython 3.12と必要な変換スクリプトはアプリ内に同梱されています。古いリリースの`runtime`フォルダをコピーしないでください。モデルの変換には時間とディスク容量が必要です。処理中はスリープを避け、外付けディスクを使用している場合は取り外さないでください。
+
+### 2.2 モデル導入の確認とアプリ更新
+
+まず重みと変換結果の存在を確認します。macOS 26ではCore AIの2行は不要です。
+
+```zsh
+APP=/Applications/mioh-universal.app
+MODELS="$APP/Contents/Resources/models"
+test -s "$MODELS/lada_mosaic_restoration_model_generic_v1.2.pth"
+find "$MODELS" -maxdepth 1 -name '*.mlpackage' -print
+find "$MODELS" -maxdepth 1 -name '*.aimodel' -print
+find "$MODELS/basicvsrpp-v1.2-variable-coreai.aimodel" \
+  -maxdepth 1 -name '*.aimodel' -print
+```
+
+可変長BasicVSR++のCore AIコレクションは11個の`.aimodel`で構成されます。miohを起動し、「復元」「検出」タブのモデル一覧に変換済みモデルが表示されることを確認して、短い動画で試してください。ファイルの存在だけでは推論の成功までは確認できません。
+
+モデルはアプリの中にあるため、新しい`mioh-universal.app`でアプリを置き換えるとモデルも置き換わります。更新前に必要なモデルを別の場所へバックアップするか、更新後に上記2つのスクリプトを再実行してください。既存のモデルを新アプリへ移す場合も、必ず同じバージョンの変換ツールで動作を確認してください。
+
+### 2.3 ソースからmioh Universalをビルドする
+
+開発者向けの手順です。Apple Silicon Mac、XcodeとCommand Line Tools、`uv`、Python 3.12、十分な空き容量が必要です。macOS 26以降でアプリをビルドでき、Core AI変換・動作確認にはmacOS 27以降と対応するXcodeが必要です。以下はリポジトリのルートで実行します。
+
+```zsh
+cd /path/to/mioh
+xcodebuild -version
+xcrun --find swiftc
+uv python install 3.12
+uv venv .venv-coreai --python 3.12
+uv pip install --python .venv-coreai/bin/python \
+  -e '.[apple-coreml]' 'coreai-torch==0.4.2' \
+  'torch==2.11.0' 'torchvision==0.26.0'
+```
+
+既に`.venv-coreai`がある場合は作り直さず、`coreai`、`coremltools`、`torch`がその環境に入っていることを確認してください。ビルドスクリプトはこの環境と`uv`のPython 3.12をアプリへ同梱します。ほかの環境を使う場合は`LADA_STANDALONE_PYTHON_ENV`と`PYTHON_SOURCE`で指定できます。
+
+PDFを更新してからUniversalビルドを実行します。PDFがないとDMG作成は失敗します。
+
+```zsh
+uv run --no-project --python 3.12 --with reportlab \
+  scripts/docs/build_mioh_manual_pdf.py
+zsh packaging/macOS/standalone/build_universal_app.sh
+```
+
+成果物は`build/macos-standalone-universal/mioh-universal.app`と`build/macos-standalone-universal/mioh-universal-0.14.3-014-unsigned.dmg`です。ビルドはモデルなしの配布物を作成します。モデルを使うMacでは、アプリのインストール後に2.1節のダウンロード・変換を行ってください。ビルド用スクリプトはアプリ本体とCore AIヘルパーを別々のmacOSターゲット向けにコンパイルします。
+
+ビルド後は次を確認します。`hdiutil verify`の成功に加え、アプリ内のPythonと2本のモデルツールが存在することが重要です。
+
+```zsh
+APP=build/macos-standalone-universal/mioh-universal.app
+DMG=build/macos-standalone-universal/mioh-universal-0.14.3-014-unsigned.dmg
+test -x "$APP/Contents/Resources/runtime/bin/python3.12"
+test -f "$APP/Contents/Resources/model-tools/download-mioh-models.zsh"
+test -f "$APP/Contents/Resources/model-tools/convert-mioh-models.zsh"
+codesign --verify --deep --strict "$APP"
+hdiutil verify "$DMG"
+shasum -a 256 "$DMG"
+```
+
+リリース作成・公開まで行う場合は、`docs/mioh-universal-build-release-runbook.md`の追加検証と公開チェックリストも実施してください。この節はビルド手順であり、リリースへのアップロードは行いません。
 
 ## 3. 最短の使い方
 
@@ -73,8 +153,8 @@ miohは、動画内のモザイク領域を検出し、復元モデルで処理�
 
 | 項目 | 初期値 | 説明 |
 | --- | --- | --- |
-| 並列数 | 1 | 同時に処理するセグメント数です。値を増やすほどメモリを消費します。 |
-| 実行方式 | プロセス | 独立したPythonプロセスで処理します。 |
+| ネイティブ並列数 | 1 | 連続する時間バッチを1〜10レーンで処理します。レーン数を増やすほど復元モデルと中間フレームのメモリを消費します。 |
+| 実行方式 | Swiftネイティブ | デコードから書き出しまでSwiftネイティブ経路で処理します。 |
 | 分割方法 | 個数 | 分割数または1セグメントの秒数を指定します。 |
 | 分割数 | 4 | 動画全体を指定数に分けます。 |
 | 長さ | 60秒 | 秒数方式で使うセグメント長です。 |
@@ -83,7 +163,7 @@ miohは、動画内のモザイク領域を検出し、復元モデルで処理�
 | 一時ファイルを保持 | オン | 障害時の再開や調査に利用できます。 |
 | 強制的に再分割 | オフ | 既存セグメントを使わず、最初から分割し直します。 |
 
-M1などメモリの少ないMacでも、まず並列数1を推奨します。処理が安定している場合だけ増やしてください。Core AI T90モデルはメモリ保護のため並列数が自動的に1へ制限される場合があります。
+まずネイティブ並列数1を推奨します。処理が安定している場合だけ増やしてください。4〜10レーンは高メモリのMac向けです。スワップが増えた場合は並列数を下げてください。
 
 ## 6. 復元タブ - モデル
 
@@ -324,7 +404,11 @@ miohはファイル名、コンテナメタデータ、縦横比からVR180・36
 
 ### Core AIモデルを選べない
 
-Core AIモデルにはmacOS 27以降が必要です。macOS 26では`basicvsrpp-v1.2`とCore ML検出モデルを使用してください。
+Core AIモデルにはmacOS 27以降が必要です。macOS 26では`basicvsrpp-v1.2`とCore ML検出モデルを使用してください。macOS 27以降でも一覧に出ない場合は、2.1節の変換コマンドの終了コードと最後のエラーを確認し、2.2節のモデルファイルを確認してください。
+
+### ダウンロードや変換に失敗する
+
+モデル取得が失敗した場合は、ダウンロードスクリプトの最後に表示される失敗一覧を確認し、同じコマンドを再実行します。SHA-256不一致の場合はファイルを使わず再取得します。変換時に`missing packaged Python`が出た場合は、アプリ内の`Contents/Resources/runtime/bin/python3.12`を確認してください。古いアプリからruntimeだけを移植せず、正しいUniversal版をインストールし直します。macOS 26で`--coreai-only`を指定すると失敗します。
 
 ### メモリ不足・極端に遅い
 
@@ -362,7 +446,7 @@ ROIエンハンサー強度、テクスチャ、ディテール、シャープ�
 
 | 分類 | 初期値 |
 | --- | --- |
-| 並列 | 1プロセス、4分割 |
+| 並列 | ネイティブ1レーン、4分割 |
 | デバイス | MPS、FP16、自動最適化オン |
 | 復元 | 自動選択、最大クリップ長自動、Temporal overlap 8、クロスフェードオン |
 | 合成 | シャープ0、ディテール0、境界フェザー1、テクスチャ0、スムージング0、1x |
@@ -372,4 +456,4 @@ ROIエンハンサー強度、テクスチャ、ディテール、シャープ�
 | メモリ | 掃除間隔1、空き4GB、MPS比率0.46 |
 | 再生 | バッファ8秒、通常、SBS左右、左目、視野角60度 |
 
-本マニュアルはmioh 0.11.0の画面と実装を基準にしています。
+本マニュアルのインストール・ビルド・モデル導入手順はmioh-universal 0.14.3-014の配布スクリプトを基準にしています。画面項目は配布版や選択したモデルにより異なる場合があります。
