@@ -826,7 +826,25 @@ final class RestorationRunner: ObservableObject {
   @Published var progress = 0.0
   @Published var status = "待機中"
   @Published var log = ""
-  @Published var isRunning = false
+  @Published var isRunning = false {
+    didSet { updateExportActivity() }
+  }
+  /// While work runs, tell macOS it is user-initiated. Without this, App Nap
+  /// throttled mioh and the export processes it launches once the window left
+  /// the foreground: the same SwiftVR export took about 2.3x as long from the
+  /// app as from a shell (209-232 s vs 8-9 min).
+  private var exportActivity: NSObjectProtocol?
+
+  private func updateExportActivity() {
+    if isRunning, exportActivity == nil {
+      exportActivity = ProcessInfo.processInfo.beginActivity(
+        options: [.userInitiated, .idleSystemSleepDisabled],
+        reason: "mioh restoration or export")
+    } else if !isRunning, let activity = exportActivity {
+      ProcessInfo.processInfo.endActivity(activity)
+      exportActivity = nil
+    }
+  }
   @Published var defaultsStatus = "未保存"
 
   @Published var tempDirectory = "/tmp"
