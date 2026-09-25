@@ -928,7 +928,9 @@ final class RestorationRunner: ObservableObject {
   private var nativeExportMiohDirectoryURL: URL?
   private var nativeExportPreservesTemporaryFiles = false
   private var runningNativeExport = false
+  private var runningNativeSwiftVR = false
   private var nativeExportLastProgressBucket = -1
+  private var nativeExportLastSwiftVRBucket = -1
   private var nativeExportBatchPending: [MacNativeExportBatchItem] = []
   private var nativeExportBatchCurrent: MacNativeExportBatchItem?
   private var nativeExportBatchResources: URL?
@@ -1106,7 +1108,7 @@ final class RestorationRunner: ObservableObject {
       }
     }
   }
-  let enhancerModels = ["none", "realesrgan", "mewzoom", "swinir", "spandrel", "pipersr"]
+  let enhancerModels = ["none", "realesrgan", "mewzoom", "swinir", "spandrel", "pipersr", "swiftvr"]
   private let knownROIEnhancerModelNames: Set<String> = [
     "realesrgan-x2", "realesrgan-x2-coreai",
     "realesrgan-x4", "realesrgan-x4-coreml", "realesrgan-x4-coreai",
@@ -1133,6 +1135,8 @@ final class RestorationRunner: ObservableObject {
   ) -> [ROIEnhancerModelOption] {
     var options: [ROIEnhancerModelOption]
     switch enhancer {
+    case "swiftvr":
+      options = [] // The large local model pack is selected as a directory.
     case "pipersr":
       options = [
         ROIEnhancerModelOption(
@@ -1282,6 +1286,10 @@ final class RestorationRunner: ObservableObject {
     panel.allowsMultipleSelection = false
     guard panel.runModal() == .OK, let path = panel.url?.path else { return }
     roiEnhancerModel = path
+    if roiEnhancer == "swiftvr" {
+      roiEnhancerScale = 4
+      return
+    }
     let normalized = panel.url?.lastPathComponent.lowercased() ?? ""
     if normalized.contains("x2") || normalized.hasPrefix("2x") {
       roiEnhancerScale = 2
@@ -1342,6 +1350,7 @@ final class RestorationRunner: ObservableObject {
     activeProgress.removeAll()
     activeProgressOrder.removeAll()
     nativeExportLastProgressBucket = -1
+    nativeExportLastSwiftVRBucket = -1
     log = ""
     progress = 0
     nativeExportBatchPending = plan.items
@@ -1398,6 +1407,7 @@ final class RestorationRunner: ObservableObject {
     activeProgress.removeAll()
     activeProgressOrder.removeAll()
     nativeExportLastProgressBucket = -1
+    nativeExportLastSwiftVRBucket = -1
     lineBuffer = ""
     status = nativeExportBatchTotal > 1
       ? "バッチ \(itemIndex)/\(nativeExportBatchTotal) 準備中"
@@ -1562,7 +1572,12 @@ final class RestorationRunner: ObservableObject {
       self.processInput = nil
       try? processInput.fileHandleForWriting.close()
     }
-    process?.interrupt()
+    // The two-stage SwiftVR exporter owns a second child process. Let its
+    // control reader terminate that child cleanly rather than interrupting
+    // only the parent and leaving expensive inference orphaned.
+    if roiEnhancer != "swiftvr" || !runningNativeExport {
+      process?.interrupt()
+    }
     status = "停止中"
   }
 
@@ -1790,7 +1805,7 @@ final class RestorationRunner: ObservableObject {
         8
       ),
       detectFaceMosaics: detectFaceMosaics,
-      crossfade: restoreCrossfade,
+      crossfade: roiEnhancer == "swiftvr" ? false : restoreCrossfade,
       targetFPS: useFPS ? max(1, fps) : nil,
       targetFPSDenominator: useFPS ? max(1, fpsDenominator) : nil,
       preFPSConversion: preFPSConversion,
@@ -1826,6 +1841,9 @@ final class RestorationRunner: ObservableObject {
     nativeExportConfigurationURL = configurationURL
     nativeExportPreservesTemporaryFiles = keepTemp && !deleteSegments
     runningNativeExport = true
+    runningNativeSwiftVR = roiEnhancer == "swiftvr"
+      && configuration.roiEnhancerModel != nil
+      && configuration.roiEnhancerStrength > 0
     return (task, outputPipe, configuration)
   }
 
@@ -2809,6 +2827,12 @@ final class RestorationRunner: ObservableObject {
     let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return nil }
     let custom = URL(fileURLWithPath: trimmed)
+    if FileManager.default.fileExists(atPath: custom.appendingPathComponent(
+      "reae-stateful-encoder-28f-1024-fp32.mlpackage").path),
+      FileManager.default.fileExists(atPath: custom.appendingPathComponent(
+        "native-4x-t7-fp16/components/patch.mlpackage").path) {
+      return (custom, 4)
+    }
     if custom.isFileURL,
       FileManager.default.fileExists(atPath: custom.path),
       ["aimodel", "aimodelc", "mlpackage", "mlmodelc"].contains(
@@ -2925,6 +2949,7 @@ final class RestorationRunner: ObservableObject {
       nativeExportDirectoryURL = nil
       nativeExportPreservesTemporaryFiles = false
       runningNativeExport = false
+      runningNativeSwiftVR = false
       return
     }
     if let nativeExportFFmpegDirectoryURL {
@@ -2941,6 +2966,7 @@ final class RestorationRunner: ObservableObject {
     nativeExportDirectoryURL = nil
     nativeExportPreservesTemporaryFiles = false
     runningNativeExport = false
+    runningNativeSwiftVR = false
   }
 
   func revealOutput() {
@@ -3227,7 +3253,7 @@ final class RestorationRunner: ObservableObject {
     let selectedPreviewDetectionModel = previewDetectionModel
     try rejectUnsupportedCoreAIModel(selectedPreviewDetectionModel)
     let skipsCompositeParameters = previewRealtimeOptimization
-    let effectiveEnhancerStrength = skipsCompositeParameters
+    let effectiveEnhancerStrength = skipsCompositeParameters || roiEnhancer == "swiftvr"
       ? 0
       : roiEnhancerStrength
     let effectiveUpscale = skipsCompositeParameters ? 1 : effectUpscale
@@ -3472,7 +3498,7 @@ final class RestorationRunner: ObservableObject {
         return
       case "export_progress":
         if let percent = payload["percent"] as? Double {
-          setProgress(percent)
+          setProgress(runningNativeSwiftVR ? percent * 0.5 : percent)
           let bucket = Int(percent) / 5
           if bucket > nativeExportLastProgressBucket, bucket > 0 {
             nativeExportLastProgressBucket = bucket
@@ -3497,8 +3523,36 @@ final class RestorationRunner: ObservableObject {
         }
         return
       case "export_finalizing":
-        status = "音声を結合中"
-        appendLog("\n映像処理完了。音声を結合して出力を確定中...\n")
+        let message = payload["message"] as? String ?? "音声を結合しています"
+        status = message
+        appendLog("\n\(message)...\n")
+        return
+      case "swiftvr_progress":
+        let completed = payload["completed_frames"] as? Int ?? 0
+        let total = max(1, payload["total_frames"] as? Int ?? 1)
+        let completedUnits = payload["completed_units"] as? Int ?? completed
+        let totalUnits = max(1, payload["total_units"] as? Int ?? total)
+        let phase = payload["phase"] as? String ?? "preparing"
+        let scene = payload["scene_index"] as? Int ?? 0
+        let sceneCount = payload["scene_count"] as? Int ?? 0
+        let percent = Int((Double(completedUnits) / Double(totalUnits) * 100)
+          .rounded(.down))
+        setProgress(50 + 49 * Double(completedUnits) / Double(totalUnits))
+        switch phase {
+        case "inference":
+          status = "SwiftVR推論中 \(percent)%（ROI \(scene)/\(sceneCount)）"
+        case "compositing":
+          status = "SwiftVR合成中 \(percent)%"
+        case "muxing":
+          status = "SwiftVR映像と音声を結合中"
+        default:
+          status = "SwiftVR二次処理を準備中"
+        }
+        let bucket = percent / 5
+        if bucket > nativeExportLastSwiftVRBucket || phase == "muxing" {
+          nativeExportLastSwiftVRBucket = bucket
+          appendLog("SwiftVR: \(status) | \(completed)/\(total)フレーム\n")
+        }
         return
       case "segment":
         return
@@ -4094,6 +4148,11 @@ struct ContentView: View {
           ForEach(runner.enhancerModels, id: \.self) { Text($0).tag($0) }
         }
         if runner.roiEnhancer != "none" {
+          if runner.roiEnhancer == "swiftvr" {
+            Text("書き出し専用。一次復元動画とROI情報を保存してからSwiftVRで最終動画を作ります。時間窓オーバーラップは維持し、クロスフェードはこの方式のみ無効です。モデルフォルダを選択してください。エキスパートROI復元との併用は未対応です。")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+          }
           if runner.roiEnhancer == "pipersr" {
             Text("PiperSR by Ben Racicot / ModelPiper。256px ROIを512pxへ復元し、その出力を直接貼り戻します（境界フェザーのみ維持）。単一フレーム型のため時間方向の復元は行いません。")
               .font(.caption)
@@ -4117,8 +4176,12 @@ struct ContentView: View {
             }
           }
         }
-        LabeledContent("倍率") { Stepper(value: $runner.roiEnhancerScale, in: 1...8) { Text("\(runner.roiEnhancerScale)x") } }
-          .disabled(runner.roiEnhancer == "none")
+        if runner.roiEnhancer == "swiftvr" {
+          LabeledContent("倍率") { Text("4x固定") }
+        } else {
+          LabeledContent("倍率") { Stepper(value: $runner.roiEnhancerScale, in: 1...8) { Text("\(runner.roiEnhancerScale)x") } }
+            .disabled(runner.roiEnhancer == "none")
+        }
         doubleSliderField("強度", value: $runner.roiEnhancerStrength, range: 0...1, step: 0.05).disabled(runner.roiEnhancer == "none")
         if runner.roiEnhancer == "pipersr" {
           LabeledContent("PiperSR反復") {
@@ -4130,7 +4193,9 @@ struct ContentView: View {
             .font(.caption)
             .foregroundStyle(.secondary)
         }
-        integerSliderField("タイル", value: $runner.roiEnhancerTile, range: 0...1024, step: 32).disabled(runner.roiEnhancer == "none")
+        if runner.roiEnhancer != "swiftvr" {
+          integerSliderField("タイル", value: $runner.roiEnhancerTile, range: 0...1024, step: 32).disabled(runner.roiEnhancer == "none")
+        }
       }
     }.formStyle(.grouped)
   }
