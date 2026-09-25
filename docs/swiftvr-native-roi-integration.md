@@ -1,40 +1,49 @@
-# SwiftVR native ROI integration — conversion gate
+# SwiftVR native ROI integration
 
-Status: two-stage native Swift/Core ML export passed one end-to-end MIDV-670
-clip in an isolated model-less app. The converted model pack remains external,
-and the installed `/Applications/mioh.app` is unchanged. Do not present this
-as a broadly validated or installed ROI enhancer.
+Status: one-step native Swift/Core ML export (2026-09-25) passed a 3-second
+MIDV-670 export, a mid-inference stop and a repeat run with identical output.
+The converted model pack remains external. Do not present this as a broadly
+validated ROI enhancer. The earlier visual evaluation
+(`/Volumes/Project_HD/swiftvr-eval/README-evaluation.md`) failed its
+face-restoration gate.
 
-## Intended runtime
+## Runtime (one step)
 
-- Conversion may use Python offline; playback/export inference must use Swift
-  and Apple model runtimes only. Do not embed the test virtual environment or
-  invoke PyTorch from mioh.
-- Complete the ordinary BasicVSR++ export first, saving the independently
-  playable `<name>.restored.mp4`. While restoring, persist each 256px FP16
-  scene, its detector/composite mask, ROI geometry and source PTS in
-  `<name>.swiftvr-roi/`. Write `manifest.json` only after the restored movie
-  has been finalized. Then launch the separate SwiftVR postprocess executable.
-- Keep temporal overlap for the first pass. Crossfade is disabled for this
-  export mode. The sidecar marks overlap-prefix frames that were used only as
-  temporal context, so the second pass does not composite them a second time.
-  Expert ROI is not yet supported.
-- Run SwiftVR in one export lane initially. Its 30-layer DiT is not a per-frame
-  model, and starting an independent copy per lane would multiply the model's
-  memory demand. Do not enable it for realtime playback until latency is
-  measured end to end.
-- Composite the 1024px SwiftVR output over the completed first-pass movie
-  using the saved 256px input as a difference base and the saved ROI mask.
-  The base movie is not modified. The final movie is encoded separately and
-  retains audio from the first-pass movie.
-- The second pass now infers scenes only when their first output frame is
-  reached, and deletes each high-resolution scene cache after its last frame
-  is composited. The 256px ROI inputs, masks, manifest and completed first-pass
-  movie remain for retry. Set `MIOH_SWIFTVR_KEEP_HIGH_CACHE=1` only when a
-  fast re-composite is needed for testing; this can consume substantial disk.
+- Conversion may use Python offline. Export inference uses Swift and Apple
+  model runtimes only. mioh never invokes PyTorch.
+- `NativeFrameProcessor.process` hands each restored BasicVSR++ scene (256px
+  planar FP16, after restore effects) to `SwiftVRSceneEnhancer`
+  (`SwiftVRInlineEnhancer.swift`). The enhancer sends it to one long-lived
+  `mioh-native-swiftvr-clip --serve` worker and composites every 1024px result
+  before encoding.
+  - Compositing uses the direct-replacement path shared with PiperSR:
+    `base + (SwiftVR - base) * strength * mask`.
+  - There is no sidecar, no second pass and no re-encode. The final movie is
+    the normal export.
+- Scene frames travel as temporary files under the export's working
+  directory. They are removed once the scene is composited, so disk use is
+  bounded by one scene (≤48 frames: about 19 MB in, 300 MB out).
+- Local export only, one lane, Expert ROI off. Crossfade stays available;
+  overlap frames are simply enhanced in both batches.
+- Stopping the export terminates the worker. The current scene finishes
+  without SwiftVR, and the export ends exactly like a stop without SwiftVR
+  (exit 0, no error event).
+- Worker progress lines go to stderr. This process's stdout carries mioh's
+  JSON event stream.
 - Keep checkpoint assets external to the app. The local checkpoint is about
   19 GiB; the converted FP16 T6/T7 packs occupy about 18.4 GiB and have not
   been approved for redistribution.
+
+One-step measurements (3 s MIDV-670 excerpt, 90 frames, M5 Pro):
+- Time: 2.8 s without SwiftVR; 48.6–63.5 s with SwiftVR, including one-time
+  model loading.
+- The SwiftVR change is confined to the ROI: mean 3.6 levels inside, 0.27
+  outside. The two-stage re-encode had changed the outside by 1.35.
+- Stop: 2.1 s after the stop command, exit 0, no worker left. A repeat run was
+  bit-identical.
+
+The two-stage implementation (sidecar recorder, postprocess executable) was
+removed. It remains in branch history (commits 5ef75da..e83c08e).
 
 ## Evidence gathered on M5 Pro / macOS 27.2
 
@@ -86,8 +95,8 @@ or output sizes without additional variants or a validated dynamic export.
   per-run temporary cache was deleted after every export, so every export
   recompiled about 34 packages while the GPU sat idle.
 - One `mioh-native-swiftvr-clip --serve` worker handles every scene of an
-  export. It still receives scenes one at a time, over stdin, when their
-  first output frame is reached. This replaces a worker process per scene.
+  export, one scene at a time over stdin. This replaces a worker process per
+  scene.
 - Models load for each use; none stay resident. A loaded DiT block holds far
   more than its 312 MB of weights. Keeping the stack resident reached 42–63 GB
   and swapped, while on-demand loading ran a warm 49-frame scene in 16.7 s.
@@ -117,7 +126,7 @@ or output sizes without additional variants or a validated dynamic export.
     three layers) at equal accuracy.
 - If the worker dies mid-scene (one uncatchable Core ML
   "MPSGraph unexpected rank" abort was seen and did not reproduce), the
-  postprocess restarts it once and retries that scene.
+  enhancer restarts it once and retries that scene.
 - Still open: a scene shorter than 25 frames is padded to a full
   28-frame/7-latent chunk. A 4-frame scene costs the same 10.8 s as a
   25-frame one. Removing this needs smaller exported graph variants.

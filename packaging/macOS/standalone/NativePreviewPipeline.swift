@@ -3298,7 +3298,7 @@ private final class NativeFrameProcessor: @unchecked Sendable {
   private let sourceHeight: Int
   private let restorer: any NativeRestoring
   private let roiEnhancer: NativeROIEnhancer?
-  private let swiftVRRecorder: SwiftVRROISidecarRecorder?
+  private let swiftVR: SwiftVRSceneEnhancer?
   private let roiExpertMode: Bool
   private let blendFeather: Float
   private let effects: NativeRestoreEffects
@@ -3323,7 +3323,7 @@ private final class NativeFrameProcessor: @unchecked Sendable {
     height: Int,
     restorer: any NativeRestoring,
     roiEnhancer: NativeROIEnhancer?,
-    swiftVRRecorder: SwiftVRROISidecarRecorder?,
+    swiftVR: SwiftVRSceneEnhancer?,
     roiExpertMode: Bool,
     blendFeather: Float,
     effects: NativeRestoreEffects,
@@ -3334,7 +3334,7 @@ private final class NativeFrameProcessor: @unchecked Sendable {
     sourceHeight = height
     self.restorer = restorer
     self.roiEnhancer = roiEnhancer
-    self.swiftVRRecorder = swiftVRRecorder
+    self.swiftVR = swiftVR
     self.roiExpertMode = roiExpertMode
     self.blendFeather = max(0, blendFeather)
     self.effects = effects
@@ -3425,6 +3425,48 @@ private final class NativeFrameProcessor: @unchecked Sendable {
         try await restore(scene, outputSkipPrefix: skipPrefix)
       let restoredFrameElements =
         3 * restorationSize * restorationSize
+      // SwiftVR restores the whole scene temporally, then each 1024px frame
+      // replaces the BasicVSR++ ROI through the direct-replacement path:
+      // base + (SwiftVR - base) * strength * mask.
+      let enhancementStart = Date()
+      if let swiftVR, let sceneOutput = try await swiftVR.enhance(
+        restored: restored, frameCount: scene.frames.count)
+      {
+        defer { sceneOutput.remove() }
+        restorationSeconds += Date().timeIntervalSince(enhancementStart)
+        let compositionStart = Date()
+        for index in scene.frames.indices {
+          let offset = index * restoredFrameElements
+          let base = Array(restored[offset..<(offset + restoredFrameElements)])
+          let enhancedFrame = NativeEnhancerFrame(
+            output: NativeEnhancerOutput(
+              pixels: try sceneOutput.frame(index),
+              width: SwiftVRSceneEnhancer.outputSide,
+              height: SwiftVRSceneEnhancer.outputSide,
+              legacyLowResolution: nil
+            ),
+            lowResolution: base,
+            strength: swiftVR.strength,
+            directReplacement: true
+          )
+          let frameIndex = scene.frames[index].batchIndex
+          outputs[frameIndex] = try composite(
+            source: outputs[frameIndex],
+            restored: base,
+            enhancerBase: base,
+            restorationBase: base,
+            restoredOffset: 0,
+            geometry: geometries[index],
+            hardMask: masks[index],
+            plan: compositePlans[index],
+            enhancedFrame: enhancedFrame,
+            expertContext: expertContext,
+            expertFrameIndex: index
+          )
+        }
+        compositionSeconds += Date().timeIntervalSince(compositionStart)
+        continue
+      }
       if let roiEnhancer {
         guard let originalInput else {
           throw NativePreviewError.restorer(
@@ -3886,36 +3928,6 @@ private final class NativeFrameProcessor: @unchecked Sendable {
         cropMasks: hardMasks,
         effects: effects
       )
-    }
-    if let swiftVRRecorder {
-      let sceneFrames = scene.frames.indices.map { index -> SwiftVRROIFrameInput in
-        let geometry = geometries[index]
-        let planeCount = 3 * restorationSize * restorationSize
-        let offset = index * planeCount
-        let enhancerMask = Self.createEnhancerBlendMask(
-          hardMasks[index],
-          width: geometry.cropBox.width,
-          height: geometry.cropBox.height
-        )
-        let combinedMask = zip(
-          compositePlans[index].blendMask, enhancerMask
-        ).map { pair in pair.0 * pair.1 }
-        return SwiftVRROIFrameInput(
-          ptsNanoseconds: scene.frames[index].ptsNanoseconds,
-          outputEligible: scene.frames[index].batchIndex >= outputSkipPrefix,
-          pixels: Array(restored[offset..<(offset + planeCount)]),
-          mask: combinedMask,
-          cropLeft: geometry.cropBox.left,
-          cropTop: geometry.cropBox.top,
-          cropWidth: geometry.cropBox.width,
-          cropHeight: geometry.cropBox.height,
-          resizedWidth: geometry.resizedWidth,
-          resizedHeight: geometry.resizedHeight,
-          padLeft: geometry.padLeft,
-          padTop: geometry.padTop
-        )
-      }
-      try swiftVRRecorder.recordScene(sceneFrames)
     }
     return (
       restored,
@@ -6225,44 +6237,29 @@ private struct NativePreviewPipeline {
           return SwiftVRROIAssets.isRoot(url) ? url : nil
         }
       : nil
+    let swiftVR: SwiftVRSceneEnhancer?
     if let swiftVRAsset {
+      // SwiftVR takes seconds per scene, so it is offered for local exports
+      // only. Its direct replacement would discard the Expert ROI blend.
       guard config.isExport, !config.isWorker else {
         throw NativePreviewError.invalidConfiguration(
-          "SwiftVR two-stage enhancement requires a local export"
+          "SwiftVR ROI enhancement requires a local export"
         )
       }
-      guard config.crossfade != true,
-        config.roiExpertMode != true else {
+      guard config.roiExpertMode != true else {
         throw NativePreviewError.invalidConfiguration(
-          "SwiftVR two-stage export requires crossfade and Expert ROI to be off"
+          "SwiftVR ROI enhancement requires Expert ROI to be off"
         )
       }
-      try SwiftVRROIAssets.validate(swiftVRAsset)
-    }
-    let swiftVRRecorder: SwiftVRROISidecarRecorder?
-    if swiftVRAsset != nil {
-      guard let path = config.outputFile else {
-        throw NativePreviewError.invalidConfiguration(
-          "SwiftVR two-stage export requires outputFile"
-        )
-      }
-      let output = URL(fileURLWithPath: path)
-      let restored = output.deletingPathExtension()
-        .appendingPathExtension("restored")
-        .appendingPathExtension("mp4")
-      guard !FileManager.default.fileExists(atPath: output.path),
-        !FileManager.default.fileExists(atPath: restored.path) else {
-        throw NativePreviewError.invalidConfiguration(
-          "SwiftVR output or completed restoration already exists: \(output.path)"
-        )
-      }
-      let root = output.deletingPathExtension().appendingPathExtension(
-        "swiftvr-roi"
+      swiftVR = try SwiftVRSceneEnhancer(
+        model: swiftVRAsset,
+        strength: config.roiEnhancerStrength ?? 1,
+        workDirectory: URL(fileURLWithPath: config.outputDirectory, isDirectory: true)
       )
-      swiftVRRecorder = try SwiftVRROISidecarRecorder(root: root)
     } else {
-      swiftVRRecorder = nil
+      swiftVR = nil
     }
+    defer { swiftVR?.close() }
     let nativeParallelWorkers = swiftVRAsset != nil ? 1 : config.isExport && !config.isWorker
       ? min(max(config.nativeParallelWorkers ?? 1, 1), 10)
       : 1
@@ -6317,7 +6314,7 @@ private struct NativePreviewPipeline {
           height: video.height,
           restorer: restorer,
           roiEnhancer: roiEnhancer,
-          swiftVRRecorder: swiftVRRecorder,
+          swiftVR: swiftVR,
           roiExpertMode: config.roiExpertMode ?? false,
           blendFeather: config.blendFeather ?? 1,
           effects: restoreEffects,
@@ -6368,6 +6365,7 @@ private struct NativePreviewPipeline {
         : config.bufferLimitSeconds
     )
     let wallStart = Date()
+    swiftVR?.shouldStop = { control.shouldStop() }
     control.runReader()
     emit([
       "kind": "ready",
@@ -6541,7 +6539,6 @@ private struct NativePreviewPipeline {
           }
           return accepted && belongsToCoreOutput(frame.ptsNanoseconds)
         }
-        swiftVRRecorder?.appendOutputFrames(acceptedFrames.map(\.ptsNanoseconds))
         pendingEncoding = Task.detached(priority: .userInitiated) {
           var completedSegments: [SegmentEvent] = []
           var encodingNextSequence = startingSequence
@@ -6929,7 +6926,6 @@ private struct NativePreviewPipeline {
               if !accepted { continue }
             }
             guard belongsToCoreOutput(frame.ptsNanoseconds) else { continue }
-            swiftVRRecorder?.appendOutputFrames([frame.ptsNanoseconds])
             if let segment = try await writer.append(
               pixelBuffer: frame.pixelBuffer,
               ptsNanoseconds: frame.ptsNanoseconds
@@ -6956,10 +6952,6 @@ private struct NativePreviewPipeline {
             )
           }
           let finalOutput = URL(fileURLWithPath: outputFile)
-          let restoredOutput = swiftVRRecorder == nil ? finalOutput
-            : finalOutput.deletingPathExtension()
-              .appendingPathExtension("restored")
-              .appendingPathExtension("mp4")
           if config.isWorker {
             emit([
               "kind": "export_finalizing",
@@ -6993,118 +6985,16 @@ private struct NativePreviewPipeline {
             emit([
               "kind": "export_finalizing",
               "generation": config.generation,
-              "message": swiftVRRecorder == nil
-                ? "出力動画を確定しています"
-                : "一次復元動画を確定しています",
+              "message": "出力動画を確定しています",
             ])
             try NativeExportSupport.finishExport(
               segments: completedSegments,
               source: URL(fileURLWithPath: config.input),
-              output: restoredOutput,
+              output: finalOutput,
               ffmpeg: ffmpegURL,
               workingDirectory: ffmpegTemporaryDirectory,
               fastStart: config.mp4FastStart ?? false
             )
-            if let swiftVRRecorder, let swiftVRAsset {
-              _ = try swiftVRRecorder.finish(
-                restoredVideo: restoredOutput,
-                width: video.width, height: video.height,
-                fpsNumerator: outputFPSNumerator,
-                fpsDenominator: outputFPSDenominator
-              )
-              emit([
-                "kind": "export_finalizing",
-                "generation": config.generation,
-                "message": "一次復元を保存しました。SwiftVRでROIを二次処理しています",
-              ])
-              let progressURL = swiftVRRecorder.root.appendingPathComponent(
-                "postprocess-status.json")
-              try? FileManager.default.removeItem(at: progressURL)
-              let postprocess = Process()
-              postprocess.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
-                .deletingLastPathComponent()
-                .appendingPathComponent("mioh-native-swiftvr-roi-postprocess")
-              postprocess.arguments = [
-                swiftVRRecorder.root.path, swiftVRAsset.path,
-                finalOutput.path, String(config.roiEnhancerStrength ?? 1),
-                ffmpegURL.path,
-                URL(fileURLWithPath: CommandLine.arguments[0])
-                  .deletingLastPathComponent()
-                  .appendingPathComponent("mioh-native-swiftvr-clip").path,
-              ]
-              let logURL = swiftVRRecorder.root.appendingPathComponent(
-                "postprocess.log")
-              FileManager.default.createFile(atPath: logURL.path,
-                contents: nil)
-              let log = try FileHandle(forWritingTo: logURL)
-              postprocess.standardOutput = log
-              postprocess.standardError = log
-              defer { try? log.close() }
-              try postprocess.run()
-              var lastProgress = -1
-              var lastPhase = ""
-              var lastScene = -1
-              while postprocess.isRunning {
-                if control.shouldStop() {
-                  try Data("stop\n".utf8).write(
-                    to: swiftVRRecorder.root.appendingPathComponent(
-                      "stop-requested"), options: .atomic)
-                  postprocess.waitUntilExit()
-                  throw NativePreviewError.export(
-                    "SwiftVR二次処理を停止しました。一次復元動画とROI情報は保存済みです"
-                  )
-                }
-                if let data = try? Data(contentsOf: progressURL),
-                  let state = try? JSONSerialization.jsonObject(with: data)
-                    as? [String: Any] {
-                  let phase = state["phase"] as? String ?? "preparing"
-                  let completed = state["completed_frames"] as? Int ?? 0
-                  let total = max(1, state["total_frames"] as? Int ?? 1)
-                  let completedInference = state["completed_inference_frames"]
-                    as? Int ?? 0
-                  let totalInference = state["total_inference_frames"]
-                    as? Int ?? 0
-                  let scene = state["scene_index"] as? Int ?? 0
-                  let sceneCount = state["scene_count"] as? Int ?? 0
-                  let sceneFrames = state["scene_frames"] as? Int ?? 0
-                  var inferred = 0
-                  if phase == "inference",
-                    let folder = state["scene_output"] as? String,
-                    let names = try? FileManager.default.contentsOfDirectory(
-                      atPath: folder) {
-                    inferred = min(sceneFrames,
-                      names.filter { $0.hasSuffix(".f16") }.count)
-                  }
-                  let displayed = min(total, completed + inferred)
-                  let workCompleted = min(total + totalInference,
-                    completed + completedInference + inferred)
-                  let workTotal = max(1, total + totalInference)
-                  if displayed != lastProgress || phase != lastPhase
-                    || scene != lastScene {
-                    emit([
-                      "kind": "swiftvr_progress",
-                      "generation": config.generation,
-                      "phase": phase,
-                      "completed_frames": completed,
-                      "total_frames": total,
-                      "completed_units": workCompleted,
-                      "total_units": workTotal,
-                      "scene_index": scene,
-                      "scene_count": sceneCount,
-                    ])
-                    lastProgress = displayed
-                    lastPhase = phase
-                    lastScene = scene
-                  }
-                }
-                try await Task.sleep(for: .milliseconds(500))
-              }
-              guard postprocess.terminationStatus == 0 else {
-                throw NativePreviewError.export(
-                  "SwiftVR二次処理に失敗しました。一次復元動画とROI情報は保存済みです。ログ: \(logURL.path)"
-                )
-              }
-            }
           }
         }
         let elapsed = max(0.001, Date().timeIntervalSince(wallStart))
