@@ -541,7 +541,6 @@ private final class MacHLSCaptureSegmentWriter {
   private var fileSequence = 0
   private var segmentStartNanoseconds: Int64?
   private var lastPTS: Int64?
-  private var framesInSegment = 0
   private var writer: AVAssetWriter?
   private var pixelBufferReceiver: AVAssetWriterInput.PixelBufferReceiver?
   private var workingURL: URL?
@@ -590,9 +589,18 @@ private final class MacHLSCaptureSegmentWriter {
       )
     }
     try Task.checkCancellation()
+    guard let segmentStart = segmentStartNanoseconds else {
+      throw MacHLSAVFoundationCapture.CaptureError.encoder(
+        "一時映像の開始時刻がありません"
+      )
+    }
+    // Keep each frame at its captured time. Numbering frames at a nominal rate
+    // shortened a segment by every frame the capture loop missed, while its
+    // audio and timeline stayed two seconds long: audio was cut at every
+    // segment boundary and motion ran fast.
     let presentationTime = CMTime(
-      value: Int64(framesInSegment * fpsDenominator),
-      timescale: Int32(fpsNumerator)
+      value: ptsNanoseconds - segmentStart,
+      timescale: 1_000_000_000
     )
     do {
       try await receiver.append(
@@ -604,7 +612,6 @@ private final class MacHLSCaptureSegmentWriter {
         "フレームを書き込めません: \(error.localizedDescription)"
       )
     }
-    framesInSegment += 1
     lastPTS = ptsNanoseconds
     return completed
   }
@@ -677,7 +684,6 @@ private final class MacHLSCaptureSegmentWriter {
     workingURL = working
     finalURL = final
     segmentStartNanoseconds = startNanoseconds
-    framesInSegment = 0
   }
 
   private func close(endNanoseconds: Int64) async throws -> Output {
@@ -690,6 +696,12 @@ private final class MacHLSCaptureSegmentWriter {
       )
     }
     receiver.finish()
+    // The last frame lasts until the segment's end, so the file spans exactly
+    // [start, end) like the timeline it is placed on.
+    writer.endSession(atSourceTime: CMTime(
+      value: max(1, endNanoseconds - start),
+      timescale: 1_000_000_000
+    ))
     await writer.finishWriting()
     guard writer.status == .completed else {
       throw MacHLSAVFoundationCapture.CaptureError.encoder(
@@ -714,6 +726,5 @@ private final class MacHLSCaptureSegmentWriter {
     finalURL = nil
     segmentStartNanoseconds = nil
     lastPTS = nil
-    framesInSegment = 0
   }
 }
