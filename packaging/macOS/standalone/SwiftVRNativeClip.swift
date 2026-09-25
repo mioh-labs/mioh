@@ -145,9 +145,7 @@ private func contiguous(_ value: MLMultiArray, shape: [Int]) throws -> MLMultiAr
   return result
 }
 
-private func predictFeatures(
-  _ package: URL, values: [String: Any]
-) throws -> MLFeatureProvider {
+private func compiledURL(for package: URL) throws -> URL {
   let compiled: URL
   if let cached = compiledModels[package] {
     compiled = cached
@@ -174,12 +172,45 @@ private func predictFeatures(
     compiled = try MLModel.compileModel(at: package)
     compiledModels[package] = compiled
   }
+  return compiled
+}
+
+private func loadModel(compiled: URL) throws -> MLModel {
   let configuration = MLModelConfiguration()
   configuration.computeUnits = .all
-  let model = try MLModel(contentsOf: compiled, configuration: configuration)
-  return try model.prediction(
-    from: MLDictionaryFeatureProvider(dictionary: values)
-  )
+  return try MLModel(contentsOf: compiled, configuration: configuration)
+}
+
+private func predictFeatures(
+  _ package: URL, values: [String: Any]
+) throws -> MLFeatureProvider {
+  try predictFeatures(loadModel(compiled: compiledURL(for: package)), values: values)
+}
+
+private func predictFeatures(
+  _ model: MLModel, values: [String: Any]
+) throws -> MLFeatureProvider {
+  try model.prediction(from: MLDictionaryFeatureProvider(dictionary: values))
+}
+
+/// Loads a model on another thread. Loading a DiT block takes longer than
+/// running it and uses the CPU, so the next block loads while the current one
+/// runs on the GPU. At most two blocks are alive at once.
+private final class PendingModel: @unchecked Sendable {
+  private let finished = DispatchSemaphore(value: 0)
+  private var result: Result<MLModel, Error>?
+
+  init(compiled: URL) {
+    DispatchQueue.global(qos: .userInitiated).async {
+      self.result = Result { try autoreleasepool { try loadModel(compiled: compiled) } }
+      self.finished.signal()
+    }
+  }
+
+  func wait() throws -> MLModel {
+    finished.wait()
+    return try result!.get()
+  }
 }
 
 private func feature(
@@ -244,8 +275,6 @@ private func imagePixels(_ url: URL) throws -> [UInt8] {
 private func inputFrames(
   _ folder: URL, start: Int, validCount: Int, paddedCount: Int
 ) throws -> MLMultiArray {
-  let result = try array([1, paddedCount, 3, outputSize, outputSize])
-  let destination = result.dataPointer.assumingMemoryBound(to: Float.self)
   let allFiles = try FileManager.default.contentsOfDirectory(
     at: folder, includingPropertiesForKeys: nil
   )
@@ -260,60 +289,79 @@ private func inputFrames(
     throw ClipError.invalid("Input PNG range is unavailable")
   }
   let plane = outputSize * outputSize
-  for frame in 0..<paddedCount {
-    let frameURL = files[min(start + min(frame, validCount - 1), files.count - 1)]
-    let pixels = usesRawInput ? nil : try imagePixels(frameURL)
-    let rawPixels: [Float16]?
-    if usesRawInput {
-      let data = try Data(contentsOf: frameURL)
-      guard data.count == 3 * inputSize * inputSize * MemoryLayout<Float16>.size else {
-        throw ClipError.invalid("Invalid planar FP16 input: \(frameURL.path)")
-      }
-      rawPixels = data.withUnsafeBytes { Array($0.bindMemory(to: Float16.self)) }
-    } else {
-      rawPixels = nil
-    }
-    for y in 0..<outputSize {
-      let sourceY = max(0, min(Float(inputSize - 1),
-        (Float(y) + 0.5) * Float(inputSize) / Float(outputSize) - 0.5))
-      let y0 = Int(sourceY)
-      let y1 = min(inputSize - 1, y0 + 1)
-      let wy = sourceY - Float(y0)
-      for x in 0..<outputSize {
-        let sourceX = max(0, min(Float(inputSize - 1),
-          (Float(x) + 0.5) * Float(inputSize) / Float(outputSize) - 0.5))
-        let x0 = Int(sourceX)
-        let x1 = min(inputSize - 1, x0 + 1)
-        let wx = sourceX - Float(x0)
-        for channel in 0..<3 {
-          let a: Float
-          let b: Float
-          let c: Float
-          let d: Float
-          if let rawPixels {
-            let base = channel * inputSize * inputSize
-            a = Float(rawPixels[base + y0 * inputSize + x0])
-            b = Float(rawPixels[base + y0 * inputSize + x1])
-            c = Float(rawPixels[base + y1 * inputSize + x0])
-            d = Float(rawPixels[base + y1 * inputSize + x1])
-          } else if let pixels {
-            a = Float(pixels[(y0 * inputSize + x0) * 4 + channel]) / 255
-            b = Float(pixels[(y0 * inputSize + x1) * 4 + channel]) / 255
-            c = Float(pixels[(y1 * inputSize + x0) * 4 + channel]) / 255
-            d = Float(pixels[(y1 * inputSize + x1) * 4 + channel]) / 255
-          } else {
-            throw ClipError.invalid("Missing input frame pixels")
-          }
-          let upper = a * (1 - wx) + b * wx
-          let lower = c * (1 - wx) + d * wx
-          destination[(frame * 3 + channel) * plane + y * outputSize + x] =
-            upper * (1 - wy) + lower * wy
+  let inputPlane = inputSize * inputSize
+  // Decode every frame to planar Float, then upscale 4x. Frames are
+  // independent and write disjoint output planes, so both steps run in parallel.
+  var sources = [[Float]](repeating: [], count: paddedCount)
+  var readFailures = [Error?](repeating: nil, count: paddedCount)
+  sources.withUnsafeMutableBufferPointer { output in
+    readFailures.withUnsafeMutableBufferPointer { failure in
+      DispatchQueue.concurrentPerform(iterations: paddedCount) { frame in
+        do {
+          let frameURL = files[min(start + min(frame, validCount - 1), files.count - 1)]
+          output[frame] = try planarSource(frameURL, raw: usesRawInput)
+        } catch {
+          failure[frame] = error
         }
       }
     }
-    print("Prepared frame \(frame)")
   }
+  if let failure = readFailures.lazy.compactMap({ $0 }).first { throw failure }
+  // Half-pixel-centred bilinear taps are identical for every row, column,
+  // channel and frame, so compute them once. A Metal version was measured
+  // slower (0.06-0.08 s vs 0.03 s per chunk) because of buffer setup.
+  let result = try array([1, paddedCount, 3, outputSize, outputSize])
+  let destination = result.dataPointer.assumingMemoryBound(to: Float.self)
+  let taps = (0..<outputSize).map { index -> (Int, Int, Float) in
+    let position = max(0, min(Float(inputSize - 1),
+      (Float(index) + 0.5) * Float(inputSize) / Float(outputSize) - 0.5))
+    let lower = Int(position)
+    return (lower, min(inputSize - 1, lower + 1), position - Float(lower))
+  }
+  DispatchQueue.concurrentPerform(iterations: paddedCount) { frame in
+    let source = sources[frame]
+    for channel in 0..<3 {
+      let base = channel * inputPlane
+      let target = destination + (frame * 3 + channel) * plane
+      for y in 0..<outputSize {
+        let (y0, y1, wy) = taps[y]
+        let upperRow = base + y0 * inputSize
+        let lowerRow = base + y1 * inputSize
+        for x in 0..<outputSize {
+          let (x0, x1, wx) = taps[x]
+          let upper = source[upperRow + x0] * (1 - wx) + source[upperRow + x1] * wx
+          let lower = source[lowerRow + x0] * (1 - wx) + source[lowerRow + x1] * wx
+          target[y * outputSize + x] = upper * (1 - wy) + lower * wy
+        }
+      }
+    }
+  }
+  print("Prepared \(paddedCount) frames")
   return result
+}
+
+/// One input frame as planar RGB Float in [0, 1].
+private func planarSource(_ url: URL, raw: Bool) throws -> [Float] {
+  let inputPlane = inputSize * inputSize
+  var source = [Float](repeating: 0, count: 3 * inputPlane)
+  if raw {
+    let data = try Data(contentsOf: url)
+    guard data.count == 3 * inputPlane * MemoryLayout<Float16>.size else {
+      throw ClipError.invalid("Invalid planar FP16 input: \(url.path)")
+    }
+    data.withUnsafeBytes { bytes in
+      let values = bytes.bindMemory(to: Float16.self)
+      for index in 0..<(3 * inputPlane) { source[index] = Float(values[index]) }
+    }
+  } else {
+    let pixels = try imagePixels(url)
+    for channel in 0..<3 {
+      for index in 0..<inputPlane {
+        source[channel * inputPlane + index] = Float(pixels[index * 4 + channel]) / 255
+      }
+    }
+  }
+  return source
 }
 
 private func zeroStates(_ sizes: [[Int]]) throws -> [String: Any] {
@@ -490,13 +538,22 @@ private func denoise(
     "sine": try rotary(components, axis: "sine", temporalOffset: temporalOffset,
       latentCount: ditCount),
   ]
-  for layer in 0..<30 {
-    let name = String(format: "dit-block-%02d-%@-4x-float16.mlpackage", layer, shapeName)
+  let blocks = try (0..<30).map { layer in
+    try compiledURL(for: variant.appendingPathComponent(String(
+      format: "dit-block-%02d-%@-4x-float16.mlpackage", layer, shapeName)))
+  }
+  var pending = PendingModel(compiled: blocks[0])
+  for layer in blocks.indices {
+    let model = try pending.wait()
+    if layer + 1 < blocks.count {
+      pending = PendingModel(compiled: blocks[layer + 1])
+    }
     var inputs = conditions
     inputs["hidden"] = hidden
     hidden = try pooled {
       try contiguous(
-        predict(variant.appendingPathComponent(name), values: inputs, output: "output"),
+        feature(predictFeatures(model, values: inputs), name: "output",
+          source: blocks[layer]),
         shape: [1, tokens, 3072]
       )
     }
