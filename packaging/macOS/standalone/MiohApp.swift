@@ -1106,7 +1106,7 @@ final class RestorationRunner: ObservableObject {
       }
     }
   }
-  let enhancerModels = ["none", "realesrgan", "mewzoom", "swinir", "spandrel", "pipersr"]
+  let enhancerModels = ["none", "realesrgan", "mewzoom", "swinir", "spandrel", "pipersr", "swiftvr"]
   private let knownROIEnhancerModelNames: Set<String> = [
     "realesrgan-x2", "realesrgan-x2-coreai",
     "realesrgan-x4", "realesrgan-x4-coreml", "realesrgan-x4-coreai",
@@ -1133,6 +1133,8 @@ final class RestorationRunner: ObservableObject {
   ) -> [ROIEnhancerModelOption] {
     var options: [ROIEnhancerModelOption]
     switch enhancer {
+    case "swiftvr":
+      options = [] // The large local model pack is selected as a directory.
     case "pipersr":
       options = [
         ROIEnhancerModelOption(
@@ -1282,6 +1284,10 @@ final class RestorationRunner: ObservableObject {
     panel.allowsMultipleSelection = false
     guard panel.runModal() == .OK, let path = panel.url?.path else { return }
     roiEnhancerModel = path
+    if roiEnhancer == "swiftvr" {
+      roiEnhancerScale = 4
+      return
+    }
     let normalized = panel.url?.lastPathComponent.lowercased() ?? ""
     if normalized.contains("x2") || normalized.hasPrefix("2x") {
       roiEnhancerScale = 2
@@ -1562,7 +1568,12 @@ final class RestorationRunner: ObservableObject {
       self.processInput = nil
       try? processInput.fileHandleForWriting.close()
     }
-    process?.interrupt()
+    // A SwiftVR export owns a long-lived inference worker. Let the export's
+    // control reader stop that child cleanly rather than interrupting only
+    // the parent and leaving expensive inference orphaned.
+    if roiEnhancer != "swiftvr" || !runningNativeExport {
+      process?.interrupt()
+    }
     status = "停止中"
   }
 
@@ -2809,6 +2820,12 @@ final class RestorationRunner: ObservableObject {
     let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return nil }
     let custom = URL(fileURLWithPath: trimmed)
+    if FileManager.default.fileExists(atPath: custom.appendingPathComponent(
+      "reae-stateful-encoder-28f-1024-fp32.mlpackage").path),
+      FileManager.default.fileExists(atPath: custom.appendingPathComponent(
+        "native-4x-t7-fp16/components/patch.mlpackage").path) {
+      return (custom, 4)
+    }
     if custom.isFileURL,
       FileManager.default.fileExists(atPath: custom.path),
       ["aimodel", "aimodelc", "mlpackage", "mlmodelc"].contains(
@@ -3227,7 +3244,7 @@ final class RestorationRunner: ObservableObject {
     let selectedPreviewDetectionModel = previewDetectionModel
     try rejectUnsupportedCoreAIModel(selectedPreviewDetectionModel)
     let skipsCompositeParameters = previewRealtimeOptimization
-    let effectiveEnhancerStrength = skipsCompositeParameters
+    let effectiveEnhancerStrength = skipsCompositeParameters || roiEnhancer == "swiftvr"
       ? 0
       : roiEnhancerStrength
     let effectiveUpscale = skipsCompositeParameters ? 1 : effectUpscale
@@ -3497,8 +3514,9 @@ final class RestorationRunner: ObservableObject {
         }
         return
       case "export_finalizing":
-        status = "音声を結合中"
-        appendLog("\n映像処理完了。音声を結合して出力を確定中...\n")
+        let message = payload["message"] as? String ?? "音声を結合しています"
+        status = message
+        appendLog("\n\(message)...\n")
         return
       case "segment":
         return
@@ -4094,6 +4112,11 @@ struct ContentView: View {
           ForEach(runner.enhancerModels, id: \.self) { Text($0).tag($0) }
         }
         if runner.roiEnhancer != "none" {
+          if runner.roiEnhancer == "swiftvr" {
+            Text("書き出し専用。BasicVSR++で復元した各シーンをその場でSwiftVRにかけて合成します（1シーン数秒〜十数秒）。モデルフォルダを選択してください。エキスパートROI復元との併用は未対応です。")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+          }
           if runner.roiEnhancer == "pipersr" {
             Text("PiperSR by Ben Racicot / ModelPiper。256px ROIを512pxへ復元し、その出力を直接貼り戻します（境界フェザーのみ維持）。単一フレーム型のため時間方向の復元は行いません。")
               .font(.caption)
@@ -4117,8 +4140,12 @@ struct ContentView: View {
             }
           }
         }
-        LabeledContent("倍率") { Stepper(value: $runner.roiEnhancerScale, in: 1...8) { Text("\(runner.roiEnhancerScale)x") } }
-          .disabled(runner.roiEnhancer == "none")
+        if runner.roiEnhancer == "swiftvr" {
+          LabeledContent("倍率") { Text("4x固定") }
+        } else {
+          LabeledContent("倍率") { Stepper(value: $runner.roiEnhancerScale, in: 1...8) { Text("\(runner.roiEnhancerScale)x") } }
+            .disabled(runner.roiEnhancer == "none")
+        }
         doubleSliderField("強度", value: $runner.roiEnhancerStrength, range: 0...1, step: 0.05).disabled(runner.roiEnhancer == "none")
         if runner.roiEnhancer == "pipersr" {
           LabeledContent("PiperSR反復") {
@@ -4130,7 +4157,9 @@ struct ContentView: View {
             .font(.caption)
             .foregroundStyle(.secondary)
         }
-        integerSliderField("タイル", value: $runner.roiEnhancerTile, range: 0...1024, step: 32).disabled(runner.roiEnhancer == "none")
+        if runner.roiEnhancer != "swiftvr" {
+          integerSliderField("タイル", value: $runner.roiEnhancerTile, range: 0...1024, step: 32).disabled(runner.roiEnhancer == "none")
+        }
       }
     }.formStyle(.grouped)
   }

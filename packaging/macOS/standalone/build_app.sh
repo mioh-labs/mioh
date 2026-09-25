@@ -146,8 +146,18 @@ xcrun swiftc \
   "$ROOT/packages/MiohRemoteKit/Sources/MiohRemoteKit/MiohHTTPRangeAsset.swift" \
   "$PACKAGE_DIR/MacChildProcessPipe.swift" \
   "$PACKAGE_DIR/PreviewVideoToolboxEncoder.swift" \
+  "$PACKAGE_DIR/SwiftVRInlineEnhancer.swift" \
   "$PACKAGE_DIR/NativePreviewPipeline.swift" \
   -o "$RESOURCES/bin/mioh-native-coreai-preview"
+xcrun swiftc \
+  "${SWIFT_SUBPROCESS_FLAGS[@]}" \
+  -O \
+  -parse-as-library \
+  -target arm64-apple-macosx27.0 \
+  -framework CoreML \
+  -framework ImageIO \
+  "$PACKAGE_DIR/SwiftVRNativeClip.swift" \
+  -o "$RESOURCES/bin/mioh-native-swiftvr-clip"
 xcrun swiftc \
   "${SWIFT_SUBPROCESS_FLAGS[@]}" \
   -O \
@@ -938,6 +948,11 @@ if [[ "$MIOH_BUNDLE_PYTHON_RUNTIME" == 1 ]]; then
 fi
 
 codesign --force --deep --sign - "$APP"
+
+if [[ "${MIOH_SKIP_DMG:-0}" == 1 ]]; then
+  print "App: $APP"
+  exit 0
+fi
 
 DMG_ROOT="$BUILD_DIR/dmg-root"
 rm -f "$DMG"

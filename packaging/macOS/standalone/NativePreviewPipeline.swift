@@ -2560,6 +2560,7 @@ private final class FixedRestorerBridge: NativeRestoring, @unchecked Sendable {
 private struct NativeSceneFrame: @unchecked Sendable {
   let batchIndex: Int
   let source: CVPixelBuffer
+  let ptsNanoseconds: Int64
   var box: IntBox
   var detections: [Detection]
 }
@@ -2573,6 +2574,7 @@ private struct NativeScene: @unchecked Sendable {
   mutating func add(
     batchIndex: Int,
     source: CVPixelBuffer,
+    ptsNanoseconds: Int64,
     detection: Detection
   ) {
     let box = IntBox(
@@ -2589,6 +2591,7 @@ private struct NativeScene: @unchecked Sendable {
         NativeSceneFrame(
           batchIndex: batchIndex,
           source: source,
+          ptsNanoseconds: ptsNanoseconds,
           box: box,
           detections: [detection]
         )
@@ -3295,6 +3298,7 @@ private final class NativeFrameProcessor: @unchecked Sendable {
   private let sourceHeight: Int
   private let restorer: any NativeRestoring
   private let roiEnhancer: NativeROIEnhancer?
+  private let swiftVR: SwiftVRSceneEnhancer?
   private let roiExpertMode: Bool
   private let blendFeather: Float
   private let effects: NativeRestoreEffects
@@ -3319,6 +3323,7 @@ private final class NativeFrameProcessor: @unchecked Sendable {
     height: Int,
     restorer: any NativeRestoring,
     roiEnhancer: NativeROIEnhancer?,
+    swiftVR: SwiftVRSceneEnhancer?,
     roiExpertMode: Bool,
     blendFeather: Float,
     effects: NativeRestoreEffects,
@@ -3329,6 +3334,7 @@ private final class NativeFrameProcessor: @unchecked Sendable {
     sourceHeight = height
     self.restorer = restorer
     self.roiEnhancer = roiEnhancer
+    self.swiftVR = swiftVR
     self.roiExpertMode = roiExpertMode
     self.blendFeather = max(0, blendFeather)
     self.effects = effects
@@ -3403,7 +3409,8 @@ private final class NativeFrameProcessor: @unchecked Sendable {
     return pool
   }
 
-  func process(_ detected: [DetectedFrame]) async throws -> [CVPixelBuffer] {
+  func process(_ detected: [DetectedFrame], skipPrefix: Int = 0)
+    async throws -> [CVPixelBuffer] {
     guard !detected.isEmpty else { return [] }
     var outputs = detected.map { $0.frame.pixelBuffer }
     let scenes = trackScenes(detected)
@@ -3415,9 +3422,51 @@ private final class NativeFrameProcessor: @unchecked Sendable {
         restored, originalInput, geometries, masks, compositePlans,
         expertContext
       ) =
-        try await restore(scene)
+        try await restore(scene, outputSkipPrefix: skipPrefix)
       let restoredFrameElements =
         3 * restorationSize * restorationSize
+      // SwiftVR restores the whole scene temporally, then each 1024px frame
+      // replaces the BasicVSR++ ROI through the direct-replacement path:
+      // base + (SwiftVR - base) * strength * mask.
+      let enhancementStart = Date()
+      if let swiftVR, let sceneOutput = try await swiftVR.enhance(
+        restored: restored, frameCount: scene.frames.count)
+      {
+        defer { sceneOutput.remove() }
+        restorationSeconds += Date().timeIntervalSince(enhancementStart)
+        let compositionStart = Date()
+        for index in scene.frames.indices {
+          let offset = index * restoredFrameElements
+          let base = Array(restored[offset..<(offset + restoredFrameElements)])
+          let enhancedFrame = NativeEnhancerFrame(
+            output: NativeEnhancerOutput(
+              pixels: try sceneOutput.frame(index),
+              width: SwiftVRSceneEnhancer.outputSide,
+              height: SwiftVRSceneEnhancer.outputSide,
+              legacyLowResolution: nil
+            ),
+            lowResolution: base,
+            strength: swiftVR.strength,
+            directReplacement: true
+          )
+          let frameIndex = scene.frames[index].batchIndex
+          outputs[frameIndex] = try composite(
+            source: outputs[frameIndex],
+            restored: base,
+            enhancerBase: base,
+            restorationBase: base,
+            restoredOffset: 0,
+            geometry: geometries[index],
+            hardMask: masks[index],
+            plan: compositePlans[index],
+            enhancedFrame: enhancedFrame,
+            expertContext: expertContext,
+            expertFrameIndex: index
+          )
+        }
+        compositionSeconds += Date().timeIntervalSince(compositionStart)
+        continue
+      }
       if let roiEnhancer {
         guard let originalInput else {
           throw NativePreviewError.restorer(
@@ -3593,6 +3642,7 @@ private final class NativeFrameProcessor: @unchecked Sendable {
           scenes[matchingIndex].add(
             batchIndex: frameIndex,
             source: item.frame.pixelBuffer,
+            ptsNanoseconds: item.frame.ptsNanoseconds,
             detection: detection
           )
         } else {
@@ -3600,6 +3650,7 @@ private final class NativeFrameProcessor: @unchecked Sendable {
           scene.add(
             batchIndex: frameIndex,
             source: item.frame.pixelBuffer,
+            ptsNanoseconds: item.frame.ptsNanoseconds,
             detection: detection
           )
           scenes.append(scene)
@@ -3610,7 +3661,8 @@ private final class NativeFrameProcessor: @unchecked Sendable {
   }
 
   private func restore(
-    _ scene: NativeScene
+    _ scene: NativeScene,
+    outputSkipPrefix: Int
   ) async throws -> (
     [Float16], [Float16]?, [NativeClipGeometry], [[Float]],
     [NativeCompositePlan], NativeExpertROIContext?
@@ -6179,7 +6231,36 @@ private struct NativePreviewPipeline {
         computeUnits: config.detectionComputeUnits
       )
     }
-    let nativeParallelWorkers = config.isExport && !config.isWorker
+    let swiftVRAsset: URL? = (config.roiEnhancerStrength ?? 0) > 0
+      ? config.roiEnhancerModel.flatMap { path in
+          let url = URL(fileURLWithPath: path)
+          return SwiftVRROIAssets.isRoot(url) ? url : nil
+        }
+      : nil
+    let swiftVR: SwiftVRSceneEnhancer?
+    if let swiftVRAsset {
+      // SwiftVR takes seconds per scene, so it is offered for local exports
+      // only. Its direct replacement would discard the Expert ROI blend.
+      guard config.isExport, !config.isWorker else {
+        throw NativePreviewError.invalidConfiguration(
+          "SwiftVR ROI enhancement requires a local export"
+        )
+      }
+      guard config.roiExpertMode != true else {
+        throw NativePreviewError.invalidConfiguration(
+          "SwiftVR ROI enhancement requires Expert ROI to be off"
+        )
+      }
+      swiftVR = try SwiftVRSceneEnhancer(
+        model: swiftVRAsset,
+        strength: config.roiEnhancerStrength ?? 1,
+        workDirectory: URL(fileURLWithPath: config.outputDirectory, isDirectory: true)
+      )
+    } else {
+      swiftVR = nil
+    }
+    defer { swiftVR?.close() }
+    let nativeParallelWorkers = swiftVRAsset != nil ? 1 : config.isExport && !config.isWorker
       ? min(max(config.nativeParallelWorkers ?? 1, 1), 10)
       : 1
     let restoreEffects = NativeRestoreEffects(
@@ -6215,7 +6296,7 @@ private struct NativePreviewPipeline {
         )
       }
       let roiEnhancer: NativeROIEnhancer?
-      if let modelPath = config.roiEnhancerModel,
+      if let modelPath = config.roiEnhancerModel, swiftVRAsset == nil,
         (config.roiEnhancerStrength ?? 0) > 0
       {
         roiEnhancer = try await NativeROIEnhancer(
@@ -6233,6 +6314,7 @@ private struct NativePreviewPipeline {
           height: video.height,
           restorer: restorer,
           roiEnhancer: roiEnhancer,
+          swiftVR: swiftVR,
           roiExpertMode: config.roiExpertMode ?? false,
           blendFeather: config.blendFeather ?? 1,
           effects: restoreEffects,
@@ -6283,6 +6365,7 @@ private struct NativePreviewPipeline {
         : config.bufferLimitSeconds
     )
     let wallStart = Date()
+    swiftVR?.shouldStop = { control.shouldStop() }
     control.runReader()
     emit([
       "kind": "ready",
@@ -6511,7 +6594,8 @@ private struct NativePreviewPipeline {
         nextProcessorIndex = (nextProcessorIndex + 1) % processors.count
         let batch = detectedBatch.frames
         let task = Task.detached(priority: .userInitiated) {
-          let outputs = try await processor.process(batch)
+          let outputs = try await processor.process(batch,
+            skipPrefix: detectedBatch.skipPrefix)
           return NativeProcessedBatch(
             outputs: outputs,
             restoredSceneCount: processor.lastRestoredSceneCount
@@ -6901,7 +6985,7 @@ private struct NativePreviewPipeline {
             emit([
               "kind": "export_finalizing",
               "generation": config.generation,
-              "message": "音声を結合しています",
+              "message": "出力動画を確定しています",
             ])
             try NativeExportSupport.finishExport(
               segments: completedSegments,
