@@ -2646,6 +2646,9 @@ private struct NativeEnhancerFrame {
   let lowResolution: [Float16]
   let strength: Float
   let directReplacement: Bool
+  /// Width of the inward fade of the enhancer's effect, as a fraction of the
+  /// crop's short side. 0 keeps the default seam taper of at most 4 px.
+  var featherFraction: Float = 0
 }
 
 /// Optional second restoration lane used only by Expert ROI mode. Each frame
@@ -3425,8 +3428,9 @@ private final class NativeFrameProcessor: @unchecked Sendable {
         try await restore(scene, outputSkipPrefix: skipPrefix)
       let restoredFrameElements =
         3 * restorationSize * restorationSize
-      // SwiftVR restores the whole scene temporally, then each 1024px frame
-      // replaces the BasicVSR++ ROI through the direct-replacement path:
+      // SwiftVR restores the whole scene temporally. Each 512px (2x) or
+      // 1024px (4x) frame is stabilized against its neighbours, then replaces
+      // the BasicVSR++ ROI through the direct-replacement path:
       // base + (SwiftVR - base) * strength * mask.
       let enhancementStart = Date()
       if let swiftVR, let sceneOutput = try await swiftVR.enhance(
@@ -3435,19 +3439,33 @@ private final class NativeFrameProcessor: @unchecked Sendable {
         defer { sceneOutput.remove() }
         restorationSeconds += Date().timeIntervalSince(enhancementStart)
         let compositionStart = Date()
+        // Only the current frame and its two neighbours are held at once.
+        var window: [Int: [Float16]] = [:]
         for index in scene.frames.indices {
           let offset = index * restoredFrameElements
           let base = Array(restored[offset..<(offset + restoredFrameElements)])
+          let neighbours = max(0, index - 1)...min(scene.frames.count - 1, index + 1)
+          window = window.filter { neighbours.contains($0.key) }
+          for neighbour in neighbours where window[neighbour] == nil {
+            window[neighbour] = try sceneOutput.frame(neighbour)
+          }
+          let stabilized = Self.stabilizeSwiftVRFrame(
+            center: index,
+            frames: neighbours.map { (index: $0, pixels: window[$0]!) },
+            restored: restored,
+            side: sceneOutput.side
+          )
           let enhancedFrame = NativeEnhancerFrame(
             output: NativeEnhancerOutput(
-              pixels: try sceneOutput.frame(index),
-              width: SwiftVRSceneEnhancer.outputSide,
-              height: SwiftVRSceneEnhancer.outputSide,
+              pixels: stabilized,
+              width: sceneOutput.side,
+              height: sceneOutput.side,
               legacyLowResolution: nil
             ),
             lowResolution: base,
             strength: swiftVR.strength,
-            directReplacement: true
+            directReplacement: true,
+            featherFraction: 0.08
           )
           let frameIndex = scene.frames[index].batchIndex
           outputs[frameIndex] = try composite(
@@ -5263,7 +5281,8 @@ private final class NativeFrameProcessor: @unchecked Sendable {
       : Self.createEnhancerBlendMask(
         hardMask,
         width: cropWidth,
-        height: cropHeight
+        height: cropHeight,
+        featherFraction: validEnhancer?.featherFraction ?? 0
       )
     for cropY in 0..<geometry.cropBox.height {
       let sourceY = geometry.cropBox.top + cropY
@@ -5405,15 +5424,83 @@ private final class NativeFrameProcessor: @unchecked Sendable {
   /// Inward-only feather for the high-resolution residual. Values outside the
   /// detector mask stay exactly zero; only the inner few pixels are tapered,
   /// preventing a one-pixel enhancer seam from flickering with mask motion.
+  /// SwiftVR re-synthesizes texture for every frame, and inside the ROI that
+  /// added about 13% to frame-to-frame jitter (a boiling texture, not seams).
+  /// Each output pixel is averaged with the same pixel of the neighbouring
+  /// frames where the BasicVSR++ base barely changed there, carrying the base
+  /// difference along. Where the base moved, the weight falls to zero and the
+  /// pixel keeps its own frame. On a real export this removed about 98% of
+  /// the added jitter and kept about 87% of SwiftVR's change.
+  private static func stabilizeSwiftVRFrame(
+    center: Int,
+    frames: [(index: Int, pixels: [Float16])],
+    restored: [Float16],
+    side: Int
+  ) -> [Float16] {
+    let plane = side * side
+    let basePlane = restorationSize * restorationSize
+    let baseFrame = 3 * basePlane
+    let factor = max(1, side / restorationSize)
+    // 8 levels of the 8-bit base; neighbours count 0.8 of the centre.
+    let sigma: Float = 8 / 255
+    let weights = frames.map { frame -> [Float] in
+      let temporal: Float = frame.index == center ? 1 : 0.8
+      return (0..<basePlane).map { pixel in
+        var difference: Float = 0
+        for channel in 0..<3 {
+          difference += abs(
+            Float(restored[frame.index * baseFrame + channel * basePlane + pixel])
+              - Float(restored[center * baseFrame + channel * basePlane + pixel]))
+        }
+        let normalized = difference / 3 / sigma
+        return temporal * exp(-normalized * normalized)
+      }
+    }
+    var output = [Float16](repeating: 0, count: 3 * plane)
+    output.withUnsafeMutableBufferPointer { target in
+      DispatchQueue.concurrentPerform(iterations: side) { y in
+        let baseRow = min(restorationSize - 1, y / factor) * restorationSize
+        for x in 0..<side {
+          let basePixel = baseRow + min(restorationSize - 1, x / factor)
+          for channel in 0..<3 {
+            let outputIndex = channel * plane + y * side + x
+            let centerBase = Float(
+              restored[center * baseFrame + channel * basePlane + basePixel])
+            var sum: Float = 0
+            var weightSum: Float = 0
+            for (slot, frame) in frames.enumerated() {
+              let weight = weights[slot][basePixel]
+              let neighbourBase = Float(
+                restored[frame.index * baseFrame + channel * basePlane + basePixel])
+              sum += weight
+                * (Float(frame.pixels[outputIndex]) - neighbourBase + centerBase)
+              weightSum += weight
+            }
+            target[outputIndex] = Float16(sum / max(weightSum, 1e-6))
+          }
+        }
+      }
+    }
+    return output
+  }
+
+  /// A positive `featherFraction` widens the taper to that fraction of the
+  /// crop's short side with a smoothstep ramp, so a generative enhancer that
+  /// changes colour or texture fades into the restoration instead of ending
+  /// at a visible edge.
   private static func createEnhancerBlendMask(
     _ mask: [Float],
     width: Int,
-    height: Int
+    height: Int,
+    featherFraction: Float = 0
   ) -> [Float] {
     guard width > 0, height > 0, mask.count == width * height else {
       return [Float](repeating: 0, count: max(0, width * height))
     }
-    let radius = max(1, min(4, min(width, height) / 64))
+    let wide = featherFraction > 0
+    let radius = wide
+      ? max(4, Int(Float(min(width, height)) * featherFraction))
+      : max(1, min(4, min(width, height) / 64))
     let maximumDistance = radius + 1
     var distance = mask.map { $0 > 0.5 ? maximumDistance : 0 }
     // Treat the crop exterior as mask=0 so an ROI touching the crop edge also
@@ -5456,7 +5543,8 @@ private final class NativeFrameProcessor: @unchecked Sendable {
     }
     return distance.map {
       guard $0 > 1 else { return 0 }
-      return min(1, Float($0 - 1) / Float(radius))
+      let ramp = min(1, Float($0 - 1) / Float(radius))
+      return wide ? ramp * ramp * (3 - 2 * ramp) : ramp
     }
   }
 
@@ -6254,6 +6342,7 @@ private struct NativePreviewPipeline {
       swiftVR = try SwiftVRSceneEnhancer(
         model: swiftVRAsset,
         strength: config.roiEnhancerStrength ?? 1,
+        scale: config.roiEnhancerScale == 2 ? 2 : 4,
         workDirectory: URL(fileURLWithPath: config.outputDirectory, isDirectory: true)
       )
     } else {

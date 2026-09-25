@@ -35,6 +35,34 @@ face-restoration gate.
   19 GiB; the converted FP16 T6/T7 packs occupy about 18.4 GiB and have not
   been approved for redistribution.
 
+- Scale: the ROI enhancer scale setting chooses 2x (512px output) or 4x
+  (1024px) for every scene, whatever the ROI size. 2x needs its own pack in
+  the same model root:
+  - `reae-stateful-{encoder-28f,encoder-24f,decoder-7latent,decoder-6latent}-512-fp32.mlpackage`
+  - `native-2x-t7-fp16/components` and `native-2x-t6-fp16/components`
+  - `native-2x-fp16-grouped` (multifunction t7/t6 groups)
+  The worker takes the scale per scene from its request.
+- Composition fades SwiftVR's change in over 8% of the crop's short side
+  (smoothstep). The previous seam taper was at most 4 px, which left a visible
+  edge wherever SwiftVR shifted colour or texture.
+- Temporal stabilization: SwiftVR re-synthesizes texture per frame, which
+  added frame-to-frame jitter inside the ROI (+13% on a 65 s export). The
+  added jitter was uniform, not at scene or chunk seams. Each output pixel is
+  averaged with the neighbouring frames where the 256px BasicVSR++ base moved
+  less than about 8 levels, carrying the base difference along.
+- Expert ROI is hidden from the settings and always off; its code remains.
+
+12 s excerpt of a real export (180-frame clips), second-difference jitter
+inside the SwiftVR region, relative to BasicVSR++ alone:
+
+| | per scene | added jitter | change vs old 4x | detail vs BasicVSR++ |
+| --- | --- | --- | --- | --- |
+| old 4x | — | +1.03 | 100 | 108% |
+| new 4x | 8–56 s | +0.34 | 68 | 104% |
+| new 2x | 1–9 s | +0.06 | 66 | 98% |
+
+The first 2x scene also compiled the 2x pack (86 s once).
+
 One-step measurements (3 s MIDV-670 excerpt, 90 frames, M5 Pro):
 - Time: 2.8 s without SwiftVR; 48.6–63.5 s with SwiftVR, including one-time
   model loading.
