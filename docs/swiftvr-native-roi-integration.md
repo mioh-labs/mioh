@@ -22,7 +22,8 @@ face-restoration gate.
     the normal export.
 - Scene frames travel as temporary files under the export's working
   directory. They are removed once the scene is composited, so disk use is
-  bounded by one scene (≤48 frames: about 19 MB in, 300 MB out).
+  bounded by one scene (48 frames: about 19 MB in, 300 MB out; export clips
+  reach 180 frames, about 70 MB in and 1.1 GB out).
 - Local export only, one lane, Expert ROI off. Crossfade stays available;
   overlap frames are simply enhanced in both batches.
 - Stopping the export terminates the worker. The current scene finishes
@@ -117,7 +118,22 @@ or output sizes without additional variants or a validated dynamic export.
   Five 6-layer groups take about 100 s each and 5.5 GB peak to convert, and
   occupy 9 GB. When present, the worker loads them once and keeps them
   resident, using about 8.5 GB instead of the 42–63 GB of 30 resident blocks.
-  Scenes are at most 48 frames, so only the 7-latent stack is used.
+  - Export clips reach 180 frames, whose middle chunks need the 6-latent
+    stack. `--latent-frames 7 6` writes each group as one multifunction
+    package with `t7` and `t6` functions into
+    `<model-root>/native-4x-fp16-grouped/dit-group-AA-BB-4x-float16.mlpackage`.
+    The worker prefers that directory and falls back to the t7-only one.
+  - The functions share their weights on disk (1.8 GB per group, the same as
+    t7 alone) and in memory: adding t6 to a loaded group raised the footprint
+    by 0.48 GB, against about 1.5 GB for a separate package. The t6 function
+    runs six layers in 0.45 s.
+  - A 180-frame scene took 45–49 s instead of 58–65 s (6-latent chunks loaded
+    block by block), with all 180 output frames bit-identical. Peak footprint
+    was 29.4 GB (28.0 GB before), almost all of it the 1024px ReAE graphs.
+  - Keeping the ReAE encoders and decoders resident is counterproductive: the
+    same scene reached a 49.8 GB footprint and took 123–135 s.
+  - One group's conversion once failed with "Caught an unknown exception"
+    while validating t6, and succeeded on retry.
   - Speed and output: 30 layers run in 2.8 s per chunk. A warm 49-frame scene
     takes 9.5–10.9 s, versus 12.8 s per block, with output bit-identical to
     the per-block stack.
