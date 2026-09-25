@@ -886,7 +886,8 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertEqual(info["LSMinimumSystemVersion"], "26.0")
         self.assertNotIn("import CoreAI", source)
         self.assertEqual(build_script.count("-target arm64-apple-macosx26.0"), 1)
-        self.assertEqual(build_script.count("-target arm64-apple-macosx27.0"), 4)
+        # Four Core AI binaries plus the SwiftVR Core ML worker.
+        self.assertEqual(build_script.count("-target arm64-apple-macosx27.0"), 5)
         self.assertEqual(build_script.count("-framework CoreAI"), 4)
 
     def test_model_choices_follow_coreai_os_availability(self):
@@ -1906,7 +1907,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
             ROOT / "packaging" / "macOS" / "standalone" / "DedicatedModelVerifier.swift"
         ).read_text()
 
-        self.assertIn('let enhancerModels = ["none", "realesrgan", "mewzoom", "swinir", "spandrel", "pipersr"]', source)
+        self.assertIn('let enhancerModels = ["none", "realesrgan", "mewzoom", "swinir", "spandrel", "pipersr", "swiftvr"]', source)
         self.assertIn('"nomos-webphoto-realplksr-x4-coreai"', source)
         self.assertIn('"nomos-webphoto-realplksr-x4-coreml"', source)
         self.assertIn("4xNomosWebPhoto_RealPLKSR_256.mlpackage", script)
