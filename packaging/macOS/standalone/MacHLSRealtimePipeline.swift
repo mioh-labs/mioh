@@ -2674,18 +2674,20 @@ final class MacHLSRealtimeProducer {
             String(format: "hls-restored-%06d.mov", outputSequence),
             isDirectory: false
           )
-          // The output's audio covers exactly the input interval of its video.
-          let inputStart = mappedStart - coreTimelineStartSeconds + coreMediaStartSeconds
+          // The output's audio covers the input interval of its video, not the
+          // timeline range clamped to the core. AVQueuePlayer stalls ~130 ms
+          // at every item whose audio ends even one sample before its video,
+          // so the audio runs one sample past the video.
           let outputBytes: Int64
           do {
             try await MacHLSAudio.writeMovie(
               videoURL: workerURL,
               samples: MacHLSAudio.samples(
-                from: inputStart,
-                to: inputStart + (mappedEnd - mappedStart),
+                from: localStart,
+                to: localEnd + 1 / Double(MacHLSAudio.sampleRate),
                 placements: audio
               ),
-              duration: mappedEnd - mappedStart,
+              duration: localEnd - localStart,
               outputURL: stableURL,
               ffmpeg: resources.appendingPathComponent("bin/ffmpeg")
             )
