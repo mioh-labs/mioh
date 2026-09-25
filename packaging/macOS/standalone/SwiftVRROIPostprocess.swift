@@ -86,16 +86,13 @@ private enum SwiftVRROIPostprocess {
       try fileManager.copyItem(at: restored, to: output)
       return
     }
-    let temporaryRoot = URL(fileURLWithPath:
-      ProcessInfo.processInfo.environment["TMPDIR"] ?? NSTemporaryDirectory(),
-      isDirectory: true)
-    let compiledCache = temporaryRoot.appendingPathComponent(
-      "mioh-swiftvr-compiled-\(UUID().uuidString)", isDirectory: true)
-    try fileManager.createDirectory(at: compiledCache,
-      withIntermediateDirectories: true)
-    defer { try? fileManager.removeItem(at: compiledCache) }
+    // Compiling the model pack takes minutes and leaves the GPU idle, so the
+    // compiled models persist across exports instead of per-run temporaries.
+    let compiledCache = try persistentCompiledCache()
     var helperEnvironment = ProcessInfo.processInfo.environment
     helperEnvironment["MIOH_SWIFTVR_COMPILED_CACHE"] = compiledCache.path
+    var helperSession: SwiftVRHelperSession?
+    defer { helperSession?.terminate() }
 
     let enhancedRoot = root.appendingPathComponent("swiftvr-output", isDirectory: true)
     let modelKey = model.standardizedFileURL.path
@@ -235,10 +232,14 @@ private enum SwiftVRROIPostprocess {
           try report("inference", completed: index,
             sceneIndex: sceneIndex, sceneFrames: scene.frames.count,
             sceneOutput: sceneOutput)
-          try run(helper, [model.path,
-            sceneRoot.appendingPathComponent("input").path,
-            sceneOutput.path, String(scene.frames.count)], stopFile: stopFile,
-            environment: helperEnvironment)
+          if helperSession == nil {
+            helperSession = try SwiftVRHelperSession(helper: helper,
+              model: model, environment: helperEnvironment)
+          }
+          try helperSession?.infer(
+            input: sceneRoot.appendingPathComponent("input"),
+            output: sceneOutput, frames: scene.frames.count,
+            stopFile: stopFile)
         }
         completedInferenceFrames += scene.frames.count
         try report("compositing", completed: index,
@@ -393,6 +394,40 @@ private enum SwiftVRROIPostprocess {
     }
   }
 
+  /// `~/Library/Caches/<bundle>/mioh/swiftvr-compiled`. Entries that no
+  /// export has used for 30 days are removed; the helper refreshes the date
+  /// of every entry it uses.
+  private static func persistentCompiledCache() throws -> URL {
+    let fileManager = FileManager.default
+    let cache: URL
+    if let configured = ProcessInfo.processInfo.environment[
+      "MIOH_SWIFTVR_COMPILED_CACHE"], !configured.isEmpty
+    {
+      cache = URL(fileURLWithPath: configured, isDirectory: true)
+    } else {
+      guard let caches = fileManager.urls(for: .cachesDirectory,
+        in: .userDomainMask).first else {
+        throw PostprocessFailure.invalid("User cache directory is unavailable")
+      }
+      cache = caches
+        .appendingPathComponent("com.okatti.lada.coreai", isDirectory: true)
+        .appendingPathComponent("mioh", isDirectory: true)
+        .appendingPathComponent("swiftvr-compiled", isDirectory: true)
+    }
+    try fileManager.createDirectory(at: cache, withIntermediateDirectories: true)
+    let expiry = Date().addingTimeInterval(-30 * 24 * 60 * 60)
+    for entry in (try? fileManager.contentsOfDirectory(at: cache,
+      includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+    where entry.pathExtension == "mlmodelc" {
+      let modified = try? entry.resourceValues(
+        forKeys: [.contentModificationDateKey]).contentModificationDate
+      if let modified, modified < expiry {
+        try? fileManager.removeItem(at: entry)
+      }
+    }
+    return cache
+  }
+
   private static func run(_ executable: URL, _ arguments: [String],
     stopFile: URL? = nil, environment: [String: String]? = nil) throws {
     let process = Process()
@@ -451,5 +486,106 @@ private enum SwiftVRROIPostprocess {
       try run(ffmpeg, arguments("aac"), stopFile: stopFile)
     }
     try FileManager.default.moveItem(at: part, to: output)
+  }
+}
+
+/// One SwiftVR worker serves every scene of an export instead of a new
+/// process per scene. Scenes are still requested one at a time, when their
+/// first output frame is reached, so the high-resolution cache stays bounded.
+private final class SwiftVRHelperSession: @unchecked Sendable {
+  private static let replyPrefix = "SWIFTVR-DONE "
+  private let process = Process()
+  private let requests = Pipe()
+  private let responses = Pipe()
+  private let lock = NSLock()
+  private var pending = Data()
+  private var completed: [String] = []
+
+  init(helper: URL, model: URL, environment: [String: String]) throws {
+    // A worker that exits between scenes must surface as an error on write,
+    // not terminate this process with SIGPIPE.
+    signal(SIGPIPE, SIG_IGN)
+    process.executableURL = helper
+    process.arguments = [model.path, "--serve"]
+    process.environment = environment
+    process.standardInput = requests
+    process.standardOutput = responses
+    responses.fileHandleForReading.readabilityHandler = { [weak self] handle in
+      self?.receive(handle.availableData)
+    }
+    try process.run()
+  }
+
+  private func receive(_ data: Data) {
+    lock.lock()
+    defer { lock.unlock() }
+    pending.append(data)
+    while let newline = pending.firstIndex(of: 0x0A) {
+      let line = String(decoding: pending[pending.startIndex..<newline], as: UTF8.self)
+      pending.removeSubrange(pending.startIndex...newline)
+      if line.hasPrefix(Self.replyPrefix) {
+        completed.append(String(line.dropFirst(Self.replyPrefix.count)))
+      } else {
+        // Keep the worker's progress lines in postprocess.log as before.
+        FileHandle.standardOutput.write(Data((line + "\n").utf8))
+      }
+    }
+  }
+
+  private func takeCompleted() -> String? {
+    lock.lock()
+    defer { lock.unlock() }
+    return completed.isEmpty ? nil : completed.removeFirst()
+  }
+
+  func infer(input: URL, output: URL, frames: Int, stopFile: URL) throws {
+    let request = try JSONSerialization.data(withJSONObject: [
+      "input": input.path, "output": output.path, "frames": frames,
+    ]) + Data([0x0A])
+    do {
+      try requests.fileHandleForWriting.write(contentsOf: request)
+    } catch {
+      throw PostprocessFailure.invalid(
+        "SwiftVR worker is not accepting scenes (\(process.terminationStatusIfExited))"
+      )
+    }
+    while true {
+      if let finished = takeCompleted() {
+        guard finished == output.path else {
+          throw PostprocessFailure.invalid("SwiftVR worker answered for another scene")
+        }
+        return
+      }
+      if FileManager.default.fileExists(atPath: stopFile.path) {
+        terminate()
+        throw PostprocessFailure.invalid("SwiftVR processing was stopped")
+      }
+      guard process.isRunning else {
+        throw PostprocessFailure.invalid(
+          "SwiftVR worker failed (\(process.terminationStatus))"
+        )
+      }
+      Thread.sleep(forTimeInterval: 0.1)
+    }
+  }
+
+  /// Ends the worker. Closing its input lets an idle worker exit normally;
+  /// one still inferring is terminated.
+  func terminate() {
+    try? requests.fileHandleForWriting.close()
+    if process.isRunning {
+      for _ in 0..<20 where process.isRunning {
+        Thread.sleep(forTimeInterval: 0.05)
+      }
+      if process.isRunning { process.terminate() }
+      process.waitUntilExit()
+    }
+    responses.fileHandleForReading.readabilityHandler = nil
+  }
+}
+
+private extension Process {
+  var terminationStatusIfExited: String {
+    isRunning ? "running" : "exit \(terminationStatus)"
   }
 }

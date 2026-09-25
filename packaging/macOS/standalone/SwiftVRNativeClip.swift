@@ -22,37 +22,43 @@ private enum ClipError: Error, CustomStringConvertible {
 private let outputSize = 1024
 private let inputSize = 256
 private let latentSide = 64
-// A scene runs many 24-frame chunks through the same DiT blocks. Compiling
-// each package again for every chunk leaves the GPU idle for most of the job.
-// Keep compiled URLs only for this worker's lifetime; the next scene gets a
-// fresh worker, so this does not accumulate loaded model weights in memory.
+// Compiling a package takes about ten times longer than running it, and
+// nothing uses the GPU meanwhile. Compiled models therefore persist across
+// exports in the shared cache the postprocess supplies.
 private var compiledModels: [URL: URL] = [:]
-// The t6 DiT stack is revisited for every 24-frame continuation. Retaining
-// all 30 large models can exhaust unified memory, so pin only the first 12;
-// the remaining layers still load on demand.
-private var residentModels: [URL: MLModel] = [:]
+// Models are loaded for each use and released afterwards. A loaded DiT block
+// holds far more than its 312 MB of weights (GPU buffers for 7,168 tokens):
+// keeping the stack resident reached 42–63 GB and swapped, while loading on
+// demand ran a warm 49-frame scene in 16.7 s, as fast as keeping 12 resident.
 private let sharedCompiledRoot = ProcessInfo.processInfo.environment[
   "MIOH_SWIFTVR_COMPILED_CACHE"].map {
     URL(fileURLWithPath: $0, isDirectory: true)
   }
 
+private func packageFiles(_ package: URL) -> [URL] {
+  let data = package.appendingPathComponent("Data/com.apple.CoreML")
+  return [
+    data.appendingPathComponent("model.mlmodel"),
+    data.appendingPathComponent("weights/weight.bin"),
+  ]
+}
+
 private func compiledCacheName(for package: URL) -> String {
   // Swift's Hasher is process-randomized, so it cannot name a cache shared by
-  // separate scene workers. The full standardized path is stable for this job.
+  // separate workers. The key covers the path and the size and modification
+  // time of the package contents, so a replaced model pack is recompiled.
+  var identity = package.standardizedFileURL.path
+  for file in packageFiles(package) {
+    let values = try? file.resourceValues(
+      forKeys: [.fileSizeKey, .contentModificationDateKey])
+    identity += "|\(values?.fileSize ?? -1)"
+      + "|\(values?.contentModificationDate?.timeIntervalSince1970 ?? -1)"
+  }
   var hash: UInt64 = 14_695_981_039_346_656_037
-  for byte in package.standardizedFileURL.path.utf8 {
+  for byte in identity.utf8 {
     hash = (hash ^ UInt64(byte)) &* 1_099_511_628_211
   }
   return String(format: "%016llx.mlmodelc", hash)
-}
-
-private func shouldKeepResident(_ package: URL) -> Bool {
-  guard package.deletingLastPathComponent().lastPathComponent
-    == "native-4x-t6-fp16",
-    package.lastPathComponent.hasPrefix("dit-block-") else { return false }
-  let name = package.lastPathComponent
-  let layer = Int(name.dropFirst("dit-block-".count).prefix(2)) ?? 30
-  return layer < 12
 }
 
 private func array(_ shape: [Int]) throws -> MLMultiArray {
@@ -152,23 +158,25 @@ private func predictFeatures(
       compiledCacheName(for: package))
     if !FileManager.default.fileExists(atPath: cached.path) {
       let temporary = try MLModel.compileModel(at: package)
-      try FileManager.default.moveItem(at: temporary, to: cached)
+      do {
+        try FileManager.default.moveItem(at: temporary, to: cached)
+      } catch where FileManager.default.fileExists(atPath: cached.path) {
+        // Another export compiled the same package first.
+        try? FileManager.default.removeItem(at: temporary)
+      }
     }
+    // The postprocess prunes entries that no export has used for a while.
+    try? FileManager.default.setAttributes(
+      [.modificationDate: Date()], ofItemAtPath: cached.path)
     compiledModels[package] = cached
     compiled = cached
   } else {
     compiled = try MLModel.compileModel(at: package)
     compiledModels[package] = compiled
   }
-  let model: MLModel
-  if let resident = residentModels[package] {
-    model = resident
-  } else {
-    let configuration = MLModelConfiguration()
-    configuration.computeUnits = .all
-    model = try MLModel(contentsOf: compiled, configuration: configuration)
-    if shouldKeepResident(package) { residentModels[package] = model }
-  }
+  let configuration = MLModelConfiguration()
+  configuration.computeUnits = .all
+  let model = try MLModel(contentsOf: compiled, configuration: configuration)
   return try model.prediction(
     from: MLDictionaryFeatureProvider(dictionary: values)
   )
@@ -187,6 +195,14 @@ private func predict(
   _ package: URL, values: [String: Any], output: String
 ) throws -> MLMultiArray {
   try feature(predictFeatures(package, values: values), name: output, source: package)
+}
+
+/// Core ML returns its inputs, outputs and loaded models autoreleased.
+/// This worker has no run loop, so without explicit pools nothing is freed
+/// until exit: one 30-block chunk alone leaves several GB behind, and a
+/// worker serving many scenes grows until the system swaps.
+private func pooled<Result>(_ body: () throws -> Result) rethrows -> Result {
+  try autoreleasepool(invoking: body)
 }
 
 private func followingStates(
@@ -459,11 +475,13 @@ private func denoise(
   let variant = assetRoot.appendingPathComponent("native-4x-\(shapeName)-fp16")
   let components = variant.appendingPathComponent("components")
   let tokens = ditCount * 32 * 32
-  var hidden = try contiguous(
-    predict(components.appendingPathComponent("patch.mlpackage"),
-      values: ["latents": ditInput], output: "output"),
-    shape: [1, tokens, 3072]
-  )
+  var hidden = try pooled {
+    try contiguous(
+      predict(components.appendingPathComponent("patch.mlpackage"),
+        values: ["latents": ditInput], output: "output"),
+      shape: [1, tokens, 3072]
+    )
+  }
   let conditions: [String: Any] = [
     "context": try fromFile(components.appendingPathComponent("context.f32"), shape: [1, 512, 3072]),
     "modulation": try fromFile(components.appendingPathComponent("modulation.f32"), shape: [1, 6, 3072]),
@@ -476,17 +494,21 @@ private func denoise(
     let name = String(format: "dit-block-%02d-%@-4x-float16.mlpackage", layer, shapeName)
     var inputs = conditions
     inputs["hidden"] = hidden
-    hidden = try contiguous(
-      predict(variant.appendingPathComponent(name), values: inputs, output: "output"),
-      shape: [1, tokens, 3072]
-    )
+    hidden = try pooled {
+      try contiguous(
+        predict(variant.appendingPathComponent(name), values: inputs, output: "output"),
+        shape: [1, tokens, 3072]
+      )
+    }
     print("DiT \(layer + 1)/30 elapsed=\(Date().timeIntervalSince(started))s")
   }
-  let velocity = try contiguous(
-    predict(components.appendingPathComponent("head.mlpackage"),
-      values: ["hidden": hidden], output: "output"),
-    shape: [1, 48, ditCount, 64, 64]
-  )
+  let velocity = try pooled {
+    try contiguous(
+      predict(components.appendingPathComponent("head.mlpackage"),
+        values: ["hidden": hidden], output: "output"),
+      shape: [1, 48, ditCount, 64, 64]
+    )
+  }
   let velocityValues = velocity.dataPointer.assumingMemoryBound(to: Float.self)
   let decodedInput = try array([1, encodedCount, 48, 64, 64])
   let decodedValues = decodedInput.dataPointer.assumingMemoryBound(to: Float.self)
@@ -508,7 +530,6 @@ private func denoise(
 private enum SwiftVRNativeClipRunner {
   static func main() throws {
     defer {
-      residentModels.removeAll()
       if sharedCompiledRoot == nil {
         for compiled in compiledModels.values {
           try? FileManager.default.removeItem(at: compiled)
@@ -516,12 +537,60 @@ private enum SwiftVRNativeClipRunner {
       }
       compiledModels.removeAll()
     }
-    guard [4, 5].contains(CommandLine.arguments.count) else {
-      throw ClipError.invalid("usage: swiftvr-native-clip <asset-root> <input-png-directory> <output-png-directory> [frame-count]")
+    let arguments = CommandLine.arguments
+    if arguments.count == 3, arguments[2] == "--serve" {
+      try serve(root: URL(fileURLWithPath: arguments[1], isDirectory: true))
+      return
     }
-    let root = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
-    let input = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
-    let output = URL(fileURLWithPath: CommandLine.arguments[3], isDirectory: true)
+    guard [4, 5].contains(arguments.count) else {
+      throw ClipError.invalid("usage: swiftvr-native-clip <asset-root> (--serve | <input-png-directory> <output-png-directory> [frame-count])")
+    }
+    let requested: Int?
+    if arguments.count == 5 {
+      guard let value = Int(arguments[4]) else {
+        throw ClipError.invalid("frame-count must be an integer")
+      }
+      requested = value
+    } else {
+      requested = nil
+    }
+    try runScene(
+      root: URL(fileURLWithPath: arguments[1], isDirectory: true),
+      input: URL(fileURLWithPath: arguments[2], isDirectory: true),
+      output: URL(fileURLWithPath: arguments[3], isDirectory: true),
+      requestedFrames: requested
+    )
+  }
+
+  /// Serves every scene of one export from this process instead of starting
+  /// a worker per scene. Each stdin line is a JSON request
+  /// `{"input": path, "output": path, "frames": count}`; each completed scene
+  /// is acknowledged by one stdout line `SWIFTVR-DONE <output path>`.
+  static func serve(root: URL) throws {
+    struct Request: Decodable {
+      let input: String
+      let output: String
+      let frames: Int
+    }
+    while let line = readLine() {
+      guard !line.isEmpty else { continue }
+      let request = try JSONDecoder().decode(Request.self, from: Data(line.utf8))
+      try pooled {
+        try runScene(
+          root: root,
+          input: URL(fileURLWithPath: request.input, isDirectory: true),
+          output: URL(fileURLWithPath: request.output, isDirectory: true),
+          requestedFrames: request.frames
+        )
+      }
+      print("SWIFTVR-DONE \(request.output)")
+      fflush(stdout)
+    }
+  }
+
+  static func runScene(
+    root: URL, input: URL, output: URL, requestedFrames: Int?
+  ) throws {
     try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
     let inputs = try FileManager.default.contentsOfDirectory(
       at: input, includingPropertiesForKeys: nil
@@ -531,9 +600,8 @@ private enum SwiftVRNativeClipRunner {
       $0.pathExtension.lowercased() == (rawOutput ? "f16" : "png")
     }.count
     let totalFrames: Int
-    if CommandLine.arguments.count == 5 {
-      guard let requested = Int(CommandLine.arguments[4]),
-        requested > 0, requested <= availableFrames else {
+    if let requested = requestedFrames {
+      guard requested > 0, requested <= availableFrames else {
         throw ClipError.invalid("frame-count must be between 1 and \(availableFrames)")
       }
       totalFrames = requested
@@ -600,62 +668,64 @@ private enum SwiftVRNativeClipRunner {
     var rawLatentCount = 7
     var latentOffset = 7
     while nextOutput < totalFrames {
-      let remaining = paddedTotal - nextInput
-      let isLast = remaining <= 24
-      let chunkFrames = min(remaining, 24)
-      let availableFrames = max(1, min(totalFrames - nextInput, chunkFrames))
-      let continuationFrames = try inputFrames(
-        input, start: nextInput, validCount: availableFrames, paddedCount: 24
-      )
-      var encoderInputs = try followingStates(encoded, source: encodedURL)
-      encoderInputs["frames"] = continuationFrames
-      let encoderURL = root.appendingPathComponent(
-        "reae-stateful-encoder-24f-1024-fp32.mlpackage"
-      )
-      let nextEncoded = try predictFeatures(encoderURL, values: encoderInputs)
-      let nextLatents = try feature(
-        nextEncoded, name: "latents", source: encoderURL
-      )
-      let validLatents = isLast ? (chunkFrames - 1) / 4 + 1 : 6
-      let padLatents = isLast ? 7 - validLatents : 0
-      let precedingLatents = padLatents > 0
-        ? try trailingLatents(rawLatents, count: rawLatentCount,
-          trailing: padLatents)
-        : nil
-      // MIDDLE uses the six-latent graph without overlap. LAST prepends the
-      // previous raw latents (not denoised latents) to the seven-latent graph.
-      let nextDenoised = try denoise(
-        latents: nextLatents, encodedCount: 6, validCount: validLatents,
-        previous: precedingLatents,
-        temporalOffset: max(0, latentOffset - padLatents),
-        assetRoot: root, started: started
-      )
-      var decoderInputs = try followingStates(decoded, source: decodedURL)
-      decoderInputs["latents"] = nextDenoised
-      let decoderURL = root.appendingPathComponent(
-        "reae-stateful-decoder-6latent-1024-fp32.mlpackage"
-      )
-      let nextDecoded = try predictFeatures(decoderURL, values: decoderInputs)
-      let decodedFrames = try feature(nextDecoded, name: "frames", source: decoderURL)
-      let outputCount = min(totalFrames - nextOutput, 24)
-      for index in 0..<outputCount {
-        if rawOutput {
-          try saveRaw(decodedFrames, decoderFrame: index,
-            outputFrame: nextOutput + index, latentCount: 6, folder: output)
-        } else {
-          try savePNG(decodedFrames, decoderFrame: index,
-            outputFrame: nextOutput + index, latentCount: 6, folder: output)
+      try pooled {
+        let remaining = paddedTotal - nextInput
+        let isLast = remaining <= 24
+        let chunkFrames = min(remaining, 24)
+        let availableFrames = max(1, min(totalFrames - nextInput, chunkFrames))
+        let continuationFrames = try inputFrames(
+          input, start: nextInput, validCount: availableFrames, paddedCount: 24
+        )
+        var encoderInputs = try followingStates(encoded, source: encodedURL)
+        encoderInputs["frames"] = continuationFrames
+        let encoderURL = root.appendingPathComponent(
+          "reae-stateful-encoder-24f-1024-fp32.mlpackage"
+        )
+        let nextEncoded = try predictFeatures(encoderURL, values: encoderInputs)
+        let nextLatents = try feature(
+          nextEncoded, name: "latents", source: encoderURL
+        )
+        let validLatents = isLast ? (chunkFrames - 1) / 4 + 1 : 6
+        let padLatents = isLast ? 7 - validLatents : 0
+        let precedingLatents = padLatents > 0
+          ? try trailingLatents(rawLatents, count: rawLatentCount,
+            trailing: padLatents)
+          : nil
+        // MIDDLE uses the six-latent graph without overlap. LAST prepends the
+        // previous raw latents (not denoised latents) to the seven-latent graph.
+        let nextDenoised = try denoise(
+          latents: nextLatents, encodedCount: 6, validCount: validLatents,
+          previous: precedingLatents,
+          temporalOffset: max(0, latentOffset - padLatents),
+          assetRoot: root, started: started
+        )
+        var decoderInputs = try followingStates(decoded, source: decodedURL)
+        decoderInputs["latents"] = nextDenoised
+        let decoderURL = root.appendingPathComponent(
+          "reae-stateful-decoder-6latent-1024-fp32.mlpackage"
+        )
+        let nextDecoded = try predictFeatures(decoderURL, values: decoderInputs)
+        let decodedFrames = try feature(nextDecoded, name: "frames", source: decoderURL)
+        let outputCount = min(totalFrames - nextOutput, 24)
+        for index in 0..<outputCount {
+          if rawOutput {
+            try saveRaw(decodedFrames, decoderFrame: index,
+              outputFrame: nextOutput + index, latentCount: 6, folder: output)
+          } else {
+            try savePNG(decodedFrames, decoderFrame: index,
+              outputFrame: nextOutput + index, latentCount: 6, folder: output)
+          }
         }
+        nextInput += chunkFrames
+        nextOutput += outputCount
+        latentOffset += validLatents
+        encoded = nextEncoded
+        encodedURL = encoderURL
+        decoded = nextDecoded
+        decodedURL = decoderURL
+        rawLatents = nextLatents
+        rawLatentCount = 6
       }
-      nextInput += chunkFrames
-      nextOutput += outputCount
-      latentOffset += validLatents
-      encoded = nextEncoded
-      encodedURL = encoderURL
-      decoded = nextDecoded
-      decodedURL = decoderURL
-      rawLatents = nextLatents
-      rawLatentCount = 6
     }
     print("Swift/Core ML clip complete in \(Date().timeIntervalSince(started))s: \(output.path)")
   }
