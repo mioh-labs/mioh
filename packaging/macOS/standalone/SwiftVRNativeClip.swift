@@ -175,12 +175,16 @@ private func compiledURL(for package: URL) throws -> URL {
   return compiled
 }
 
-private func loadModel(compiled: URL) throws -> MLModel {
+private func loadModel(compiled: URL, functionName: String? = nil) throws -> MLModel {
   let configuration = MLModelConfiguration()
   configuration.computeUnits = .all
+  configuration.functionName = functionName
   return try MLModel(contentsOf: compiled, configuration: configuration)
 }
 
+/// ReAE graphs are loaded for every chunk on purpose. Their 1024px GPU working
+/// buffers are released with the model; keeping the four encoders/decoders
+/// resident pushed a 180-frame scene to a 49.8 GB footprint and 3x the time.
 private func predictFeatures(
   _ package: URL, values: [String: Any]
 ) throws -> MLFeatureProvider {
@@ -193,41 +197,53 @@ private func predictFeatures(
   try model.prediction(from: MLDictionaryFeatureProvider(dictionary: values))
 }
 
-/// When the model pack provides the DiT stack as a few multi-layer groups
-/// (`native-4x-<shape>-fp16-grouped/dit-group-AA-BB-*.mlpackage`), the groups
-/// load once per worker and stay loaded. A group shares one set of GPU
-/// working buffers across its layers, so a whole stack fits in memory where
-/// 30 separate resident blocks swapped. mioh scenes are at most 48 frames,
-/// which only ever uses the 7-latent stack.
-private var residentGroups: [URL: [MLModel]] = [:]
+/// When the model pack provides the DiT stack as a few multi-layer groups,
+/// the groups load once per worker and stay loaded. A group shares one set of
+/// GPU working buffers across its layers, so a whole stack fits in memory
+/// where 30 separate resident blocks swapped.
+///
+/// Preferred layout: `native-4x-fp16-grouped/dit-group-AA-BB-4x-float16.mlpackage`,
+/// each a multifunction package with a `t7` and a `t6` function. The shapes
+/// share their weights on disk and in memory (a t6 function added 0.48 GB to
+/// a group, a separate package about 1.5 GB). Export clips reach 180 frames,
+/// and their middle chunks need t6. Older packs carry a t7-only stack in
+/// `native-4x-t7-fp16-grouped`.
+private var residentGroups: [String: [MLModel]] = [:]
 
 private func groupedStack(_ assetRoot: URL, shapeName: String) throws -> [MLModel]? {
-  let directory = assetRoot.appendingPathComponent(
+  let shared = assetRoot.appendingPathComponent("native-4x-fp16-grouped", isDirectory: true)
+  let single = assetRoot.appendingPathComponent(
     "native-4x-\(shapeName)-fp16-grouped", isDirectory: true)
-  if let resident = residentGroups[directory] { return resident }
-  guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path)
-    .filter({ $0.hasPrefix("dit-group-") && $0.hasSuffix(".mlpackage") })
-    .sorted(),
-    !names.isEmpty
-  else { return nil }
-  var nextLayer = 0
-  for name in names {
-    let parts = name.split(separator: "-")
-    guard parts.count > 3, let first = Int(parts[2]), let last = Int(parts[3]),
-      first == nextLayer, last >= first
-    else { throw ClipError.invalid("DiT groups must cover layers contiguously: \(name)") }
-    nextLayer = last + 1
-  }
-  guard nextLayer == 30 else {
-    throw ClipError.invalid("DiT groups cover \(nextLayer) of 30 layers")
-  }
-  let models = try names.map { name in
-    try pooled {
-      try loadModel(compiled: compiledURL(for: directory.appendingPathComponent(name)))
+  for (directory, functionName) in [(shared, shapeName as String?), (single, nil)] {
+    let key = "\(directory.path)#\(shapeName)"
+    if let resident = residentGroups[key] { return resident }
+    guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path)
+      .filter({ $0.hasPrefix("dit-group-") && $0.hasSuffix(".mlpackage") })
+      .sorted(),
+      !names.isEmpty
+    else { continue }
+    var nextLayer = 0
+    for name in names {
+      let parts = name.split(separator: "-")
+      guard parts.count > 3, let first = Int(parts[2]), let last = Int(parts[3]),
+        first == nextLayer, last >= first
+      else { throw ClipError.invalid("DiT groups must cover layers contiguously: \(name)") }
+      nextLayer = last + 1
     }
+    guard nextLayer == 30 else {
+      throw ClipError.invalid("DiT groups cover \(nextLayer) of 30 layers")
+    }
+    let models = try names.map { name in
+      try pooled {
+        try loadModel(
+          compiled: compiledURL(for: directory.appendingPathComponent(name)),
+          functionName: functionName)
+      }
+    }
+    residentGroups[key] = models
+    return models
   }
-  residentGroups[directory] = models
-  return models
+  return nil
 }
 
 /// Loads a model on another thread. Loading a DiT block takes longer than

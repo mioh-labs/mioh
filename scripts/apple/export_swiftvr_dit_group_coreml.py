@@ -9,12 +9,18 @@ The group keeps the per-layer package contract: inputs hidden, context,
 modulation, cosine, sine; output ``output`` (the hidden state after the last
 layer of the group). Verification compares the fused graph with the upstream
 blocks run one after another, then the Core ML result with PyTorch.
+
+Several ``--latent-frames`` values produce one multifunction package with a
+function per shape (``t7``, ``t6``). The shapes share every weight, which
+Core ML stores once, so a 6- and 7-latent stack cost the disk of one.
 """
 
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -69,7 +75,9 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--first-layer", type=int, required=True)
     parser.add_argument("--end-layer", type=int, required=True)
-    parser.add_argument("--latent-frames", type=int, choices=(6, 7), required=True)
+    parser.add_argument(
+        "--latent-frames", type=int, choices=(6, 7), nargs="+", required=True
+    )
     parser.add_argument("--scale", type=int, choices=(2, 4), default=4)
     parser.add_argument("--precision", choices=("float16", "float32"), default="float16")
     parser.add_argument("--backend", choices=("coreml", "coreai"), default="coreml")
@@ -80,7 +88,30 @@ def main() -> None:
     args = parser.parse_args()
     if not 0 <= args.first_layer < args.end_layer <= 30:
         parser.error("layer range must be within 0..<30 and nonempty")
+    shapes = list(dict.fromkeys(args.latent_frames))
+    if len(shapes) == 1:
+        export_group(args, shapes[0], args.output)
+        return
+    if args.backend != "coreml" or args.fixture_directory:
+        parser.error("several latent shapes need the coreml backend and no fixture")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=args.output.parent) as directory:
+        descriptor = ct.utils.MultiFunctionDescriptor()
+        for latent_frames in shapes:
+            single = Path(directory) / f"t{latent_frames}.mlpackage"
+            export_group(args, latent_frames, single)
+            descriptor.add_function(
+                str(single), src_function_name="main",
+                target_function_name=f"t{latent_frames}",
+            )
+        descriptor.default_function_name = f"t{shapes[0]}"
+        if args.output.exists():
+            shutil.rmtree(args.output)
+        ct.utils.save_multifunction(descriptor, str(args.output))
+    print(f"multifunction package written: {args.output}")
 
+
+def export_group(args, latent_frames: int, output: Path) -> None:
     sys.path.insert(0, str(args.source))
     import swiftvr.models.transformer as transformer_module  # noqa: E402
     from swiftvr.models.transformer import (  # noqa: E402
@@ -93,8 +124,8 @@ def main() -> None:
     set_attention_backend("sdpa")
     dim, ffn_dim, heads, window = 3072, 14336, 24, 16
     side = 16 if args.scale == 2 else 32
-    grid = (args.latent_frames, side, side)
-    tokens = args.latent_frames * side * side
+    grid = (latent_frames, side, side)
+    tokens = latent_frames * side * side
 
     blocks = []
     with safe_open(str(args.checkpoint), framework="pt", device="cpu") as source:
@@ -152,7 +183,7 @@ def main() -> None:
         expected.astype("<f4").tofile(fixture / "expected.f32")
 
     if args.backend == "coreai":
-        export_coreai(wrapper, inputs, args.output)
+        export_coreai(wrapper, inputs, output)
         return
 
     started = time.perf_counter()
@@ -170,8 +201,8 @@ def main() -> None:
         ),
     )
     print(f"converted in {time.perf_counter() - started:.1f}s", flush=True)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    converted.save(str(args.output))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    converted.save(str(output))
     native = converted.predict(
         {name: value.numpy() for name, value in zip(INPUT_NAMES, inputs)}
     )["output"]
