@@ -826,7 +826,25 @@ final class RestorationRunner: ObservableObject {
   @Published var progress = 0.0
   @Published var status = "待機中"
   @Published var log = ""
-  @Published var isRunning = false
+  @Published var isRunning = false {
+    didSet { updateExportActivity() }
+  }
+  /// While work runs, tell macOS it is user-initiated. Without this, App Nap
+  /// throttled mioh and the export processes it launches once the window left
+  /// the foreground: the same SwiftVR export took about 2.3x as long from the
+  /// app as from a shell (209-232 s vs 8-9 min).
+  private var exportActivity: NSObjectProtocol?
+
+  private func updateExportActivity() {
+    if isRunning, exportActivity == nil {
+      exportActivity = ProcessInfo.processInfo.beginActivity(
+        options: [.userInitiated, .idleSystemSleepDisabled],
+        reason: "mioh restoration or export")
+    } else if !isRunning, let activity = exportActivity {
+      ProcessInfo.processInfo.endActivity(activity)
+      exportActivity = nil
+    }
+  }
   @Published var defaultsStatus = "未保存"
 
   @Published var tempDirectory = "/tmp"
@@ -1285,7 +1303,7 @@ final class RestorationRunner: ObservableObject {
     guard panel.runModal() == .OK, let path = panel.url?.path else { return }
     roiEnhancerModel = path
     if roiEnhancer == "swiftvr" {
-      roiEnhancerScale = 4
+      roiEnhancerScale = roiEnhancerScale == 2 ? 2 : 4
       return
     }
     let normalized = panel.url?.lastPathComponent.lowercased() ?? ""
@@ -1299,6 +1317,9 @@ final class RestorationRunner: ObservableObject {
   func selectROIEnhancer(_ enhancer: String) {
     roiEnhancer = enhancer
     synchronizeROIEnhancerModel(forceDefault: true)
+    if enhancer == "swiftvr" {
+      roiEnhancerScale = roiEnhancerScale == 2 ? 2 : 4
+    }
   }
 
   func selectROIEnhancerModel(_ model: String) {
@@ -2824,7 +2845,9 @@ final class RestorationRunner: ObservableObject {
       "reae-stateful-encoder-28f-1024-fp32.mlpackage").path),
       FileManager.default.fileExists(atPath: custom.appendingPathComponent(
         "native-4x-t7-fp16/components/patch.mlpackage").path) {
-      return (custom, 4)
+      // A SwiftVR pack: 4x, or 2x when chosen (512px output, about a quarter
+      // of the DiT work). The worker checks that the 2x assets exist.
+      return (custom, requestedScale == 2 ? 2 : 4)
     }
     if custom.isFileURL,
       FileManager.default.fileExists(atPath: custom.path),
@@ -3166,7 +3189,9 @@ final class RestorationRunner: ObservableObject {
     roiEnhancerStrength = min(max(snapshot.roiEnhancerStrength, 0), 1)
     roiEnhancerTile = min(max(snapshot.roiEnhancerTile, 0), 1024)
     roiEnhancerPasses = min(max(snapshot.roiEnhancerPasses ?? 1, 1), 10)
-    roiExpertMode = snapshot.roiExpertMode ?? false
+    // Expert ROI is hidden from the GUI (its code stays), so a previously
+    // saved "on" must not keep applying invisibly.
+    roiExpertMode = false
 
     detectionModel = detectionModels.contains(snapshot.detectionModel) ? snapshot.detectionModel : "v2-coreml"
     customDetectionModel = snapshot.customDetectionModel
@@ -4099,12 +4124,6 @@ struct ContentView: View {
         LabeledContent("エフェクト倍率") { Stepper(value: $runner.effectUpscale, in: 1...4) { Text("\(runner.effectUpscale)x") } }
       }
       Section("ROIエンハンサー") {
-        Toggle("エキスパートROI復元", isOn: $runner.roiExpertMode)
-        if runner.roiExpertMode {
-          Text("マルチスケール二重復元・原寸ROI高周波・近隣フレーム融合を一括で有効にします。処理時間は通常より増加します。")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-        }
         Picker("方式", selection: Binding(
           get: { runner.roiEnhancer },
           set: { runner.selectROIEnhancer($0) }
@@ -4113,7 +4132,7 @@ struct ContentView: View {
         }
         if runner.roiEnhancer != "none" {
           if runner.roiEnhancer == "swiftvr" {
-            Text("書き出し専用。BasicVSR++で復元した各シーンをその場でSwiftVRにかけて合成します（1シーン数秒〜十数秒）。モデルフォルダを選択してください。エキスパートROI復元との併用は未対応です。")
+            Text("書き出し専用。BasicVSR++で復元した各シーンをその場でSwiftVRにかけて合成します（1シーン数秒〜十数秒）。モデルフォルダを選択してください。")
               .font(.caption)
               .foregroundStyle(.secondary)
           }
@@ -4141,7 +4160,14 @@ struct ContentView: View {
           }
         }
         if runner.roiEnhancer == "swiftvr" {
-          LabeledContent("倍率") { Text("4x固定") }
+          Picker("倍率", selection: $runner.roiEnhancerScale) {
+            Text("2x").tag(2)
+            Text("4x").tag(4)
+          }
+          .pickerStyle(.segmented)
+          Text("ROIの大きさに関係なく、すべてのシーンをこの倍率で処理します。2xは出力512pxで、4x（1024px）より大幅に速くなります。")
+            .font(.caption)
+            .foregroundStyle(.secondary)
         } else {
           LabeledContent("倍率") { Stepper(value: $runner.roiEnhancerScale, in: 1...8) { Text("\(runner.roiEnhancerScale)x") } }
             .disabled(runner.roiEnhancer == "none")
