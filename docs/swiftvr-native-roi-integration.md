@@ -75,6 +75,33 @@ conversion. The probe compares the rewritten block to upstream before exporting.
 Fixed input shapes are traced; the model cannot accept arbitrary frame counts
 or output sizes without additional variants or a validated dynamic export.
 
+## Runtime structure and GPU utilization (2026-09-25)
+
+- Compiled Core ML models persist in
+  `~/Library/Caches/com.okatti.lada.coreai/mioh/swiftvr-compiled`, or in the
+  directory named by `MIOH_SWIFTVR_COMPILED_CACHE`. The cache key includes each
+  package's path plus the size and modification time of its model and
+  weights, so a replaced pack is recompiled. Entries unused for 30 days are
+  pruned. The cache occupies about 9.5 GB per model pack. Previously a
+  per-run temporary cache was deleted after every export, so every export
+  recompiled about 34 packages while the GPU sat idle.
+- One `mioh-native-swiftvr-clip --serve` worker handles every scene of an
+  export. It still receives scenes one at a time, over stdin, when their
+  first output frame is reached. This replaces a worker process per scene.
+- Models load for each use; none stay resident. A loaded DiT block holds far
+  more than its 312 MB of weights. Keeping the stack resident reached 42–63 GB
+  and swapped, while on-demand loading ran a warm 49-frame scene in 16.7 s.
+  Every prediction, chunk and scene runs inside an autorelease pool. Without
+  the pools the long-lived worker grew until the system swapped.
+- Five-scene MIDV-670 sidecar (48+11+7+3+3 frames, M5 Pro, GPU sampled from
+  ioreg): the previous code took 132.7 s at 39% mean GPU. The new code took
+  87.8 s at 57% on its first export (cache build) and 55.8 s at 74% once
+  cached. All 144 high-resolution frames were bit-identical to the previous
+  code.
+- Still open: a scene shorter than 25 frames is padded to a full
+  28-frame/7-latent chunk. A 4-frame scene costs the same 10.8 s as a
+  25-frame one. Removing this needs smaller exported graph variants.
+
 ## Remaining release gates
 
 1. Validate the generalized clip runner at short, odd and three-chunk scene
