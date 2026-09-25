@@ -83,7 +83,6 @@ final class SegmentWriter {
   private var sequence = 0
   private var segmentStartNanoseconds: Int64?
   private var lastPTS: Int64?
-  private var framesInSegment = 0
   private var writer: AVAssetWriter?
   private var pixelBufferReceiver: AVAssetWriterInput.PixelBufferReceiver?
   private var workingURL: URL?
@@ -221,7 +220,6 @@ final class SegmentWriter {
     workingURL = paths.working
     finalURL = paths.final
     segmentStartNanoseconds = startNanoseconds
-    framesInSegment = 0
   }
 
   private func makePixelBuffer(fromBGR source: UnsafeMutableRawPointer) throws
@@ -326,7 +324,9 @@ final class SegmentWriter {
     if let start = segmentStartNanoseconds,
       ptsNanoseconds >= start + segmentNanoseconds
     {
-      completed = try await closeSegment(endNanoseconds: start + segmentNanoseconds)
+      // The segment ends where the next one begins, so consecutive segments
+      // tile the timeline and each file's video lasts exactly its span.
+      completed = try await closeSegment(endNanoseconds: ptsNanoseconds)
     }
     if writer == nil {
       try openSegment(startNanoseconds: ptsNanoseconds)
@@ -334,10 +334,13 @@ final class SegmentWriter {
     guard writer != nil, let receiver = pixelBufferReceiver else {
       throw EncoderError.writer("segment is not open")
     }
-    let presentationTime = CMTime(
-      value: Int64(framesInSegment * fpsDenominator),
-      timescale: Int32(fpsNumerator)
-    )
+    guard let segmentStart = segmentStartNanoseconds else {
+      throw EncoderError.writer("segment has no start time")
+    }
+    // Frames keep their source times. Numbering them at the nominal rate
+    // made a 60-frame NTSC segment 2.002 s long while its span and audio were
+    // 2.000 s, and AVQueuePlayer then stalled ~130 ms at every item boundary.
+    let presentationTime = exactTime(ptsNanoseconds - segmentStart)
     do {
       try await receiver.append(
         readOnlyPixelBuffer,
@@ -348,9 +351,16 @@ final class SegmentWriter {
         "pixel-buffer append failed: \(error.localizedDescription)"
       )
     }
-    framesInSegment += 1
     lastPTS = ptsNanoseconds
     return completed
+  }
+
+  private func exactTime(_ nanoseconds: Int64) -> CMTime {
+    CMTimeConvertScale(
+      CMTime(value: nanoseconds, timescale: 1_000_000_000),
+      timescale: CMTimeScale(fpsNumerator),
+      method: .roundHalfAwayFromZero
+    )
   }
 
   func finish() async throws -> SegmentEvent? {
@@ -368,6 +378,7 @@ final class SegmentWriter {
       throw EncoderError.writer("cannot close a segment that is not open")
     }
     receiver.finish()
+    writer.endSession(atSourceTime: exactTime(max(1, endNanoseconds - start)))
     await writer.finishWriting()
     guard writer.status == .completed else {
       throw EncoderError.writer(
@@ -388,7 +399,6 @@ final class SegmentWriter {
     self.workingURL = nil
     self.finalURL = nil
     segmentStartNanoseconds = nil
-    framesInSegment = 0
     return event
   }
 

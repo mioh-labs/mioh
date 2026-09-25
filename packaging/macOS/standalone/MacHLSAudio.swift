@@ -135,7 +135,6 @@ enum MacHLSAudio {
       "-f", "s16le", "-ar", "\(sampleRate)", "-ac", "\(channels)", "-i", pcmURL.path,
       "-map", "0:v:0", "-map", "1:a:0",
       "-c:v", "copy", "-c:a", "pcm_s16le",
-      "-t", String(format: "%.6f", duration),
       "-f", "mov", outputURL.path,
     ])
   }
