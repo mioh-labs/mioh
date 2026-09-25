@@ -98,6 +98,26 @@ or output sizes without additional variants or a validated dynamic export.
   87.8 s at 57% on its first export (cache build) and 55.8 s at 74% once
   cached. All 144 high-resolution frames were bit-identical to the previous
   code.
+- Loading the next DiT block overlaps with running the current one. The
+  256→1024 input upscale runs on all CPU cores (0.03 s per chunk; a Metal
+  version measured slower). A warm 49-frame scene went from 21.4 s to 15.8 s,
+  with bit-identical output.
+- Optional grouped stack: `scripts/apple/export_swiftvr_dit_group_coreml.py`
+  exports layers as multi-layer Core ML programs into
+  `<model-root>/native-4x-t7-fp16-grouped/dit-group-AA-BB-t7-4x-float16.mlpackage`.
+  Five 6-layer groups take about 100 s each and 5.5 GB peak to convert, and
+  occupy 9 GB. When present, the worker loads them once and keeps them
+  resident, using about 8.5 GB instead of the 42–63 GB of 30 resident blocks.
+  Scenes are at most 48 frames, so only the 7-latent stack is used.
+  - Speed and output: 30 layers run in 2.8 s per chunk. A warm 49-frame scene
+    takes 9.5–10.9 s, versus 12.8 s per block, with output bit-identical to
+    the per-block stack.
+  - Loading the five groups costs about 20–30 s once per export.
+  - The same group exported to Core AI was 1.8x slower (0.51 s vs 0.29 s for
+    three layers) at equal accuracy.
+- If the worker dies mid-scene (one uncatchable Core ML
+  "MPSGraph unexpected rank" abort was seen and did not reproduce), the
+  postprocess restarts it once and retries that scene.
 - Still open: a scene shorter than 25 frames is padded to a full
   28-frame/7-latent chunk. A 4-frame scene costs the same 10.8 s as a
   25-frame one. Removing this needs smaller exported graph variants.

@@ -193,6 +193,43 @@ private func predictFeatures(
   try model.prediction(from: MLDictionaryFeatureProvider(dictionary: values))
 }
 
+/// When the model pack provides the DiT stack as a few multi-layer groups
+/// (`native-4x-<shape>-fp16-grouped/dit-group-AA-BB-*.mlpackage`), the groups
+/// load once per worker and stay loaded. A group shares one set of GPU
+/// working buffers across its layers, so a whole stack fits in memory where
+/// 30 separate resident blocks swapped. mioh scenes are at most 48 frames,
+/// which only ever uses the 7-latent stack.
+private var residentGroups: [URL: [MLModel]] = [:]
+
+private func groupedStack(_ assetRoot: URL, shapeName: String) throws -> [MLModel]? {
+  let directory = assetRoot.appendingPathComponent(
+    "native-4x-\(shapeName)-fp16-grouped", isDirectory: true)
+  if let resident = residentGroups[directory] { return resident }
+  guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path)
+    .filter({ $0.hasPrefix("dit-group-") && $0.hasSuffix(".mlpackage") })
+    .sorted(),
+    !names.isEmpty
+  else { return nil }
+  var nextLayer = 0
+  for name in names {
+    let parts = name.split(separator: "-")
+    guard parts.count > 3, let first = Int(parts[2]), let last = Int(parts[3]),
+      first == nextLayer, last >= first
+    else { throw ClipError.invalid("DiT groups must cover layers contiguously: \(name)") }
+    nextLayer = last + 1
+  }
+  guard nextLayer == 30 else {
+    throw ClipError.invalid("DiT groups cover \(nextLayer) of 30 layers")
+  }
+  let models = try names.map { name in
+    try pooled {
+      try loadModel(compiled: compiledURL(for: directory.appendingPathComponent(name)))
+    }
+  }
+  residentGroups[directory] = models
+  return models
+}
+
 /// Loads a model on another thread. Loading a DiT block takes longer than
 /// running it and uses the CPU, so the next block loads while the current one
 /// runs on the GPU. At most two blocks are alive at once.
@@ -538,26 +575,41 @@ private func denoise(
     "sine": try rotary(components, axis: "sine", temporalOffset: temporalOffset,
       latentCount: ditCount),
   ]
-  let blocks = try (0..<30).map { layer in
-    try compiledURL(for: variant.appendingPathComponent(String(
-      format: "dit-block-%02d-%@-4x-float16.mlpackage", layer, shapeName)))
-  }
-  var pending = PendingModel(compiled: blocks[0])
-  for layer in blocks.indices {
-    let model = try pending.wait()
-    if layer + 1 < blocks.count {
-      pending = PendingModel(compiled: blocks[layer + 1])
+  if let groups = try groupedStack(assetRoot, shapeName: shapeName) {
+    for (index, model) in groups.enumerated() {
+      var inputs = conditions
+      inputs["hidden"] = hidden
+      hidden = try pooled {
+        try contiguous(
+          feature(predictFeatures(model, values: inputs), name: "output",
+            source: variant),
+          shape: [1, tokens, 3072]
+        )
+      }
+      print("DiT group \(index + 1)/\(groups.count) elapsed=\(Date().timeIntervalSince(started))s")
     }
-    var inputs = conditions
-    inputs["hidden"] = hidden
-    hidden = try pooled {
-      try contiguous(
-        feature(predictFeatures(model, values: inputs), name: "output",
-          source: blocks[layer]),
-        shape: [1, tokens, 3072]
-      )
+  } else {
+    let blocks = try (0..<30).map { layer in
+      try compiledURL(for: variant.appendingPathComponent(String(
+        format: "dit-block-%02d-%@-4x-float16.mlpackage", layer, shapeName)))
     }
-    print("DiT \(layer + 1)/30 elapsed=\(Date().timeIntervalSince(started))s")
+    var pending = PendingModel(compiled: blocks[0])
+    for layer in blocks.indices {
+      let model = try pending.wait()
+      if layer + 1 < blocks.count {
+        pending = PendingModel(compiled: blocks[layer + 1])
+      }
+      var inputs = conditions
+      inputs["hidden"] = hidden
+      hidden = try pooled {
+        try contiguous(
+          feature(predictFeatures(model, values: inputs), name: "output",
+            source: blocks[layer]),
+          shape: [1, tokens, 3072]
+        )
+      }
+      print("DiT \(layer + 1)/30 elapsed=\(Date().timeIntervalSince(started))s")
+    }
   }
   let velocity = try pooled {
     try contiguous(

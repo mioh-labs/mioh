@@ -232,14 +232,29 @@ private enum SwiftVRROIPostprocess {
           try report("inference", completed: index,
             sceneIndex: sceneIndex, sceneFrames: scene.frames.count,
             sceneOutput: sceneOutput)
-          if helperSession == nil {
-            helperSession = try SwiftVRHelperSession(helper: helper,
-              model: model, environment: helperEnvironment)
+          // Core ML occasionally aborts the worker with an uncatchable
+          // exception (seen once as an MPSGraph "unexpected rank" error that
+          // did not reproduce). A dead worker is restarted once per scene.
+          for attempt in 1...2 {
+            if helperSession == nil {
+              helperSession = try SwiftVRHelperSession(helper: helper,
+                model: model, environment: helperEnvironment)
+            }
+            do {
+              try helperSession?.infer(
+                input: sceneRoot.appendingPathComponent("input"),
+                output: sceneOutput, frames: scene.frames.count,
+                stopFile: stopFile)
+              break
+            } catch where attempt == 1
+              && helperSession?.isRunning == false
+              && !fileManager.fileExists(atPath: stopFile.path)
+            {
+              print("SwiftVR worker stopped unexpectedly; restarting it for scene \(sceneIndex)")
+              helperSession?.terminate()
+              helperSession = nil
+            }
           }
-          try helperSession?.infer(
-            input: sceneRoot.appendingPathComponent("input"),
-            output: sceneOutput, frames: scene.frames.count,
-            stopFile: stopFile)
         }
         completedInferenceFrames += scene.frames.count
         try report("compositing", completed: index,
@@ -568,6 +583,8 @@ private final class SwiftVRHelperSession: @unchecked Sendable {
       Thread.sleep(forTimeInterval: 0.1)
     }
   }
+
+  var isRunning: Bool { process.isRunning }
 
   /// Ends the worker. Closing its input lets an idle worker exit normally;
   /// one still inferring is terminated.
