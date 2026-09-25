@@ -3,7 +3,7 @@
 
 // One-step SwiftVR ROI enhancement for mioh exports. Each BasicVSR++ scene is
 // handed to a long-lived SwiftVR worker right after restoration, and its
-// 1024px result is composited before the frame is encoded. There is no
+// 512px (2x) or 1024px (4x) result is composited before the frame is encoded. There is no
 // sidecar, no second pass and no re-encode.
 
 import Foundation
@@ -17,43 +17,47 @@ enum SwiftVRROIAssets {
     ).path)
   }
 
-  static func validate(_ root: URL) throws {
-    let fixed = [
-      "reae-stateful-encoder-24f-1024-fp32.mlpackage",
-      "reae-stateful-encoder-28f-1024-fp32.mlpackage",
-      "reae-stateful-decoder-6latent-1024-fp32.mlpackage",
-      "reae-stateful-decoder-7latent-1024-fp32.mlpackage",
-    ]
-    for relative in fixed where !FileManager.default.fileExists(
-      atPath: root.appendingPathComponent(relative).path
-    ) {
-      throw NSError(domain: "SwiftVRROIAssets", code: 1, userInfo: [
-        NSLocalizedDescriptionKey: "SwiftVR model is missing \(relative)"
+  /// Checks the assets one enlargement factor needs: the ReAE graphs at its
+  /// output size, the DiT components for both chunk shapes, and the DiT
+  /// stack either as grouped packages or as 30 per-block packages per shape.
+  static func validate(_ root: URL, scale: Int = 4) throws {
+    let fileManager = FileManager.default
+    func require(_ relative: String, code: Int) throws {
+      guard fileManager.fileExists(atPath: root.appendingPathComponent(relative).path)
+      else {
+        throw NSError(domain: "SwiftVRROIAssets", code: code, userInfo: [
+          NSLocalizedDescriptionKey: "SwiftVR \(scale)x model is missing \(relative)"
+        ])
+      }
+    }
+    guard [2, 4].contains(scale) else {
+      throw NSError(domain: "SwiftVRROIAssets", code: 4, userInfo: [
+        NSLocalizedDescriptionKey: "SwiftVR supports 2x and 4x, not \(scale)x"
       ])
     }
+    let size = 256 * scale
+    for relative in [
+      "reae-stateful-encoder-24f-\(size)-fp32.mlpackage",
+      "reae-stateful-encoder-28f-\(size)-fp32.mlpackage",
+      "reae-stateful-decoder-6latent-\(size)-fp32.mlpackage",
+      "reae-stateful-decoder-7latent-\(size)-fp32.mlpackage",
+    ] {
+      try require(relative, code: 1)
+    }
+    let grouped = ((try? fileManager.contentsOfDirectory(atPath: root
+      .appendingPathComponent("native-\(scale)x-fp16-grouped").path)) ?? [])
+      .filter { $0.hasPrefix("dit-group-") && $0.hasSuffix(".mlpackage") }
     for variant in ["t6", "t7"] {
-      let prefix = "native-4x-\(variant)-fp16"
-      let components = ["patch.mlpackage", "head.mlpackage", "context.f32",
+      let prefix = "native-\(scale)x-\(variant)-fp16"
+      for name in ["patch.mlpackage", "head.mlpackage", "context.f32",
         "modulation.f32", "rope-cosine.f32", "rope-sine.f32"]
-      for name in components {
-        let relative = "\(prefix)/components/\(name)"
-        guard FileManager.default.fileExists(atPath: root.appendingPathComponent(
-          relative).path) else {
-          throw NSError(domain: "SwiftVRROIAssets", code: 2, userInfo: [
-            NSLocalizedDescriptionKey: "SwiftVR model is missing \(relative)"
-          ])
-        }
+      {
+        try require("\(prefix)/components/\(name)", code: 2)
       }
+      guard grouped.isEmpty else { continue }
       for layer in 0..<30 {
-        let name = String(format: "dit-block-%02d-%@-4x-float16.mlpackage",
-          layer, variant)
-        let relative = "\(prefix)/\(name)"
-        guard FileManager.default.fileExists(atPath: root.appendingPathComponent(
-          relative).path) else {
-          throw NSError(domain: "SwiftVRROIAssets", code: 3, userInfo: [
-            NSLocalizedDescriptionKey: "SwiftVR model is missing \(relative)"
-          ])
-        }
+        try require(String(format: "%@/dit-block-%02d-%@-%dx-float16.mlpackage",
+          prefix, layer, variant, scale), code: 3)
       }
     }
   }
@@ -148,10 +152,10 @@ final class SwiftVRWorkerSession: @unchecked Sendable {
   }
 
   func infer(
-    input: URL, output: URL, frames: Int, shouldStop: () -> Bool
+    input: URL, output: URL, frames: Int, scale: Int, shouldStop: () -> Bool
   ) async throws {
     let request = try JSONSerialization.data(withJSONObject: [
-      "input": input.path, "output": output.path, "frames": frames,
+      "input": input.path, "output": output.path, "frames": frames, "scale": scale,
     ]) + Data([0x0A])
     do {
       try requests.fileHandleForWriting.write(contentsOf: request)
@@ -201,11 +205,12 @@ final class SwiftVRWorkerSession: @unchecked Sendable {
 /// Runs SwiftVR over one restored scene at a time for the export pipeline.
 /// Scene frames travel to the worker as temporary files that are removed as
 /// soon as the scene is composited, so disk use is bounded by one scene
-/// (about 0.4 MB in and 6 MB out per frame).
+/// (about 0.4 MB in and 1.5 MB (2x) or 6 MB (4x) out per frame).
 final class SwiftVRSceneEnhancer: @unchecked Sendable {
-  static let outputSide = 1024
-
   let strength: Float
+  /// 2 (512px output, about a quarter of the DiT work) or 4 (1024px).
+  let scale: Int
+  var outputSide: Int { 256 * scale }
   /// Set once the export's stop control exists.
   var shouldStop: () -> Bool = { false }
   private let model: URL
@@ -214,8 +219,9 @@ final class SwiftVRSceneEnhancer: @unchecked Sendable {
   private let environment: [String: String]
   private var session: SwiftVRWorkerSession?
 
-  init(model: URL, strength: Float, workDirectory: URL) throws {
-    try SwiftVRROIAssets.validate(model)
+  init(model: URL, strength: Float, scale: Int, workDirectory: URL) throws {
+    try SwiftVRROIAssets.validate(model, scale: scale)
+    self.scale = scale
     self.model = model
     self.strength = max(0, min(1, strength))
     self.workDirectory = workDirectory
@@ -268,7 +274,7 @@ final class SwiftVRSceneEnhancer: @unchecked Sendable {
         }
         do {
           try await session?.infer(
-            input: input, output: output, frames: frameCount,
+            input: input, output: output, frames: frameCount, scale: scale,
             shouldStop: shouldStop)
           break
         } catch where attempt == 1 && session?.isRunning == false && !shouldStop() {
@@ -284,7 +290,7 @@ final class SwiftVRSceneEnhancer: @unchecked Sendable {
       throw error
     }
     try? FileManager.default.removeItem(at: input)
-    return SwiftVRSceneOutput(root: root, output: output)
+    return SwiftVRSceneOutput(root: root, output: output, side: outputSide)
   }
 
   func close() {
@@ -293,13 +299,13 @@ final class SwiftVRSceneEnhancer: @unchecked Sendable {
   }
 }
 
-/// The worker's 1024px planar RGB FP16 frames for one scene.
+/// The worker's 512px or 1024px planar RGB FP16 frames for one scene.
 struct SwiftVRSceneOutput {
   let root: URL
   let output: URL
+  let side: Int
 
   func frame(_ index: Int) throws -> [Float16] {
-    let side = SwiftVRSceneEnhancer.outputSide
     let url = output.appendingPathComponent(String(format: "%04d.f16", index))
     let data = try Data(contentsOf: url)
     guard data.count == 3 * side * side * MemoryLayout<Float16>.size else {
