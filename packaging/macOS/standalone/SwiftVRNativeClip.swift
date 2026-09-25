@@ -19,9 +19,33 @@ private enum ClipError: Error, CustomStringConvertible {
   }
 }
 
-private let outputSize = 1024
 private let inputSize = 256
-private let latentSide = 64
+
+/// Sizes and asset names for one enlargement factor. 4x turns the 256px
+/// restoration into 1024px; 2x into 512px with a quarter of the DiT tokens.
+private struct Geometry {
+  let scale: Int
+
+  init(scale: Int) throws {
+    guard [2, 4].contains(scale) else {
+      throw ClipError.invalid("scale must be 2 or 4")
+    }
+    self.scale = scale
+  }
+
+  var outputSize: Int { inputSize * scale }
+  var latentSide: Int { outputSize / 16 }
+  /// DiT tokens per latent frame along each axis (2x2 patches).
+  var tokenSide: Int { latentSide / 2 }
+  var packName: String { "\(scale)x" }
+  func pack(_ shapeName: String) -> String { "native-\(packName)-\(shapeName)-fp16" }
+  func encoder(frames: Int) -> String {
+    "reae-stateful-encoder-\(frames)f-\(outputSize)-fp32.mlpackage"
+  }
+  func decoder(latents: Int) -> String {
+    "reae-stateful-decoder-\(latents)latent-\(outputSize)-fp32.mlpackage"
+  }
+}
 // Compiling a package takes about ten times longer than running it, and
 // nothing uses the GPU meanwhile. Compiled models therefore persist across
 // exports in the shared cache the postprocess supplies.
@@ -202,7 +226,7 @@ private func predictFeatures(
 /// GPU working buffers across its layers, so a whole stack fits in memory
 /// where 30 separate resident blocks swapped.
 ///
-/// Preferred layout: `native-4x-fp16-grouped/dit-group-AA-BB-4x-float16.mlpackage`,
+/// Preferred layout: `native-<scale>x-fp16-grouped/dit-group-AA-BB-<scale>x-float16.mlpackage`,
 /// each a multifunction package with a `t7` and a `t6` function. The shapes
 /// share their weights on disk and in memory (a t6 function added 0.48 GB to
 /// a group, a separate package about 1.5 GB). Export clips reach 180 frames,
@@ -210,10 +234,13 @@ private func predictFeatures(
 /// `native-4x-t7-fp16-grouped`.
 private var residentGroups: [String: [MLModel]] = [:]
 
-private func groupedStack(_ assetRoot: URL, shapeName: String) throws -> [MLModel]? {
-  let shared = assetRoot.appendingPathComponent("native-4x-fp16-grouped", isDirectory: true)
+private func groupedStack(
+  _ assetRoot: URL, shapeName: String, geometry: Geometry
+) throws -> [MLModel]? {
+  let shared = assetRoot.appendingPathComponent(
+    "native-\(geometry.packName)-fp16-grouped", isDirectory: true)
   let single = assetRoot.appendingPathComponent(
-    "native-4x-\(shapeName)-fp16-grouped", isDirectory: true)
+    "\(geometry.pack(shapeName))-grouped", isDirectory: true)
   for (directory, functionName) in [(shared, shapeName as String?), (single, nil)] {
     let key = "\(directory.path)#\(shapeName)"
     if let resident = residentGroups[key] { return resident }
@@ -326,8 +353,9 @@ private func imagePixels(_ url: URL) throws -> [UInt8] {
 }
 
 private func inputFrames(
-  _ folder: URL, start: Int, validCount: Int, paddedCount: Int
+  _ folder: URL, start: Int, validCount: Int, paddedCount: Int, geometry: Geometry
 ) throws -> MLMultiArray {
+  let outputSize = geometry.outputSize
   let allFiles = try FileManager.default.contentsOfDirectory(
     at: folder, includingPropertiesForKeys: nil
   )
@@ -343,7 +371,7 @@ private func inputFrames(
   }
   let plane = outputSize * outputSize
   let inputPlane = inputSize * inputSize
-  // Decode every frame to planar Float, then upscale 4x. Frames are
+  // Decode every frame to planar Float, then upscale 2x or 4x. Frames are
   // independent and write disjoint output planes, so both steps run in parallel.
   var sources = [[Float]](repeating: [], count: paddedCount)
   var readFailures = [Error?](repeating: nil, count: paddedCount)
@@ -432,7 +460,7 @@ private func zeroStates(_ sizes: [[Int]]) throws -> [String: Any] {
 
 private func rotary(
   _ components: URL, axis: String, temporalOffset: Int,
-  latentCount: Int
+  latentCount: Int, side: Int
 ) throws -> MLMultiArray {
   guard temporalOffset >= 0, temporalOffset + latentCount <= 1024 else {
     throw ClipError.invalid("Temporal RoPE table is too short")
@@ -440,12 +468,12 @@ private func rotary(
   let path = components.appendingPathComponent("rope-\(axis).f32")
   let table = try fromFile(path, shape: [1024, 128])
   let source = table.dataPointer.assumingMemoryBound(to: Float.self)
-  let result = try array([1, latentCount * 32 * 32, 1, 128])
+  let result = try array([1, latentCount * side * side, 1, 128])
   let target = result.dataPointer.assumingMemoryBound(to: Float.self)
   for time in 0..<latentCount {
-    for y in 0..<32 {
-      for x in 0..<32 {
-        let start = ((time * 32 + y) * 32 + x) * 128
+    for y in 0..<side {
+      for x in 0..<side {
+        let start = ((time * side + y) * side + x) * 128
         for dimension in 0..<44 { target[start + dimension] = source[(time + temporalOffset) * 128 + dimension] }
         for dimension in 0..<42 { target[start + 44 + dimension] = source[y * 128 + 44 + dimension] }
         for dimension in 0..<42 { target[start + 86 + dimension] = source[x * 128 + 86 + dimension] }
@@ -457,7 +485,7 @@ private func rotary(
 
 private func savePNG(
   _ frames: MLMultiArray, decoderFrame: Int,
-  outputFrame: Int, latentCount: Int, folder: URL
+  outputFrame: Int, latentCount: Int, folder: URL, outputSize: Int
 ) throws {
   let shape = [1, latentCount * 4, 3, outputSize, outputSize]
   guard frames.shape.map(\.intValue) == shape else {
@@ -500,7 +528,7 @@ private func savePNG(
 
 private func saveRaw(
   _ frames: MLMultiArray, decoderFrame: Int,
-  outputFrame: Int, latentCount: Int, folder: URL
+  outputFrame: Int, latentCount: Int, folder: URL, outputSize: Int
 ) throws {
   let shape = [1, latentCount * 4, 3, outputSize, outputSize]
   guard frames.shape.map(\.intValue) == shape else {
@@ -524,14 +552,14 @@ private func saveRaw(
 }
 
 private func trailingLatents(
-  _ latents: MLMultiArray, count: Int, trailing: Int
+  _ latents: MLMultiArray, count: Int, trailing: Int, side: Int
 ) throws -> MLMultiArray {
   guard (1...count).contains(trailing) else {
     throw ClipError.invalid("Invalid preceding latent count")
   }
-  let source = try contiguous(latents, shape: [count, 48, 64, 64])
-  let result = try array([trailing, 48, 64, 64])
-  let elements = 48 * 64 * 64
+  let source = try contiguous(latents, shape: [count, 48, side, side])
+  let result = try array([trailing, 48, side, side])
+  let elements = 48 * side * side
   memcpy(
     result.dataPointer,
     source.dataPointer.advanced(by: (count - trailing) * elements * MemoryLayout<Float>.size),
@@ -543,17 +571,19 @@ private func trailingLatents(
 private func denoise(
   latents: MLMultiArray, encodedCount: Int, validCount: Int,
   previous: MLMultiArray?, temporalOffset: Int,
-  assetRoot: URL, started: Date
+  assetRoot: URL, geometry: Geometry, started: Date
 ) throws -> MLMultiArray {
+  let latentSide = geometry.latentSide
+  let tokenSide = geometry.tokenSide
   guard [6, 7].contains(encodedCount), (1...encodedCount).contains(validCount) else {
     throw ClipError.invalid("Invalid encoded or valid latent count")
   }
   let ditCount = encodedCount == 7 || previous != nil ? 7 : 6
   let padding = ditCount - validCount
-  let raw = try contiguous(latents, shape: [encodedCount, 48, 64, 64])
+  let raw = try contiguous(latents, shape: [encodedCount, 48, latentSide, latentSide])
   let rawValues = raw.dataPointer.assumingMemoryBound(to: Float.self)
   let previousValues = previous?.dataPointer.assumingMemoryBound(to: Float.self)
-  let ditInput = try array([1, 48, ditCount, 64, 64])
+  let ditInput = try array([1, 48, ditCount, latentSide, latentSide])
   let ditValues = ditInput.dataPointer.assumingMemoryBound(to: Float.self)
   let spatial = latentSide * latentSide
   for time in 0..<ditCount {
@@ -573,9 +603,9 @@ private func denoise(
     }
   }
   let shapeName = ditCount == 6 ? "t6" : "t7"
-  let variant = assetRoot.appendingPathComponent("native-4x-\(shapeName)-fp16")
+  let variant = assetRoot.appendingPathComponent(geometry.pack(shapeName))
   let components = variant.appendingPathComponent("components")
-  let tokens = ditCount * 32 * 32
+  let tokens = ditCount * tokenSide * tokenSide
   var hidden = try pooled {
     try contiguous(
       predict(components.appendingPathComponent("patch.mlpackage"),
@@ -587,11 +617,11 @@ private func denoise(
     "context": try fromFile(components.appendingPathComponent("context.f32"), shape: [1, 512, 3072]),
     "modulation": try fromFile(components.appendingPathComponent("modulation.f32"), shape: [1, 6, 3072]),
     "cosine": try rotary(components, axis: "cosine", temporalOffset: temporalOffset,
-      latentCount: ditCount),
+      latentCount: ditCount, side: tokenSide),
     "sine": try rotary(components, axis: "sine", temporalOffset: temporalOffset,
-      latentCount: ditCount),
+      latentCount: ditCount, side: tokenSide),
   ]
-  if let groups = try groupedStack(assetRoot, shapeName: shapeName) {
+  if let groups = try groupedStack(assetRoot, shapeName: shapeName, geometry: geometry) {
     for (index, model) in groups.enumerated() {
       var inputs = conditions
       inputs["hidden"] = hidden
@@ -607,7 +637,8 @@ private func denoise(
   } else {
     let blocks = try (0..<30).map { layer in
       try compiledURL(for: variant.appendingPathComponent(String(
-        format: "dit-block-%02d-%@-4x-float16.mlpackage", layer, shapeName)))
+        format: "dit-block-%02d-%@-%@-float16.mlpackage", layer, shapeName,
+        geometry.packName)))
     }
     var pending = PendingModel(compiled: blocks[0])
     for layer in blocks.indices {
@@ -631,11 +662,11 @@ private func denoise(
     try contiguous(
       predict(components.appendingPathComponent("head.mlpackage"),
         values: ["hidden": hidden], output: "output"),
-      shape: [1, 48, ditCount, 64, 64]
+      shape: [1, 48, ditCount, latentSide, latentSide]
     )
   }
   let velocityValues = velocity.dataPointer.assumingMemoryBound(to: Float.self)
-  let decodedInput = try array([1, encodedCount, 48, 64, 64])
+  let decodedInput = try array([1, encodedCount, 48, latentSide, latentSide])
   let decodedValues = decodedInput.dataPointer.assumingMemoryBound(to: Float.self)
   for time in 0..<encodedCount {
     for channel in 0..<48 {
@@ -667,11 +698,11 @@ private enum SwiftVRNativeClipRunner {
       try serve(root: URL(fileURLWithPath: arguments[1], isDirectory: true))
       return
     }
-    guard [4, 5].contains(arguments.count) else {
-      throw ClipError.invalid("usage: swiftvr-native-clip <asset-root> (--serve | <input-png-directory> <output-png-directory> [frame-count])")
+    guard (4...6).contains(arguments.count) else {
+      throw ClipError.invalid("usage: swiftvr-native-clip <asset-root> (--serve | <input-png-directory> <output-png-directory> [frame-count [scale]])")
     }
     let requested: Int?
-    if arguments.count == 5 {
+    if arguments.count >= 5 {
       guard let value = Int(arguments[4]) else {
         throw ClipError.invalid("frame-count must be an integer")
       }
@@ -683,19 +714,22 @@ private enum SwiftVRNativeClipRunner {
       root: URL(fileURLWithPath: arguments[1], isDirectory: true),
       input: URL(fileURLWithPath: arguments[2], isDirectory: true),
       output: URL(fileURLWithPath: arguments[3], isDirectory: true),
-      requestedFrames: requested
+      requestedFrames: requested,
+      geometry: Geometry(scale: arguments.count == 6 ? Int(arguments[5]) ?? 0 : 4)
     )
   }
 
   /// Serves every scene of one export from this process instead of starting
   /// a worker per scene. Each stdin line is a JSON request
-  /// `{"input": path, "output": path, "frames": count}`; each completed scene
+  /// `{"input": path, "output": path, "frames": count, "scale": 2|4}` (scale
+  /// defaults to 4); each completed scene
   /// is acknowledged by one stdout line `SWIFTVR-DONE <output path>`.
   static func serve(root: URL) throws {
     struct Request: Decodable {
       let input: String
       let output: String
       let frames: Int
+      let scale: Int?
     }
     while let line = readLine() {
       guard !line.isEmpty else { continue }
@@ -705,7 +739,8 @@ private enum SwiftVRNativeClipRunner {
           root: root,
           input: URL(fileURLWithPath: request.input, isDirectory: true),
           output: URL(fileURLWithPath: request.output, isDirectory: true),
-          requestedFrames: request.frames
+          requestedFrames: request.frames,
+          geometry: Geometry(scale: request.scale ?? 4)
         )
       }
       print("SWIFTVR-DONE \(request.output)")
@@ -714,8 +749,9 @@ private enum SwiftVRNativeClipRunner {
   }
 
   static func runScene(
-    root: URL, input: URL, output: URL, requestedFrames: Int?
+    root: URL, input: URL, output: URL, requestedFrames: Int?, geometry: Geometry
   ) throws {
+    let size = geometry.outputSize
     try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
     let inputs = try FileManager.default.contentsOfDirectory(
       at: input, includingPropertiesForKeys: nil
@@ -739,17 +775,15 @@ private enum SwiftVRNativeClipRunner {
     let started = Date()
     let firstCount = min(totalFrames, 28)
     let frames = try inputFrames(
-      input, start: 0, validCount: firstCount, paddedCount: 28
+      input, start: 0, validCount: firstCount, paddedCount: 28, geometry: geometry
     )
     var encoderInputs = try zeroStates(
-      Array(repeating: [64, 256, 256], count: 3)
-        + Array(repeating: [64, 128, 128], count: 3)
-        + Array(repeating: [64, 64, 64], count: 3)
+      Array(repeating: [64, size / 4, size / 4], count: 3)
+        + Array(repeating: [64, size / 8, size / 8], count: 3)
+        + Array(repeating: [64, size / 16, size / 16], count: 3)
     )
     encoderInputs["frames"] = frames
-    let firstEncoderURL = root.appendingPathComponent(
-      "reae-stateful-encoder-28f-1024-fp32.mlpackage"
-    )
+    let firstEncoderURL = root.appendingPathComponent(geometry.encoder(frames: 28))
     let firstEncoded = try predictFeatures(firstEncoderURL, values: encoderInputs)
     let firstLatents = try feature(
       firstEncoded, name: "latents", source: firstEncoderURL
@@ -759,27 +793,27 @@ private enum SwiftVRNativeClipRunner {
       latents: firstLatents, encodedCount: 7,
       validCount: min(7, (max(totalFrames, 1) - 1 + 3) / 4 + 1),
       previous: nil, temporalOffset: 0,
-      assetRoot: root, started: started
+      assetRoot: root, geometry: geometry, started: started
     )
     var decoderInputs = try zeroStates(
-      Array(repeating: [512, 64, 64], count: 3)
-        + Array(repeating: [256, 128, 128], count: 3)
-        + Array(repeating: [128, 256, 256], count: 3)
+      Array(repeating: [512, size / 16, size / 16], count: 3)
+        + Array(repeating: [256, size / 8, size / 8], count: 3)
+        + Array(repeating: [128, size / 4, size / 4], count: 3)
     )
     decoderInputs["latents"] = firstDenoised
-    let firstDecoderURL = root.appendingPathComponent(
-      "reae-stateful-decoder-7latent-1024-fp32.mlpackage"
-    )
+    let firstDecoderURL = root.appendingPathComponent(geometry.decoder(latents: 7))
     let firstDecoded = try predictFeatures(firstDecoderURL, values: decoderInputs)
     let firstOutput = try feature(firstDecoded, name: "frames", source: firstDecoderURL)
     let firstOutputCount = min(totalFrames, 25)
     for index in 0..<firstOutputCount {
       if rawOutput {
         try saveRaw(firstOutput, decoderFrame: index + 3,
-          outputFrame: index, latentCount: 7, folder: output)
+          outputFrame: index, latentCount: 7, folder: output,
+          outputSize: size)
       } else {
         try savePNG(firstOutput, decoderFrame: index + 3,
-          outputFrame: index, latentCount: 7, folder: output)
+          outputFrame: index, latentCount: 7, folder: output,
+          outputSize: size)
       }
     }
     let paddedTotal = ((totalFrames - 1 + 3) / 4) * 4 + 1
@@ -799,13 +833,12 @@ private enum SwiftVRNativeClipRunner {
         let chunkFrames = min(remaining, 24)
         let availableFrames = max(1, min(totalFrames - nextInput, chunkFrames))
         let continuationFrames = try inputFrames(
-          input, start: nextInput, validCount: availableFrames, paddedCount: 24
+          input, start: nextInput, validCount: availableFrames, paddedCount: 24,
+          geometry: geometry
         )
         var encoderInputs = try followingStates(encoded, source: encodedURL)
         encoderInputs["frames"] = continuationFrames
-        let encoderURL = root.appendingPathComponent(
-          "reae-stateful-encoder-24f-1024-fp32.mlpackage"
-        )
+        let encoderURL = root.appendingPathComponent(geometry.encoder(frames: 24))
         let nextEncoded = try predictFeatures(encoderURL, values: encoderInputs)
         let nextLatents = try feature(
           nextEncoded, name: "latents", source: encoderURL
@@ -814,7 +847,7 @@ private enum SwiftVRNativeClipRunner {
         let padLatents = isLast ? 7 - validLatents : 0
         let precedingLatents = padLatents > 0
           ? try trailingLatents(rawLatents, count: rawLatentCount,
-            trailing: padLatents)
+            trailing: padLatents, side: geometry.latentSide)
           : nil
         // MIDDLE uses the six-latent graph without overlap. LAST prepends the
         // previous raw latents (not denoised latents) to the seven-latent graph.
@@ -822,23 +855,23 @@ private enum SwiftVRNativeClipRunner {
           latents: nextLatents, encodedCount: 6, validCount: validLatents,
           previous: precedingLatents,
           temporalOffset: max(0, latentOffset - padLatents),
-          assetRoot: root, started: started
+          assetRoot: root, geometry: geometry, started: started
         )
         var decoderInputs = try followingStates(decoded, source: decodedURL)
         decoderInputs["latents"] = nextDenoised
-        let decoderURL = root.appendingPathComponent(
-          "reae-stateful-decoder-6latent-1024-fp32.mlpackage"
-        )
+        let decoderURL = root.appendingPathComponent(geometry.decoder(latents: 6))
         let nextDecoded = try predictFeatures(decoderURL, values: decoderInputs)
         let decodedFrames = try feature(nextDecoded, name: "frames", source: decoderURL)
         let outputCount = min(totalFrames - nextOutput, 24)
         for index in 0..<outputCount {
           if rawOutput {
             try saveRaw(decodedFrames, decoderFrame: index,
-              outputFrame: nextOutput + index, latentCount: 6, folder: output)
+              outputFrame: nextOutput + index, latentCount: 6, folder: output,
+              outputSize: size)
           } else {
             try savePNG(decodedFrames, decoderFrame: index,
-              outputFrame: nextOutput + index, latentCount: 6, folder: output)
+              outputFrame: nextOutput + index, latentCount: 6, folder: output,
+              outputSize: size)
           }
         }
         nextInput += chunkFrames
