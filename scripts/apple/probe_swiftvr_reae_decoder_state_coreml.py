@@ -63,6 +63,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--size", type=int, choices=(256, 512, 1024), default=256)
     parser.add_argument("--latent-frames", type=int, choices=(1, 6, 7), default=1)
+    parser.add_argument("--precision", choices=("float32", "float16"), default="float32")
     args = parser.parse_args()
 
     module = load_reae(args.source)
@@ -114,7 +115,12 @@ def main() -> None:
         + [ct.TensorType(name=f"next_state_{i}") for i in range(9)],
         minimum_deployment_target=ct.target.macOS15,
         convert_to="mlprogram",
-        compute_precision=ct.precision.FLOAT32,
+        compute_precision=(
+            ct.precision.FLOAT16 if args.precision == "float16" else ct.precision.FLOAT32
+        ),
+        # An FP16 decoder is ANE-eligible; compiling it for the ANE took over
+        # 45 minutes at 1024px, and mioh runs it on the GPU.
+        compute_units=ct.ComputeUnit.CPU_AND_GPU,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     converted.save(str(args.output))
