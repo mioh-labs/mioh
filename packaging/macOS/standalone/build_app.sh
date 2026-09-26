@@ -146,18 +146,11 @@ xcrun swiftc \
   "$ROOT/packages/MiohRemoteKit/Sources/MiohRemoteKit/MiohHTTPRangeAsset.swift" \
   "$PACKAGE_DIR/MacChildProcessPipe.swift" \
   "$PACKAGE_DIR/PreviewVideoToolboxEncoder.swift" \
+  -framework ImageIO \
+  "$PACKAGE_DIR/SwiftVRNativeClip.swift" \
   "$PACKAGE_DIR/SwiftVRInlineEnhancer.swift" \
   "$PACKAGE_DIR/NativePreviewPipeline.swift" \
   -o "$RESOURCES/bin/mioh-native-coreai-preview"
-xcrun swiftc \
-  "${SWIFT_SUBPROCESS_FLAGS[@]}" \
-  -O \
-  -parse-as-library \
-  -target arm64-apple-macosx27.0 \
-  -framework CoreML \
-  -framework ImageIO \
-  "$PACKAGE_DIR/SwiftVRNativeClip.swift" \
-  -o "$RESOURCES/bin/mioh-native-swiftvr-clip"
 xcrun swiftc \
   "${SWIFT_SUBPROCESS_FLAGS[@]}" \
   -O \

@@ -13,26 +13,38 @@ face-restoration gate.
   model runtimes only. mioh never invokes PyTorch.
 - `NativeFrameProcessor.process` hands each restored BasicVSR++ scene (256px
   planar FP16, after restore effects) to `SwiftVRSceneEnhancer`
-  (`SwiftVRInlineEnhancer.swift`). The enhancer sends it to one long-lived
-  `mioh-native-swiftvr-clip --serve` worker and composites every 1024px result
-  before encoding.
+  (`SwiftVRInlineEnhancer.swift`). The enhancer runs SwiftVR
+  (`SwiftVRNativeClip.swift`, compiled into `mioh-native-coreai-preview`) in
+  the export process, like every other ROI enhancer, and composites every
+  512px or 1024px result before encoding.
   - Compositing uses the direct-replacement path shared with PiperSR:
     `base + (SwiftVR - base) * strength * mask`.
   - There is no sidecar, no second pass and no re-encode. The final movie is
     the normal export.
-- Scene frames travel as temporary files under the export's working
-  directory. They are removed once the scene is composited, so disk use is
-  bounded by one scene (48 frames: about 19 MB in, 300 MB out; export clips
-  reach 180 frames, about 70 MB in and 1.1 GB out).
+- Scene frames go from memory straight into Core ML, and the result stays
+  in memory until the scene is composited: one scene per lane (48 frames at
+  4x: about 300 MB; export clips reach 180 frames, about 1.1 GB). Until
+  2026-09-26 a separate `mioh-native-swiftvr-clip --serve` worker exchanged
+  them as temporary files. The in-process result is bit-identical to that
+  worker's (30 frames at 2x, 100 frames at 4x), and the file exchange had
+  cost well under 1% of a scene.
 - Local export only, Expert ROI off. Export lanes follow the native
-  parallel setting and take turns on the one worker; the other lanes keep
+  parallel setting and take turns running SwiftVR; the other lanes keep
   detecting, restoring, compositing and encoding meanwhile. Crossfade stays available;
   overlap frames are simply enhanced in both batches.
-- Stopping the export terminates the worker. The current scene finishes
-  without SwiftVR, and the export ends exactly like a stop without SwiftVR
-  (exit 0, no error event).
-- Worker progress lines go to stderr. This process's stdout carries mioh's
+- Stopping the export cancels SwiftVR between chunks and DiT groups (0.06 s
+  after the stop in a 4x test). The current scene finishes without SwiftVR,
+  and the export ends exactly like a stop without SwiftVR (exit 0, no error
+  event).
+- SwiftVR progress lines go to stderr. This process's stdout carries mioh's
   JSON event stream.
+- Core ML keeps a per-executable cache in `~/Library/Caches/<executable>`.
+  Moving SwiftVR into `mioh-native-coreai-preview` rebuilt it once (a 4x test
+  scene took 51 s instead of 21 s) and it reached 28 GB; the old worker's
+  `mioh-native-swiftvr-clip` cache (93 GB) is no longer used.
+- `SwiftVRNativeClip.swift` still builds on its own as a command-line tool
+  for folders of PNG or `.f16` frames (`--serve` included); the app no longer
+  ships it.
 - Keep checkpoint assets external to the app. The local checkpoint is about
   19 GiB; the converted FP16 T6/T7 packs occupy about 18.4 GiB and have not
   been approved for redistribution.
@@ -43,7 +55,7 @@ face-restoration gate.
   - `reae-stateful-{encoder-28f,encoder-24f,decoder-7latent,decoder-6latent}-512-fp32.mlpackage`
   - `native-2x-t7-fp16/components` and `native-2x-t6-fp16/components`
   - `native-2x-fp16-grouped` (multifunction t7/t6 groups)
-  The worker takes the scale per scene from its request.
+  The scale is chosen per scene.
 - Composition fades SwiftVR's change in over 4% of the crop's short side
   (smoothstep). The previous seam taper was at most 4 px, which left a visible
   edge wherever SwiftVR shifted colour or texture.
@@ -151,14 +163,14 @@ or output sizes without additional variants or a validated dynamic export.
   pruned. The cache occupies about 9.5 GB per model pack. Previously a
   per-run temporary cache was deleted after every export, so every export
   recompiled about 34 packages while the GPU sat idle.
-- One `mioh-native-swiftvr-clip --serve` worker handles every scene of an
-  export, one scene at a time over stdin. This replaces a worker process per
-  scene.
+- One process handles every scene of an export, one scene at a time (at
+  first a long-lived worker, now the export process itself). This replaced a
+  worker process per scene.
 - Models load for each use; none stay resident. A loaded DiT block holds far
   more than its 312 MB of weights. Keeping the stack resident reached 42–63 GB
   and swapped, while on-demand loading ran a warm 49-frame scene in 16.7 s.
   Every prediction, chunk and scene runs inside an autorelease pool. Without
-  the pools the long-lived worker grew until the system swapped.
+  the pools a long-lived process grew until the system swapped.
 - Five-scene MIDV-670 sidecar (48+11+7+3+3 frames, M5 Pro, GPU sampled from
   ioreg): the previous code took 132.7 s at 39% mean GPU. The new code took
   87.8 s at 57% on its first export (cache build) and 55.8 s at 74% once
@@ -172,13 +184,13 @@ or output sizes without additional variants or a validated dynamic export.
   exports layers as multi-layer Core ML programs into
   `<model-root>/native-4x-t7-fp16-grouped/dit-group-AA-BB-t7-4x-float16.mlpackage`.
   Five 6-layer groups take about 100 s each and 5.5 GB peak to convert, and
-  occupy 9 GB. When present, the worker loads them once and keeps them
+  occupy 9 GB. When present, SwiftVR loads them once and keeps them
   resident, using about 8.5 GB instead of the 42–63 GB of 30 resident blocks.
   - Export clips reach 180 frames, whose middle chunks need the 6-latent
     stack. `--latent-frames 7 6` writes each group as one multifunction
     package with `t7` and `t6` functions into
     `<model-root>/native-4x-fp16-grouped/dit-group-AA-BB-4x-float16.mlpackage`.
-    The worker prefers that directory and falls back to the t7-only one.
+    SwiftVR prefers that directory and falls back to the t7-only one.
   - The functions share their weights on disk (1.8 GB per group, the same as
     t7 alone) and in memory: adding t6 to a loaded group raised the footprint
     by 0.48 GB, against about 1.5 GB for a separate package. The t6 function
@@ -209,9 +221,9 @@ or output sizes without additional variants or a validated dynamic export.
   - Loading the five groups costs about 20–30 s once per export.
   - The same group exported to Core AI was 1.8x slower (0.51 s vs 0.29 s for
     three layers) at equal accuracy.
-- If the worker dies mid-scene (one uncatchable Core ML
-  "MPSGraph unexpected rank" abort was seen and did not reproduce), the
-  enhancer restarts it once and retries that scene.
+- One uncatchable Core ML "MPSGraph unexpected rank" abort was seen during
+  development and did not reproduce. The worker used to be restarted once
+  for it; in the export process such an abort would end the export.
 - Still open: a scene shorter than 25 frames is padded to a full
   28-frame/7-latent chunk. A 4-frame scene costs the same 10.8 s as a
   25-frame one. Removing this needs smaller exported graph variants.

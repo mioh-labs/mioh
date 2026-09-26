@@ -99,109 +99,6 @@ func swiftVRPersistentCompiledCache() throws -> URL {
   return cache
 }
 
-/// A long-lived `mioh-native-swiftvr-clip --serve` process. Scenes are sent
-/// one at a time as JSON lines; the worker answers `SWIFTVR-DONE <output>`.
-/// Its progress lines go to stderr, because this process's stdout carries
-/// the JSON event stream read by mioh.
-final class SwiftVRWorkerSession: @unchecked Sendable {
-  private static let replyPrefix = "SWIFTVR-DONE "
-  private let process = Process()
-  private let requests = Pipe()
-  private let responses = Pipe()
-  private let lock = NSLock()
-  private var pending = Data()
-  private var completed: [String] = []
-
-  init(worker: URL, model: URL, environment: [String: String]) throws {
-    // A worker that exits between scenes must surface as a write error, not
-    // terminate this process with SIGPIPE.
-    signal(SIGPIPE, SIG_IGN)
-    process.executableURL = worker
-    process.arguments = [model.path, "--serve"]
-    process.environment = environment
-    process.standardInput = requests
-    process.standardOutput = responses
-    process.standardError = FileHandle.standardError
-    responses.fileHandleForReading.readabilityHandler = { [weak self] handle in
-      self?.receive(handle.availableData)
-    }
-    try process.run()
-  }
-
-  var isRunning: Bool { process.isRunning }
-
-  private func receive(_ data: Data) {
-    lock.lock()
-    defer { lock.unlock() }
-    pending.append(data)
-    while let newline = pending.firstIndex(of: 0x0A) {
-      let line = String(decoding: pending[pending.startIndex..<newline], as: UTF8.self)
-      pending.removeSubrange(pending.startIndex...newline)
-      if line.hasPrefix(Self.replyPrefix) {
-        completed.append(String(line.dropFirst(Self.replyPrefix.count)))
-      } else {
-        FileHandle.standardError.write(Data(("SwiftVR: " + line + "\n").utf8))
-      }
-    }
-  }
-
-  private func takeCompleted() -> String? {
-    lock.lock()
-    defer { lock.unlock() }
-    return completed.isEmpty ? nil : completed.removeFirst()
-  }
-
-  func infer(
-    input: URL, output: URL, frames: Int, scale: Int, shouldStop: () -> Bool
-  ) async throws {
-    let request = try JSONSerialization.data(withJSONObject: [
-      "input": input.path, "output": output.path, "frames": frames, "scale": scale,
-    ]) + Data([0x0A])
-    do {
-      try requests.fileHandleForWriting.write(contentsOf: request)
-    } catch {
-      throw NSError(domain: "SwiftVR", code: 11, userInfo: [
-        NSLocalizedDescriptionKey: "SwiftVR worker is not accepting scenes"
-      ])
-    }
-    while true {
-      if let finished = takeCompleted() {
-        guard finished == output.path else {
-          throw NSError(domain: "SwiftVR", code: 12, userInfo: [
-            NSLocalizedDescriptionKey: "SwiftVR worker answered for another scene"
-          ])
-        }
-        return
-      }
-      if shouldStop() {
-        terminate()
-        throw CancellationError()
-      }
-      guard process.isRunning else {
-        throw NSError(domain: "SwiftVR", code: 13, userInfo: [
-          NSLocalizedDescriptionKey:
-            "SwiftVR worker failed (\(process.terminationStatus))"
-        ])
-      }
-      try await Task.sleep(for: .milliseconds(50))
-    }
-  }
-
-  /// Closing the input lets an idle worker exit normally; one still
-  /// inferring is terminated after a short grace period.
-  func terminate() {
-    try? requests.fileHandleForWriting.close()
-    if process.isRunning {
-      for _ in 0..<20 where process.isRunning {
-        Thread.sleep(forTimeInterval: 0.05)
-      }
-      if process.isRunning { process.terminate() }
-      process.waitUntilExit()
-    }
-    responses.fileHandleForReading.readabilityHandler = nil
-  }
-}
-
 /// Admits one caller at a time without blocking a thread while it waits.
 private final class SwiftVRTurn: @unchecked Sendable {
   private let lock = NSLock()
@@ -235,10 +132,10 @@ private final class SwiftVRTurn: @unchecked Sendable {
   }
 }
 
-/// Runs SwiftVR over one restored scene at a time for the export pipeline.
-/// Scene frames travel to the worker as temporary files that are removed as
-/// soon as the scene is composited, so disk use is bounded by one scene
-/// (about 0.4 MB in and 1.5 MB (2x) or 6 MB (4x) out per frame).
+/// Runs SwiftVR over one restored scene at a time inside the export process.
+/// Scene frames go straight from memory to Core ML and back; the result is
+/// released once the scene is composited (about 1.5 MB (2x) or 6 MB (4x) per
+/// frame).
 final class SwiftVRSceneEnhancer: @unchecked Sendable {
   let strength: Float
   /// 2 (512px output, about a quarter of the DiT work) or 4 (1024px).
@@ -247,36 +144,25 @@ final class SwiftVRSceneEnhancer: @unchecked Sendable {
   /// Set once the export's stop control exists.
   var shouldStop: () -> Bool = { false }
   private let model: URL
-  private let worker: URL
-  private let workDirectory: URL
-  private let environment: [String: String]
-  private var session: SwiftVRWorkerSession?
-  /// Export lanes share one worker. It answers scenes in order, so a lane
-  /// holds the turn from request to reply; the other lanes keep detecting,
-  /// restoring, compositing and encoding meanwhile. A second worker would
-  /// double the resident DiT memory without more GPU to run on.
+  private let compiledCache: URL
+  /// Export lanes take turns: a lane holds the turn while SwiftVR runs its
+  /// scene, and the other lanes keep detecting, restoring, compositing and
+  /// encoding meanwhile. Running two scenes at once would double the
+  /// resident DiT memory without more GPU to run on.
   private let turn = SwiftVRTurn()
+  /// Core ML runs off the Swift concurrency pool; SwiftVR's model state is
+  /// process-wide, so one queue serves every scene.
+  private static let queue = DispatchQueue(
+    label: "com.okatti.mioh.swiftvr", qos: .userInitiated,
+    autoreleaseFrequency: .workItem)
 
-  init(model: URL, strength: Float, scale: Int, workDirectory: URL) throws {
+  init(model: URL, strength: Float, scale: Int) throws {
     try SwiftVRROIAssets.validate(model, scale: scale)
     self.scale = scale
     self.model = model
     self.strength = max(0, min(1, strength))
-    self.workDirectory = workDirectory
-    worker = URL(fileURLWithPath: CommandLine.arguments[0])
-      .deletingLastPathComponent()
-      .appendingPathComponent("mioh-native-swiftvr-clip")
-    guard FileManager.default.isExecutableFile(atPath: worker.path) else {
-      throw NSError(domain: "SwiftVR", code: 14, userInfo: [
-        NSLocalizedDescriptionKey: "SwiftVR worker is missing: \(worker.path)"
-      ])
-    }
-    var environment = ProcessInfo.processInfo.environment
-    environment["MIOH_SWIFTVR_COMPILED_CACHE"] = try swiftVRPersistentCompiledCache().path
-    self.environment = environment
+    compiledCache = try swiftVRPersistentCompiledCache()
   }
-
-  deinit { session?.terminate() }
 
   /// `restored` holds the scene's frames as consecutive planar RGB 256px
   /// FP16 images, exactly the BasicVSR++ result that is composited. Returns
@@ -289,74 +175,55 @@ final class SwiftVRSceneEnhancer: @unchecked Sendable {
         NSLocalizedDescriptionKey: "SwiftVR scene input is incomplete"
       ])
     }
-    let root = workDirectory.appendingPathComponent(
-      "swiftvr-scene-\(UUID().uuidString)", isDirectory: true)
-    let input = root.appendingPathComponent("input", isDirectory: true)
-    let output = root.appendingPathComponent("output", isDirectory: true)
-    try FileManager.default.createDirectory(at: input, withIntermediateDirectories: true)
+    await turn.acquire()
+    defer { turn.release() }
+    if shouldStop() { return nil }
+    let output = SwiftVRSceneOutput(frames: frameCount, side: outputSide)
+    let (model, compiledCache, scale, shouldStop) = (model, compiledCache, scale, shouldStop)
     do {
-      try restored.withUnsafeBytes { bytes in
-        for frame in 0..<frameCount {
-          let start = frame * plane * MemoryLayout<Float16>.size
-          try Data(bytes[start..<(start + plane * MemoryLayout<Float16>.size)])
-            .write(to: input.appendingPathComponent(String(format: "%04d.f16", frame)))
-        }
-      }
-      await turn.acquire()
-      defer { turn.release() }
-      // Core ML occasionally aborts the worker with an uncatchable exception
-      // (seen once as an MPSGraph "unexpected rank" error that did not
-      // reproduce). A dead worker is restarted once per scene.
-      for attempt in 1...2 {
-        if session == nil {
-          session = try SwiftVRWorkerSession(
-            worker: worker, model: model, environment: environment)
-        }
-        do {
-          try await session?.infer(
-            input: input, output: output, frames: frameCount, scale: scale,
-            shouldStop: shouldStop)
-          break
-        } catch where attempt == 1 && session?.isRunning == false && !shouldStop() {
-          FileHandle.standardError.write(Data(
-            "SwiftVR worker stopped unexpectedly; restarting it\n".utf8))
-          session?.terminate()
-          session = nil
+      try await withCheckedThrowingContinuation {
+        (finished: CheckedContinuation<Void, Error>) in
+        Self.queue.async {
+          do {
+            try restored.withUnsafeBufferPointer { input in
+              try runSwiftVRScene(
+                root: model, compiledCache: compiledCache, input: input,
+                frames: frameCount, scale: scale, output: output.pixels,
+                shouldStop: shouldStop)
+            }
+            finished.resume()
+          } catch {
+            finished.resume(throwing: error)
+          }
         }
       }
     } catch {
-      try? FileManager.default.removeItem(at: root)
       if shouldStop() || error is CancellationError { return nil }
       throw error
     }
-    try? FileManager.default.removeItem(at: input)
-    return SwiftVRSceneOutput(root: root, output: output, side: outputSide)
+    return output
   }
 
   func close() {
-    session?.terminate()
-    session = nil
+    Self.queue.sync { releaseSwiftVRModels() }
   }
 }
 
-/// The worker's 512px or 1024px planar RGB FP16 frames for one scene.
-struct SwiftVRSceneOutput {
-  let root: URL
-  let output: URL
+/// SwiftVR's 512px or 1024px planar RGB FP16 frames for one scene.
+final class SwiftVRSceneOutput: @unchecked Sendable {
   let side: Int
+  fileprivate let pixels: UnsafeMutablePointer<Float16>
+  private let frameElements: Int
 
-  func frame(_ index: Int) throws -> [Float16] {
-    let url = output.appendingPathComponent(String(format: "%04d.f16", index))
-    let data = try Data(contentsOf: url)
-    guard data.count == 3 * side * side * MemoryLayout<Float16>.size else {
-      throw NSError(domain: "SwiftVR", code: 16, userInfo: [
-        NSLocalizedDescriptionKey: "Unexpected SwiftVR output size: \(url.path)"
-      ])
-    }
-    return data.withUnsafeBytes { Array($0.bindMemory(to: Float16.self)) }
+  fileprivate init(frames: Int, side: Int) {
+    self.side = side
+    frameElements = 3 * side * side
+    pixels = .allocate(capacity: frames * frameElements)
   }
 
-  func remove() {
-    try? FileManager.default.removeItem(at: root)
+  deinit { pixels.deallocate() }
+
+  func frame(_ index: Int) throws -> [Float16] {
+    Array(UnsafeBufferPointer(start: pixels + index * frameElements, count: frameElements))
   }
 }

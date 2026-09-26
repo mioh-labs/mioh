@@ -149,7 +149,8 @@ private var compiledModels: [URL: URL] = [:]
 // holds far more than its 312 MB of weights (GPU buffers for 7,168 tokens):
 // keeping the stack resident reached 42–63 GB and swapped, while loading on
 // demand ran a warm 49-frame scene in 16.7 s, as fast as keeping 12 resident.
-private let sharedCompiledRoot = ProcessInfo.processInfo.environment[
+// The export sets it directly when SwiftVR runs in its process.
+private var sharedCompiledRoot = ProcessInfo.processInfo.environment[
   "MIOH_SWIFTVR_COMPILED_CACHE"].map {
     URL(fileURLWithPath: $0, isDirectory: true)
   }
@@ -411,6 +412,23 @@ private func predict(
 /// This worker has no run loop, so without explicit pools nothing is freed
 /// until exit: one 30-block chunk alone leaves several GB behind, and a
 /// worker serving many scenes grows until the system swaps.
+/// Progress lines go to stdout on the command line. Inside the export, stdout
+/// carries mioh's JSON event stream, so they go to stderr instead.
+private func progress(_ message: String) {
+#if MIOH_NATIVE_PREVIEW_PIPELINE
+  FileHandle.standardError.write(Data("SwiftVR: \(message)\n".utf8))
+#else
+  print(message)
+#endif
+}
+
+/// Set while the export runs a scene; checked between chunks and DiT groups.
+private var sceneShouldStop: () -> Bool = { false }
+
+private func checkStop() throws {
+  if sceneShouldStop() { throw CancellationError() }
+}
+
 private func pooled<Result>(_ body: () throws -> Result) rethrows -> Result {
   try autoreleasepool(invoking: body)
 }
@@ -451,22 +469,79 @@ private func imagePixels(_ url: URL) throws -> [UInt8] {
   return rgba
 }
 
+/// Where one scene's frames are read from and written to: folders of PNG or
+/// planar FP16 files on the command line, or the export's memory.
+private enum SceneFrames {
+  case folder(inputs: [URL], raw: Bool, output: URL)
+  /// Planar RGB FP16 frames: 256px in, 512px or 1024px out.
+  case memory(
+    input: UnsafeBufferPointer<Float16>, frames: Int, output: UnsafeMutablePointer<Float16>)
+
+  init(input: URL, output: URL) throws {
+    try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+    let files = try FileManager.default.contentsOfDirectory(
+      at: input, includingPropertiesForKeys: nil
+    )
+    let raw = files.contains { $0.pathExtension.lowercased() == "f16" }
+    self = .folder(
+      inputs: files.filter { $0.pathExtension.lowercased() == (raw ? "f16" : "png") }
+        .sorted { $0.lastPathComponent < $1.lastPathComponent },
+      raw: raw, output: output)
+  }
+
+  var inputCount: Int {
+    switch self {
+    case .folder(let inputs, _, _): inputs.count
+    case .memory(_, let frames, _): frames
+    }
+  }
+
+  var description: String {
+    switch self {
+    case .folder(_, _, let output): output.path
+    case .memory(_, let frames, _): "\(frames) frames in memory"
+    }
+  }
+
+  func planarSource(_ frame: Int) throws -> [Float] {
+    switch self {
+    case .folder(let inputs, let raw, _):
+      return try planarFileSource(inputs[frame], raw: raw)
+    case .memory(let input, _, _):
+      let plane = 3 * inputSize * inputSize
+      return input[(frame * plane)..<((frame + 1) * plane)].map(Float.init)
+    }
+  }
+
+  func save(
+    _ frames: MLMultiArray, decoderFrame: Int, outputFrame: Int, latentCount: Int,
+    outputSize: Int
+  ) throws {
+    switch self {
+    case .folder(_, let raw, let output):
+      if raw {
+        try saveRaw(frames, decoderFrame: decoderFrame, outputFrame: outputFrame,
+          latentCount: latentCount, folder: output, outputSize: outputSize)
+      } else {
+        try savePNG(frames, decoderFrame: decoderFrame, outputFrame: outputFrame,
+          latentCount: latentCount, folder: output, outputSize: outputSize)
+      }
+    case .memory(_, _, let output):
+      try writePlanar(frames, decoderFrame: decoderFrame, latentCount: latentCount,
+        outputSize: outputSize,
+        into: output + outputFrame * 3 * outputSize * outputSize)
+    }
+  }
+}
+
 private func inputFrames(
-  _ folder: URL, start: Int, validCount: Int, paddedCount: Int, geometry: Geometry
+  _ scene: SceneFrames, start: Int, validCount: Int, paddedCount: Int, geometry: Geometry
 ) throws -> MLMultiArray {
   let outputSize = geometry.outputSize
-  let allFiles = try FileManager.default.contentsOfDirectory(
-    at: folder, includingPropertiesForKeys: nil
-  )
-  let rawFiles = allFiles.filter { $0.pathExtension.lowercased() == "f16" }
-  let usesRawInput = !rawFiles.isEmpty
-  let files = (usesRawInput ? rawFiles : allFiles.filter {
-    $0.pathExtension.lowercased() == "png"
-  })
-    .sorted { $0.lastPathComponent < $1.lastPathComponent }
+  let available = scene.inputCount
   guard validCount > 0, paddedCount >= validCount,
-    !files.isEmpty, start <= files.count + 3 else {
-    throw ClipError.invalid("Input PNG range is unavailable")
+    available > 0, start <= available + 3 else {
+    throw ClipError.invalid("Input frame range is unavailable")
   }
   let plane = outputSize * outputSize
   let inputPlane = inputSize * inputSize
@@ -478,8 +553,8 @@ private func inputFrames(
     readFailures.withUnsafeMutableBufferPointer { failure in
       DispatchQueue.concurrentPerform(iterations: paddedCount) { frame in
         do {
-          let frameURL = files[min(start + min(frame, validCount - 1), files.count - 1)]
-          output[frame] = try planarSource(frameURL, raw: usesRawInput)
+          output[frame] = try scene.planarSource(
+            min(start + min(frame, validCount - 1), available - 1))
         } catch {
           failure[frame] = error
         }
@@ -516,12 +591,12 @@ private func inputFrames(
       }
     }
   }
-  print("Prepared \(paddedCount) frames")
+  progress("Prepared \(paddedCount) frames")
   return result
 }
 
 /// One input frame as planar RGB Float in [0, 1].
-private func planarSource(_ url: URL, raw: Bool) throws -> [Float] {
+private func planarFileSource(_ url: URL, raw: Bool) throws -> [Float] {
   let inputPlane = inputSize * inputSize
   var source = [Float](repeating: 0, count: 3 * inputPlane)
   if raw {
@@ -629,6 +704,20 @@ private func saveRaw(
   _ frames: MLMultiArray, decoderFrame: Int,
   outputFrame: Int, latentCount: Int, folder: URL, outputSize: Int
 ) throws {
+  var planar = [Float16](repeating: 0, count: outputSize * outputSize * 3)
+  try planar.withUnsafeMutableBufferPointer { destination in
+    try writePlanar(frames, decoderFrame: decoderFrame, latentCount: latentCount,
+      outputSize: outputSize, into: destination.baseAddress!)
+  }
+  let url = folder.appendingPathComponent(String(format: "%04d.f16", outputFrame))
+  try planar.withUnsafeBytes { try Data($0).write(to: url, options: .atomic) }
+}
+
+/// One decoded frame as planar RGB FP16 clamped to [0, 1].
+private func writePlanar(
+  _ frames: MLMultiArray, decoderFrame: Int, latentCount: Int, outputSize: Int,
+  into destination: UnsafeMutablePointer<Float16>
+) throws {
   let shape = [1, latentCount * 4, 3, outputSize, outputSize]
   guard frames.shape.map(\.intValue) == shape else {
     throw ClipError.invalid("Unexpected decoded frame shape")
@@ -636,18 +725,15 @@ private func saveRaw(
   let strides = frames.strides.map(\.intValue)
   let (source, dataType) = try checkedDataPointer(frames)
   let plane = outputSize * outputSize
-  var planar = [Float16](repeating: 0, count: plane * 3)
   for channel in 0..<3 {
     for pixel in 0..<plane {
       let sourceOffset = decoderFrame * strides[1] + channel * strides[2]
         + (pixel / outputSize) * strides[3] + (pixel % outputSize) * strides[4]
-      planar[channel * plane + pixel] = Float16(
+      destination[channel * plane + pixel] = Float16(
         max(0, min(1, readValue(source, type: dataType, at: sourceOffset)))
       )
     }
   }
-  let url = folder.appendingPathComponent(String(format: "%04d.f16", outputFrame))
-  try planar.withUnsafeBytes { try Data($0).write(to: url, options: .atomic) }
 }
 
 private func trailingLatents(
@@ -731,7 +817,8 @@ private func denoise(
           shape: [1, tokens, 3072]
         )
       }
-      print("DiT group \(index + 1)/\(groups.count) elapsed=\(Date().timeIntervalSince(started))s")
+      try checkStop()
+      progress("DiT group \(index + 1)/\(groups.count) elapsed=\(Date().timeIntervalSince(started))s")
     }
   } else {
     let blocks = try (0..<30).map { layer in
@@ -754,7 +841,7 @@ private func denoise(
           shape: [1, tokens, 3072]
         )
       }
-      print("DiT \(layer + 1)/30 elapsed=\(Date().timeIntervalSince(started))s")
+      progress("DiT \(layer + 1)/30 elapsed=\(Date().timeIntervalSince(started))s")
     }
   }
   let velocity = try pooled {
@@ -781,7 +868,36 @@ private func denoise(
   return decodedInput
 }
 
+#if MIOH_NATIVE_PREVIEW_PIPELINE
+/// Runs SwiftVR over one scene inside the export process. `input` holds
+/// `frames` planar RGB FP16 256px frames and `output` receives as many 512px
+/// (2x) or 1024px (4x) frames. Calls must not overlap: the models, the
+/// compiled cache and the stop check are process-wide. Throws
+/// `CancellationError` when `shouldStop` turns true between chunks or DiT
+/// groups.
+func runSwiftVRScene(
+  root: URL, compiledCache: URL, input: UnsafeBufferPointer<Float16>, frames: Int,
+  scale: Int, output: UnsafeMutablePointer<Float16>, shouldStop: @escaping () -> Bool
+) throws {
+  sharedCompiledRoot = compiledCache
+  sceneShouldStop = shouldStop
+  defer { sceneShouldStop = { false } }
+  try pooled {
+    try SwiftVRNativeClipRunner.runScene(
+      root: root, scene: .memory(input: input, frames: frames, output: output),
+      requestedFrames: frames, geometry: Geometry(scale: scale))
+  }
+}
+
+/// Drops the DiT groups kept loaded between scenes.
+func releaseSwiftVRModels() {
+  residentGroups.removeAll()
+}
+#endif
+
+#if !MIOH_NATIVE_PREVIEW_PIPELINE
 @main
+#endif
 private enum SwiftVRNativeClipRunner {
   static func main() throws {
     defer {
@@ -811,8 +927,9 @@ private enum SwiftVRNativeClipRunner {
     }
     try runScene(
       root: URL(fileURLWithPath: arguments[1], isDirectory: true),
-      input: URL(fileURLWithPath: arguments[2], isDirectory: true),
-      output: URL(fileURLWithPath: arguments[3], isDirectory: true),
+      scene: SceneFrames(
+        input: URL(fileURLWithPath: arguments[2], isDirectory: true),
+        output: URL(fileURLWithPath: arguments[3], isDirectory: true)),
       requestedFrames: requested,
       geometry: Geometry(scale: arguments.count == 6 ? Int(arguments[5]) ?? 0 : 4)
     )
@@ -836,8 +953,9 @@ private enum SwiftVRNativeClipRunner {
       try pooled {
         try runScene(
           root: root,
-          input: URL(fileURLWithPath: request.input, isDirectory: true),
-          output: URL(fileURLWithPath: request.output, isDirectory: true),
+          scene: SceneFrames(
+            input: URL(fileURLWithPath: request.input, isDirectory: true),
+            output: URL(fileURLWithPath: request.output, isDirectory: true)),
           requestedFrames: request.frames,
           geometry: Geometry(scale: request.scale ?? 4)
         )
@@ -848,17 +966,10 @@ private enum SwiftVRNativeClipRunner {
   }
 
   static func runScene(
-    root: URL, input: URL, output: URL, requestedFrames: Int?, geometry: Geometry
+    root: URL, scene: SceneFrames, requestedFrames: Int?, geometry: Geometry
   ) throws {
     let size = geometry.outputSize
-    try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
-    let inputs = try FileManager.default.contentsOfDirectory(
-      at: input, includingPropertiesForKeys: nil
-    )
-    let rawOutput = inputs.contains { $0.pathExtension.lowercased() == "f16" }
-    let availableFrames = inputs.filter {
-      $0.pathExtension.lowercased() == (rawOutput ? "f16" : "png")
-    }.count
+    let availableFrames = scene.inputCount
     let totalFrames: Int
     if let requested = requestedFrames {
       guard requested > 0, requested <= availableFrames else {
@@ -869,12 +980,12 @@ private enum SwiftVRNativeClipRunner {
       totalFrames = availableFrames
     }
     guard totalFrames > 0 else {
-      throw ClipError.invalid("Input directory has no PNG frames")
+      throw ClipError.invalid("Scene has no input frames")
     }
     let started = Date()
     let firstCount = min(totalFrames, 28)
     let frames = try inputFrames(
-      input, start: 0, validCount: firstCount, paddedCount: 28, geometry: geometry
+      scene, start: 0, validCount: firstCount, paddedCount: 28, geometry: geometry
     )
     let (firstLatents, firstEncoded) = try encodeChunk(
       frames: frames, frameCount: 28,
@@ -885,7 +996,7 @@ private enum SwiftVRNativeClipRunner {
       ),
       root: root, geometry: geometry
     )
-    print("Encoded 28 frames in \(Date().timeIntervalSince(started))s")
+    progress("Encoded 28 frames in \(Date().timeIntervalSince(started))s")
     let firstDenoised = try denoise(
       latents: firstLatents, encodedCount: 7,
       validCount: min(7, (max(totalFrames, 1) - 1 + 3) / 4 + 1),
@@ -906,15 +1017,8 @@ private enum SwiftVRNativeClipRunner {
       for index in 0..<count {
         let outputFrame = firstFrame + index - 3
         guard outputFrame >= 0, outputFrame < firstOutputCount else { continue }
-        if rawOutput {
-          try saveRaw(decodedFrames, decoderFrame: index,
-            outputFrame: outputFrame, latentCount: count / 4, folder: output,
-            outputSize: size)
-        } else {
-          try savePNG(decodedFrames, decoderFrame: index,
-            outputFrame: outputFrame, latentCount: count / 4, folder: output,
-            outputSize: size)
-        }
+        try scene.save(decodedFrames, decoderFrame: index,
+          outputFrame: outputFrame, latentCount: count / 4, outputSize: size)
       }
     }
     let paddedTotal = ((totalFrames - 1 + 3) / 4) * 4 + 1
@@ -926,13 +1030,14 @@ private enum SwiftVRNativeClipRunner {
     var rawLatentCount = 7
     var latentOffset = 7
     while nextOutput < totalFrames {
+      try checkStop()
       try pooled {
         let remaining = paddedTotal - nextInput
         let isLast = remaining <= 24
         let chunkFrames = min(remaining, 24)
         let availableFrames = max(1, min(totalFrames - nextInput, chunkFrames))
         let continuationFrames = try inputFrames(
-          input, start: nextInput, validCount: availableFrames, paddedCount: 24,
+          scene, start: nextInput, validCount: availableFrames, paddedCount: 24,
           geometry: geometry
         )
         let (nextLatents, nextEncoded) = try encodeChunk(
@@ -963,15 +1068,9 @@ private enum SwiftVRNativeClipRunner {
           for index in 0..<count {
             let chunkFrame = firstFrame + index
             guard chunkFrame < outputCount else { continue }
-            if rawOutput {
-              try saveRaw(decodedFrames, decoderFrame: index,
-                outputFrame: nextOutput + chunkFrame, latentCount: count / 4,
-                folder: output, outputSize: size)
-            } else {
-              try savePNG(decodedFrames, decoderFrame: index,
-                outputFrame: nextOutput + chunkFrame, latentCount: count / 4,
-                folder: output, outputSize: size)
-            }
+            try scene.save(decodedFrames, decoderFrame: index,
+              outputFrame: nextOutput + chunkFrame, latentCount: count / 4,
+              outputSize: size)
           }
         }
         nextInput += chunkFrames
@@ -983,6 +1082,6 @@ private enum SwiftVRNativeClipRunner {
         rawLatentCount = 6
       }
     }
-    print("Swift/Core ML clip complete in \(Date().timeIntervalSince(started))s: \(output.path)")
+    progress("Swift/Core ML clip complete in \(Date().timeIntervalSince(started))s: \(scene.description)")
   }
 }

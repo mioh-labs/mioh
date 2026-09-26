@@ -3449,7 +3449,6 @@ private final class NativeFrameProcessor: @unchecked Sendable {
       if runsSwiftVR, let swiftVR, let sceneOutput = try await swiftVR.enhance(
         restored: restored, frameCount: scene.frames.count)
       {
-        defer { sceneOutput.remove() }
         restorationSeconds += Date().timeIntervalSince(enhancementStart)
         let compositionStart = Date()
         // Only the current frame and its two neighbours are held at once.
@@ -6440,14 +6439,13 @@ private struct NativePreviewPipeline {
       swiftVR = try SwiftVRSceneEnhancer(
         model: swiftVRAsset,
         strength: config.roiEnhancerStrength ?? 1,
-        scale: config.roiEnhancerScale == 2 ? 2 : 4,
-        workDirectory: URL(fileURLWithPath: config.outputDirectory, isDirectory: true)
+        scale: config.roiEnhancerScale == 2 ? 2 : 4
       )
     } else {
       swiftVR = nil
     }
     defer { swiftVR?.close() }
-    // SwiftVR keeps the configured lanes: they share its one worker in turn.
+    // SwiftVR keeps the configured lanes: they take turns running it.
     let nativeParallelWorkers = config.isExport && !config.isWorker
       ? min(max(config.nativeParallelWorkers ?? 1, 1), 10)
       : 1
