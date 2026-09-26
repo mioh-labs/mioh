@@ -46,6 +46,101 @@ private struct Geometry {
     "reae-stateful-decoder-\(latents)latent-\(outputSize)-fp32.mlpackage"
   }
 }
+
+/// The stateful ReAE graphs used to run a whole chunk as one program. A
+/// 28-frame 1024px decoder call needed 15-20 GB of transient working memory,
+/// which pushed the resident DiT groups out to swap during an app export on a
+/// 48 GB Mac (a DiT group then took 10-15 s instead of 0.5 s). The graphs are
+/// causal and carry the previous frame in their states, so a chunk runs as
+/// 4-frame encoder and 1-latent decoder slices with the states passed along,
+/// whenever the pack provides those packages.
+private struct ReAEStep {
+  let features: MLFeatureProvider
+  let source: URL
+}
+
+private func encodeChunk(
+  frames: MLMultiArray, frameCount: Int, states: [String: Any],
+  root: URL, geometry: Geometry
+) throws -> (latents: MLMultiArray, step: ReAEStep) {
+  let slice = root.appendingPathComponent(
+    "reae-stateful-encoder-4f-\(geometry.outputSize)-fp32.mlpackage")
+  guard FileManager.default.fileExists(atPath: slice.path) else {
+    let whole = root.appendingPathComponent(geometry.encoder(frames: frameCount))
+    var inputs = states
+    inputs["frames"] = frames
+    let encoded = try predictFeatures(whole, values: inputs)
+    return (try feature(encoded, name: "latents", source: whole),
+      ReAEStep(features: encoded, source: whole))
+  }
+  let size = geometry.outputSize
+  let side = geometry.latentSide
+  let frameElements = 3 * size * size
+  let latentElements = 48 * side * side
+  let latents = try array([frameCount / 4, 48, side, side])
+  let model = try loadModel(compiled: compiledURL(for: slice))
+  var inputs = states
+  var last: MLFeatureProvider?
+  for group in 0..<(frameCount / 4) {
+    try pooled {
+      let part = try array([1, 4, 3, size, size])
+      memcpy(part.dataPointer,
+        frames.dataPointer.advanced(
+          by: group * 4 * frameElements * MemoryLayout<Float>.size),
+        4 * frameElements * MemoryLayout<Float>.size)
+      inputs["frames"] = part
+      let encoded = try predictFeatures(model, values: inputs)
+      let latent = try contiguous(
+        feature(encoded, name: "latents", source: slice), shape: [1, 48, side, side])
+      memcpy(latents.dataPointer.advanced(
+          by: group * latentElements * MemoryLayout<Float>.size),
+        latent.dataPointer, latentElements * MemoryLayout<Float>.size)
+      inputs = try followingStates(encoded, source: slice)
+      last = encoded
+    }
+  }
+  return (latents, ReAEStep(features: last!, source: slice))
+}
+
+/// Decodes `latentCount` latents ([1, count, 48, side, side]) and hands every
+/// decoded block to `deliver` with the chunk index of its first frame.
+private func decodeChunk(
+  latents: MLMultiArray, latentCount: Int, states: [String: Any],
+  root: URL, geometry: Geometry,
+  deliver: (_ frames: MLMultiArray, _ firstFrame: Int, _ count: Int) throws -> Void
+) throws -> ReAEStep {
+  let slice = root.appendingPathComponent(
+    "reae-stateful-decoder-1latent-\(geometry.outputSize)-fp32.mlpackage")
+  guard FileManager.default.fileExists(atPath: slice.path) else {
+    let whole = root.appendingPathComponent(geometry.decoder(latents: latentCount))
+    var inputs = states
+    inputs["latents"] = latents
+    let decoded = try predictFeatures(whole, values: inputs)
+    try deliver(try feature(decoded, name: "frames", source: whole), 0, latentCount * 4)
+    return ReAEStep(features: decoded, source: whole)
+  }
+  let side = geometry.latentSide
+  let latentElements = 48 * side * side
+  let source = try contiguous(latents, shape: [1, latentCount, 48, side, side])
+  let model = try loadModel(compiled: compiledURL(for: slice))
+  var inputs = states
+  var last: MLFeatureProvider?
+  for index in 0..<latentCount {
+    try pooled {
+      let part = try array([1, 1, 48, side, side])
+      memcpy(part.dataPointer,
+        source.dataPointer.advanced(
+          by: index * latentElements * MemoryLayout<Float>.size),
+        latentElements * MemoryLayout<Float>.size)
+      inputs["latents"] = part
+      let decoded = try predictFeatures(model, values: inputs)
+      try deliver(try feature(decoded, name: "frames", source: slice), index * 4, 4)
+      inputs = try followingStates(decoded, source: slice)
+      last = decoded
+    }
+  }
+  return ReAEStep(features: last!, source: slice)
+}
 // Compiling a package takes about ten times longer than running it, and
 // nothing uses the GPU meanwhile. Compiled models therefore persist across
 // exports in the shared cache the postprocess supplies.
@@ -777,16 +872,14 @@ private enum SwiftVRNativeClipRunner {
     let frames = try inputFrames(
       input, start: 0, validCount: firstCount, paddedCount: 28, geometry: geometry
     )
-    var encoderInputs = try zeroStates(
-      Array(repeating: [64, size / 4, size / 4], count: 3)
-        + Array(repeating: [64, size / 8, size / 8], count: 3)
-        + Array(repeating: [64, size / 16, size / 16], count: 3)
-    )
-    encoderInputs["frames"] = frames
-    let firstEncoderURL = root.appendingPathComponent(geometry.encoder(frames: 28))
-    let firstEncoded = try predictFeatures(firstEncoderURL, values: encoderInputs)
-    let firstLatents = try feature(
-      firstEncoded, name: "latents", source: firstEncoderURL
+    let (firstLatents, firstEncoded) = try encodeChunk(
+      frames: frames, frameCount: 28,
+      states: zeroStates(
+        Array(repeating: [64, size / 4, size / 4], count: 3)
+          + Array(repeating: [64, size / 8, size / 8], count: 3)
+          + Array(repeating: [64, size / 16, size / 16], count: 3)
+      ),
+      root: root, geometry: geometry
     )
     print("Encoded 28 frames in \(Date().timeIntervalSince(started))s")
     let firstDenoised = try denoise(
@@ -795,34 +888,36 @@ private enum SwiftVRNativeClipRunner {
       previous: nil, temporalOffset: 0,
       assetRoot: root, geometry: geometry, started: started
     )
-    var decoderInputs = try zeroStates(
-      Array(repeating: [512, size / 16, size / 16], count: 3)
-        + Array(repeating: [256, size / 8, size / 8], count: 3)
-        + Array(repeating: [128, size / 4, size / 4], count: 3)
-    )
-    decoderInputs["latents"] = firstDenoised
-    let firstDecoderURL = root.appendingPathComponent(geometry.decoder(latents: 7))
-    let firstDecoded = try predictFeatures(firstDecoderURL, values: decoderInputs)
-    let firstOutput = try feature(firstDecoded, name: "frames", source: firstDecoderURL)
+    // The first chunk's first three decoded frames are warm-up and dropped.
     let firstOutputCount = min(totalFrames, 25)
-    for index in 0..<firstOutputCount {
-      if rawOutput {
-        try saveRaw(firstOutput, decoderFrame: index + 3,
-          outputFrame: index, latentCount: 7, folder: output,
-          outputSize: size)
-      } else {
-        try savePNG(firstOutput, decoderFrame: index + 3,
-          outputFrame: index, latentCount: 7, folder: output,
-          outputSize: size)
+    let firstDecoded = try decodeChunk(
+      latents: firstDenoised, latentCount: 7,
+      states: zeroStates(
+        Array(repeating: [512, size / 16, size / 16], count: 3)
+          + Array(repeating: [256, size / 8, size / 8], count: 3)
+          + Array(repeating: [128, size / 4, size / 4], count: 3)
+      ),
+      root: root, geometry: geometry
+    ) { decodedFrames, firstFrame, count in
+      for index in 0..<count {
+        let outputFrame = firstFrame + index - 3
+        guard outputFrame >= 0, outputFrame < firstOutputCount else { continue }
+        if rawOutput {
+          try saveRaw(decodedFrames, decoderFrame: index,
+            outputFrame: outputFrame, latentCount: count / 4, folder: output,
+            outputSize: size)
+        } else {
+          try savePNG(decodedFrames, decoderFrame: index,
+            outputFrame: outputFrame, latentCount: count / 4, folder: output,
+            outputSize: size)
+        }
       }
     }
     let paddedTotal = ((totalFrames - 1 + 3) / 4) * 4 + 1
     var nextInput = 28
     var nextOutput = 25
     var encoded = firstEncoded
-    var encodedURL = firstEncoderURL
     var decoded = firstDecoded
-    var decodedURL = firstDecoderURL
     var rawLatents = firstLatents
     var rawLatentCount = 7
     var latentOffset = 7
@@ -836,12 +931,10 @@ private enum SwiftVRNativeClipRunner {
           input, start: nextInput, validCount: availableFrames, paddedCount: 24,
           geometry: geometry
         )
-        var encoderInputs = try followingStates(encoded, source: encodedURL)
-        encoderInputs["frames"] = continuationFrames
-        let encoderURL = root.appendingPathComponent(geometry.encoder(frames: 24))
-        let nextEncoded = try predictFeatures(encoderURL, values: encoderInputs)
-        let nextLatents = try feature(
-          nextEncoded, name: "latents", source: encoderURL
+        let (nextLatents, nextEncoded) = try encodeChunk(
+          frames: continuationFrames, frameCount: 24,
+          states: followingStates(encoded.features, source: encoded.source),
+          root: root, geometry: geometry
         )
         let validLatents = isLast ? (chunkFrames - 1) / 4 + 1 : 6
         let padLatents = isLast ? 7 - validLatents : 0
@@ -857,30 +950,31 @@ private enum SwiftVRNativeClipRunner {
           temporalOffset: max(0, latentOffset - padLatents),
           assetRoot: root, geometry: geometry, started: started
         )
-        var decoderInputs = try followingStates(decoded, source: decodedURL)
-        decoderInputs["latents"] = nextDenoised
-        let decoderURL = root.appendingPathComponent(geometry.decoder(latents: 6))
-        let nextDecoded = try predictFeatures(decoderURL, values: decoderInputs)
-        let decodedFrames = try feature(nextDecoded, name: "frames", source: decoderURL)
         let outputCount = min(totalFrames - nextOutput, 24)
-        for index in 0..<outputCount {
-          if rawOutput {
-            try saveRaw(decodedFrames, decoderFrame: index,
-              outputFrame: nextOutput + index, latentCount: 6, folder: output,
-              outputSize: size)
-          } else {
-            try savePNG(decodedFrames, decoderFrame: index,
-              outputFrame: nextOutput + index, latentCount: 6, folder: output,
-              outputSize: size)
+        let nextDecoded = try decodeChunk(
+          latents: nextDenoised, latentCount: 6,
+          states: followingStates(decoded.features, source: decoded.source),
+          root: root, geometry: geometry
+        ) { decodedFrames, firstFrame, count in
+          for index in 0..<count {
+            let chunkFrame = firstFrame + index
+            guard chunkFrame < outputCount else { continue }
+            if rawOutput {
+              try saveRaw(decodedFrames, decoderFrame: index,
+                outputFrame: nextOutput + chunkFrame, latentCount: count / 4,
+                folder: output, outputSize: size)
+            } else {
+              try savePNG(decodedFrames, decoderFrame: index,
+                outputFrame: nextOutput + chunkFrame, latentCount: count / 4,
+                folder: output, outputSize: size)
+            }
           }
         }
         nextInput += chunkFrames
         nextOutput += outputCount
         latentOffset += validLatents
         encoded = nextEncoded
-        encodedURL = encoderURL
         decoded = nextDecoded
-        decodedURL = decoderURL
         rawLatents = nextLatents
         rawLatentCount = 6
       }
