@@ -24,7 +24,9 @@ face-restoration gate.
   directory. They are removed once the scene is composited, so disk use is
   bounded by one scene (48 frames: about 19 MB in, 300 MB out; export clips
   reach 180 frames, about 70 MB in and 1.1 GB out).
-- Local export only, one lane, Expert ROI off. Crossfade stays available;
+- Local export only, Expert ROI off. Export lanes follow the native
+  parallel setting and take turns on the one worker; the other lanes keep
+  detecting, restoring, compositing and encoding meanwhile. Crossfade stays available;
   overlap frames are simply enhanced in both batches.
 - Stopping the export terminates the worker. The current scene finishes
   without SwiftVR, and the export ends exactly like a stop without SwiftVR

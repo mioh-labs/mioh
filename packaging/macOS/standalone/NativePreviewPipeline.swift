@@ -6349,7 +6349,8 @@ private struct NativePreviewPipeline {
       swiftVR = nil
     }
     defer { swiftVR?.close() }
-    let nativeParallelWorkers = swiftVRAsset != nil ? 1 : config.isExport && !config.isWorker
+    // SwiftVR keeps the configured lanes: they share its one worker in turn.
+    let nativeParallelWorkers = config.isExport && !config.isWorker
       ? min(max(config.nativeParallelWorkers ?? 1, 1), 10)
       : 1
     let restoreEffects = NativeRestoreEffects(
