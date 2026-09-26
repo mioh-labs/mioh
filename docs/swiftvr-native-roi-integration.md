@@ -55,6 +55,9 @@ face-restoration gate.
   1–3 px from 109.7% to 107.9%; on the MIDV-670 12 s clip +1.5% → −0.3%.
   Smoothing without the source-frame surround only reached +47% → +36% at
   55 s. One second (60 s) got worse (+2.8% → +6.1%).
+  A self-contained write-up with formulas, probes and a numpy/OpenCV
+  reference implementation for other pipelines is in
+  `docs/swiftvr-flicker-fix/`.
 - Stabilization range ("なじませ範囲", 1–8 frames on each side, default 1 =
   the previous ±1). Each neighbour's SwiftVR change is added to the centre's
   BasicVSR++ result, weighted by how similar the two BasicVSR++ frames are
