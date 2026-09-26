@@ -104,6 +104,8 @@ struct NativeExportConfiguration: Codable, Sendable {
   var swiftVRTemporalFilter: Float? = nil
   /// SwiftVR only: frames on each side blended by the stabilization.
   var swiftVRStabilizationRadius: Int? = nil
+  /// SwiftVR only: frames over which SwiftVR's view of the crop is averaged.
+  var swiftVRFrameSmoothing: Int? = nil
   let detectionEmptyLookahead: Int
   let detectionMaskReuseSkipFrames: Int
   let detectFaceMosaics: Bool
@@ -169,6 +171,7 @@ struct NativeExportConfiguration: Codable, Sendable {
     case roiExpertMode
     case swiftVRTemporalFilter
     case swiftVRStabilizationRadius
+    case swiftVRFrameSmoothing
     case detectionEmptyLookahead
     case detectionMaskReuseSkipFrames
     case detectFaceMosaics
@@ -705,6 +708,7 @@ struct MiohUserDefaultsSnapshot: Codable {
   var roiExpertMode: Bool?
   var swiftVRTemporalFilter: Double?
   var swiftVRStabilizationRadius: Int?
+  var swiftVRFrameSmoothing: Int?
 
   var detectionModel: String
   var customDetectionModel: String
@@ -794,6 +798,7 @@ struct MiohUserDefaultsSnapshot: Codable {
       roiExpertMode: false,
       swiftVRTemporalFilter: 1.0,
       swiftVRStabilizationRadius: 1,
+      swiftVRFrameSmoothing: 15,
       detectionModel: "v2-coreml",
       customDetectionModel: "",
       detectionEmptyLookahead: 10,
@@ -925,6 +930,8 @@ final class RestorationRunner: ObservableObject {
   @Published var swiftVRTemporalFilter = 1.0
   /// Frames on each side that SwiftVR's stabilization blends (1 = ±1).
   @Published var swiftVRStabilizationRadius = 1
+  /// Frames over which SwiftVR's view of the crop is averaged (0 = off).
+  @Published var swiftVRFrameSmoothing = 15
 
   @Published var detectionModel: String
   @Published var customDetectionModel = ""
@@ -1834,6 +1841,8 @@ final class RestorationRunner: ObservableObject {
         ? Float(min(max(swiftVRTemporalFilter, 0), 1)) : nil,
       swiftVRStabilizationRadius: roiEnhancer == "swiftvr"
         ? min(max(swiftVRStabilizationRadius, 1), 8) : nil,
+      swiftVRFrameSmoothing: roiEnhancer == "swiftvr"
+        ? min(max(swiftVRFrameSmoothing, 0), 30) : nil,
       detectionEmptyLookahead: max(0, detectionEmptyLookahead),
       detectionMaskReuseSkipFrames: min(
         max(detectionMaskReuseSkipFrames, 0),
@@ -3109,6 +3118,7 @@ final class RestorationRunner: ObservableObject {
       roiExpertMode: roiExpertMode,
       swiftVRTemporalFilter: swiftVRTemporalFilter,
       swiftVRStabilizationRadius: swiftVRStabilizationRadius,
+      swiftVRFrameSmoothing: swiftVRFrameSmoothing,
       detectionModel: detectionModel,
       customDetectionModel: customDetectionModel,
       detectionEmptyLookahead: detectionEmptyLookahead,
@@ -3214,6 +3224,7 @@ final class RestorationRunner: ObservableObject {
     roiExpertMode = false
     swiftVRTemporalFilter = min(max(snapshot.swiftVRTemporalFilter ?? 1, 0), 1)
     swiftVRStabilizationRadius = min(max(snapshot.swiftVRStabilizationRadius ?? 1, 1), 8)
+    swiftVRFrameSmoothing = min(max(snapshot.swiftVRFrameSmoothing ?? 15, 0), 30)
 
     detectionModel = detectionModels.contains(snapshot.detectionModel) ? snapshot.detectionModel : "v2-coreml"
     customDetectionModel = snapshot.customDetectionModel
@@ -4188,6 +4199,10 @@ struct ContentView: View {
           }
           .pickerStyle(.segmented)
           Text("ROIの大きさに関係なく、すべてのシーンをこの倍率で処理します。2xは出力512pxで、4x（1024px）より大幅に速くなります。")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+          integerSliderField("枠のなめらかさ", value: $runner.swiftVRFrameSmoothing, range: 0...30, step: 1)
+          Text("SwiftVRに渡す切り出し枠の位置と大きさを、このフレーム数で平均してなめらかにします。枠の伸び縮みで輪郭が太く・細く揺れるのを抑えます。BasicVSR++の復元は変わりません。0でオフ。")
             .font(.caption)
             .foregroundStyle(.secondary)
           integerSliderField("なじませ範囲", value: $runner.swiftVRStabilizationRadius, range: 1...8, step: 1)
