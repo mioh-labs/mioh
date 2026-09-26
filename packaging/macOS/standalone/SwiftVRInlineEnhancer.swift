@@ -202,6 +202,39 @@ final class SwiftVRWorkerSession: @unchecked Sendable {
   }
 }
 
+/// Admits one caller at a time without blocking a thread while it waits.
+private final class SwiftVRTurn: @unchecked Sendable {
+  private let lock = NSLock()
+  private var busy = false
+  private var waiters: [CheckedContinuation<Void, Never>] = []
+
+  func acquire() async {
+    await withCheckedContinuation { (waiter: CheckedContinuation<Void, Never>) in
+      lock.lock()
+      if busy {
+        waiters.append(waiter)
+        lock.unlock()
+      } else {
+        busy = true
+        lock.unlock()
+        waiter.resume()
+      }
+    }
+  }
+
+  func release() {
+    lock.lock()
+    if waiters.isEmpty {
+      busy = false
+      lock.unlock()
+    } else {
+      let next = waiters.removeFirst()
+      lock.unlock()
+      next.resume()
+    }
+  }
+}
+
 /// Runs SwiftVR over one restored scene at a time for the export pipeline.
 /// Scene frames travel to the worker as temporary files that are removed as
 /// soon as the scene is composited, so disk use is bounded by one scene
@@ -218,6 +251,11 @@ final class SwiftVRSceneEnhancer: @unchecked Sendable {
   private let workDirectory: URL
   private let environment: [String: String]
   private var session: SwiftVRWorkerSession?
+  /// Export lanes share one worker. It answers scenes in order, so a lane
+  /// holds the turn from request to reply; the other lanes keep detecting,
+  /// restoring, compositing and encoding meanwhile. A second worker would
+  /// double the resident DiT memory without more GPU to run on.
+  private let turn = SwiftVRTurn()
 
   init(model: URL, strength: Float, scale: Int, workDirectory: URL) throws {
     try SwiftVRROIAssets.validate(model, scale: scale)
@@ -264,6 +302,8 @@ final class SwiftVRSceneEnhancer: @unchecked Sendable {
             .write(to: input.appendingPathComponent(String(format: "%04d.f16", frame)))
         }
       }
+      await turn.acquire()
+      defer { turn.release() }
       // Core ML occasionally aborts the worker with an uncatchable exception
       // (seen once as an MPSGraph "unexpected rank" error that did not
       // reproduce). A dead worker is restarted once per scene.
