@@ -254,10 +254,7 @@ class MiohUpscalerSeparationTests(unittest.TestCase):
             "try metal.add(output: output, input: input, tile: tile, canvas: canvas)",
         ):
             self.assertIn(contract, runner)
-        self.assertIn(
-            "let overlap = selectedUpscaler == .adcSR ? 16",
-            controller,
-        )
+        self.assertIn("selectedUpscaler == .adcSR ? 16", controller)
         self.assertIn("低周波を入力へ固定したcosine blend", view)
 
     def test_upscaler_preserves_original_audio_without_intermediate_reencode(self):

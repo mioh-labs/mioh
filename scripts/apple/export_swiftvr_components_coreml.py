@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 
 import coremltools as ct
@@ -18,6 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from safetensors import safe_open
+from swiftvr_imports import load_transformer
 
 
 class PatchEmbedding(nn.Module):
@@ -92,10 +92,9 @@ def main() -> None:
     parser.add_argument("--precision", choices=("float16", "float32"), default="float16")
     args = parser.parse_args()
 
-    sys.path.insert(0, str(args.source))
-    from swiftvr.models.transformer import (
-        WanRotaryPosEmbed, WanTimeTextImageEmbedding,
-    )
+    transformer = load_transformer(args.source)
+    WanRotaryPosEmbed = transformer.WanRotaryPosEmbed
+    WanTimeTextImageEmbedding = transformer.WanTimeTextImageEmbedding
 
     root = args.output_directory.resolve()
     root.mkdir(parents=True, exist_ok=True)

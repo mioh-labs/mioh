@@ -30,7 +30,7 @@ class MiohClusterWorkerLauncherTests(unittest.TestCase):
             "outputCoreStartNanoseconds: request.mediaRange.coreStartNanoseconds",
             "outputCoreEndNanoseconds: request.mediaRange.coreEndNanoseconds",
             'splitMode: "none"',
-            "detectionEmptyLookahead: 1",
+            "detectionEmptyLookahead: request.options.detectionEmptyLookahead",
             "targetFPS: request.options.targetFPSNumerator",
             "targetFPSDenominator: request.options.targetFPSDenominator",
         ]:
@@ -54,7 +54,12 @@ class MiohClusterWorkerLauncherTests(unittest.TestCase):
 
     def test_worker_preserves_fps_conversion_across_shards(self):
         self.assertIn(
-            "request.options.detectionEmptyLookahead == 1", self.source
+            "detectionEmptyLookahead: min(max(detectionEmptyLookahead, 1), 300)",
+            self.source,
+        )
+        self.assertIn(
+            "detectionEmptyLookahead: request.options.detectionEmptyLookahead",
+            self.source,
         )
         self.assertIn(
             "targetFPSNumerator: useFPS ? max(1, fps) : nil", self.source

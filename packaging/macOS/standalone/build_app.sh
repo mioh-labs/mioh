@@ -246,7 +246,8 @@ if [[ "$COREAI_DISTRIBUTION" == "portable" && -d "$MODEL_TOOLS_SOURCE" ]]; then
     "$RESOURCES/model-tools/scripts/download_nomos_roi_enhancers.py"
 chmod +x \
     "$RESOURCES/model-tools/download-mioh-models.zsh" \
-    "$RESOURCES/model-tools/convert-mioh-models.zsh"
+    "$RESOURCES/model-tools/convert-mioh-models.zsh" \
+    "$RESOURCES/model-tools/install-swiftvr-models.zsh"
 fi
 
 if [[ "$MIOH_MODELESS_DISTRIBUTION" != 1 ]]; then
@@ -897,6 +898,12 @@ if [[ "$COREAI_DISTRIBUTION" == "portable" ]]; then
     "$RESOURCES/runtime/bin/python3.12"
     "$RESOURCES/model-tools/convert-mioh-models.zsh"
     "$RESOURCES/model-tools/download-mioh-models.zsh"
+    "$RESOURCES/model-tools/install-swiftvr-models.zsh"
+    "$RESOURCES/model-tools/scripts/apple/export_swiftvr_components_coreml.py"
+    "$RESOURCES/model-tools/scripts/apple/export_swiftvr_dit_group_coreml.py"
+    "$RESOURCES/model-tools/scripts/apple/swiftvr_imports.py"
+    "$RESOURCES/model-tools/scripts/apple/probe_swiftvr_reae_state_coreml.py"
+    "$RESOURCES/model-tools/scripts/apple/probe_swiftvr_reae_decoder_state_coreml.py"
     "$RESOURCES/model-tools/scripts/apple/export_basicvsrpp_coreai.py"
     "$RESOURCES/model-tools/scripts/apple/export_basicvsrpp_variable_chunk6.py"
     "$RESOURCES/model-tools/scripts/apple/export_v4_fast_coreai.py"
@@ -965,6 +972,7 @@ if [[ -d "$RESOURCES/model-tools" ]]; then
   ditto "$RESOURCES/model-tools" "$DMG_ROOT/model-tools"
   ln -s "model-tools/download-mioh-models.zsh" "$DMG_ROOT/download-mioh-models.zsh"
   ln -s "model-tools/convert-mioh-models.zsh" "$DMG_ROOT/convert-mioh-models.zsh"
+  ln -s "model-tools/install-swiftvr-models.zsh" "$DMG_ROOT/install-swiftvr-models.zsh"
 fi
 diskutil image create from \
   --volumeName "$APP_BASENAME" \

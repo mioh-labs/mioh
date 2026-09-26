@@ -353,6 +353,7 @@ private final class MiohMCPServer {
     let flash = bin.appendingPathComponent("flashvsr-coreai-video")
     let adcsr = bin.appendingPathComponent("adcsr-coreai-video")
     let pipersr = bin.appendingPathComponent("pipersr-coreml-video")
+    let swiftvr = bin.appendingPathComponent("swiftvr-coreml-video")
     return [
       "app": applicationURL().path,
       "native_swift": true,
@@ -361,6 +362,7 @@ private final class MiohMCPServer {
       "flashvsr": FileManager.default.isExecutableFile(atPath: flash.path),
       "adcsr": FileManager.default.isExecutableFile(atPath: adcsr.path),
       "pipersr": FileManager.default.isExecutableFile(atPath: pipersr.path),
+      "swiftvr": FileManager.default.isExecutableFile(atPath: swiftvr.path),
       "default_manifest": defaultManifestPath(),
       "music_video_continuation_modes": [
         "hybrid-av", "latent-prefix", "first", "first-last-provided",
@@ -585,8 +587,8 @@ private final class MiohMCPServer {
     let output = try requiredPath("output", in: values, mustExist: false)
     try validateNewOutput(output)
     let model = (values["model"] as? String ?? "flashvsr").lowercased()
-    guard model == "flashvsr" || model == "adcsr" || model == "pipersr" else {
-      throw MCPServerError.invalidArguments("model must be flashvsr, adcsr or pipersr")
+    guard ["flashvsr", "adcsr", "pipersr", "swiftvr"].contains(model) else {
+      throw MCPServerError.invalidArguments("model must be flashvsr, adcsr, pipersr or swiftvr")
     }
     let request = MCPUpscaleRequest(
       input: input,
@@ -887,11 +889,11 @@ private final class MiohMCPServer {
       ),
       tool(
         "mioh_start_upscale",
-        "FlashVSRまたはAdcSRでアップスケールを開始します。",
+        "FlashVSR、AdcSR、PiperSRまたはSwiftVRでアップスケールを開始します。",
         [
           "input": property("string", "入力動画の絶対パス"),
           "output": property("string", "新規MP4の絶対パス"),
-          "model": enumProperty(["flashvsr", "adcsr", "pipersr"], "使用モデル"),
+          "model": enumProperty(["flashvsr", "adcsr", "pipersr", "swiftvr"], "使用モデル"),
           "model_root": property("string", "モデル格納場所"),
           "start_seconds": property("number", "開始秒"),
           "end_seconds": property("number", "終了秒"),
@@ -997,6 +999,8 @@ private struct MiohUpscalerMCPMain {
         controller.adcSRRootPath = modelRoot
       } else if request.model == "flashvsr" {
         controller.flashVSRRootPath = modelRoot
+      } else if request.model == "swiftvr" {
+        controller.swiftVRRootPath = modelRoot
       }
     }
     controller.inputURL = URL(fileURLWithPath: request.input).standardizedFileURL

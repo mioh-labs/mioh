@@ -92,6 +92,16 @@ xcrun swiftc \
   -framework CoreVideo -framework Metal -framework VideoToolbox \
   "$UPSCALER_DIR/PiperSRNativeVideoRunner.swift" \
   -o "$RESOURCES/bin/pipersr-coreml-video"
+xcrun swiftc \
+  -O -parse-as-library -D MIOH_NATIVE_PREVIEW_PIPELINE \
+  -target arm64-apple-macosx27.0 \
+  -framework AVFoundation -framework CoreGraphics -framework CoreML \
+  -framework CoreMedia -framework CoreVideo -framework ImageIO \
+  -framework UniformTypeIdentifiers -framework VideoToolbox \
+  "$ROOT/packaging/macOS/standalone/SwiftVRNativeClip.swift" \
+  "$ROOT/packaging/macOS/standalone/SwiftVRInlineEnhancer.swift" \
+  "$UPSCALER_DIR/SwiftVRNativeVideoRunner.swift" \
+  -o "$RESOURCES/bin/swiftvr-coreml-video"
 mkdir -p "$RESOURCES/pipersr-models" "$RESOURCES/licenses/pipersr"
 for model in PiperSR_2x_256 PiperSR_2x_video_720p PiperSR_2x_video_720p_fp16; do
   source="$PIPERSR_SOURCE_DIR/$model.mlpackage"
@@ -199,6 +209,7 @@ chmod +x "$CONTENTS/MacOS/mioh-upscaler" \
   "$RESOURCES/bin/adcsr-coreai-video" \
   "$RESOURCES/bin/flashvsr-coreai-video" \
   "$RESOURCES/bin/pipersr-coreml-video" \
+  "$RESOURCES/bin/swiftvr-coreml-video" \
   "$RESOURCES/bin/mioh-minimax-h3-native" \
   "$RESOURCES/bin/mioh-upscaler-mcp" \
   "$RESOURCES/bin/ffmpeg" "$RESOURCES/bin/ffprobe"

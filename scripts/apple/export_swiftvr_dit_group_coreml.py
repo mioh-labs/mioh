@@ -28,6 +28,7 @@ import coremltools as ct
 import numpy as np
 import torch
 from safetensors import safe_open
+from swiftvr_imports import load_transformer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from probe_swiftvr_dit_block_coreml import BlockWrapper, portable_rope  # noqa: E402
@@ -112,13 +113,10 @@ def main() -> None:
 
 
 def export_group(args, latent_frames: int, output: Path) -> None:
-    sys.path.insert(0, str(args.source))
-    import swiftvr.models.transformer as transformer_module  # noqa: E402
-    from swiftvr.models.transformer import (  # noqa: E402
-        WanShiftWindow2DInferProcessor,
-        WanTransformerBlock,
-        set_attention_backend,
-    )
+    transformer_module = load_transformer(args.source)
+    WanShiftWindow2DInferProcessor = transformer_module.WanShiftWindow2DInferProcessor
+    WanTransformerBlock = transformer_module.WanTransformerBlock
+    set_attention_backend = transformer_module.set_attention_backend
 
     torch.manual_seed(1)
     set_attention_backend("sdpa")

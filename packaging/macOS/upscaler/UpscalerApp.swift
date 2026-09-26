@@ -94,12 +94,12 @@ private struct UpscalerContentView: View {
     .onAppear {
       guard !checkedInitialModelSetup else { return }
       checkedInitialModelSetup = true
-      if !upscaler.selectedModelReady {
+      if upscaler.selectedUpscaler != .swiftVR && !upscaler.selectedModelReady {
         presentModelSetup()
       }
     }
     .onChange(of: upscaler.upscalerModel) { _, _ in
-      if !upscaler.selectedModelReady {
+      if upscaler.selectedUpscaler != .swiftVR && !upscaler.selectedModelReady {
         presentModelSetup()
       }
     }
@@ -194,7 +194,7 @@ private struct UpscalerContentView: View {
       applicationIcon
       VStack(alignment: .leading, spacing: 2) {
         Text("mioh upscaler").font(.title2.weight(.semibold))
-        Text("FlashVSR Tiny / AdcSR Core AI")
+        Text("FlashVSR / AdcSR / PiperSR / SwiftVR")
           .font(.caption).foregroundStyle(.secondary)
       }
       Spacer()
@@ -298,6 +298,7 @@ private struct UpscalerContentView: View {
         Text("FlashVSR Tiny（動画・時間整合）").tag("flashvsr")
         Text("AdcSR（軽量な1-step拡散）").tag("adcsr")
         Text("PiperSR（軽量・ANE・2倍）").tag("pipersr")
+        Text("SwiftVR（動画・高画質）").tag("swiftvr")
       }
       .pickerStyle(.segmented)
       HStack {
@@ -308,7 +309,7 @@ private struct UpscalerContentView: View {
         )
         .foregroundStyle(upscaler.selectedModelReady ? .green : .orange)
         Spacer()
-        if upscaler.selectedUpscaler != .piperSR {
+        if upscaler.selectedUpscaler != .piperSR && upscaler.selectedUpscaler != .swiftVR {
           Button("モデルを自動設定…", action: presentModelSetup)
         }
       }
@@ -334,6 +335,8 @@ private struct UpscalerContentView: View {
       }
       if upscaler.selectedUpscaler == .piperSR {
         LabeledContent("計算デバイス") { Text("Core ML / ANE優先") }
+      } else if upscaler.selectedUpscaler == .swiftVR {
+        LabeledContent("計算デバイス") { Text("Core ML / GPU") }
       } else {
         Picker("計算デバイス", selection: $upscaler.computeMode) {
           Text(upscaler.selectedUpscaler == .adcSR ? "GPU優先（推奨）" : "Hybrid（推奨）")
@@ -387,6 +390,14 @@ private struct UpscalerContentView: View {
           action: upscaler.chooseFlashVSRRoot
         )
         Text("85フレーム単位で共有デコードし、タイル処理・合成・書き込みの進捗を表示します。")
+          .font(.caption).foregroundStyle(.secondary)
+      } else if upscaler.selectedUpscaler == .swiftVR {
+        UpscalerPathSettingRow(
+          title: "SwiftVR Core MLモデル（外部）",
+          value: $upscaler.swiftVRRootPath,
+          action: upscaler.chooseSwiftVRRoot
+        )
+        Text("256pxタイルを重ねて時間方向に2倍／4倍復元し、境界をフェザー合成します。非常に重い処理です。変換済みモデルを指定してください。")
           .font(.caption).foregroundStyle(.secondary)
       } else {
         Text("PiperSRはモデル同梱。対応解像度では全画面の動画向けCore ML版、それ以外は256pxタイル版を使います。各フレーム独立のため、時間方向の復元が必要ならFlashVSRを選んでください。")

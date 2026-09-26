@@ -327,7 +327,7 @@ class CoreAIMetalKernelTests(unittest.TestCase):
             if node.op == "call_function"
         }
         self.assertIn(
-            "coreai_metal_kernels.flow_warp_nchw_bilinear_align_corners.default",
+            "coreai_metal_kernels.flow_warp_nchw_bilinear_align_corners_fp32_v1.default",
             targets,
         )
         self.assertNotIn("aten.grid_sampler_2d.default", targets)

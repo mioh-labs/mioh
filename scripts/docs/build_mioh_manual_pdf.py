@@ -32,10 +32,13 @@ from reportlab.platypus import (
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SOURCE = ROOT / "docs/mioh-user-manual-ja.md"
 DEFAULT_OUTPUT = ROOT / "output/pdf/mioh-user-manual-ja.pdf"
-FONT_REGULAR = Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf")
-# Arial Unicode is used for both faces because macOS's Hiragino fonts use CFF
-# outlines inside TTC files, which ReportLab cannot embed.  Heading size and
-# colour still provide a clear hierarchy while keeping all Japanese glyphs.
+YU_GOTHIC = Path.home() / "Library/Fonts/YuGothR.ttc"
+FONT_REGULAR = YU_GOTHIC if YU_GOTHIC.is_file() else Path(
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"
+)
+# YuGothR.ttc contains embeddable TrueType outlines. Use the same regular
+# face for headings when no separate Yu Gothic Bold is installed; size and
+# colour provide hierarchy. Arial Unicode remains the portable fallback.
 FONT_BOLD = FONT_REGULAR
 ICON = ROOT / "lada/gui/icons/mioh-icon.png"
 
@@ -49,7 +52,7 @@ def arguments() -> argparse.Namespace:
 
 def register_fonts() -> None:
     if not FONT_REGULAR.is_file() or not FONT_BOLD.is_file():
-        raise FileNotFoundError("Arial Unicode is required to build the Japanese manual")
+        raise FileNotFoundError("Yu Gothic or Arial Unicode is required to build the Japanese manual")
     pdfmetrics.registerFont(TTFont("MiohGothic", str(FONT_REGULAR), subfontIndex=0))
     pdfmetrics.registerFont(TTFont("MiohGothicBold", str(FONT_BOLD), subfontIndex=0))
 
@@ -104,7 +107,7 @@ def styles():
             spaceAfter=3,
         ),
         "code": ParagraphStyle(
-            "CodeJP", parent=body, fontName="MiohGothic", fontSize=8.1,
+            "CodeJP", parent=body, fontName="Courier", fontSize=8.1,
             leading=12, leftIndent=8, rightIndent=8, borderPadding=7,
             borderColor=colors.HexColor("#D5DAE4"), borderWidth=0.6,
             borderRadius=3, backColor=colors.HexColor("#F5F7FA"),

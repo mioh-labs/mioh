@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 import time
 from pathlib import Path
 
@@ -18,6 +17,7 @@ import coremltools as ct
 import numpy as np
 import torch
 from safetensors import safe_open
+from swiftvr_imports import load_transformer
 
 
 class BlockWrapper(torch.nn.Module):
@@ -69,13 +69,10 @@ def main() -> None:
     parser.add_argument("--fixture-directory", type=Path)
     args = parser.parse_args()
 
-    sys.path.insert(0, str(args.source))
-    import swiftvr.models.transformer as transformer_module  # noqa: E402
-    from swiftvr.models.transformer import (  # noqa: E402
-        WanShiftWindow2DInferProcessor,
-        WanTransformerBlock,
-        set_attention_backend,
-    )
+    transformer_module = load_transformer(args.source)
+    WanShiftWindow2DInferProcessor = transformer_module.WanShiftWindow2DInferProcessor
+    WanTransformerBlock = transformer_module.WanTransformerBlock
+    set_attention_backend = transformer_module.set_attention_backend
 
     torch.manual_seed(1)
     set_attention_backend("sdpa")
