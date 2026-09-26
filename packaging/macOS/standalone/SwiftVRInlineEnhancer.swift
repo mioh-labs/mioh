@@ -149,6 +149,8 @@ final class SwiftVRSceneEnhancer: @unchecked Sendable {
   let temporalFilter: Float
   /// Frames on each side that the stabilization blends (1...8).
   let stabilizationRadius: Int
+  /// Frames over which SwiftVR's view of each crop is averaged (0-30).
+  let frameSmoothing: Int
   /// Set once the export's stop control exists.
   var shouldStop: () -> Bool = { false }
   private let model: URL
@@ -165,11 +167,13 @@ final class SwiftVRSceneEnhancer: @unchecked Sendable {
     autoreleaseFrequency: .workItem)
 
   init(
-    model: URL, strength: Float, scale: Int, temporalFilter: Float, stabilizationRadius: Int
+    model: URL, strength: Float, scale: Int, temporalFilter: Float, stabilizationRadius: Int,
+    frameSmoothing: Int
   ) throws {
     try SwiftVRROIAssets.validate(model, scale: scale)
     self.scale = scale
     self.stabilizationRadius = max(1, min(8, stabilizationRadius))
+    self.frameSmoothing = max(0, min(30, frameSmoothing))
     self.model = model
     self.strength = max(0, min(1, strength))
     let temporalFilter = max(0, min(1, temporalFilter))

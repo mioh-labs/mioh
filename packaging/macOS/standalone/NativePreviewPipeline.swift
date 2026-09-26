@@ -86,6 +86,9 @@ private struct NativePreviewConfiguration: Decodable {
   let swiftVRTemporalFilter: Float?
   /// SwiftVR only: frames on each side that the stabilization blends; 1 if absent.
   let swiftVRStabilizationRadius: Int?
+  /// SwiftVR only: frames over which SwiftVR's view of the crop is averaged;
+  /// 0 or 1 is off, absent is 0 (configurations written before it).
+  let swiftVRFrameSmoothing: Int?
   let detectionEmptyLookahead: Int?
   let detectionMaskReuseSkipFrames: Int?
   let detectFaceMosaics: Bool?
@@ -3450,8 +3453,23 @@ private final class NativeFrameProcessor: @unchecked Sendable {
           "SwiftVR: skipped a \(scene.frames.count)-frame scene (largest crop \(largestCropSide)px <= \(restorationSize)px)\n".utf8))
       }
       let enhancementStart = Date()
+      // SwiftVR sees each frame through a view that moves with the detector
+      // crop, which grows and shrinks by up to ~8% a frame. SwiftVR redraws
+      // its added outlines at every shift, so they looked thicker and
+      // thinner from frame to frame. With frame smoothing, SwiftVR gets the
+      // same BasicVSR++ result through a view whose placement is averaged
+      // over the surrounding frames, and its output is mapped back to each
+      // frame's own view before compositing.
+      let swiftVRViews = runsSwiftVR && (swiftVR?.frameSmoothing ?? 0) > 1
+        ? Self.smoothedSwiftVRViews(geometries, window: swiftVR?.frameSmoothing ?? 0)
+        : nil
       if runsSwiftVR, let swiftVR, let sceneOutput = try await swiftVR.enhance(
-        restored: restored, frameCount: scene.frames.count)
+        restored: swiftVRViews.map {
+          Self.reframeForSwiftVR(
+            restored, views: $0, geometries: geometries,
+            sources: scene.frames.map { detected[$0.batchIndex].frame.pixelBuffer })
+        } ?? restored,
+        frameCount: scene.frames.count)
       {
         // SwiftVR keeps producing frames while earlier ones are composited.
         // A frame is composited once the frames within the stabilization
@@ -3490,7 +3508,11 @@ private final class NativeFrameProcessor: @unchecked Sendable {
           sceneOutput.discard(before: neighbours.lowerBound)
           let waitStart = Date()
           for neighbour in neighbours where window[neighbour] == nil {
-            window[neighbour] = try await sceneOutput.frame(neighbour)
+            window[neighbour] = try await sceneOutput.frame(neighbour).map { pixels in
+              swiftVRViews.map {
+                Self.mapSwiftVRFrameBack(pixels, side: sceneOutput.side, view: $0[neighbour])
+              } ?? pixels
+            }
           }
           waitingSeconds += Date().timeIntervalSince(waitStart)
           // Frames SwiftVR did not produce because the export is stopping
@@ -5604,6 +5626,192 @@ private final class NativeFrameProcessor: @unchecked Sendable {
     }
   }
 
+  /// How one frame's restoration grid and SwiftVR's smoothed view both see
+  /// the frame, per axis: grid = scale * frame + offset (pixel centres).
+  private struct SwiftVRView {
+    let scaleX: Float
+    let offsetX: Float
+    let scaleY: Float
+    let offsetY: Float
+    let smoothScaleX: Float
+    let smoothOffsetX: Float
+    let smoothScaleY: Float
+    let smoothOffsetY: Float
+  }
+
+  /// Averages each frame's grid placement over `window` frames of the scene.
+  private static func smoothedSwiftVRViews(
+    _ geometries: [NativeClipGeometry], window: Int
+  ) -> [SwiftVRView] {
+    // Matches makeModelInputAxes: grid centre g samples frame
+    // cropStart + (g - pad + 0.5) * crop / resized - 0.5.
+    let placements = geometries.map { geometry -> (Float, Float, Float, Float) in
+      let scaleX = Float(geometry.resizedWidth) / Float(geometry.cropBox.width)
+      let scaleY = Float(geometry.resizedHeight) / Float(geometry.cropBox.height)
+      return (
+        scaleX,
+        Float(geometry.padLeft) - 0.5 - (Float(geometry.cropBox.left) - 0.5) * scaleX,
+        scaleY,
+        Float(geometry.padTop) - 0.5 - (Float(geometry.cropBox.top) - 0.5) * scaleY
+      )
+    }
+    let half = max(0, window / 2)
+    return placements.indices.map { index in
+      let range = max(0, index - half)...min(placements.count - 1, index + half)
+      let count = Float(range.count)
+      let mean = range.reduce((Float(0), Float(0), Float(0), Float(0))) {
+        ($0.0 + placements[$1].0, $0.1 + placements[$1].1,
+         $0.2 + placements[$1].2, $0.3 + placements[$1].3)
+      }
+      let own = placements[index]
+      return SwiftVRView(
+        scaleX: own.0, offsetX: own.1, scaleY: own.2, offsetY: own.3,
+        smoothScaleX: mean.0 / count, smoothOffsetX: mean.1 / count,
+        smoothScaleY: mean.2 / count, smoothOffsetY: mean.3 / count)
+    }
+  }
+
+  /// Resamples each 256px restoration grid into its smoothed view. Outside
+  /// the crop, the grid holds a mirror image of the crop whose seams move
+  /// with the crop; the view shows the source frame there instead, blended
+  /// in over 4 grid pixels at the crop edge.
+  private static func reframeForSwiftVR(
+    _ restored: [Float16], views: [SwiftVRView], geometries: [NativeClipGeometry],
+    sources: [CVPixelBuffer]
+  ) -> [Float16] {
+    let side = restorationSize
+    let plane = side * side
+    var output = restored
+    for (frame, view) in views.enumerated() {
+      let geometry = geometries[frame]
+      // Smoothed grid -> frame (pixel centres) -> this frame's grid.
+      let frameXs = (0..<side).map { (Float($0) - view.smoothOffsetX) / view.smoothScaleX }
+      let frameYs = (0..<side).map { (Float($0) - view.smoothOffsetY) / view.smoothScaleY }
+      let xs = frameXs.map { $0 * view.scaleX + view.offsetX }
+      let ys = frameYs.map { $0 * view.scaleY + view.offsetY }
+      let base = frame * 3 * plane
+      resample(restored, sourceOffset: base, sourceSide: side, xs: xs, ys: ys,
+        into: &output, targetOffset: base, targetSide: side)
+      // Weight of the restoration: 1 inside the crop, 0 outside.
+      func inside(_ grid: [Float], pad: Int, count: Int) -> [Float] {
+        grid.map { position in
+          let distance = min(position - Float(pad), Float(pad + count - 1) - position)
+          return max(0, min(1, (distance + 0.5) / 4))
+        }
+      }
+      let weightX = inside(xs, pad: geometry.padLeft, count: geometry.resizedWidth)
+      let weightY = inside(ys, pad: geometry.padTop, count: geometry.resizedHeight)
+      blendSource(
+        sources[frame], frameXs: frameXs, frameYs: frameYs,
+        weightX: weightX, weightY: weightY, into: &output, offset: base)
+    }
+    return output
+  }
+
+  /// Blends bilinear source-frame samples (BGRA) into a planar RGB view
+  /// wherever the restoration weight is below 1.
+  private static func blendSource(
+    _ source: CVPixelBuffer, frameXs: [Float], frameYs: [Float],
+    weightX: [Float], weightY: [Float], into output: inout [Float16], offset: Int
+  ) {
+    let side = restorationSize
+    let plane = side * side
+    CVPixelBufferLockBaseAddress(source, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(source, .readOnly) }
+    let width = CVPixelBufferGetWidth(source)
+    let height = CVPixelBufferGetHeight(source)
+    let row = CVPixelBufferGetBytesPerRow(source)
+    let pixels = CVPixelBufferGetBaseAddress(source)!.assumingMemoryBound(to: UInt8.self)
+    output.withUnsafeMutableBufferPointer { target in
+      DispatchQueue.concurrentPerform(iterations: side) { y in
+        let fy = max(0, min(Float(height - 1), frameYs[y]))
+        let y0 = Int(fy)
+        let y1 = min(height - 1, y0 + 1)
+        let wy = fy - Float(y0)
+        for x in 0..<side {
+          let weight = weightX[x] * weightY[y]
+          guard weight < 1 else { continue }
+          let fx = max(0, min(Float(width - 1), frameXs[x]))
+          let x0 = Int(fx)
+          let x1 = min(width - 1, x0 + 1)
+          let wx = fx - Float(x0)
+          for channel in 0..<3 {
+            // BGRA: red is byte 2, blue byte 0.
+            let byte = 2 - channel
+            let top = Float(pixels[y0 * row + x0 * 4 + byte]) * (1 - wx)
+              + Float(pixels[y0 * row + x1 * 4 + byte]) * wx
+            let bottom = Float(pixels[y1 * row + x0 * 4 + byte]) * (1 - wx)
+              + Float(pixels[y1 * row + x1 * 4 + byte]) * wx
+            let value = (top * (1 - wy) + bottom * wy) / 255
+            let index = offset + channel * plane + y * side + x
+            target[index] = Float16(Float(target[index]) * weight + value * (1 - weight))
+          }
+        }
+      }
+    }
+  }
+
+  /// Maps a SwiftVR frame from its smoothed view back to the frame's own
+  /// grid at SwiftVR's output size.
+  private static func mapSwiftVRFrameBack(
+    _ pixels: [Float16], side: Int, view: SwiftVRView
+  ) -> [Float16] {
+    let factor = Float(side) / Float(restorationSize)
+    // Output pixel u covers grid (u + 0.5) / factor - 0.5.
+    let xs = (0..<side).map { u -> Float in
+      let grid = (Float(u) + 0.5) / factor - 0.5
+      let smooth = (grid - view.offsetX) / view.scaleX * view.smoothScaleX
+        + view.smoothOffsetX
+      return (smooth + 0.5) * factor - 0.5
+    }
+    let ys = (0..<side).map { v -> Float in
+      let grid = (Float(v) + 0.5) / factor - 0.5
+      let smooth = (grid - view.offsetY) / view.scaleY * view.smoothScaleY
+        + view.smoothOffsetY
+      return (smooth + 0.5) * factor - 0.5
+    }
+    var output = pixels
+    resample(pixels, sourceOffset: 0, sourceSide: side, xs: xs, ys: ys,
+      into: &output, targetOffset: 0, targetSide: side)
+    return output
+  }
+
+  /// Bilinear resampling of a planar RGB square at the given source
+  /// coordinates (clamped at the edges).
+  private static func resample(
+    _ source: [Float16], sourceOffset: Int, sourceSide: Int, xs: [Float], ys: [Float],
+    into output: inout [Float16], targetOffset: Int, targetSide: Int
+  ) {
+    let sourcePlane = sourceSide * sourceSide
+    let targetPlane = targetSide * targetSide
+    let taps = { (position: Float) -> (Int, Int, Float) in
+      let clamped = max(0, min(Float(sourceSide - 1), position))
+      let lower = Int(clamped)
+      return (lower, min(sourceSide - 1, lower + 1), clamped - Float(lower))
+    }
+    let xTaps = xs.map(taps)
+    let yTaps = ys.map(taps)
+    source.withUnsafeBufferPointer { input in
+      output.withUnsafeMutableBufferPointer { target in
+        DispatchQueue.concurrentPerform(iterations: targetSide) { y in
+          let (y0, y1, wy) = yTaps[y]
+          for channel in 0..<3 {
+            let plane = sourceOffset + channel * sourcePlane
+            let row = targetOffset + channel * targetPlane + y * targetSide
+            for x in 0..<targetSide {
+              let (x0, x1, wx) = xTaps[x]
+              let upper = Float(input[plane + y0 * sourceSide + x0]) * (1 - wx)
+                + Float(input[plane + y0 * sourceSide + x1]) * wx
+              let lower = Float(input[plane + y1 * sourceSide + x0]) * (1 - wx)
+                + Float(input[plane + y1 * sourceSide + x1]) * wx
+              target[row + x] = Float16(upper * (1 - wy) + lower * wy)
+            }
+          }
+        }
+      }
+    }
+  }
+
   private static func stabilizeSwiftVRFrame(
     center: Int,
     frames: [(index: Int, pixels: [Float16])],
@@ -6597,7 +6805,8 @@ private struct NativePreviewPipeline {
         strength: config.roiEnhancerStrength ?? 1,
         scale: config.roiEnhancerScale == 2 ? 2 : 4,
         temporalFilter: config.swiftVRTemporalFilter ?? 0,
-        stabilizationRadius: config.swiftVRStabilizationRadius ?? 1
+        stabilizationRadius: config.swiftVRStabilizationRadius ?? 1,
+        frameSmoothing: config.swiftVRFrameSmoothing ?? 0
       )
     } else {
       swiftVR = nil
