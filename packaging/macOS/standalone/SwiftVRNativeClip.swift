@@ -296,7 +296,11 @@ private func compiledURL(for package: URL) throws -> URL {
 
 private func loadModel(compiled: URL, functionName: String? = nil) throws -> MLModel {
   let configuration = MLModelConfiguration()
-  configuration.computeUnits = .all
+  // GPU only (with CPU fallback), never the ANE. With `.all` Core ML ran the
+  // 2x FP16 patch embedding on the ANE and got it wrong (mean error 0.31,
+  // max 6.5 against CPU/GPU's 0.0004), corrupting every 2x frame. The DiT
+  // was 7.5x slower on the ANE anyway, and 4x output is unchanged.
+  configuration.computeUnits = .cpuAndGPU
   configuration.functionName = functionName
   return try MLModel(contentsOf: compiled, configuration: configuration)
 }

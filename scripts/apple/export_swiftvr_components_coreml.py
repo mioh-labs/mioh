@@ -67,6 +67,9 @@ def convert_and_check(model, example, name: str, output: Path, precision) -> dic
         minimum_deployment_target=ct.target.macOS15,
         convert_to="mlprogram",
         compute_precision=precision,
+        # Validate where mioh runs it. On the ANE the 2x FP16 patch embedding
+        # computed wrong results (mean error 0.31) that went unnoticed.
+        compute_units=ct.ComputeUnit.CPU_AND_GPU,
     )
     converted.save(str(output))
     native = converted.predict({name: example.numpy()})["output"]
@@ -160,6 +163,14 @@ def main() -> None:
     }
     (root / "components.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
+    # Healthy FP16 components stay near 1e-4; a large error used to be
+    # recorded and silently shipped.
+    for name, part in (("patch", patch_report), ("head", head_report)):
+        if part["mean_abs_error"] > 0.01:
+            raise SystemExit(
+                f"{name} differs from PyTorch: mean {part['mean_abs_error']:.4g}, "
+                f"max {part['max_abs_error']:.4g}"
+            )
 
 
 if __name__ == "__main__":
