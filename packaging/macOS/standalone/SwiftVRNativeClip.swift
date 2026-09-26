@@ -473,9 +473,10 @@ private func imagePixels(_ url: URL) throws -> [UInt8] {
 /// planar FP16 files on the command line, or the export's memory.
 private enum SceneFrames {
   case folder(inputs: [URL], raw: Bool, output: URL)
-  /// Planar RGB FP16 frames: 256px in, 512px or 1024px out.
+  /// Planar RGB FP16 frames: 256px in, 512px or 1024px out, handed over in
+  /// frame order as each is decoded.
   case memory(
-    input: UnsafeBufferPointer<Float16>, frames: Int, output: UnsafeMutablePointer<Float16>)
+    input: UnsafeBufferPointer<Float16>, frames: Int, deliver: (Int, [Float16]) -> Void)
 
   init(input: URL, output: URL) throws {
     try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
@@ -526,10 +527,13 @@ private enum SceneFrames {
         try savePNG(frames, decoderFrame: decoderFrame, outputFrame: outputFrame,
           latentCount: latentCount, folder: output, outputSize: outputSize)
       }
-    case .memory(_, _, let output):
-      try writePlanar(frames, decoderFrame: decoderFrame, latentCount: latentCount,
-        outputSize: outputSize,
-        into: output + outputFrame * 3 * outputSize * outputSize)
+    case .memory(_, _, let deliver):
+      var planar = [Float16](repeating: 0, count: 3 * outputSize * outputSize)
+      try planar.withUnsafeMutableBufferPointer { destination in
+        try writePlanar(frames, decoderFrame: decoderFrame, latentCount: latentCount,
+          outputSize: outputSize, into: destination.baseAddress!)
+      }
+      deliver(outputFrame, planar)
     }
   }
 }
@@ -870,21 +874,22 @@ private func denoise(
 
 #if MIOH_NATIVE_PREVIEW_PIPELINE
 /// Runs SwiftVR over one scene inside the export process. `input` holds
-/// `frames` planar RGB FP16 256px frames and `output` receives as many 512px
-/// (2x) or 1024px (4x) frames. Calls must not overlap: the models, the
-/// compiled cache and the stop check are process-wide. Throws
-/// `CancellationError` when `shouldStop` turns true between chunks or DiT
-/// groups.
+/// `frames` planar RGB FP16 256px frames; `deliver` receives each 512px (2x)
+/// or 1024px (4x) frame in order as soon as it is decoded. Calls must not
+/// overlap: the models, the compiled cache and the stop check are
+/// process-wide. Throws `CancellationError` when `shouldStop` turns true
+/// between chunks or DiT groups.
 func runSwiftVRScene(
   root: URL, compiledCache: URL, input: UnsafeBufferPointer<Float16>, frames: Int,
-  scale: Int, output: UnsafeMutablePointer<Float16>, shouldStop: @escaping () -> Bool
+  scale: Int, deliver: @escaping (Int, [Float16]) -> Void,
+  shouldStop: @escaping () -> Bool
 ) throws {
   sharedCompiledRoot = compiledCache
   sceneShouldStop = shouldStop
   defer { sceneShouldStop = { false } }
   try pooled {
     try SwiftVRNativeClipRunner.runScene(
-      root: root, scene: .memory(input: input, frames: frames, output: output),
+      root: root, scene: .memory(input: input, frames: frames, deliver: deliver),
       requestedFrames: frames, geometry: Geometry(scale: scale))
   }
 }

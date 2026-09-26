@@ -3449,47 +3449,61 @@ private final class NativeFrameProcessor: @unchecked Sendable {
       if runsSwiftVR, let swiftVR, let sceneOutput = try await swiftVR.enhance(
         restored: restored, frameCount: scene.frames.count)
       {
-        restorationSeconds += Date().timeIntervalSince(enhancementStart)
+        // SwiftVR keeps producing frames while earlier ones are composited.
+        // A frame is composited once its successor exists, and only frames
+        // not yet composited are held.
+        defer { sceneOutput.cancel() }
+        var waitingSeconds = 0.0
         let compositionStart = Date()
-        // Only the current frame and its two neighbours are held at once.
         var window: [Int: [Float16]] = [:]
         for index in scene.frames.indices {
           let offset = index * restoredFrameElements
           let base = Array(restored[offset..<(offset + restoredFrameElements)])
           let neighbours = max(0, index - 1)...min(scene.frames.count - 1, index + 1)
           window = window.filter { neighbours.contains($0.key) }
+          sceneOutput.discard(before: neighbours.lowerBound)
+          let waitStart = Date()
           for neighbour in neighbours where window[neighbour] == nil {
-            window[neighbour] = try sceneOutput.frame(neighbour)
+            window[neighbour] = try await sceneOutput.frame(neighbour)
           }
-          let stabilized = Self.matchSwiftVRColour(
-            Self.stabilizeSwiftVRFrame(
-              center: index,
-              frames: neighbours.map { (index: $0, pixels: window[$0]!) },
+          waitingSeconds += Date().timeIntervalSince(waitStart)
+          // Frames SwiftVR did not produce because the export is stopping
+          // keep the BasicVSR++ result.
+          let enhancedFrame: NativeEnhancerFrame?
+          if window[index] != nil {
+            let available = neighbours.filter { window[$0] != nil }
+            let stabilized = Self.matchSwiftVRColour(
+              Self.stabilizeSwiftVRFrame(
+                center: index,
+                frames: available.map { (index: $0, pixels: window[$0]!) },
+                restored: restored,
+                side: sceneOutput.side
+              ),
               restored: restored,
+              center: index,
               side: sceneOutput.side
-            ),
-            restored: restored,
-            center: index,
-            side: sceneOutput.side
-          )
-          let enhancedFrame = NativeEnhancerFrame(
-            output: NativeEnhancerOutput(
-              pixels: stabilized,
-              width: sceneOutput.side,
-              height: sceneOutput.side,
-              legacyLowResolution: nil
-            ),
-            lowResolution: base,
-            strength: swiftVR.strength,
-            directReplacement: true,
-            featherFraction: 0.04
-          )
+            )
+            enhancedFrame = NativeEnhancerFrame(
+              output: NativeEnhancerOutput(
+                pixels: stabilized,
+                width: sceneOutput.side,
+                height: sceneOutput.side,
+                legacyLowResolution: nil
+              ),
+              lowResolution: base,
+              strength: swiftVR.strength,
+              directReplacement: true,
+              featherFraction: 0.04
+            )
+          } else {
+            enhancedFrame = nil
+          }
           let frameIndex = scene.frames[index].batchIndex
           outputs[frameIndex] = try composite(
             source: outputs[frameIndex],
             restored: base,
-            enhancerBase: base,
-            restorationBase: base,
+            enhancerBase: enhancedFrame == nil ? nil : base,
+            restorationBase: enhancedFrame == nil ? nil : base,
             restoredOffset: 0,
             geometry: geometries[index],
             hardMask: masks[index],
@@ -3499,7 +3513,10 @@ private final class NativeFrameProcessor: @unchecked Sendable {
             expertFrameIndex: index
           )
         }
-        compositionSeconds += Date().timeIntervalSince(compositionStart)
+        // Time spent waiting for SwiftVR counts as restoration.
+        restorationSeconds += compositionStart.timeIntervalSince(enhancementStart)
+          + waitingSeconds
+        compositionSeconds += Date().timeIntervalSince(compositionStart) - waitingSeconds
         continue
       }
       if let roiEnhancer {
