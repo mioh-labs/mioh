@@ -133,9 +133,9 @@ private final class SwiftVRTurn: @unchecked Sendable {
 }
 
 /// Runs SwiftVR over one restored scene at a time inside the export process.
-/// Scene frames go straight from memory to Core ML and back; the result is
-/// released once the scene is composited (about 1.5 MB (2x) or 6 MB (4x) per
-/// frame).
+/// Scene frames go from memory straight into Core ML, and each result frame
+/// is handed to the compositor as soon as it is decoded, so only the frames
+/// not yet composited are held (about 1.5 MB (2x) or 6 MB (4x) each).
 final class SwiftVRSceneEnhancer: @unchecked Sendable {
   let strength: Float
   /// 2 (512px output, about a quarter of the DiT work) or 4 (1024px).
@@ -145,9 +145,9 @@ final class SwiftVRSceneEnhancer: @unchecked Sendable {
   var shouldStop: () -> Bool = { false }
   private let model: URL
   private let compiledCache: URL
-  /// Export lanes take turns: a lane holds the turn while SwiftVR runs its
-  /// scene, and the other lanes keep detecting, restoring, compositing and
-  /// encoding meanwhile. Running two scenes at once would double the
+  /// Export lanes take turns: a lane holds the turn while SwiftVR produces
+  /// its scene, and the other lanes keep detecting, restoring, compositing
+  /// and encoding meanwhile. Running two scenes at once would double the
   /// resident DiT memory without more GPU to run on.
   private let turn = SwiftVRTurn()
   /// Core ML runs off the Swift concurrency pool; SwiftVR's model state is
@@ -164,10 +164,11 @@ final class SwiftVRSceneEnhancer: @unchecked Sendable {
     compiledCache = try swiftVRPersistentCompiledCache()
   }
 
+  /// Starts SwiftVR on a scene once this lane has the turn and returns
+  /// without waiting for it; frames arrive through the returned output.
   /// `restored` holds the scene's frames as consecutive planar RGB 256px
   /// FP16 images, exactly the BasicVSR++ result that is composited. Returns
-  /// nil when the export is being stopped, so the pipeline finishes the scene
-  /// without SwiftVR and stops the same way as an export without it.
+  /// nil when the export is being stopped.
   func enhance(restored: [Float16], frameCount: Int) async throws -> SwiftVRSceneOutput? {
     let plane = 3 * 256 * 256
     guard frameCount > 0, restored.count >= frameCount * plane else {
@@ -176,30 +177,27 @@ final class SwiftVRSceneEnhancer: @unchecked Sendable {
       ])
     }
     await turn.acquire()
-    defer { turn.release() }
-    if shouldStop() { return nil }
-    let output = SwiftVRSceneOutput(frames: frameCount, side: outputSide)
-    let (model, compiledCache, scale, shouldStop) = (model, compiledCache, scale, shouldStop)
-    do {
-      try await withCheckedThrowingContinuation {
-        (finished: CheckedContinuation<Void, Error>) in
-        Self.queue.async {
-          do {
-            try restored.withUnsafeBufferPointer { input in
-              try runSwiftVRScene(
-                root: model, compiledCache: compiledCache, input: input,
-                frames: frameCount, scale: scale, output: output.pixels,
-                shouldStop: shouldStop)
-            }
-            finished.resume()
-          } catch {
-            finished.resume(throwing: error)
-          }
+    if shouldStop() {
+      turn.release()
+      return nil
+    }
+    let output = SwiftVRSceneOutput(side: outputSide)
+    let (model, compiledCache, scale, shouldStop, turn) =
+      (model, compiledCache, scale, shouldStop, turn)
+    Self.queue.async {
+      defer { turn.release() }
+      do {
+        try restored.withUnsafeBufferPointer { input in
+          try runSwiftVRScene(
+            root: model, compiledCache: compiledCache, input: input,
+            frames: frameCount, scale: scale,
+            deliver: { output.deliver($0, $1) },
+            shouldStop: { shouldStop() || output.isCancelled })
         }
+        output.finish(nil)
+      } catch {
+        output.finish(error)
       }
-    } catch {
-      if shouldStop() || error is CancellationError { return nil }
-      throw error
     }
     return output
   }
@@ -209,21 +207,72 @@ final class SwiftVRSceneEnhancer: @unchecked Sendable {
   }
 }
 
-/// SwiftVR's 512px or 1024px planar RGB FP16 frames for one scene.
+/// SwiftVR's 512px or 1024px planar RGB FP16 frames for one scene, handed
+/// from the SwiftVR queue to one compositing task as they are produced.
 final class SwiftVRSceneOutput: @unchecked Sendable {
   let side: Int
-  fileprivate let pixels: UnsafeMutablePointer<Float16>
-  private let frameElements: Int
+  private let lock = NSLock()
+  private var frames: [Int: [Float16]] = [:]
+  private var finished = false
+  private var failure: Error?
+  private var cancelled = false
+  private var waiter: CheckedContinuation<Void, Never>?
 
-  fileprivate init(frames: Int, side: Int) {
+  fileprivate init(side: Int) {
     self.side = side
-    frameElements = 3 * side * side
-    pixels = .allocate(capacity: frames * frameElements)
   }
 
-  deinit { pixels.deallocate() }
+  fileprivate var isCancelled: Bool {
+    lock.withLock { cancelled }
+  }
 
-  func frame(_ index: Int) throws -> [Float16] {
-    Array(UnsafeBufferPointer(start: pixels + index * frameElements, count: frameElements))
+  fileprivate func deliver(_ index: Int, _ pixels: [Float16]) {
+    let waiting = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+      frames[index] = pixels
+      defer { waiter = nil }
+      return waiter
+    }
+    waiting?.resume()
+  }
+
+  fileprivate func finish(_ error: Error?) {
+    let waiting = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+      finished = true
+      failure = error is CancellationError ? nil : error
+      defer { waiter = nil }
+      return waiter
+    }
+    waiting?.resume()
+  }
+
+  /// Waits for frame `index`. Returns nil when SwiftVR stopped before
+  /// producing it, and throws when SwiftVR failed.
+  func frame(_ index: Int) async throws -> [Float16]? {
+    while true {
+      let ready = try lock.withLock { () throws -> [Float16]?? in
+        if let pixels = frames[index] { return .some(pixels) }
+        if let failure { throw failure }
+        return finished ? .some(nil) : nil
+      }
+      if let ready { return ready }
+      await withCheckedContinuation { (waiting: CheckedContinuation<Void, Never>) in
+        let resumeNow = lock.withLock { () -> Bool in
+          if frames[index] != nil || finished { return true }
+          waiter = waiting
+          return false
+        }
+        if resumeNow { waiting.resume() }
+      }
+    }
+  }
+
+  /// Releases the frames before `index`, which the compositor no longer needs.
+  func discard(before index: Int) {
+    lock.withLock { frames = frames.filter { $0.key >= index } }
+  }
+
+  /// Stops SwiftVR at its next check when the compositor gives up early.
+  func cancel() {
+    lock.withLock { cancelled = true }
   }
 }

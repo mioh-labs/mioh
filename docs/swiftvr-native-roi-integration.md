@@ -21,9 +21,15 @@ face-restoration gate.
     `base + (SwiftVR - base) * strength * mask`.
   - There is no sidecar, no second pass and no re-encode. The final movie is
     the normal export.
-- Scene frames go from memory straight into Core ML, and the result stays
-  in memory until the scene is composited: one scene per lane (48 frames at
-  4x: about 300 MB; export clips reach 180 frames, about 1.1 GB). Until
+- Scene frames go from memory straight into Core ML. Each result frame is
+  handed to the compositor as soon as it is decoded, and a frame is
+  composited once its successor exists (the ±1 stabilization needs it), so
+  only frames not yet composited are held instead of a whole scene (up to
+  1.1 GB at 4x). On the 12 s MIDV clip (6 SwiftVR scenes, 363 frames) the
+  streamed export was pixel-identical to the whole-scene one; 2x took 46–49 s
+  instead of 64–67 s (the DiT groups themselves ran about 25% faster; the
+  cause is not established), 4x took 145–155 s either way, and the 4x peak
+  footprint fell from 14.8–15.0 GB to 14.3 GB. Until
   2026-09-26 a separate `mioh-native-swiftvr-clip --serve` worker exchanged
   them as temporary files. The in-process result is bit-identical to that
   worker's (30 frames at 2x, 100 frames at 4x), and the file exchange had
@@ -33,9 +39,9 @@ face-restoration gate.
   detecting, restoring, compositing and encoding meanwhile. Crossfade stays available;
   overlap frames are simply enhanced in both batches.
 - Stopping the export cancels SwiftVR between chunks and DiT groups (0.06 s
-  after the stop in a 4x test). The current scene finishes without SwiftVR,
-  and the export ends exactly like a stop without SwiftVR (exit 0, no error
-  event).
+  after the stop in a 4x test). Frames of the current scene that SwiftVR
+  did not produce keep the BasicVSR++ result, and the export ends exactly
+  like a stop without SwiftVR (exit 0, no error event).
 - SwiftVR progress lines go to stderr. This process's stdout carries mioh's
   JSON event stream.
 - Core ML keeps a per-executable cache in `~/Library/Caches/<executable>`.
