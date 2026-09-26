@@ -3432,8 +3432,21 @@ private final class NativeFrameProcessor: @unchecked Sendable {
       // 1024px (4x) frame is stabilized against its neighbours, then replaces
       // the BasicVSR++ ROI through the direct-replacement path:
       // base + (SwiftVR - base) * strength * mask.
+      // A scene whose largest crop fits the 256px restoration grid was
+      // restored at native resolution, so SwiftVR has no lost resolution to
+      // rebuild (+1.4% detail measured there, the least of any size). Those
+      // scenes keep the BasicVSR++ result; on MIDV-995 they were about 48% of
+      // the SwiftVR jobs.
+      let largestCropSide = geometries.map {
+        max($0.cropBox.width, $0.cropBox.height)
+      }.max() ?? 0
+      let runsSwiftVR = swiftVR != nil && largestCropSide > restorationSize
+      if swiftVR != nil, !runsSwiftVR {
+        FileHandle.standardError.write(Data(
+          "SwiftVR: skipped a \(scene.frames.count)-frame scene (largest crop \(largestCropSide)px <= \(restorationSize)px)\n".utf8))
+      }
       let enhancementStart = Date()
-      if let swiftVR, let sceneOutput = try await swiftVR.enhance(
+      if runsSwiftVR, let swiftVR, let sceneOutput = try await swiftVR.enhance(
         restored: restored, frameCount: scene.frames.count)
       {
         defer { sceneOutput.remove() }
