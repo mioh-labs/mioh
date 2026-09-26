@@ -102,6 +102,8 @@ struct NativeExportConfiguration: Codable, Sendable {
   let roiExpertMode: Bool
   /// SwiftVR only: Apple temporal noise filter strength (0 turns it off).
   var swiftVRTemporalFilter: Float? = nil
+  /// SwiftVR only: frames on each side blended by the stabilization.
+  var swiftVRStabilizationRadius: Int? = nil
   let detectionEmptyLookahead: Int
   let detectionMaskReuseSkipFrames: Int
   let detectFaceMosaics: Bool
@@ -166,6 +168,7 @@ struct NativeExportConfiguration: Codable, Sendable {
     case roiEnhancerPasses
     case roiExpertMode
     case swiftVRTemporalFilter
+    case swiftVRStabilizationRadius
     case detectionEmptyLookahead
     case detectionMaskReuseSkipFrames
     case detectFaceMosaics
@@ -701,6 +704,7 @@ struct MiohUserDefaultsSnapshot: Codable {
   var roiEnhancerPasses: Int?
   var roiExpertMode: Bool?
   var swiftVRTemporalFilter: Double?
+  var swiftVRStabilizationRadius: Int?
 
   var detectionModel: String
   var customDetectionModel: String
@@ -789,6 +793,7 @@ struct MiohUserDefaultsSnapshot: Codable {
       roiEnhancerPasses: 1,
       roiExpertMode: false,
       swiftVRTemporalFilter: 1.0,
+      swiftVRStabilizationRadius: 1,
       detectionModel: "v2-coreml",
       customDetectionModel: "",
       detectionEmptyLookahead: 10,
@@ -918,6 +923,8 @@ final class RestorationRunner: ObservableObject {
   @Published var roiExpertMode = false
   /// Strength of the temporal noise filter on SwiftVR's frames (0 = off).
   @Published var swiftVRTemporalFilter = 1.0
+  /// Frames on each side that SwiftVR's stabilization blends (1 = ±1).
+  @Published var swiftVRStabilizationRadius = 1
 
   @Published var detectionModel: String
   @Published var customDetectionModel = ""
@@ -1825,6 +1832,8 @@ final class RestorationRunner: ObservableObject {
       roiExpertMode: roiExpertMode,
       swiftVRTemporalFilter: roiEnhancer == "swiftvr"
         ? Float(min(max(swiftVRTemporalFilter, 0), 1)) : nil,
+      swiftVRStabilizationRadius: roiEnhancer == "swiftvr"
+        ? min(max(swiftVRStabilizationRadius, 1), 8) : nil,
       detectionEmptyLookahead: max(0, detectionEmptyLookahead),
       detectionMaskReuseSkipFrames: min(
         max(detectionMaskReuseSkipFrames, 0),
@@ -3099,6 +3108,7 @@ final class RestorationRunner: ObservableObject {
       roiEnhancerPasses: roiEnhancerPasses,
       roiExpertMode: roiExpertMode,
       swiftVRTemporalFilter: swiftVRTemporalFilter,
+      swiftVRStabilizationRadius: swiftVRStabilizationRadius,
       detectionModel: detectionModel,
       customDetectionModel: customDetectionModel,
       detectionEmptyLookahead: detectionEmptyLookahead,
@@ -3203,6 +3213,7 @@ final class RestorationRunner: ObservableObject {
     // saved "on" must not keep applying invisibly.
     roiExpertMode = false
     swiftVRTemporalFilter = min(max(snapshot.swiftVRTemporalFilter ?? 1, 0), 1)
+    swiftVRStabilizationRadius = min(max(snapshot.swiftVRStabilizationRadius ?? 1, 1), 8)
 
     detectionModel = detectionModels.contains(snapshot.detectionModel) ? snapshot.detectionModel : "v2-coreml"
     customDetectionModel = snapshot.customDetectionModel
@@ -4177,6 +4188,10 @@ struct ContentView: View {
           }
           .pickerStyle(.segmented)
           Text("ROIの大きさに関係なく、すべてのシーンをこの倍率で処理します。2xは出力512pxで、4x（1024px）より大幅に速くなります。")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+          integerSliderField("なじませ範囲", value: $runner.swiftVRStabilizationRadius, range: 1...8, step: 1)
+          Text("SwiftVRの結果を前後何フレームまで混ぜるか。BasicVSR++の結果が似ている所だけを混ぜるので、広げても動いた所は混ざらず、止まった場面ほどチラつきが減ります。1が従来どおり。")
             .font(.caption)
             .foregroundStyle(.secondary)
           doubleSliderField("揺らぎ低減", value: $runner.swiftVRTemporalFilter, range: 0...1, step: 0.05)
