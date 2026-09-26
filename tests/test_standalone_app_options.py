@@ -886,8 +886,9 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertEqual(info["LSMinimumSystemVersion"], "26.0")
         self.assertNotIn("import CoreAI", source)
         self.assertEqual(build_script.count("-target arm64-apple-macosx26.0"), 1)
-        # Four Core AI binaries plus the SwiftVR Core ML worker.
-        self.assertEqual(build_script.count("-target arm64-apple-macosx27.0"), 5)
+        # Four Core AI binaries; SwiftVR runs inside the export binary.
+        self.assertEqual(build_script.count("-target arm64-apple-macosx27.0"), 4)
+        self.assertNotIn("mioh-native-swiftvr-clip", build_script)
         self.assertEqual(build_script.count("-framework CoreAI"), 4)
 
     def test_model_choices_follow_coreai_os_availability(self):
