@@ -82,6 +82,8 @@ private struct NativePreviewConfiguration: Decodable {
   let roiEnhancerScale: Int?
   let roiEnhancerPasses: Int?
   let roiExpertMode: Bool?
+  /// SwiftVR only: Apple temporal noise filter strength; 0 or absent is off.
+  let swiftVRTemporalFilter: Float?
   let detectionEmptyLookahead: Int?
   let detectionMaskReuseSkipFrames: Int?
   let detectFaceMosaics: Bool?
@@ -3453,6 +3455,26 @@ private final class NativeFrameProcessor: @unchecked Sendable {
         // A frame is composited once its successor exists, and only frames
         // not yet composited are held.
         defer { sceneOutput.cancel() }
+        // The temporal noise filter runs on the composited frames, within
+        // one rectangle around every crop of the scene, and is written back
+        // only where SwiftVR was blended in. Filtering SwiftVR's own 512 or
+        // 1024 px frames instead cut the 4x flicker increase only from
+        // +19.5% to +13.9%: composition resamples them into a crop whose
+        // size and position change every frame.
+        let filterRegion = swiftVR.temporalFilter > 0
+          ? Self.swiftVRFilterRegion(geometries, frame: outputs[scene.frames[0].batchIndex])
+          : nil
+        let filter = try filterRegion.map {
+          try SwiftVRTemporalNoiseFilter(
+            width: $0.width, height: $0.height, strength: swiftVR.temporalFilter)
+        }
+        if swiftVR.temporalFilter > 0 {
+          FileHandle.standardError.write(Data((filterRegion.map {
+            "SwiftVR: temporal noise filter over \($0.width)x\($0.height) for \(scene.frames.count) frames\n"
+          } ?? "SwiftVR: no temporal noise filter region for \(scene.frames.count) frames\n").utf8))
+        }
+        let lookahead = filter?.nextCount ?? 0
+        var filterInputs = Set<Int>()
         var waitingSeconds = 0.0
         let compositionStart = Date()
         var window: [Int: [Float16]] = [:]
@@ -3512,6 +3534,30 @@ private final class NativeFrameProcessor: @unchecked Sendable {
             expertContext: expertContext,
             expertFrameIndex: index
           )
+          if let filter, let filterRegion {
+            if enhancedFrame != nil {
+              try filter.add(
+                index, from: outputs[frameIndex],
+                left: filterRegion.left, top: filterRegion.top)
+              filterInputs.insert(index)
+            }
+            let ready = index - lookahead
+            if ready >= 0, filterInputs.contains(ready) {
+              try await applySwiftVRFilter(
+                filter, index: ready, region: filterRegion,
+                into: outputs[scene.frames[ready].batchIndex],
+                geometry: geometries[ready], hardMask: masks[ready])
+            }
+          }
+        }
+        if let filter, let filterRegion {
+          for ready in max(0, scene.frames.count - lookahead)..<scene.frames.count
+          where filterInputs.contains(ready) {
+            try await applySwiftVRFilter(
+              filter, index: ready, region: filterRegion,
+              into: outputs[scene.frames[ready].batchIndex],
+              geometry: geometries[ready], hardMask: masks[ready])
+          }
         }
         // Time spent waiting for SwiftVR counts as restoration.
         restorationSeconds += compositionStart.timeIntervalSince(enhancementStart)
@@ -5465,6 +5511,95 @@ private final class NativeFrameProcessor: @unchecked Sendable {
   /// difference along. Where the base moved, the weight falls to zero and the
   /// pixel keeps its own frame. On a real export this removed about 98% of
   /// the added jitter and kept about 87% of SwiftVR's change.
+  /// The rectangle around every crop of a scene, inside the frame, where the
+  /// SwiftVR temporal noise filter runs.
+  private static func swiftVRFilterRegion(
+    _ geometries: [NativeClipGeometry], frame: CVPixelBuffer
+  ) -> IntBox? {
+    guard let first = geometries.first else { return nil }
+    let frameWidth = CVPixelBufferGetWidth(frame)
+    let frameHeight = CVPixelBufferGetHeight(frame)
+    var left = first.cropBox.left, top = first.cropBox.top
+    var right = first.cropBox.right, bottom = first.cropBox.bottom
+    for geometry in geometries.dropFirst() {
+      left = min(left, geometry.cropBox.left)
+      top = min(top, geometry.cropBox.top)
+      right = max(right, geometry.cropBox.right)
+      bottom = max(bottom, geometry.cropBox.bottom)
+    }
+    left = max(0, left)
+    top = max(0, top)
+    right = min(frameWidth - 1, right)
+    bottom = min(frameHeight - 1, bottom)
+    // The filter's 4:2:0 frames need an even size of at least 160x64.
+    func fit(_ lower: inout Int, _ upper: inout Int, minimum: Int, limit: Int) {
+      while upper - lower + 1 < minimum || !(upper - lower + 1).isMultiple(of: 2) {
+        if upper < limit - 1 {
+          upper += 1
+        } else if lower > 0 {
+          lower -= 1
+        } else {
+          return
+        }
+      }
+    }
+    fit(&left, &right, minimum: 160, limit: frameWidth)
+    fit(&top, &bottom, minimum: 64, limit: frameHeight)
+    let box = IntBox(left: left, top: top, right: right, bottom: bottom)
+    guard box.width >= 160, box.height >= 64,
+      box.width.isMultiple(of: 2), box.height.isMultiple(of: 2)
+    else { return nil }
+    return box
+  }
+
+  /// Blends the filtered rectangle back into a composited frame with the
+  /// weights SwiftVR itself was blended in with.
+  private func applySwiftVRFilter(
+    _ filter: SwiftVRTemporalNoiseFilter, index: Int, region: IntBox,
+    into frame: CVPixelBuffer, geometry: NativeClipGeometry, hardMask: [Float]
+  ) async throws {
+    let filtered = try await filter.filtered(index)
+    let crop = geometry.cropBox
+    let weights = Self.createEnhancerBlendMask(
+      hardMask, width: crop.width, height: crop.height, featherFraction: 0.04)
+    Self.blend(filtered, region: region, into: frame, crop: crop, weights: weights)
+  }
+
+  private static func blend(
+    _ filtered: CVPixelBuffer, region: IntBox, into frame: CVPixelBuffer,
+    crop: IntBox, weights: [Float]
+  ) {
+    CVPixelBufferLockBaseAddress(filtered, .readOnly)
+    CVPixelBufferLockBaseAddress(frame, [])
+    defer {
+      CVPixelBufferUnlockBaseAddress(frame, [])
+      CVPixelBufferUnlockBaseAddress(filtered, .readOnly)
+    }
+    let sourceRow = CVPixelBufferGetBytesPerRow(filtered)
+    let targetRow = CVPixelBufferGetBytesPerRow(frame)
+    let source = CVPixelBufferGetBaseAddress(filtered)!.assumingMemoryBound(to: UInt8.self)
+    let target = CVPixelBufferGetBaseAddress(frame)!.assumingMemoryBound(to: UInt8.self)
+    let top = max(crop.top, region.top), bottom = min(crop.bottom, region.bottom)
+    let left = max(crop.left, region.left), right = min(crop.right, region.right)
+    guard top <= bottom, left <= right else { return }
+    DispatchQueue.concurrentPerform(iterations: bottom - top + 1) { row in
+      let y = top + row
+      let weightRow = (y - crop.top) * crop.width
+      let sourceLine = source + (y - region.top) * sourceRow
+      let targetLine = target + y * targetRow
+      for x in left...right {
+        let weight = weights[weightRow + x - crop.left]
+        guard weight > 0 else { continue }
+        for channel in 0..<3 {
+          let current = Float(targetLine[x * 4 + channel])
+          let value = Float(sourceLine[(x - region.left) * 4 + channel])
+          targetLine[x * 4 + channel] = UInt8(
+            max(0, min(255, (current + weight * (value - current)).rounded())))
+        }
+      }
+    }
+  }
+
   private static func stabilizeSwiftVRFrame(
     center: Int,
     frames: [(index: Int, pixels: [Float16])],
@@ -6456,7 +6591,8 @@ private struct NativePreviewPipeline {
       swiftVR = try SwiftVRSceneEnhancer(
         model: swiftVRAsset,
         strength: config.roiEnhancerStrength ?? 1,
-        scale: config.roiEnhancerScale == 2 ? 2 : 4
+        scale: config.roiEnhancerScale == 2 ? 2 : 4,
+        temporalFilter: config.swiftVRTemporalFilter ?? 0
       )
     } else {
       swiftVR = nil

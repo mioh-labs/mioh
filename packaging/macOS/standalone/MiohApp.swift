@@ -100,6 +100,8 @@ struct NativeExportConfiguration: Codable, Sendable {
   let roiEnhancerScale: Int
   let roiEnhancerPasses: Int
   let roiExpertMode: Bool
+  /// SwiftVR only: Apple temporal noise filter strength (0 turns it off).
+  var swiftVRTemporalFilter: Float? = nil
   let detectionEmptyLookahead: Int
   let detectionMaskReuseSkipFrames: Int
   let detectFaceMosaics: Bool
@@ -163,6 +165,7 @@ struct NativeExportConfiguration: Codable, Sendable {
     case roiEnhancerScale
     case roiEnhancerPasses
     case roiExpertMode
+    case swiftVRTemporalFilter
     case detectionEmptyLookahead
     case detectionMaskReuseSkipFrames
     case detectFaceMosaics
@@ -697,6 +700,7 @@ struct MiohUserDefaultsSnapshot: Codable {
   var roiEnhancerTile: Int
   var roiEnhancerPasses: Int?
   var roiExpertMode: Bool?
+  var swiftVRTemporalFilter: Double?
 
   var detectionModel: String
   var customDetectionModel: String
@@ -784,6 +788,7 @@ struct MiohUserDefaultsSnapshot: Codable {
       roiEnhancerTile: 0,
       roiEnhancerPasses: 1,
       roiExpertMode: false,
+      swiftVRTemporalFilter: 1.0,
       detectionModel: "v2-coreml",
       customDetectionModel: "",
       detectionEmptyLookahead: 10,
@@ -911,6 +916,8 @@ final class RestorationRunner: ObservableObject {
   @Published var roiEnhancerTile = 0
   @Published var roiEnhancerPasses = 1
   @Published var roiExpertMode = false
+  /// Strength of the temporal noise filter on SwiftVR's frames (0 = off).
+  @Published var swiftVRTemporalFilter = 1.0
 
   @Published var detectionModel: String
   @Published var customDetectionModel = ""
@@ -1816,6 +1823,8 @@ final class RestorationRunner: ObservableObject {
       roiEnhancerPasses: roiEnhancer == "pipersr"
         ? min(max(roiEnhancerPasses, 1), 10) : 1,
       roiExpertMode: roiExpertMode,
+      swiftVRTemporalFilter: roiEnhancer == "swiftvr"
+        ? Float(min(max(swiftVRTemporalFilter, 0), 1)) : nil,
       detectionEmptyLookahead: max(0, detectionEmptyLookahead),
       detectionMaskReuseSkipFrames: min(
         max(detectionMaskReuseSkipFrames, 0),
@@ -3089,6 +3098,7 @@ final class RestorationRunner: ObservableObject {
       roiEnhancerTile: roiEnhancerTile,
       roiEnhancerPasses: roiEnhancerPasses,
       roiExpertMode: roiExpertMode,
+      swiftVRTemporalFilter: swiftVRTemporalFilter,
       detectionModel: detectionModel,
       customDetectionModel: customDetectionModel,
       detectionEmptyLookahead: detectionEmptyLookahead,
@@ -3192,6 +3202,7 @@ final class RestorationRunner: ObservableObject {
     // Expert ROI is hidden from the GUI (its code stays), so a previously
     // saved "on" must not keep applying invisibly.
     roiExpertMode = false
+    swiftVRTemporalFilter = min(max(snapshot.swiftVRTemporalFilter ?? 1, 0), 1)
 
     detectionModel = detectionModels.contains(snapshot.detectionModel) ? snapshot.detectionModel : "v2-coreml"
     customDetectionModel = snapshot.customDetectionModel
@@ -4166,6 +4177,10 @@ struct ContentView: View {
           }
           .pickerStyle(.segmented)
           Text("ROIの大きさに関係なく、すべてのシーンをこの倍率で処理します。2xは出力512pxで、4x（1024px）より大幅に速くなります。")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+          doubleSliderField("揺らぎ低減", value: $runner.swiftVRTemporalFilter, range: 0...1, step: 0.05)
+          Text("SwiftVRの結果に、前後のフレームを使うAppleの時間方向ノイズ除去をかけて、質感のチラつきを抑えます。0でオフ。上げるほどチラつきが減り、ごく細かいざらつきも減ります。")
             .font(.caption)
             .foregroundStyle(.secondary)
         } else {
