@@ -158,7 +158,20 @@ or output sizes without additional variants or a validated dynamic export.
   - A 180-frame scene took 45–49 s instead of 58–65 s (6-latent chunks loaded
     block by block), with all 180 output frames bit-identical. Peak footprint
     was 29.4 GB (28.0 GB before), almost all of it the 1024px ReAE graphs.
-  - Keeping the ReAE encoders and decoders resident is counterproductive: the
+  - ReAE slices: with `reae-stateful-encoder-4f-<size>-fp32` and
+  `reae-stateful-decoder-1latent-<size>-fp32` in the pack, each chunk is
+  encoded four frames and decoded one latent at a time, carrying the states.
+  A whole-chunk 1024px decoder call needed 15-20 GB of transient memory. In an
+  app export on a 48 GB Mac, that evicted the idle DiT groups to swap, and a
+  group then took 10-15 s instead of 0.5 s.
+  180-frame scene:
+
+  | scale | peak | swap written | time | output vs whole-chunk |
+  | --- | --- | --- | --- | --- |
+  | 4x | 29.3 → 10.5 GB | 1463 → 106 MB | 42.1 → 36.0 s | identical |
+  | 2x | 10.6 → 3.1 GB | 192 → 0 MB | 9.0 → 8.7 s | mean 0.01, max 2.2 levels |
+
+- Keeping the ReAE encoders and decoders resident is counterproductive: the
     same scene reached a 49.8 GB footprint and took 123–135 s.
   - One group's conversion once failed with "Caught an unknown exception"
     while validating t6, and succeeded on retry.
