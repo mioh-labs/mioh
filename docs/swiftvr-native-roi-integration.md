@@ -44,7 +44,7 @@ face-restoration gate.
   - `native-2x-t7-fp16/components` and `native-2x-t6-fp16/components`
   - `native-2x-fp16-grouped` (multifunction t7/t6 groups)
   The worker takes the scale per scene from its request.
-- Composition fades SwiftVR's change in over 8% of the crop's short side
+- Composition fades SwiftVR's change in over 4% of the crop's short side
   (smoothstep). The previous seam taper was at most 4 px, which left a visible
   edge wherever SwiftVR shifted colour or texture.
 - Temporal stabilization: SwiftVR re-synthesizes texture per frame, which
@@ -52,6 +52,13 @@ face-restoration gate.
   added jitter was uniform, not at scene or chunk seams. Each output pixel is
   averaged with the neighbouring frames where the 256px BasicVSR++ base moved
   less than about 8 levels, carrying the base difference along.
+- Colour match: SwiftVR shifts the ROI brighter and bluer than its input
+  (+3.1/+4.1/+4.8 levels R/G/B at 4x on a 12 s excerpt). The upstream
+  pipeline has no colour correction. Each stabilized frame is reduced to the
+  256px grid and its difference from the restoration is box-blurred (9 px).
+  That coarse shift is upsampled and subtracted. The bias fell to
+  +0.2/+0.4/+0.3, the mean change from 4.80 to 1.73 levels, and added jitter
+  from +5.2% to +4.3%. Detail stayed at 104% of BasicVSR++.
 - Expert ROI is hidden from the settings and always off; its code remains.
 
 12 s excerpt of a real export (180-frame clips), second-difference jitter
