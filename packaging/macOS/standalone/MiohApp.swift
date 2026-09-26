@@ -1589,9 +1589,9 @@ final class RestorationRunner: ObservableObject {
       self.processInput = nil
       try? processInput.fileHandleForWriting.close()
     }
-    // A SwiftVR export owns a long-lived inference worker. Let the export's
-    // control reader stop that child cleanly rather than interrupting only
-    // the parent and leaving expensive inference orphaned.
+    // A SwiftVR export stops between DiT groups once its control reader sees
+    // the stop command, finishing the current scene without SwiftVR; an
+    // interrupt would end it in the middle of Core ML inference instead.
     if roiEnhancer != "swiftvr" || !runningNativeExport {
       process?.interrupt()
     }
