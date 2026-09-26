@@ -14,6 +14,10 @@ Supported backends:
   enhanced independently; it is not a temporal video-restoration model. The
   full-frame path uses a derived FP16-I/O model, two reusable frame sessions,
   Metal output conversion and overlapped frame scheduling.
+- SwiftVR x2/x4 Core ML, using the same temporal 256px model pack as mioh
+  Universal. The full frame is divided into overlapping 256px tiles, each
+  processed as a video scene; tiles and 8-frame scene boundaries are blended.
+  This is substantially slower than PiperSR and the model pack stays external.
 - MiniMax H3 / 10Eros-Max H3 native Swift generation. Ref2VA accepts a video
   or up to eight identity-reference images; the separate FL2VA profile generates
   video and audio from a prompt alone. Converted graphs, tokenizer and
@@ -30,7 +34,7 @@ Outputs:
 - `build/mioh-upscaler/mioh upscaler.app`
 - `build/mioh-upscaler/mioh-upscaler-0.14.3-unsigned.dmg`
 
-FlashVSR, AdcSR and H3 weights remain external. The small CC BY 4.0 PiperSR
+FlashVSR, AdcSR, SwiftVR and H3 weights remain external. The small CC BY 4.0 PiperSR
 models are bundled with attribution so the 2x option works without setup.
 The default external locations are:
 
@@ -38,8 +42,10 @@ The default external locations are:
 - `model_weights/adcsr_x4_float32.aimodel`
 - `/Volumes/Project_HD/model_weights/minimax-h3-native/manifest.json`
 - `/Volumes/Project_HD/model_weights/minimax-h3-native/manifest-fl2va.json`
+- `/Volumes/Project_HD/swiftvr-eval` (or the folder produced by mioh
+  Universal's `install-swiftvr-models.zsh`)
 
-The first two can also be selected from the **アップスケール** tab and the
+The first two and SwiftVR can also be selected from the **アップスケール** tab and the
 MiniMax H3 manifest from the **動画生成** tab. The MiniMax H3 weights live on
 the external `Project_HD` volume, so that volume must be mounted before 動画生成
 can run.
@@ -88,7 +94,7 @@ codex mcp add mioh-upscaler -- \
 ```
 
 The server exposes capability inspection, MiniMax H3 video generation,
-FlashVSR/AdcSR/PiperSR upscaling, job status/list/stop, and app opening tools. The
+FlashVSR/AdcSR/PiperSR/SwiftVR upscaling, job status/list/stop, and app opening tools. The
 `prompt` passed to `mioh_start_video_generation` is forwarded byte-for-byte to
 the native H3 runner without summarizing or rewriting it. Model weights remain
 external and are not exposed through MCP responses.

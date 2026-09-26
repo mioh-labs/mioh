@@ -1,9 +1,9 @@
 # mioh ユーザーマニュアル
 
-バージョン 0.14.3-014
+バージョン 0.14.3-015
 
 対象: mioh-universal for macOS
-改訂日: 2026年9月24日
+改訂日: 2026年9月26日
 
 ## 1. miohについて
 
@@ -23,7 +23,7 @@ miohは、動画内のモザイク領域を検出し、復元モデルで処理�
 
 ## 2. インストールと起動
 
-1. [miohのv0.14.3-014リリース](https://github.com/mioh-labs/mioh/releases/tag/v0.14.3-014)から`mioh-universal-0.14.3-014-unsigned.dmg`を入手します。
+1. [miohのv0.14.3-015リリース](https://github.com/mioh-labs/mioh/releases/tag/v0.14.3-015)から`mioh-universal-0.14.3-015-unsigned.dmg`を入手します。
 2. `mioh-universal.app`を`Applications`へドラッグします。
 3. 次節のモデルダウンロードと変換を完了します。
 4. Applicationsフォルダからmiohを起動します。
@@ -68,6 +68,20 @@ find "$MODELS/basicvsrpp-v1.2-variable-coreai.aimodel" \
 
 モデルはアプリの中にあるため、新しい`mioh-universal.app`でアプリを置き換えるとモデルも置き換わります。更新前に必要なモデルを別の場所へバックアップするか、更新後に上記2つのスクリプトを再実行してください。既存のモデルを新アプリへ移す場合も、必ず同じバージョンの変換ツールで動作を確認してください。
 
+### SwiftVRをROIエンハンサーとして追加する場合
+
+SwiftVRは標準モデルとは別の大容量モデルです。SwiftVR対応のUniversal版とmacOS 27以降が必要です。インストール済みアプリ内に`install-swiftvr-models.zsh`がない場合は、SwiftVR対応版へ更新してください。次のスクリプトが公式重みの取得とCore ML変換を行います。`uv`、Xcode Command Line Tools、十分な空き容量が必要です。モデルはアプリ外に保存されるため、アプリを更新しても残ります。
+
+```zsh
+APP=/Applications/mioh-universal.app
+zsh "$APP/Contents/Resources/model-tools/install-swiftvr-models.zsh" --app "$APP" \
+  --workspace /path/to/fast-disk/SwiftVR
+```
+
+既に公式SwiftVRのソースと重みがある場合は、`--source`と`--checkpoints`で指定できます。変換済みモデルがある場合は`--model-root`を指定し、`--verify-only`で不足ファイルを確認できます。標準では2xと4xの両方を作ります。重みは約19 GiB、変換後のモデルは両方で約19 GiBです。変換時の一時領域とCore MLのコンパイルキャッシュにも追加の空き容量が必要です。モデル変換は長時間かかるため、途中で失敗した場合は同じコマンドを再実行してください。完成したモデルは再利用されます。
+
+完了後、表示されたモデルフォルダをmiohの「復元」→「ROIエンハンサー」→「SwiftVR」のモデル選択で指定します。SwiftVRは書き出し専用で、BasicVSR++の一次復元を行った後に適用されます。モデルの存在確認だけでは画質や長い動画での安定動作は保証できません。最初は短い動画で確認してください。
+
 ### 2.3 ソースからmioh Universalをビルドする
 
 開発者向けの手順です。Apple Silicon Mac、XcodeとCommand Line Tools、`uv`、Python 3.12、十分な空き容量が必要です。macOS 26以降でアプリをビルドでき、Core AI変換・動作確認にはmacOS 27以降と対応するXcodeが必要です。以下はリポジトリのルートで実行します。
@@ -93,13 +107,13 @@ uv run --no-project --python 3.12 --with reportlab \
 zsh packaging/macOS/standalone/build_universal_app.sh
 ```
 
-成果物は`build/macos-standalone-universal/mioh-universal.app`と`build/macos-standalone-universal/mioh-universal-0.14.3-014-unsigned.dmg`です。ビルドはモデルなしの配布物を作成します。モデルを使うMacでは、アプリのインストール後に2.1節のダウンロード・変換を行ってください。ビルド用スクリプトはアプリ本体とCore AIヘルパーを別々のmacOSターゲット向けにコンパイルします。
+成果物は`build/macos-standalone-universal/mioh-universal.app`と`build/macos-standalone-universal/mioh-universal-0.14.3-015-unsigned.dmg`です。ビルドはモデルなしの配布物を作成します。モデルを使うMacでは、アプリのインストール後に2.1節のダウンロード・変換を行ってください。ビルド用スクリプトはアプリ本体とCore AIヘルパーを別々のmacOSターゲット向けにコンパイルします。
 
 ビルド後は次を確認します。`hdiutil verify`の成功に加え、アプリ内のPythonと2本のモデルツールが存在することが重要です。
 
 ```zsh
 APP=build/macos-standalone-universal/mioh-universal.app
-DMG=build/macos-standalone-universal/mioh-universal-0.14.3-014-unsigned.dmg
+DMG=build/macos-standalone-universal/mioh-universal-0.14.3-015-unsigned.dmg
 test -x "$APP/Contents/Resources/runtime/bin/python3.12"
 test -f "$APP/Contents/Resources/model-tools/download-mioh-models.zsh"
 test -f "$APP/Contents/Resources/model-tools/convert-mioh-models.zsh"
@@ -196,7 +210,7 @@ Temporal overlapは8から20を目安にします。増やすと境界が改善�
 
 | 項目 | 範囲 | 初期値 | 効果と注意 |
 | --- | --- | --- | --- |
-| シャープ | 0-2 | 0 | 輪郭を強調します。高すぎると白縁・黒縁やノイズが出ます。 |
+| シャープ | 0-5 | 0 | 輪郭を強調します。高すぎると白縁・黒縁やノイズが出ます。 |
 | ディテール | 0-1 | 0 | 局所コントラストを増やします。圧縮ノイズも強調する場合があります。 |
 | 境界フェザー | 0-3 | 1 | ROIと元画像の境界をぼかして段差を抑えます。大きすぎると境界がにじみます。 |
 | テクスチャ | 0-1 | 0 | 元画像の中周波成分を復元結果へ戻します。元のモザイク模様を戻す場合があります。 |
@@ -216,16 +230,35 @@ ROIエンハンサーはBasicVSR++の後に追加する空間超解像モデル�
 | mewzoom | MewZoomモデルを使用します。 |
 | swinir | SwinIRモデルを使用します。 |
 | spandrel | RealPLKSR・SPAN・CompactなどSpandrel対応モデルを使用します。 |
-| モデル | 選択した方式に対応する組み込みモデルだけを一覧表示します。フォルダボタンからカスタムモデルも選べます。 |
+| pipersr | PiperSRの単一フレーム型超解像を使用します。 |
+| swiftvr | SwiftVRでシーン内の複数フレームを処理します。書き出し専用、macOS 27以降。別途モデル導入が必要です。 |
+| モデル | 選択した方式に対応する組み込みモデルを一覧表示します。SwiftVRには組み込みモデルがないため、フォルダボタンから変換済みモデルフォルダを選びます。 |
 | 倍率 | 選択モデルに合わせて2xまたは4xへ自動設定します。必要な場合は手動変更もできます。 |
 | 強度 | 0なら結果へ混ぜません。1ならエンハンサー結果を最大限使用します。 |
-| タイル | 0で自動・無分割です。メモリ不足時だけ32刻みで指定します。 |
+| タイル | SwiftVR以外で使います。0で自動・無分割です。メモリ不足時だけ32刻みで指定します。 |
 
-ROIエンハンサーは存在しない細部を推測して追加するため、強度を上げると色味、肌の質感、輪郭が不自然になることがあります。0.2から0.4程度を開始点にしてください。
+ROIエンハンサーは存在しない細部を推測して追加するため、強度を上げると色味、肌の質感、輪郭が不自然になることがあります。SwiftVR以外は0.2から0.4程度を開始点にしてください。
 
 Real-ESRGAN方式では、軽めの2倍処理を行う
 `Real-ESRGAN x2plus — Core AI (2x)` と、より強い4倍モデルを選べます。
 x2plusは入力256px・出力512pxの固定形状モデルで、macOS 27以降のCore AI対応環境に表示されます。
+
+<!-- pagebreak -->
+
+### SwiftVRの操作と注意点
+
+1. 2.2節の追加手順でSwiftVRモデルを導入し、アプリの「復元」タブでROIエンハンサーの方式を`swiftvr`にします。
+2. 「モデル」のフォルダボタンから、導入スクリプトが最後に表示したモデルフォルダを選びます。ソースや重みのフォルダではなく、`native-4x-t7-fp16`などが入った変換済みフォルダを選んでください。
+3. 倍率を2x（512px、速め）または4x（1024px、高負荷）から選び、まず短い動画を書き出して確認します。最終動画の解像度が2倍・4倍になる設定ではありません。大きさが256px以下のROIは、追加の解像度情報がないためSwiftVRを省略します。
+
+| SwiftVR項目 | 範囲・初期値 | 説明 |
+| --- | --- | --- |
+| 強度 | 0-1 | BasicVSR++で復元したROIへSwiftVRの結果を混ぜる割合です。1が最大です。 |
+| 枠のなめらかさ | 0-30、初期値15 | SwiftVRに渡す切り出し枠の位置と大きさを時間方向にならし、輪郭が太く・細く揺れる現象を抑えます。0で無効です。一次復元には影響しません。 |
+| なじませ範囲 | 1-8、初期値1 | 前後何フレームまでSwiftVRの変化を混ぜるかを指定します。大きいほど静止場面のちらつきを抑えられる場合がありますが、処理は遅くなります。 |
+| 揺らぎ低減 | 0-1、初期値1 | Appleの時間方向ノイズ除去を合成後のROI付近に適用し、細かな粒状感のちらつきを抑えます。0で無効です。 |
+
+SwiftVRはBasicVSR++の一次復元を置き換えず、復元後に適用します。4xでも画質が必ず改善するわけではありません。元の細部が失われている場面では形状や質感を推測するため、輪郭の揺れや不自然なディテールが出る場合があります。比較には同じ短い場面でSwiftVRなし・2x・4xを書き出してください。メモリ不足やスワップが増える場合は、まずネイティブ並列数を1にし、2xを試します。
 
 ## 8. 検出タブ
 
@@ -412,6 +445,8 @@ Core AIモデルにはmacOS 27以降が必要です。macOS 26では`basicvsrpp-
 
 モデル取得が失敗した場合は、ダウンロードスクリプトの最後に表示される失敗一覧を確認し、同じコマンドを再実行します。SHA-256不一致の場合はファイルを使わず再取得します。変換時に`missing packaged Python`が出た場合は、アプリ内の`Contents/Resources/runtime/bin/python3.12`を確認してください。古いアプリからruntimeだけを移植せず、正しいUniversal版をインストールし直します。macOS 26で`--coreai-only`を指定すると失敗します。
 
+SwiftVRだけで失敗する場合は、アプリに導入スクリプトがあるか、モデルの保存先に十分な空き容量があるかを確認します。途中まで作成されたモデルは自動で完成扱いにしません。ログに示された不完全なパッケージを確認し、問題を解消してから同じスクリプトを再実行してください。完成済みモデルの確認には`install-swiftvr-models.zsh --app "$APP" --model-root /モデルフォルダ --verify-only`を使います。
+
 ### メモリ不足・極端に遅い
 
 1. 並列数を1へ戻します。
@@ -458,4 +493,4 @@ ROIエンハンサー強度、テクスチャ、ディテール、シャープ�
 | メモリ | 掃除間隔1、空き4GB、MPS比率0.46 |
 | 再生 | バッファ8秒、通常、SBS左右、左目、視野角60度 |
 
-本マニュアルのインストール・ビルド・モデル導入手順はmioh-universal 0.14.3-014の配布スクリプトを基準にしています。画面項目は配布版や選択したモデルにより異なる場合があります。
+本マニュアルのインストール・ビルド・モデル導入手順はmioh-universal 0.14.3-015の配布スクリプトを基準にしています。画面項目は配布版や選択したモデルにより異なる場合があります。

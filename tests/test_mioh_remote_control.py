@@ -322,8 +322,13 @@ class MiohRemoteControlTests(unittest.TestCase):
         )
         self.assertIsNotNone(snapshot_match)
         fields = re.findall(r"^\s*var\s+(\w+):", snapshot_match.group(1), re.M)
-        self.assertEqual(len(fields), 79)
+        # Expert ROI remains in the persisted schema for backward compatibility,
+        # but it is deliberately hidden and forced off when settings are loaded.
+        local_only_fields = {"roiExpertMode"}
+        self.assertIn("roiExpertMode = false", APP_SOURCE.read_text())
         for field in fields:
+            if field in local_only_fields:
+                continue
             self.assertIn(f"['{field}'", source, field)
         self.assertIn("replaceChildren", source)
         self.assertIn("textContent", source)

@@ -138,7 +138,7 @@ Expected outputs:
 
 ```text
 build/macos-standalone-universal/mioh-universal.app
-build/macos-standalone-universal/mioh-universal-0.14.3-014-unsigned.dmg
+build/macos-standalone-universal/mioh-universal-0.14.3-015-unsigned.dmg
 ```
 
 The build is model-free by default. It ad-hoc signs the application, includes
@@ -179,7 +179,7 @@ cmp -s \
 Verify the disk image before publishing:
 
 ```zsh
-DMG=build/macos-standalone-universal/mioh-universal-0.14.3-014-unsigned.dmg
+DMG=build/macos-standalone-universal/mioh-universal-0.14.3-015-unsigned.dmg
 hdiutil verify "$DMG"
 shasum -a 256 "$DMG"
 ```
@@ -235,8 +235,8 @@ rsync -a --delete \
   "$ROOT/build/macos-standalone-universal/mioh-universal.app/" \
   "$PUBLIC/build/macos-standalone-universal/mioh-universal.app/"
 rsync -a \
-  "$ROOT/build/macos-standalone-universal/mioh-universal-0.14.3-014-unsigned.dmg" \
-  "$PUBLIC/build/macos-standalone-universal/mioh-universal-0.14.3-014-unsigned.dmg"
+  "$ROOT/build/macos-standalone-universal/mioh-universal-0.14.3-015-unsigned.dmg" \
+  "$PUBLIC/build/macos-standalone-universal/mioh-universal-0.14.3-015-unsigned.dmg"
 ```
 
 Compare SHA-256 values after every artifact copy.
@@ -258,17 +258,17 @@ The release must not contain a VR detector checkpoint. Replace the verified
 DMG asset and then download it again for an end-to-end checksum check:
 
 ```zsh
-gh release upload v0.14.3-014 \
-  build/macos-standalone-universal/mioh-universal-0.14.3-014-unsigned.dmg \
+gh release upload v0.14.3-015 \
+  build/macos-standalone-universal/mioh-universal-0.14.3-015-unsigned.dmg \
   --clobber
 
 VERIFY_DIR=$(mktemp -d /private/tmp/mioh-release-verify.XXXXXX)
-gh release download v0.14.3-014 \
-  --pattern 'mioh-universal-0.14.3-014-unsigned.dmg' \
+gh release download v0.14.3-015 \
+  --pattern 'mioh-universal-0.14.3-015-unsigned.dmg' \
   --dir "$VERIFY_DIR"
 shasum -a 256 \
-  build/macos-standalone-universal/mioh-universal-0.14.3-014-unsigned.dmg \
-  "$VERIFY_DIR/mioh-universal-0.14.3-014-unsigned.dmg"
+  build/macos-standalone-universal/mioh-universal-0.14.3-015-unsigned.dmg \
+  "$VERIFY_DIR/mioh-universal-0.14.3-015-unsigned.dmg"
 ```
 
 The two hashes must match. Merely seeing a successful upload message is not a

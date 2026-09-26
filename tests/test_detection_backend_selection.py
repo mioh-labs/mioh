@@ -9,12 +9,20 @@ from lada.restorationpipeline import load_models
 
 
 class DetectionBackendSelectionTests(unittest.TestCase):
-    def test_vr_detection_models_are_registered(self):
-        vr_model = ModelFiles.get_detection_model_by_name("vr-v2-accurate")
-        vr_coreml_model = ModelFiles.get_detection_model_by_name("vr-v2-accurate-coreml")
+    @staticmethod
+    def registered_detection_model(name):
+        return next(
+            model
+            for model in ModelFiles._WELL_KNOWN_DETECTION_MODELS
+            if model.name == name
+        )
 
-        self.assertIsNotNone(vr_model)
-        self.assertIsNotNone(vr_coreml_model)
+    def test_vr_detection_models_are_registered(self):
+        vr_model = self.registered_detection_model("vr-v2-accurate")
+        vr_coreml_model = self.registered_detection_model(
+            "vr-v2-accurate-coreml"
+        )
+
         self.assertTrue(vr_model.path.endswith("lada_mosaic_detection_model_vr_v2_accurate.pt"))
         self.assertTrue(
             vr_coreml_model.path.endswith(
@@ -26,13 +34,11 @@ class DetectionBackendSelectionTests(unittest.TestCase):
         )
 
     def test_jasna_v6_coreml_models_are_registered(self):
-        model = ModelFiles.get_detection_model_by_name("jasna-v6-coreml")
-        large = ModelFiles.get_detection_model_by_name(
+        model = self.registered_detection_model("jasna-v6-coreml")
+        large = self.registered_detection_model(
             "jasna-v6-large-coreml"
         )
 
-        self.assertIsNotNone(model)
-        self.assertIsNotNone(large)
         self.assertTrue(
             model.path.endswith(
                 (

@@ -17,6 +17,7 @@ final class VideoUpscaleController: ObservableObject {
     case flashVSR = "flashvsr"
     case adcSR = "adcsr"
     case piperSR = "pipersr"
+    case swiftVR = "swiftvr"
   }
 
   @Published var inputURL: URL? {
@@ -74,6 +75,11 @@ final class VideoUpscaleController: ObservableObject {
       UserDefaults.standard.set(adcSRRootPath, forKey: Self.adcSRRootDefaultsKey)
     }
   }
+  @Published var swiftVRRootPath: String {
+    didSet {
+      UserDefaults.standard.set(swiftVRRootPath, forKey: Self.swiftVRRootDefaultsKey)
+    }
+  }
   @Published var progress = 0.0
   @Published var status = "待機中"
   @Published var log = ""
@@ -83,6 +89,7 @@ final class VideoUpscaleController: ObservableObject {
 
   private static let rootDefaultsKey = "mioh.flashvsr.root"
   private static let adcSRRootDefaultsKey = "mioh.adcsr.root"
+  private static let swiftVRRootDefaultsKey = "mioh.upscaler.swiftvr.root"
   private static let modelDefaultsKey = "mioh.upscaler.model"
   private static let piperSRSharpnessDefaultsKey = "mioh.upscaler.pipersr.sharpness"
   private let resourceURLOverride: URL?
@@ -113,6 +120,9 @@ final class VideoUpscaleController: ObservableObject {
     adcSRRootPath = UserDefaults.standard.string(
       forKey: Self.adcSRRootDefaultsKey
     ) ?? ""
+    swiftVRRootPath = UserDefaults.standard.string(
+      forKey: Self.swiftVRRootDefaultsKey
+    ) ?? ""
     if let saved = UserDefaults.standard.object(forKey: Self.piperSRSharpnessDefaultsKey) as? Double,
       saved.isFinite
     {
@@ -138,6 +148,7 @@ final class VideoUpscaleController: ObservableObject {
     case .adcSR: return adcSRRootPath
     case .flashVSR: return flashVSRRootPath
     case .piperSR: return ""
+    case .swiftVR: return swiftVRRootPath
     }
   }
 
@@ -153,6 +164,7 @@ final class VideoUpscaleController: ObservableObject {
     case .adcSR: return "AdcSR ×4"
     case .flashVSR: return "FlashVSR-v1.1 Tiny/Compact"
     case .piperSR: return "PiperSR ×2"
+    case .swiftVR: return "SwiftVR ×2/×4"
     }
   }
 
@@ -191,6 +203,11 @@ final class VideoUpscaleController: ObservableObject {
     if selectedUpscaler == .piperSR && sizingMode == "multiple" && scale != 2 {
       return "PiperSRは2倍のみ対応です"
     }
+    if selectedUpscaler == .swiftVR, let sourceInfo,
+      Int64(sourceInfo.width) * Int64(sourceInfo.height)
+        * Int64(inferenceScale * inferenceScale) > 3840 * 2160 {
+      return "SwiftVRの内部処理は最大3840×2160相当です"
+    }
     guard sizingMode == "custom", let sourceInfo else { return nil }
     guard targetWidth > 0, targetHeight > 0 else {
       return "出力サイズを指定してください"
@@ -218,6 +235,7 @@ final class VideoUpscaleController: ObservableObject {
       Double(targetHeight) / Double(sourceInfo.height)
     )
     if ratio <= 2.0 { return 2 }
+    if selectedUpscaler == .swiftVR { return 4 }
     return qualityMode == "quality" ? 4 : 2
   }
 
@@ -240,10 +258,14 @@ final class VideoUpscaleController: ObservableObject {
       return "\(modelTitle) モデルが見つかりません"
     }
     if selectedUpscaler == .piperSR { return "同梱 · Core ML / ANE" }
+    if selectedUpscaler == .swiftVR { return "外部 · SwiftVR \(inferenceScale)x Core ML" }
     return "外部 · \(nativeBundleSize(at: installation.modelDirectory))"
   }
 
   var runtimeText: String {
+    if selectedUpscaler == .swiftVR {
+      return "SwiftVR · Swift / Core ML / GPU · 時間整合・重なり付きタイル"
+    }
     if selectedUpscaler == .piperSR {
       return "PiperSR · Swift / Core ML / ANE · 各フレーム独立"
     }
@@ -266,8 +288,10 @@ final class VideoUpscaleController: ObservableObject {
           $0.0 == sourceInfo.width && $0.1 == sourceInfo.height
        }) { return "1（動画固定サイズ版）" }
     let side = selectedUpscaler == .adcSR ? 128
-      : selectedUpscaler == .piperSR ? 256 : 256 / inferenceScale
-    let overlap = selectedUpscaler == .adcSR ? 16
+      : selectedUpscaler == .piperSR || selectedUpscaler == .swiftVR
+        ? 256 : 256 / inferenceScale
+    let overlap = selectedUpscaler == .swiftVR ? 64
+      : selectedUpscaler == .adcSR ? 16
       : selectedUpscaler == .piperSR ? 32 : max(4, side / 8)
     let step = side - overlap
     func count(_ length: Int) -> Int {
@@ -279,6 +303,11 @@ final class VideoUpscaleController: ObservableObject {
 
   var scratchSpaceText: String {
     guard let sourceInfo else { return "—" }
+    if selectedUpscaler == .swiftVR {
+      let bytes = Int64(sourceInfo.width * inferenceScale)
+        * Int64(sourceInfo.height * inferenceScale) * 6 * 33
+      return ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
     if selectedUpscaler == .piperSR {
       let pixels = Int64(sourceInfo.width) * Int64(sourceInfo.height) * 4
       return ByteCountFormatter.string(
@@ -363,6 +392,19 @@ final class VideoUpscaleController: ObservableObject {
     }
     guard panel.runModal() == .OK, let url = panel.url else { return }
     adcSRRootPath = url.standardizedFileURL.path
+  }
+
+  func chooseSwiftVRRoot() {
+    let panel = NSOpenPanel()
+    panel.title = "SwiftVR変換済みモデルのフォルダを選択"
+    panel.canChooseFiles = false
+    panel.canChooseDirectories = true
+    panel.allowsMultipleSelection = false
+    if !swiftVRRootPath.isEmpty {
+      panel.directoryURL = URL(fileURLWithPath: swiftVRRootPath)
+    }
+    guard panel.runModal() == .OK, let url = panel.url else { return }
+    swiftVRRootPath = url.standardizedFileURL.path
   }
 
   func selectFullRange() {
@@ -474,9 +516,11 @@ final class VideoUpscaleController: ObservableObject {
         "範囲: \(Self.timecode(start)) 〜 \(Self.timecode(end)) "
           + "（\(Self.timecode(end - start))）\n"
       )
+      let deviceLabel = selectedUpscaler == .piperSR ? "ANE"
+        : selectedUpscaler == .swiftVR ? "GPU" : computeMode
       appendLog(
         "モデル: \(modelTitle) / "
-          + "\(selectedUpscaler == .piperSR ? "ANE" : computeMode) "
+          + "\(deviceLabel) "
           + "/ \(inferenceScale)x推論\n"
       )
       appendLog("出力サイズ: \(requestedOutputWidth)×\(requestedOutputHeight)\n")
@@ -551,6 +595,8 @@ final class VideoUpscaleController: ObservableObject {
       return resolvedAdcSRInstallation(resources: resources)
     case .piperSR:
       return resolvedPiperSRInstallation(resources: resources)
+    case .swiftVR:
+      return resolvedSwiftVRInstallation(resources: resources)
     }
   }
 
@@ -567,6 +613,57 @@ final class VideoUpscaleController: ObservableObject {
       kind: .piperSR, runner: runner,
       modelDirectory: models, resources: resources
     )
+  }
+
+  private func resolvedSwiftVRInstallation(resources: URL) -> Installation? {
+    let runner = resources.appendingPathComponent("bin/swiftvr-coreml-video")
+    guard FileManager.default.isExecutableFile(atPath: runner.path) else { return nil }
+    var roots: [URL] = []
+    if !swiftVRRootPath.isEmpty {
+      roots.append(URL(fileURLWithPath: swiftVRRootPath))
+    }
+    if let configured = ProcessInfo.processInfo.environment["MIOH_SWIFTVR_ROOT"],
+      !configured.isEmpty {
+      roots.append(URL(fileURLWithPath: configured))
+    }
+    roots.append(URL(fileURLWithPath: "/Volumes/Project_HD/swiftvr-eval"))
+    roots.append(FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent("Library/Application Support/mioh/SwiftVR/models"))
+    for root in roots {
+      let size = 256 * inferenceScale
+      let required = [
+        "reae-stateful-encoder-24f-\(size)-fp32.mlpackage",
+        "reae-stateful-encoder-28f-\(size)-fp32.mlpackage",
+        "reae-stateful-decoder-6latent-\(size)-fp32.mlpackage",
+        "reae-stateful-decoder-7latent-\(size)-fp32.mlpackage",
+      ]
+      let variantsReady = ["t6", "t7"].allSatisfy { shape in
+        ["patch.mlpackage", "head.mlpackage", "context.f32",
+          "modulation.f32", "rope-cosine.f32", "rope-sine.f32"].allSatisfy { name in
+            FileManager.default.fileExists(atPath: root.appendingPathComponent(
+              "native-\(inferenceScale)x-\(shape)-fp16/components/\(name)").path)
+          }
+      }
+      let groups = (try? FileManager.default.contentsOfDirectory(atPath:
+        root.appendingPathComponent("native-\(inferenceScale)x-fp16-grouped").path)) ?? []
+      let groupedReady = groups.filter {
+        $0.hasPrefix("dit-group-") && $0.hasSuffix(".mlpackage")
+      }.count == 5
+      let blocksReady = ["t6", "t7"].allSatisfy { shape in
+        (0..<30).allSatisfy { layer in
+          FileManager.default.fileExists(atPath: root.appendingPathComponent(
+            String(format: "native-%dx-%@-fp16/dit-block-%02d-%@-%dx-float16.mlpackage",
+              inferenceScale, shape, layer, shape, inferenceScale)).path)
+        }
+      }
+      if variantsReady, groupedReady || blocksReady,
+        required.allSatisfy({ FileManager.default.fileExists(
+          atPath: root.appendingPathComponent($0).path) }) {
+        return Installation(kind: .swiftVR, runner: runner,
+          modelDirectory: root, resources: resources)
+      }
+    }
+    return nil
   }
 
   private func resolvedFlashVSRInstallation(resources: URL) -> Installation? {
@@ -796,6 +893,7 @@ final class VideoUpscaleController: ObservableObject {
     case .adcSR: filename = "adcsr-native.mp4"
     case .flashVSR: filename = "flashvsr-native.mp4"
     case .piperSR: filename = "pipersr-native.mp4"
+    case .swiftVR: filename = "swiftvr-native.mp4"
     }
     var arguments = [
       "--input", trimmedInputURL.path,
@@ -804,7 +902,7 @@ final class VideoUpscaleController: ObservableObject {
       "--output-width", String(requestedOutputWidth),
       "--output-height", String(requestedOutputHeight),
     ]
-    if installation.kind != .piperSR {
+    if installation.kind != .piperSR && installation.kind != .swiftVR {
       arguments += ["--compute", computeMode]
     }
     if installation.kind == .flashVSR {
@@ -814,6 +912,8 @@ final class VideoUpscaleController: ObservableObject {
       arguments += ["--temporal-strength", String(format: "%.3f", strength)]
     } else if installation.kind == .piperSR {
       arguments += ["--sharpness", String(format: "%.2f", piperSRSharpness)]
+    } else if installation.kind == .swiftVR {
+      arguments += ["--scale", String(inferenceScale)]
     }
     task.arguments = arguments
     try launch(task, phase: .upscale)
@@ -828,6 +928,7 @@ final class VideoUpscaleController: ObservableObject {
     case .adcSR: filename = "adcsr-native.mp4"
     case .flashVSR: filename = "flashvsr-native.mp4"
     case .piperSR: filename = "pipersr-native.mp4"
+    case .swiftVR: filename = "swiftvr-native.mp4"
     }
     let expected = resultsDirectory.appendingPathComponent(filename)
     guard FileManager.default.fileExists(atPath: expected.path) else {
@@ -872,9 +973,15 @@ final class VideoUpscaleController: ObservableObject {
     } else {
       arguments += ["-map", "0:v:0", "-an"]
     }
-    arguments += [
-      "-c:v", "copy",
-    ]
+    if installation.kind == .swiftVR,
+      let sourceInfo,
+      (requestedOutputWidth != sourceInfo.width * inferenceScale
+        || requestedOutputHeight != sourceInfo.height * inferenceScale) {
+      arguments += ["-vf", "scale=\(requestedOutputWidth):\(requestedOutputHeight):flags=lanczos",
+        "-c:v", "h264_videotoolbox", "-b:v", "24M"]
+    } else {
+      arguments += ["-c:v", "copy"]
+    }
     if runPreservesAudio {
       switch audioMode {
       case .copy:

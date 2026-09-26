@@ -19,3 +19,16 @@ def test_manual_source_covers_every_tab() -> None:
     manual = (ROOT / "docs/mioh-user-manual-ja.md").read_text()
     for tab in ("基本", "分割", "復元", "検出", "出力", "メモリ", "設定", "再生", "ログ"):
         assert tab in manual
+
+
+def test_manual_explains_swiftvr_installation_and_controls() -> None:
+    manual = (ROOT / "docs/mioh-user-manual-ja.md").read_text()
+    for label in (
+        "install-swiftvr-models.zsh",
+        "SwiftVRの操作と注意点",
+        "枠のなめらかさ",
+        "なじませ範囲",
+        "揺らぎ低減",
+        "--verify-only",
+    ):
+        assert label in manual
