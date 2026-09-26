@@ -21,9 +21,15 @@ face-restoration gate.
     `base + (SwiftVR - base) * strength * mask`.
   - There is no sidecar, no second pass and no re-encode. The final movie is
     the normal export.
-- Scene frames go from memory straight into Core ML, and the result stays
-  in memory until the scene is composited: one scene per lane (48 frames at
-  4x: about 300 MB; export clips reach 180 frames, about 1.1 GB). Until
+- Scene frames go from memory straight into Core ML. Each result frame is
+  handed to the compositor as soon as it is decoded, and a frame is
+  composited once its successor exists (the ±1 stabilization needs it), so
+  only frames not yet composited are held instead of a whole scene (up to
+  1.1 GB at 4x). On the 12 s MIDV clip (6 SwiftVR scenes, 363 frames) the
+  streamed export was pixel-identical to the whole-scene one; 2x took 46–49 s
+  instead of 64–67 s (the DiT groups themselves ran about 25% faster; the
+  cause is not established), 4x took 145–155 s either way, and the 4x peak
+  footprint fell from 14.8–15.0 GB to 14.3 GB. Until
   2026-09-26 a separate `mioh-native-swiftvr-clip --serve` worker exchanged
   them as temporary files. The in-process result is bit-identical to that
   worker's (30 frames at 2x, 100 frames at 4x), and the file exchange had
@@ -32,10 +38,29 @@ face-restoration gate.
   parallel setting and take turns running SwiftVR; the other lanes keep
   detecting, restoring, compositing and encoding meanwhile. Crossfade stays available;
   overlap frames are simply enhanced in both batches.
+- Temporal noise filter ("揺らぎ低減", 0–1, default 1.0; 0 is off and
+  pixel-identical to no filter). SwiftVR is deterministic (no noise is
+  sampled: one DiT pass at t = 1000); its flicker is small input changes
+  amplified into re-synthesized texture. Apple's VTTemporalNoiseFilter
+  (macOS 26, one previous and two next frames, compressed 4:2:0 input only)
+  runs on the composited frames within one rectangle around every crop of
+  the scene, and the result is blended back with SwiftVR's own blend
+  weights. Filtering SwiftVR's 512/1024 px frames before composition worked
+  much less well (4x: +19.5% → +13.9% on the old measure), because
+  composition resamples them into a crop whose size and position change
+  every frame. On the 12 s MIDV clip, measured only where SwiftVR changed the
+  frame (15×15 mean difference > 3 levels; a plain per-pixel threshold also
+  counts the scattered differences between two separate encodes), the
+  flicker SwiftVR adds over BasicVSR++ went from +9.0% to +6.5% (4x) and from
+  +4.7% to +2.3% (2x). It removes mainly single-pixel grain; the 1–3 px
+  texture band stays above BasicVSR++ (4x 115.5% → 113.3%, 2x 111.2% →
+  109.2%). The same filter applied after encoding reached +4.2% / −0.2%,
+  partly by also removing the encoder's own flicker, which an export cannot
+  do before encoding. Cost: about 2–4 s of composition on that clip.
 - Stopping the export cancels SwiftVR between chunks and DiT groups (0.06 s
-  after the stop in a 4x test). The current scene finishes without SwiftVR,
-  and the export ends exactly like a stop without SwiftVR (exit 0, no error
-  event).
+  after the stop in a 4x test). Frames of the current scene that SwiftVR
+  did not produce keep the BasicVSR++ result, and the export ends exactly
+  like a stop without SwiftVR (exit 0, no error event).
 - SwiftVR progress lines go to stderr. This process's stdout carries mioh's
   JSON event stream.
 - Core ML keeps a per-executable cache in `~/Library/Caches/<executable>`.
