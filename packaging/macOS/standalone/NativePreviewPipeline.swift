@@ -3449,10 +3449,15 @@ private final class NativeFrameProcessor: @unchecked Sendable {
           for neighbour in neighbours where window[neighbour] == nil {
             window[neighbour] = try sceneOutput.frame(neighbour)
           }
-          let stabilized = Self.stabilizeSwiftVRFrame(
-            center: index,
-            frames: neighbours.map { (index: $0, pixels: window[$0]!) },
+          let stabilized = Self.matchSwiftVRColour(
+            Self.stabilizeSwiftVRFrame(
+              center: index,
+              frames: neighbours.map { (index: $0, pixels: window[$0]!) },
+              restored: restored,
+              side: sceneOutput.side
+            ),
             restored: restored,
+            center: index,
             side: sceneOutput.side
           )
           let enhancedFrame = NativeEnhancerFrame(
@@ -3465,7 +3470,7 @@ private final class NativeFrameProcessor: @unchecked Sendable {
             lowResolution: base,
             strength: swiftVR.strength,
             directReplacement: true,
-            featherFraction: 0.08
+            featherFraction: 0.04
           )
           let frameIndex = scene.frames[index].batchIndex
           outputs[frameIndex] = try composite(
@@ -5477,6 +5482,86 @@ private final class NativeFrameProcessor: @unchecked Sendable {
               weightSum += weight
             }
             target[outputIndex] = Float16(sum / max(weightSum, 1e-6))
+          }
+        }
+      }
+    }
+    return output
+  }
+
+  /// SwiftVR shifts the whole ROI brighter and bluer than its input (about
+  /// +2, +4 and +5 levels in R, G and B at 4x; the upstream pipeline has no
+  /// colour correction either), which showed as a colour step at the ROI edge
+  /// and as colour drift between scenes. SwiftVR keeps its detail and takes
+  /// the coarse colour of the BasicVSR++ restoration: its output reduced to
+  /// the 256px grid minus the restoration, box-blurred over 9 px there, is
+  /// interpolated back up and subtracted.
+  private static func matchSwiftVRColour(
+    _ pixels: [Float16],
+    restored: [Float16],
+    center: Int,
+    side: Int
+  ) -> [Float16] {
+    let grid = restorationSize
+    let factor = max(1, side / grid)
+    let plane = side * side
+    let gridPlane = grid * grid
+    let base = center * 3 * gridPlane
+    let radius = 4
+    var output = pixels
+    for channel in 0..<3 {
+      // Reduce SwiftVR to the restoration grid and take the difference.
+      var difference = [Float](repeating: 0, count: gridPlane)
+      let scale = 1 / Float(factor * factor)
+      for y in 0..<grid {
+        for x in 0..<grid {
+          var sum: Float = 0
+          for dy in 0..<factor {
+            let row = channel * plane + (y * factor + dy) * side + x * factor
+            for dx in 0..<factor { sum += Float(pixels[row + dx]) }
+          }
+          difference[y * grid + x] = sum * scale
+            - Float(restored[base + channel * gridPlane + y * grid + x])
+        }
+      }
+      // Separable box blur with clamped edges keeps only the coarse shift.
+      var horizontal = [Float](repeating: 0, count: gridPlane)
+      for y in 0..<grid {
+        for x in 0..<grid {
+          var sum: Float = 0
+          for k in -radius...radius {
+            sum += difference[y * grid + min(grid - 1, max(0, x + k))]
+          }
+          horizontal[y * grid + x] = sum / Float(2 * radius + 1)
+        }
+      }
+      var coarse = [Float](repeating: 0, count: gridPlane)
+      for y in 0..<grid {
+        for x in 0..<grid {
+          var sum: Float = 0
+          for k in -radius...radius {
+            sum += horizontal[min(grid - 1, max(0, y + k)) * grid + x]
+          }
+          coarse[y * grid + x] = sum / Float(2 * radius + 1)
+        }
+      }
+      // Remove the bilinearly upsampled shift at full resolution.
+      output.withUnsafeMutableBufferPointer { target in
+        DispatchQueue.concurrentPerform(iterations: side) { y in
+          let gy = max(0, min(Float(grid - 1), (Float(y) + 0.5) / Float(factor) - 0.5))
+          let y0 = Int(gy)
+          let y1 = min(grid - 1, y0 + 1)
+          let fy = gy - Float(y0)
+          for x in 0..<side {
+            let gx = max(0, min(Float(grid - 1), (Float(x) + 0.5) / Float(factor) - 0.5))
+            let x0 = Int(gx)
+            let x1 = min(grid - 1, x0 + 1)
+            let fx = gx - Float(x0)
+            let shift = (coarse[y0 * grid + x0] * (1 - fx) + coarse[y0 * grid + x1] * fx)
+              * (1 - fy)
+              + (coarse[y1 * grid + x0] * (1 - fx) + coarse[y1 * grid + x1] * fx) * fy
+            let index = channel * plane + y * side + x
+            target[index] = Float16(max(0, min(1, Float(target[index]) - shift)))
           }
         }
       }
