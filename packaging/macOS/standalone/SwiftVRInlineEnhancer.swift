@@ -6,7 +6,10 @@
 // 512px (2x) or 1024px (4x) result is composited before the frame is encoded. There is no
 // sidecar, no second pass and no re-encode.
 
+import CoreMedia
+import CoreVideo
 import Foundation
+import VideoToolbox
 
 enum SwiftVRROIAssets {
   static func isRoot(_ url: URL) -> Bool {
@@ -141,6 +144,9 @@ final class SwiftVRSceneEnhancer: @unchecked Sendable {
   /// 2 (512px output, about a quarter of the DiT work) or 4 (1024px).
   let scale: Int
   var outputSide: Int { 256 * scale }
+  /// Strength of Apple's temporal noise filter over the composited SwiftVR
+  /// frames; 0 turns it off.
+  let temporalFilter: Float
   /// Set once the export's stop control exists.
   var shouldStop: () -> Bool = { false }
   private let model: URL
@@ -156,11 +162,19 @@ final class SwiftVRSceneEnhancer: @unchecked Sendable {
     label: "com.okatti.mioh.swiftvr", qos: .userInitiated,
     autoreleaseFrequency: .workItem)
 
-  init(model: URL, strength: Float, scale: Int) throws {
+  init(model: URL, strength: Float, scale: Int, temporalFilter: Float) throws {
     try SwiftVRROIAssets.validate(model, scale: scale)
     self.scale = scale
     self.model = model
     self.strength = max(0, min(1, strength))
+    let temporalFilter = max(0, min(1, temporalFilter))
+    if temporalFilter > 0, !VTTemporalNoiseFilterConfiguration.isSupported {
+      FileHandle.standardError.write(Data(
+        "SwiftVR: the temporal noise filter is unavailable on this Mac; it stays off\n".utf8))
+      self.temporalFilter = 0
+    } else {
+      self.temporalFilter = temporalFilter
+    }
     compiledCache = try swiftVRPersistentCompiledCache()
   }
 
@@ -274,5 +288,135 @@ final class SwiftVRSceneOutput: @unchecked Sendable {
   /// Stops SwiftVR at its next check when the compositor gives up early.
   func cancel() {
     lock.withLock { cancelled = true }
+  }
+}
+
+/// Apple's temporal noise filter (VideoToolbox, macOS 26) over one scene's
+/// composited SwiftVR frames. SwiftVR re-synthesizes texture every frame and
+/// amplifies small changes in its input into flicker; the filter compares
+/// each frame with its motion-compensated neighbours (one before, two after).
+/// The export blends the result back only where SwiftVR was blended in.
+///
+/// The filter accepts only compressed 4:2:0 formats, so each rectangle passes
+/// from the 8-bit BGRA frame through 8-bit full-range 4:2:0 and back.
+final class SwiftVRTemporalNoiseFilter {
+  let previousCount: Int
+  let nextCount: Int
+  private let width: Int
+  private let height: Int
+  private let strength: Float
+  private let processor = VTFrameProcessor()
+  private let transfer: VTPixelTransferSession
+  private let sourcePool: CVPixelBufferPool
+  private let destinationPool: CVPixelBufferPool
+  private let packedPool: CVPixelBufferPool
+  private var frames: [Int: VTFrameProcessorFrame] = [:]
+
+  init(width: Int, height: Int, strength: Float) throws {
+    self.width = width
+    self.height = height
+    self.strength = strength
+    guard let configuration = VTTemporalNoiseFilterConfiguration(
+      frameWidth: width, frameHeight: height,
+      sourcePixelFormat: kCVPixelFormatType_Lossless_420YpCbCr8BiPlanarFullRange)
+    else { throw Self.failure("is not available for \(width)x\(height) frames") }
+    previousCount = configuration.previousFrameCount ?? 1
+    nextCount = configuration.nextFrameCount ?? 2
+    try processor.startSession(configuration: configuration)
+    var session: VTPixelTransferSession?
+    guard VTPixelTransferSessionCreate(allocator: nil, pixelTransferSessionOut: &session)
+      == noErr, let session
+    else { throw Self.failure("could not create a pixel transfer session") }
+    transfer = session
+    sourcePool = try Self.pool(configuration.sourcePixelBufferAttributes)
+    destinationPool = try Self.pool(configuration.destinationPixelBufferAttributes)
+    packedPool = try Self.pool([
+      kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+      kCVPixelBufferWidthKey as String: width,
+      kCVPixelBufferHeightKey as String: height,
+      kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+    ])
+  }
+
+  deinit { processor.endSession() }
+
+  /// Hands over the rectangle at (`left`, `top`) of composited BGRA frame
+  /// `index`.
+  func add(_ index: Int, from frame: CVPixelBuffer, left: Int, top: Int) throws {
+    let packed = try buffer(packedPool)
+    CVPixelBufferLockBaseAddress(frame, .readOnly)
+    CVPixelBufferLockBaseAddress(packed, [])
+    let sourceRow = CVPixelBufferGetBytesPerRow(frame)
+    let targetRow = CVPixelBufferGetBytesPerRow(packed)
+    let source = CVPixelBufferGetBaseAddress(frame)!
+    let target = CVPixelBufferGetBaseAddress(packed)!
+    for y in 0..<height {
+      memcpy(target + y * targetRow, source + (top + y) * sourceRow + left * 4, width * 4)
+    }
+    CVPixelBufferUnlockBaseAddress(packed, [])
+    CVPixelBufferUnlockBaseAddress(frame, .readOnly)
+    let yuv = try buffer(sourcePool)
+    guard VTPixelTransferSessionTransferImage(transfer, from: packed, to: yuv) == noErr
+    else { throw Self.failure("could not convert a frame to 4:2:0") }
+    guard let processorFrame = VTFrameProcessorFrame(
+      buffer: yuv, presentationTimeStamp: time(index))
+    else { throw Self.failure("rejected a frame") }
+    frames[index] = processorFrame
+  }
+
+  /// Filters frame `index` against the frames already added around it,
+  /// releases the frames it no longer needs, and returns the rectangle as
+  /// BGRA. A frame without a predecessor starts a new sequence.
+  func filtered(_ index: Int) async throws -> CVPixelBuffer {
+    guard let source = frames[index] else { throw Self.failure("is missing frame \(index)") }
+    var previous: [VTFrameProcessorFrame] = []
+    for offset in stride(from: previousCount, through: 1, by: -1) {
+      if let frame = frames[index - offset] { previous.append(frame) }
+    }
+    var next: [VTFrameProcessorFrame] = []
+    for offset in 1...max(1, nextCount) {
+      guard let frame = frames[index + offset] else { break }
+      next.append(frame)
+    }
+    let destination = try buffer(destinationPool)
+    guard let destinationFrame = VTFrameProcessorFrame(
+      buffer: destination, presentationTimeStamp: time(index)),
+      let parameters = VTTemporalNoiseFilterParameters(
+        sourceFrame: source, nextFrames: next, previousFrames: previous,
+        destinationFrame: destinationFrame, filterStrength: strength,
+        hasDiscontinuity: previous.isEmpty)
+    else { throw Self.failure("rejected the parameters for frame \(index)") }
+    try await processor.process(parameters: parameters)
+    frames = frames.filter { $0.key > index - previousCount }
+    let packed = try buffer(packedPool)
+    guard VTPixelTransferSessionTransferImage(transfer, from: destination, to: packed) == noErr
+    else { throw Self.failure("could not convert a filtered frame back to BGRA") }
+    return packed
+  }
+
+  private func time(_ index: Int) -> CMTime {
+    CMTime(value: CMTimeValue(index) * 1001, timescale: 30000)
+  }
+
+  private func buffer(_ pool: CVPixelBufferPool) throws -> CVPixelBuffer {
+    var pixels: CVPixelBuffer?
+    guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pixels) == kCVReturnSuccess,
+      let pixels
+    else { throw Self.failure("could not allocate a frame") }
+    return pixels
+  }
+
+  private static func pool(_ attributes: [String: Any]) throws -> CVPixelBufferPool {
+    var pool: CVPixelBufferPool?
+    guard CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &pool)
+      == kCVReturnSuccess, let pool
+    else { throw failure("could not create a frame pool") }
+    return pool
+  }
+
+  private static func failure(_ message: String) -> NSError {
+    NSError(domain: "SwiftVR", code: 17, userInfo: [
+      NSLocalizedDescriptionKey: "SwiftVR temporal noise filter \(message)"
+    ])
   }
 }
