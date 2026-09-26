@@ -38,6 +38,23 @@ face-restoration gate.
   parallel setting and take turns running SwiftVR; the other lanes keep
   detecting, restoring, compositing and encoding meanwhile. Crossfade stays available;
   overlap frames are simply enhanced in both batches.
+- Frame smoothing ("枠のなめらかさ", 0–30 frames, default 15; 0 is off and
+  pixel-identical to before). SwiftVR itself is stable: a static input
+  changes its output by 0.24 levels a frame and it damps noise, but a ±3%
+  scale or ±1 px position jitter of its input changes the detail it adds
+  about 5x / 3x more. The detector crop grows and shrinks by up to ~8% a
+  frame, so SwiftVR redrew outlines thicker and thinner from frame to frame
+  (MIZD-534 54–55 s: +55–59% flicker over BasicVSR++). SwiftVR now gets the
+  BasicVSR++ result through a view whose grid placement is averaged over the
+  surrounding frames; outside the crop the view shows the source frame
+  (blended over 4 grid px) instead of the grid's mirrored padding, whose
+  seams move with the crop. Its output is mapped back to each frame's grid
+  before stabilization, colour matching and compositing; BasicVSR++ is
+  unchanged. On MIZD-534 50–62 s at 2x (filter 1.0, range 1) flicker went
+  from +5.2% to +1.0% (54 s +54.5% → −9.3%, 55 s +58.8% → −11.6%), texture
+  1–3 px from 109.7% to 107.9%; on the MIDV-670 12 s clip +1.5% → −0.3%.
+  Smoothing without the source-frame surround only reached +47% → +36% at
+  55 s. One second (60 s) got worse (+2.8% → +6.1%).
 - Stabilization range ("なじませ範囲", 1–8 frames on each side, default 1 =
   the previous ±1). Each neighbour's SwiftVR change is added to the centre's
   BasicVSR++ result, weighted by how similar the two BasicVSR++ frames are
