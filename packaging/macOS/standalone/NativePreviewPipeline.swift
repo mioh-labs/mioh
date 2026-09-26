@@ -84,6 +84,8 @@ private struct NativePreviewConfiguration: Decodable {
   let roiExpertMode: Bool?
   /// SwiftVR only: Apple temporal noise filter strength; 0 or absent is off.
   let swiftVRTemporalFilter: Float?
+  /// SwiftVR only: frames on each side that the stabilization blends; 1 if absent.
+  let swiftVRStabilizationRadius: Int?
   let detectionEmptyLookahead: Int?
   let detectionMaskReuseSkipFrames: Int?
   let detectFaceMosaics: Bool?
@@ -3452,8 +3454,9 @@ private final class NativeFrameProcessor: @unchecked Sendable {
         restored: restored, frameCount: scene.frames.count)
       {
         // SwiftVR keeps producing frames while earlier ones are composited.
-        // A frame is composited once its successor exists, and only frames
-        // not yet composited are held.
+        // A frame is composited once the frames within the stabilization
+        // radius after it exist, and only the frames within that radius are
+        // held.
         defer { sceneOutput.cancel() }
         // The temporal noise filter runs on the composited frames, within
         // one rectangle around every crop of the scene, and is written back
@@ -3481,7 +3484,8 @@ private final class NativeFrameProcessor: @unchecked Sendable {
         for index in scene.frames.indices {
           let offset = index * restoredFrameElements
           let base = Array(restored[offset..<(offset + restoredFrameElements)])
-          let neighbours = max(0, index - 1)...min(scene.frames.count - 1, index + 1)
+          let radius = swiftVR.stabilizationRadius
+          let neighbours = max(0, index - radius)...min(scene.frames.count - 1, index + radius)
           window = window.filter { neighbours.contains($0.key) }
           sceneOutput.discard(before: neighbours.lowerBound)
           let waitStart = Date()
@@ -6592,7 +6596,8 @@ private struct NativePreviewPipeline {
         model: swiftVRAsset,
         strength: config.roiEnhancerStrength ?? 1,
         scale: config.roiEnhancerScale == 2 ? 2 : 4,
-        temporalFilter: config.swiftVRTemporalFilter ?? 0
+        temporalFilter: config.swiftVRTemporalFilter ?? 0,
+        stabilizationRadius: config.swiftVRStabilizationRadius ?? 1
       )
     } else {
       swiftVR = nil

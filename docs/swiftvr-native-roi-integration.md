@@ -38,6 +38,17 @@ face-restoration gate.
   parallel setting and take turns running SwiftVR; the other lanes keep
   detecting, restoring, compositing and encoding meanwhile. Crossfade stays available;
   overlap frames are simply enhanced in both batches.
+- Stabilization range ("なじませ範囲", 1–8 frames on each side, default 1 =
+  the previous ±1). Each neighbour's SwiftVR change is added to the centre's
+  BasicVSR++ result, weighted by how similar the two BasicVSR++ frames are
+  at that pixel, so moving areas are left out and still areas are averaged
+  longer. SwiftVR flickers most in near-still shots. On two segments of
+  MIZD-534 at 2x with the noise filter at 1.0 (10–18 s and 45–57 s), the
+  flicker added over BasicVSR++ went from +4.7% / +3.9% at range 1 to +3.9% /
+  +2.3% at 4 and +3.2% / +1.7% at 8; in the worst second (55 s) from +47% to
+  +25% and +21%. The 1–3 px texture band fell from 119.1% / 108.7% of
+  BasicVSR++ to 113.5% / 106.0% at 8. Range 8 added about 1.5–2 s of
+  composition to each segment.
 - Temporal noise filter ("揺らぎ低減", 0–1, default 1.0; 0 is off and
   pixel-identical to no filter). SwiftVR is deterministic (no noise is
   sampled: one DiT pass at t = 1000); its flicker is small input changes
