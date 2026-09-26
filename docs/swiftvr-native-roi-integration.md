@@ -72,6 +72,19 @@ inside the SwiftVR region, relative to BasicVSR++ alone:
 
 The first 2x scene also compiled the 2x pack (86 s once).
 
+The 2x rows above were measured with a corrupted 2x path and are void. Core ML
+ran the 2x FP16 patch embedding on the ANE (`.all`) and computed it wrong:
+mean error 0.31, max 6.5, against 0.0004 on CPU/GPU. The component exporter
+had recorded that error without failing. The worker now loads every model
+with `.cpuAndGPU`, and the exporter validates on CPU+GPU and fails above a
+mean error of 0.01. Against the upstream PyTorch outputs on the evaluation
+clip (the BasicVSR++-restored `basicvsrpp` frames):
+
+| | before | after |
+| --- | --- | --- |
+| 2x | 4.96/255, 29.5 dB | 0.35/255, 47.8 dB |
+| 4x | 0.35/255, 52.1 dB | 0.35/255, 52.1 dB |
+
 One-step measurements (3 s MIDV-670 excerpt, 90 frames, M5 Pro):
 - Time: 2.8 s without SwiftVR; 48.6–63.5 s with SwiftVR, including one-time
   model loading.
