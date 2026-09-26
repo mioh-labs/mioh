@@ -59,6 +59,12 @@ face-restoration gate.
   That coarse shift is upsampled and subtracted. The bias fell to
   +0.2/+0.4/+0.3, the mean change from 4.80 to 1.73 levels, and added jitter
   from +5.2% to +4.3%. Detail stayed at 104% of BasicVSR++.
+- Small scenes skip SwiftVR: when a scene's largest crop side is at most the
+  256px restoration grid, BasicVSR++ restored it at native resolution and
+  SwiftVR has no lost resolution to rebuild. It added +1.4% detail there, the
+  least of any size. Those scenes keep the BasicVSR++ result, and the log says
+  `SwiftVR: skipped a N-frame scene (largest crop Xpx <= 256px)`. On MIDV-995
+  they were about 48% of SwiftVR jobs.
 - Expert ROI is hidden from the settings and always off; its code remains.
 
 12 s excerpt of a real export (180-frame clips), second-difference jitter
