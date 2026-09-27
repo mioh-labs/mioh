@@ -53,6 +53,15 @@ EXPECTED_COREAI_SOURCES = (
 
 
 class StandaloneAppOptionTests(unittest.TestCase):
+    def test_native_mosaic_only_paste_is_default_and_optional(self):
+        app = APP_SOURCE.read_text()
+        pipeline = NATIVE_PIPELINE_SOURCE.read_text()
+        self.assertIn("@Published var restoreMaskOnly = true", app)
+        self.assertIn("restoreMaskOnly: true,", app)
+        self.assertIn("restoreMaskOnly: config.restoreMaskOnly ?? false", pipeline)
+        self.assertIn("? Self.createMaskOnlyBlend(", pipeline)
+        self.assertIn(": Self.createBlendMask(", pipeline)
+
     def test_native_swift_pipeline_supports_complete_file_export(self):
         app = APP_SOURCE.read_text()
         batch = BATCH_SOURCE.read_text()
@@ -100,7 +109,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
             'case "count":',
             "requestedSegmentSeconds",
             "writerSegmentSeconds",
-            "detectionEmptyLookahead + 1",
+            "roiTracker.update(",
             "allDetections.filter { $0.classIndex == 0 }",
         ]:
             self.assertIn(contract, pipeline)
@@ -1195,7 +1204,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn('COREAI_DISTRIBUTION="portable"', script)
         self.assertIn('build/macos-standalone-universal', script)
         self.assertIn('APP_BASENAME="mioh-universal"', script)
-        self.assertIn('DMG_BASENAME="mioh-universal-0.14.3-016-unsigned"', script)
+        self.assertIn('DMG_BASENAME="mioh-universal-0.14.3-017-unsigned"', script)
         self.assertIn('exec "$PACKAGE_DIR/build_app.sh"', script)
 
     def test_portable_swift_build_omits_architecture_override(self):

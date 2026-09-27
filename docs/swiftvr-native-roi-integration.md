@@ -8,24 +8,12 @@ restoration gate.
 
 ## Runtime (one step)
 
-- Mosaic-only paste ("モザイク部分だけ貼り戻す", default on; 2026-09-27). The
-  inherited whole-crop blend set the inner 95% of the crop rectangle to 1, so
-  a face or anything else inside the crop was replaced by BasicVSR++'s
-  rendering of it. The blend is now 1 on the detector mask plus a margin
-  (1.5% of the crop's short side, at least 6 px), then falls to 0 with a
-  smoothstep over the feather width (5% of the short side × 境界フェザー);
-  crop sides inside the frame still fade. Internal validation confirmed that
-  unrelated content inside the crop no longer changes and that mosaic cells
-  are still covered. Off restores the old whole-crop paste. Cluster jobs
-  always use the new paste.
-- Every detection is restored on its own (2026-09-27). `trackScenes` gives a
-  scene at most one detection per frame and assigns overlapping detections
-  one-to-one by IoU, so mosaics that meet (e.g. several converging on one
-  point) are no longer merged into one union crop restored at a coarser
-  scale; five detections mean five restorations (and five SwiftVR scenes).
-  Internal multi-detection validation confirmed one restoration per detection
-  where overlapping detections previously collapsed into a union crop.
-
+- Mosaic-only paste ("モザイク部分だけ貼り戻す", default on) blends the
+  restoration over the detector mask plus a small margin, leaving unrelated
+  pixels inside the ROI unchanged. The setting affects compositing, not
+  detection, ROI tracking, or SwiftVR inference. Pixels missed by the
+  detector mask can remain unrestored; turning it off restores the previous
+  whole-crop blend. Cluster jobs use mosaic-only paste.
 - Conversion may use Python offline. Export inference uses Swift and Apple
   model runtimes only. mioh never invokes PyTorch.
 - `NativeFrameProcessor.process` hands each restored BasicVSR++ scene (256px

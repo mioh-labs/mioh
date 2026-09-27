@@ -1,6 +1,6 @@
 # mioh ユーザーマニュアル
 
-バージョン 0.14.3-016
+バージョン 0.14.3-017
 
 対象: mioh-universal for macOS
 改訂日: 2026年9月27日
@@ -23,7 +23,7 @@ miohは、動画内のモザイク領域を検出し、復元モデルで処理�
 
 ## 2. インストールと起動
 
-1. [miohのv0.14.3-016リリース](https://github.com/mioh-labs/mioh/releases/tag/v0.14.3-016)から`mioh-universal-0.14.3-016-unsigned.dmg`を入手します。
+1. [miohのv0.14.3-017リリース](https://github.com/mioh-labs/mioh/releases/tag/v0.14.3-017)から`mioh-universal-0.14.3-017-unsigned.dmg`を入手します。
 2. `mioh-universal.app`を`Applications`へドラッグします。
 3. 次節のモデルダウンロードと変換を完了します。
 4. Applicationsフォルダからmiohを起動します。
@@ -107,13 +107,13 @@ uv run --no-project --python 3.12 --with reportlab \
 zsh packaging/macOS/standalone/build_universal_app.sh
 ```
 
-成果物は`build/macos-standalone-universal/mioh-universal.app`と`build/macos-standalone-universal/mioh-universal-0.14.3-016-unsigned.dmg`です。ビルドはモデルなしの配布物を作成します。モデルを使うMacでは、アプリのインストール後に2.1節のダウンロード・変換を行ってください。ビルド用スクリプトはアプリ本体とCore AIヘルパーを別々のmacOSターゲット向けにコンパイルします。
+成果物は`build/macos-standalone-universal/mioh-universal.app`と`build/macos-standalone-universal/mioh-universal-0.14.3-017-unsigned.dmg`です。ビルドはモデルなしの配布物を作成します。モデルを使うMacでは、アプリのインストール後に2.1節のダウンロード・変換を行ってください。ビルド用スクリプトはアプリ本体とCore AIヘルパーを別々のmacOSターゲット向けにコンパイルします。
 
 ビルド後は次を確認します。`hdiutil verify`の成功に加え、アプリ内のPythonと2本のモデルツールが存在することが重要です。
 
 ```zsh
 APP=build/macos-standalone-universal/mioh-universal.app
-DMG=build/macos-standalone-universal/mioh-universal-0.14.3-016-unsigned.dmg
+DMG=build/macos-standalone-universal/mioh-universal-0.14.3-017-unsigned.dmg
 test -x "$APP/Contents/Resources/runtime/bin/python3.12"
 test -f "$APP/Contents/Resources/model-tools/download-mioh-models.zsh"
 test -f "$APP/Contents/Resources/model-tools/convert-mioh-models.zsh"
@@ -493,4 +493,4 @@ ROIエンハンサー強度、テクスチャ、ディテール、シャープ�
 | メモリ | 掃除間隔1、空き4GB、MPS比率0.46 |
 | 再生 | バッファ8秒、通常、SBS左右、左目、視野角60度 |
 
-本マニュアルのインストール・ビルド・モデル導入手順はmioh-universal 0.14.3-016の配布スクリプトを基準にしています。画面項目は配布版や選択したモデルにより異なる場合があります。
+本マニュアルのインストール・ビルド・モデル導入手順はmioh-universal 0.14.3-017の配布スクリプトを基準にしています。画面項目は配布版や選択したモデルにより異なる場合があります。
