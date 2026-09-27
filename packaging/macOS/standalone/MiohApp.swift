@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import Combine
 import CryptoKit
 import Foundation
 import SwiftUI
@@ -90,6 +91,8 @@ struct NativeExportConfiguration: Codable, Sendable {
   let iouThreshold: Float = 0.7
   let contextFraction: Float = 0.30
   let blendFeather: Float
+  /// Paste the restoration only over the detected mosaic, not the whole crop.
+  var restoreMaskOnly: Bool? = nil
   let sharpenStrength: Float
   let detailBoost: Float
   let textureMix: Float
@@ -159,6 +162,7 @@ struct NativeExportConfiguration: Codable, Sendable {
     case iouThreshold
     case contextFraction
     case blendFeather
+    case restoreMaskOnly
     case sharpenStrength
     case detailBoost
     case textureMix
@@ -217,6 +221,8 @@ private struct NativePreviewLaunchConfiguration: Encodable {
   let iouThreshold: Float = 0.7
   let contextFraction: Float = 0.30
   let blendFeather: Float
+  /// Paste the restoration only over the detected mosaic, not the whole crop.
+  var restoreMaskOnly: Bool? = nil
   let sharpenStrength: Float
   let detailBoost: Float
   let textureMix: Float
@@ -696,6 +702,7 @@ struct MiohUserDefaultsSnapshot: Codable {
   var sharpenStrength: Double
   var detailBoost: Double
   var blendFeather: Double
+  var restoreMaskOnly: Bool?
   var textureMix: Double
   var smoothStrength: Double
   var effectUpscale: Int
@@ -786,6 +793,7 @@ struct MiohUserDefaultsSnapshot: Codable {
       sharpenStrength: 0.0,
       detailBoost: 0.0,
       blendFeather: 1.0,
+      restoreMaskOnly: true,
       textureMix: 0.0,
       smoothStrength: 0.0,
       effectUpscale: 1,
@@ -916,6 +924,9 @@ final class RestorationRunner: ObservableObject {
   @Published var sharpenStrength = 0.0
   @Published var detailBoost = 0.0
   @Published var blendFeather = 1.0
+  /// Paste the restoration only over the detected mosaic (not faces or other
+  /// unmosaicked parts of the crop).
+  @Published var restoreMaskOnly = true
   @Published var textureMix = 0.0
   @Published var smoothStrength = 0.0
   @Published var effectUpscale = 1
@@ -982,6 +993,12 @@ final class RestorationRunner: ObservableObject {
   private var remoteClusterAssetDigests: [String: String] = [:]
   private let capabilities: PlatformCapabilities
   private let defaultsKey = "mioh.userProcessingDefaults.v1"
+  /// The settings as last used, remembered automatically and restored at
+  /// launch. The saved defaults above stay a separate, explicit preset.
+  private let lastSettingsKey = "mioh.lastProcessingSettings.v1"
+  private var lastSettingsData: Data?
+  private var settingsAutosave: AnyCancellable?
+  private var terminationObserver: NSObjectProtocol?
 
   init(capabilities: PlatformCapabilities = PlatformCapabilities()) {
     self.capabilities = capabilities
@@ -990,6 +1007,29 @@ final class RestorationRunner: ObservableObject {
     previewDetectionModel = capabilities.previewDetectionModel
     detectionModel = "v2-coreml"
     loadSavedDefaultsOnLaunch()
+    startRememberingSettings()
+  }
+
+  /// Records the settings whenever they change (at most every 2 seconds,
+  /// only when they differ from the last record) and once more at quit.
+  private func startRememberingSettings() {
+    lastSettingsData = UserDefaults.standard.data(forKey: lastSettingsKey)
+    settingsAutosave = objectWillChange
+      .throttle(for: .seconds(2), scheduler: RunLoop.main, latest: true)
+      .sink { [weak self] _ in self?.rememberSettings() }
+    terminationObserver = NotificationCenter.default.addObserver(
+      forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+    ) { [weak self] _ in
+      MainActor.assumeIsolated { self?.rememberSettings() }
+    }
+  }
+
+  private func rememberSettings() {
+    guard let data = try? JSONEncoder().encode(currentDefaultsSnapshot()),
+      data != lastSettingsData
+    else { return }
+    UserDefaults.standard.set(data, forKey: lastSettingsKey)
+    lastSettingsData = data
   }
 
   let encodingPresets = [
@@ -1826,6 +1866,7 @@ final class RestorationRunner: ObservableObject {
       nativeParallelWorkers: min(max(nativeParallelWorkers, 1), 10),
       confidenceThreshold: detection.confidenceThreshold,
       blendFeather: Float(blendFeather),
+      restoreMaskOnly: restoreMaskOnly,
       sharpenStrength: Float(sharpenStrength),
       detailBoost: Float(detailBoost),
       textureMix: Float(textureMix),
@@ -2315,6 +2356,7 @@ final class RestorationRunner: ObservableObject {
       nativeParallelWorkers: 1,
       confidenceThreshold: detection.confidenceThreshold,
       blendFeather: request.options.blendFeather,
+      restoreMaskOnly: true,
       sharpenStrength: request.options.sharpenStrength,
       detailBoost: request.options.detailBoost,
       textureMix: request.options.textureMix,
@@ -3046,7 +3088,16 @@ final class RestorationRunner: ObservableObject {
     defaultsStatus = "初期値に戻しました"
   }
 
+  /// Starts from the settings as last used; before any were remembered,
+  /// from the saved defaults.
   private func loadSavedDefaultsOnLaunch() {
+    if let data = UserDefaults.standard.data(forKey: lastSettingsKey),
+      let snapshot = try? JSONDecoder().decode(MiohUserDefaultsSnapshot.self, from: data)
+    {
+      apply(defaults: snapshot)
+      defaultsStatus = "前回の設定で起動しました"
+      return
+    }
     guard let data = UserDefaults.standard.data(forKey: defaultsKey),
       let snapshot = try? JSONDecoder().decode(MiohUserDefaultsSnapshot.self, from: data)
     else { return }
@@ -3106,6 +3157,7 @@ final class RestorationRunner: ObservableObject {
       sharpenStrength: sharpenStrength,
       detailBoost: detailBoost,
       blendFeather: blendFeather,
+      restoreMaskOnly: restoreMaskOnly,
       textureMix: textureMix,
       smoothStrength: smoothStrength,
       effectUpscale: effectUpscale,
@@ -3210,6 +3262,7 @@ final class RestorationRunner: ObservableObject {
     sharpenStrength = min(max(snapshot.sharpenStrength, 0), 5)
     detailBoost = min(max(snapshot.detailBoost, 0), 1)
     blendFeather = min(max(snapshot.blendFeather, 0), 3)
+    restoreMaskOnly = snapshot.restoreMaskOnly ?? true
     textureMix = min(max(snapshot.textureMix, 0), 1)
     smoothStrength = min(max(snapshot.smoothStrength, 0), 1)
     effectUpscale = min(max(snapshot.effectUpscale, 1), 4)
@@ -3414,6 +3467,7 @@ final class RestorationRunner: ObservableObject {
       ringCapacity: max(temporalFrames * 2, 24),
       confidenceThreshold: detection.confidenceThreshold,
       blendFeather: Float(effectiveBlendFeather),
+      restoreMaskOnly: restoreMaskOnly,
       sharpenStrength: Float(effectiveSharpenStrength),
       detailBoost: Float(effectiveDetailBoost),
       textureMix: Float(effectiveTextureMix),
@@ -3914,20 +3968,68 @@ private struct WindowDragRegion: NSViewRepresentable {
   }
 }
 
+/// App-wide state. The window used to own these objects, so closing it
+/// discarded the settings, the player, a running export and the remote
+/// server, and reopening started from scratch. Owned here, they outlive the
+/// window, and a reopened window shows them as they were.
+@MainActor
+private final class MiohAppState: ObservableObject {
+  static let shared = MiohAppState()
+
+  let runner = RestorationRunner()
+  let player = RealtimePlayerController()
+  let mediaBrowser = MacMediaBrowserController()
+  let remoteControl = RemoteControlServer()
+  let remoteStreaming = RemoteStreamingCoordinator()
+  let cluster = MiohClusterController()
+  @Published var selectedTab: WorkspaceTab = .basic
+  private var subscriptions: Set<AnyCancellable> = []
+
+  private init() {
+    // Wired once here; the window's onAppear ran this on every open.
+    cluster.attach(runner: runner)
+    remoteControl.attach(runner: runner, player: player)
+    remoteControl.attachCluster(cluster)
+    remoteControl.attachStreaming(remoteStreaming)
+    remoteControl.activateIfRemembered()
+    if remoteControl.enabled {
+      player.setStreamingEventConsumer(remoteStreaming.eventConsumer())
+    }
+    // @Published publishes before the new value is stored; hop to the next
+    // main-loop turn so the handlers see it, as onChange did.
+    cluster.$role.dropFirst().removeDuplicates()
+      .receive(on: RunLoop.main)
+      .sink { [weak self] _ in self?.cluster.deactivate(preserveRole: true) }
+      .store(in: &subscriptions)
+    remoteControl.$enabled.dropFirst().removeDuplicates()
+      .receive(on: RunLoop.main)
+      .sink { [weak self] enabled in
+        guard let self else { return }
+        if enabled {
+          player.setStreamingEventConsumer(remoteStreaming.eventConsumer())
+        } else {
+          player.setStreamingEventConsumer(nil)
+          remoteStreaming.stop()
+        }
+      }
+      .store(in: &subscriptions)
+  }
+}
+
 struct ContentView: View {
-  @StateObject private var runner = RestorationRunner()
-  @StateObject private var player = RealtimePlayerController()
-  @StateObject private var mediaBrowser = MacMediaBrowserController()
-  @StateObject private var remoteControl = RemoteControlServer()
-  @StateObject private var remoteStreaming = RemoteStreamingCoordinator()
-  @StateObject private var cluster = MiohClusterController()
-  @State private var selectedTab: WorkspaceTab = .basic
+  @ObservedObject private var appState = MiohAppState.shared
+  @ObservedObject private var runner = MiohAppState.shared.runner
+  @ObservedObject private var player = MiohAppState.shared.player
+  @ObservedObject private var mediaBrowser = MiohAppState.shared.mediaBrowser
+  @ObservedObject private var remoteControl = MiohAppState.shared.remoteControl
+  @ObservedObject private var remoteStreaming = MiohAppState.shared.remoteStreaming
+  @ObservedObject private var cluster = MiohAppState.shared.cluster
 
   var body: some View {
     VStack(spacing: 0) {
       header
       Divider()
-      TabView(selection: $selectedTab) {
+      TabView(selection: $appState.selectedTab) {
         basicTab
           .tabItem { Label("基本", systemImage: "slider.horizontal.3") }
           .tag(WorkspaceTab.basic)
@@ -3935,7 +4037,7 @@ struct ContentView: View {
           controller: mediaBrowser,
           player: player,
           runner: runner,
-          selectPlayback: { selectedTab = .playback }
+          selectPlayback: { appState.selectedTab = .playback }
         )
           .tabItem { Label("ブラウザ", systemImage: "globe") }
           .tag(WorkspaceTab.browser)
@@ -3973,25 +4075,6 @@ struct ContentView: View {
     .background(MovableWindowConfigurator().frame(width: 0, height: 0))
     .onAppear {
       InputPanelThumbnailCache.shared.prepare(initialURL: runner.inputURL)
-      cluster.attach(runner: runner)
-      remoteControl.attach(runner: runner, player: player)
-      remoteControl.attachCluster(cluster)
-      remoteControl.attachStreaming(remoteStreaming)
-      remoteControl.activateIfRemembered()
-      if remoteControl.enabled {
-        player.setStreamingEventConsumer(remoteStreaming.eventConsumer())
-      }
-    }
-    .onChange(of: cluster.role) { _, _ in
-      cluster.deactivate(preserveRole: true)
-    }
-    .onChange(of: remoteControl.enabled) { _, enabled in
-      if enabled {
-        player.setStreamingEventConsumer(remoteStreaming.eventConsumer())
-      } else {
-        player.setStreamingEventConsumer(nil)
-        remoteStreaming.stop()
-      }
     }
   }
 
@@ -4152,6 +4235,10 @@ struct ContentView: View {
         doubleSliderField("シャープ", value: $runner.sharpenStrength, range: 0...5, step: 0.05)
         doubleSliderField("ディテール", value: $runner.detailBoost, range: 0...1, step: 0.05)
         doubleSliderField("境界フェザー", value: $runner.blendFeather, range: 0...3, step: 0.05)
+        Toggle("モザイク部分だけ貼り戻す", isOn: $runner.restoreMaskOnly)
+        Text("オンにすると、復元結果を検出したモザイクの範囲（と少しの余白）だけに貼り戻し、切り出し枠に入った顔などモザイクのない部分は元の映像のままにします。オフは従来どおり切り出し枠全体を貼り戻します。")
+          .font(.caption)
+          .foregroundStyle(.secondary)
         doubleSliderField("テクスチャ", value: $runner.textureMix, range: 0...1, step: 0.01)
         doubleSliderField("スムージング", value: $runner.smoothStrength, range: 0...1, step: 0.05)
         LabeledContent("エフェクト倍率") { Stepper(value: $runner.effectUpscale, in: 1...4) { Text("\(runner.effectUpscale)x") } }
@@ -4694,8 +4781,41 @@ struct ContentView: View {
 #endif
 struct MiohStandaloneApp: App {
   var body: some Scene {
-    WindowGroup { ContentView() }
+    WindowGroup(id: MiohWindowCommands.mainWindowID) { ContentView() }
       .windowResizability(.contentMinSize)
       .defaultSize(width: 920, height: 760)
+      // One window over the shared state; closing it keeps everything, and
+      // a Dock click or ウインドウ > miohウインドウを表示 (⌘0) shows it again.
+      .commands { MiohWindowCommands() }
+  }
+}
+
+private struct MiohWindowCommands: Commands {
+  static let mainWindowID = "main"
+  @Environment(\.openWindow) private var openWindow
+
+  var body: some Commands {
+    CommandGroup(replacing: .newItem) {}
+    CommandGroup(before: .windowArrangement) {
+      Button("miohウインドウを表示") { showMainWindow() }
+        .keyboardShortcut("0", modifiers: .command)
+    }
+  }
+
+  /// Brings the existing window forward (restoring it from the Dock if
+  /// minimized); opens it again only when it was closed, so there is never
+  /// more than one.
+  private func showMainWindow() {
+    let existing = NSApp.windows.first {
+      $0.identifier?.rawValue.hasPrefix(Self.mainWindowID) == true
+        && ($0.isVisible || $0.isMiniaturized)
+    }
+    if let existing {
+      if existing.isMiniaturized { existing.deminiaturize(nil) }
+      existing.makeKeyAndOrderFront(nil)
+    } else {
+      openWindow(id: Self.mainWindowID)
+    }
+    NSApp.activate()
   }
 }

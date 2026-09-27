@@ -397,7 +397,9 @@ class MiohRemoteControlTests(unittest.TestCase):
         player = PLAYER_SOURCE.read_text()
 
         for contract in [
-            "@StateObject private var remoteControl = RemoteControlServer()",
+            # App-wide state (outlives the window) owns the controllers.
+            "let remoteControl = RemoteControlServer()",
+            "@ObservedObject private var remoteControl = MiohAppState.shared.remoteControl",
             "remoteControl.attach(runner: runner, player: player)",
             'Section("ローカルネットワーク操作")',
             "remoteControl.setEnabled($0)",
@@ -525,14 +527,14 @@ class MiohRemoteControlTests(unittest.TestCase):
     def test_lan_hls_does_no_media_work_while_server_is_disabled(self):
         app = APP_SOURCE.read_text()
 
-        self.assertIn(".onChange(of: remoteControl.enabled)", app)
+        self.assertIn("remoteControl.$enabled", app)
         self.assertIn("setStreamingEventConsumer(remoteStreaming.eventConsumer())", app)
         self.assertIn("setStreamingEventConsumer(nil)", app)
         self.assertIn("remoteStreaming.stop()", app)
         # An unconditional consumer on appearance would remux every preview
         # segment even though LAN control remains opt-in and disabled.
         self.assertNotIn(
-            "remoteControl.attachStreaming(remoteStreaming)\n      "
+            "remoteControl.attachStreaming(remoteStreaming)\n    "
             "player.setStreamingEventConsumer(remoteStreaming.eventConsumer())",
             app,
         )

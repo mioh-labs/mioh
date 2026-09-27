@@ -2478,7 +2478,7 @@ private enum RemoteControlHTML {
       ]],
       ['restoration',[
         ['モデル',[['restorationModel','復元モデル','select','restorationModels'],['customRestorationModel','モデルパス','modelValue'],['useMaxClipLength','最大クリップ長を指定','bool'],['maxClipLength','最大クリップ長','number',1,180,1],['useRestoreMaxFrames','復元チャンク数を指定','bool'],['restoreMaxFrames','復元チャンク数','number',-1,180,1],['restoreTemporalOverlap','Temporal overlap','number',0,120,1],['restoreCrossfade','クロスフェードを有効化','bool']]],
-        ['合成',[['sharpenStrength','シャープ','range',0,5,0.05],['detailBoost','ディテール','range',0,1,0.05],['blendFeather','境界フェザー','range',0,3,0.05],['textureMix','テクスチャ','range',0,1,0.01],['smoothStrength','スムージング','range',0,1,0.05],['effectUpscale','エフェクト倍率','number',1,4,1]]],
+        ['合成',[['sharpenStrength','シャープ','range',0,5,0.05],['detailBoost','ディテール','range',0,1,0.05],['blendFeather','境界フェザー','range',0,3,0.05],['restoreMaskOnly','モザイク部分だけ貼り戻す','bool'],['textureMix','テクスチャ','range',0,1,0.01],['smoothStrength','スムージング','range',0,1,0.05],['effectUpscale','エフェクト倍率','number',1,4,1]]],
         ['ROIエンハンサー',[['roiEnhancer','方式','select','roiEnhancers'],['roiEnhancerModel','モデル','roiModel'],['roiEnhancerScale','倍率','number',1,8,1],['roiEnhancerStrength','強度','range',0,1,0.05],['roiEnhancerPasses','PiperSR反復','number',1,10,1],['swiftVRFrameSmoothing','SwiftVR枠のなめらかさ','number',0,30,1],['swiftVRStabilizationRadius','SwiftVRなじませ範囲','number',1,8,1],['swiftVRTemporalFilter','SwiftVR揺らぎ低減','range',0,1,0.05],['roiEnhancerTile','タイル','number',0,1024,32]]]
       ]],
       ['detection',[

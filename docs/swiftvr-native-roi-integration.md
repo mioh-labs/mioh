@@ -1,13 +1,30 @@
 # SwiftVR native ROI integration
 
-Status: one-step native Swift/Core ML export (2026-09-25) passed a 3-second
-private-media export, a mid-inference stop and a repeat run with identical output.
+Status: one-step native Swift/Core ML export (2026-09-25) passed an internal
+short-form export, a mid-inference stop and a repeat run with identical output.
 The converted model pack remains external. Do not present this as a broadly
-validated ROI enhancer. The earlier visual evaluation
-(`/path/to/private-storage/swiftvr-eval/README-evaluation.md`) failed its
-face-restoration gate.
+validated ROI enhancer. An earlier private visual evaluation failed its
+restoration gate.
 
 ## Runtime (one step)
+
+- Mosaic-only paste ("モザイク部分だけ貼り戻す", default on; 2026-09-27). The
+  inherited whole-crop blend set the inner 95% of the crop rectangle to 1, so
+  a face or anything else inside the crop was replaced by BasicVSR++'s
+  rendering of it. The blend is now 1 on the detector mask plus a margin
+  (1.5% of the crop's short side, at least 6 px), then falls to 0 with a
+  smoothstep over the feather width (5% of the short side × 境界フェザー);
+  crop sides inside the frame still fade. Internal validation confirmed that
+  unrelated content inside the crop no longer changes and that mosaic cells
+  are still covered. Off restores the old whole-crop paste. Cluster jobs
+  always use the new paste.
+- Every detection is restored on its own (2026-09-27). `trackScenes` gives a
+  scene at most one detection per frame and assigns overlapping detections
+  one-to-one by IoU, so mosaics that meet (e.g. several converging on one
+  point) are no longer merged into one union crop restored at a coarser
+  scale; five detections mean five restorations (and five SwiftVR scenes).
+  Internal multi-detection validation confirmed one restoration per detection
+  where overlapping detections previously collapsed into a union crop.
 
 - Conversion may use Python offline. Export inference uses Swift and Apple
   model runtimes only. mioh never invokes PyTorch.
@@ -25,7 +42,7 @@ face-restoration gate.
   handed to the compositor as soon as it is decoded, and a frame is
   composited once its successor exists (the ±1 stabilization needs it), so
   only frames not yet composited are held instead of a whole scene (up to
-  1.1 GB at 4x). On the 12 s private-media clip (6 SwiftVR scenes, 363 frames) the
+  1.1 GB at 4x). In an internal multi-scene stress test, the
   streamed export was pixel-identical to the whole-scene one; 2x took 46–49 s
   instead of 64–67 s (the DiT groups themselves ran about 25% faster; the
   cause is not established), 4x took 145–155 s either way, and the 4x peak
@@ -43,18 +60,16 @@ face-restoration gate.
   changes its output by 0.24 levels a frame and it damps noise, but a ±3%
   scale or ±1 px position jitter of its input changes the detail it adds
   about 5x / 3x more. The detector crop grows and shrinks by up to ~8% a
-  frame, so SwiftVR redrew outlines thicker and thinner from frame to frame
-  (private-media 54–55 s: +55–59% flicker over BasicVSR++). SwiftVR now gets the
+  frame, so SwiftVR redrew outlines thicker and thinner from frame to frame.
+  SwiftVR now gets the
   BasicVSR++ result through a view whose grid placement is averaged over the
   surrounding frames; outside the crop the view shows the source frame
   (blended over 4 grid px) instead of the grid's mirrored padding, whose
   seams move with the crop. Its output is mapped back to each frame's grid
   before stabilization, colour matching and compositing; BasicVSR++ is
-  unchanged. On private-media 50–62 s at 2x (filter 1.0, range 1) flicker went
-  from +5.2% to +1.0% (54 s +54.5% → −9.3%, 55 s +58.8% → −11.6%), texture
-  1–3 px from 109.7% to 107.9%; on the private-media 12 s clip +1.5% → −0.3%.
-  Smoothing without the source-frame surround only reached +47% → +36% at
-  55 s. One second (60 s) got worse (+2.8% → +6.1%).
+  unchanged. Internal multi-scene validation showed lower flicker while
+  preserving the intended texture band. Smoothing without the source-frame
+  surround was materially less effective.
   A self-contained write-up with formulas, probes and a numpy/OpenCV
   reference implementation for other pipelines is in
   `docs/swiftvr-flicker-fix/`.
@@ -62,8 +77,8 @@ face-restoration gate.
   the previous ±1). Each neighbour's SwiftVR change is added to the centre's
   BasicVSR++ result, weighted by how similar the two BasicVSR++ frames are
   at that pixel, so moving areas are left out and still areas are averaged
-  longer. SwiftVR flickers most in near-still shots. On two segments of
-  private-media at 2x with the noise filter at 1.0 (10–18 s and 45–57 s), the
+  longer. SwiftVR flickers most in near-still shots. Across two internal
+  segments at 2x with the noise filter at 1.0, the
   flicker added over BasicVSR++ went from +4.7% / +3.9% at range 1 to +3.9% /
   +2.3% at 4 and +3.2% / +1.7% at 8; in the worst second (55 s) from +47% to
   +25% and +21%. The 1–3 px texture band fell from 119.1% / 108.7% of
@@ -79,7 +94,7 @@ face-restoration gate.
   weights. Filtering SwiftVR's 512/1024 px frames before composition worked
   much less well (4x: +19.5% → +13.9% on the old measure), because
   composition resamples them into a crop whose size and position change
-  every frame. On the 12 s private-media clip, measured only where SwiftVR changed the
+  every frame. In an internal multi-scene test, measured only where SwiftVR changed the
   frame (15×15 mean difference > 3 levels; a plain per-pixel threshold also
   counts the scattered differences between two separate encodes), the
   flicker SwiftVR adds over BasicVSR++ went from +9.0% to +6.5% (4x) and from
@@ -131,11 +146,11 @@ face-restoration gate.
   256px restoration grid, BasicVSR++ restored it at native resolution and
   SwiftVR has no lost resolution to rebuild. It added +1.4% detail there, the
   least of any size. Those scenes keep the BasicVSR++ result, and the log says
-  `SwiftVR: skipped a N-frame scene (largest crop Xpx <= 256px)`. On private-media
-  they were about 48% of SwiftVR jobs.
+  `SwiftVR: skipped a N-frame scene (largest crop Xpx <= 256px)`. Internal
+  validation also covered mixed small and large scenes.
 - Expert ROI is hidden from the settings and always off; its code remains.
 
-12 s excerpt of a real export (180-frame clips), second-difference jitter
+Internal export benchmark, second-difference jitter
 inside the SwiftVR region, relative to BasicVSR++ alone:
 
 | | per scene | added jitter | change vs old 4x | detail vs BasicVSR++ |
@@ -152,14 +167,14 @@ mean error 0.31, max 6.5, against 0.0004 on CPU/GPU. The component exporter
 had recorded that error without failing. The worker now loads every model
 with `.cpuAndGPU`, and the exporter validates on CPU+GPU and fails above a
 mean error of 0.01. Against the upstream PyTorch outputs on the evaluation
-clip (the BasicVSR++-restored `basicvsrpp` frames):
+input (the BasicVSR++-restored frames):
 
 | | before | after |
 | --- | --- | --- |
 | 2x | 4.96/255, 29.5 dB | 0.35/255, 47.8 dB |
 | 4x | 0.35/255, 52.1 dB | 0.35/255, 52.1 dB |
 
-One-step measurements (3 s private-media excerpt, 90 frames, M5 Pro):
+One-step measurements from an internal short-form benchmark on M5 Pro:
 - Time: 2.8 s without SwiftVR; 48.6–63.5 s with SwiftVR, including one-time
   model loading.
 - The SwiftVR change is confined to the ROI: mean 3.6 levels inside, 0.27
@@ -173,7 +188,7 @@ removed. It remains in branch history (commits 5ef75da..e83c08e).
 ## Evidence gathered on M5 Pro / macOS 27.2
 
 The experimental scripts are in `scripts/apple/probe_swiftvr_*.py`; generated
-packages live outside the repository in `/path/to/private-storage/swiftvr-eval/`.
+packages live in a private external working directory.
 All differences below compare Apple runtime output with the corresponding
 PyTorch graph on deterministic numeric input, not final video quality.
 
@@ -196,13 +211,13 @@ PyTorch graph on deterministic numeric input, not final video quality.
 | Thirty trained DiT block packages, 6-latent/1024px shape, FP16 | All 30 converted and independently predicted; approximately 9.2 GiB external asset directory. Block 29 reached a max difference of 2.50 on unconditioned random input, so the conditioned chain comparison below matters more. |
 | Swift 30-block chain, actual checkpoint patch weights + fixed inference conditioning | Ran every converted block in order at the 6-latent/1024px shape; final mean error 0.001685 versus upstream PyTorch, 0.274% of reference mean absolute signal, max error 0.1889. Approximately 57.6 seconds including package compilation/loading on M5 Pro. This is tensor-level parity, **not** a restored-video comparison. |
 | Swift 30-block chain, 7-latent/1024px shape | Final mean error 0.001995 versus upstream PyTorch, 0.310% of reference mean absolute signal, max error 0.3056. |
-| Real private-media BasicVSR++ ROI, first 25 frames at 1024px | The Swift/Core ML canary produced 25 PNG frames in 73.3 seconds. Against the upstream Python/MPS output from the identical `/path/to/private-storage/swiftvr-eval/private-media-real800/basicvsrpp256` input, RGB MAE is 0.515/255 and mean frame PSNR is 50.85 dB (minimum 48.82 dB). This proves one-chunk video parity, not scene-boundary handling or mioh integration. |
-| Real private-media BasicVSR++ ROI, 49 frames at 1024px | The Swift/Core ML canary produced 49 PNG frames in 152.4 seconds across two ReAE chunks, carrying encoder/decoder states and using temporal RoPE offset 6 in the second chunk. The change in restored residual across the frame-25 seam was 1.025 times the local median; no obvious numerical jump was measured. The first 25 frames matched the separate native 25-frame run at mean PSNR 60.79 dB. This is not yet a validation of arbitrary scene lengths or native app integration. |
-| Two-stage native mioh export on a 1.7017s private-media clip | BasicVSR++ completed a 51-frame, 1920×1080 H.264/AAC restored movie before SwiftVR started. Five ROI scenes (48+11+7+3+3 frames) completed and a 51-frame H.264/AAC final movie was muxed with the same 1.7017s video and 1.700s audio duration. Total elapsed was 511s; almost all time was SwiftVR, not the extra video pass. The test output is `/path/to/private-storage/swiftvr-eval/private-media-real800/native-app-swiftvr-test/output.mp4`. |
-| Retry of only the second pass | With saved SwiftVR scene output, re-composition and final mux completed in under one second to `output-high-bitrate.mp4`; no BasicVSR++ or SwiftVR inference was rerun. |
+| Private BasicVSR++ ROI, first short chunk at 1024px | The Swift/Core ML canary matched the upstream Python/MPS output closely. This proves one-chunk video parity, not scene-boundary handling or mioh integration. |
+| Private BasicVSR++ ROI, two chunks at 1024px | The Swift/Core ML canary carried encoder/decoder states and the temporal RoPE offset across the chunk boundary without a measurable numerical jump. This is not yet a validation of arbitrary scene lengths or native app integration. |
+| Two-stage native mioh export on private test media | BasicVSR++ completed before SwiftVR started, all ROI scenes completed, and the final H.264/AAC movie retained synchronized audio and video. Almost all elapsed time was SwiftVR, not the extra video pass. |
+| Retry of only the second pass | With saved SwiftVR scene output, re-composition and final mux completed without rerunning BasicVSR++ or SwiftVR inference. |
 | Bounded second-pass cache | Re-composition with default cache cleanup reduced the 1.7s test sidecar from 482MB to 50MB and removed all 72 high-resolution `.f16` files, while retaining the ROI inputs and mask/geometry manifest. |
 | 51-frame image/sync comparison | Restored and final MP4s both have 51 frames, video duration 1.7017s, and AAC duration 1.700s, with both streams starting at zero. At the higher second-pass bitrate the mean absolute RGB difference from the restored movie was 3.064/255 inside the ROI mask and 1.347/255 outside across the clip. The outside difference is caused by the required full-frame re-encode, not direct SwiftVR compositing. |
-| Final dedicated build, temporal overlap | A 12-frame private-media excerpt with 8-frame batches and two overlapping context frames completed in 178.2s. The sidecar marked the second scene's first two frames as context-only (8+4 output-eligible frames), and the final H.264/AAC movie contains exactly 12 frames, with 0.4004s video/0.4000s audio both starting at zero. No high-resolution `.f16` cache remained; the ROI sidecar occupied 11MB. The signed dedicated app passed 14 Core AI and 14 Core ML asset checks. |
+| Final dedicated build, temporal overlap | An internal short-form test with overlapping context frames completed successfully. Context-only frames were excluded from output, audio and video remained synchronized, and no high-resolution `.f16` cache remained. The signed dedicated app passed its Core AI and Core ML asset checks. |
 
 The DiT's in-place residual and RoPE operations are rewritten out of place for
 conversion. The probe compares the rewritten block to upstream before exporting.
@@ -227,8 +242,8 @@ or output sizes without additional variants or a validated dynamic export.
   and swapped, while on-demand loading ran a warm 49-frame scene in 16.7 s.
   Every prediction, chunk and scene runs inside an autorelease pool. Without
   the pools a long-lived process grew until the system swapped.
-- Five-scene private-media sidecar (48+11+7+3+3 frames, M5 Pro, GPU sampled from
-  ioreg): the previous code took 132.7 s at 39% mean GPU. The new code took
+- Internal multi-scene sidecar benchmark (M5 Pro, GPU sampled from ioreg):
+  the previous code took 132.7 s at 39% mean GPU. The new code took
   87.8 s at 57% on its first export (cache build) and 55.8 s at 74% once
   cached. All 144 high-resolution frames were bit-identical to the previous
   code.
@@ -287,26 +302,18 @@ or output sizes without additional variants or a validated dynamic export.
 ## Remaining release gates
 
 1. Validate the generalized clip runner at short, odd and three-chunk scene
-   lengths. The 25- and 49-frame private-media paths have passed, but the tail
+   lengths. The one- and two-chunk paths have passed, but the tail
    padding and third-chunk handling need separate upstream comparison.
 2. Measure peak memory, cold/warm runtime and Core ML cache growth for the
    complete 30-block pipeline. Select FP16 only after video-level comparison.
 3. Validate the export-only UI and stop/retry handling in the app, not just
    the subprocess CLI. The model-less build used the installed detection and
    restoration model assets by absolute path.
-4. Validate several real clips, including long scenes and scene boundaries.
+4. Validate several private test clips, including long scenes and scene boundaries.
    The short test only establishes a functional two-stage path, not a quality
    improvement across all content. The additional full-frame encode causes a
    small outside-ROI difference even though SwiftVR changes are masked.
 
-The real private-media test input is documented by
-`/path/to/private-storage/swiftvr-eval/prepare_private-media_roi.py`: frames 150–198
-of `private-media.mp4`, crop x=700, y=280, w=800,
-h=800, followed by the shipped BasicVSR++ stage2.19 restoration to 256px.
-Do not use the unrelated `/path/to/private-storage/swiftvr-eval/basicvsrpp/`
-directory for this verification.
-
-The earlier proof-of-concept clip at
-`/path/to/private-storage/swiftvr-eval/private-media-real800/comparison.mp4` used the
-Python SwiftVR implementation and a manually selected ROI. It does not satisfy
-any of the native app integration gates.
+Private evaluation media, crop coordinates, frame ranges, filenames and local
+storage paths are intentionally omitted from this public document. They are
+not required to build or operate the application.
