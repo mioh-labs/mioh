@@ -209,6 +209,17 @@ if [[ "$MIOH_BUNDLE_PYTHON_RUNTIME" == 1 ]]; then
   cp "$PACKAGE_DIR/mioh_preview_worker.py" \
     "$RESOURCES/runtime/lib/python3.12/site-packages/mioh_preview_worker.py"
   rm -f "$RESOURCES/runtime/lib/python3.12/site-packages"/lada-*.dist-info/direct_url.json(N)
+  # The installed console wrappers are not used by the application and have
+  # build-machine absolute shebangs. Keep the bundled runtime self-contained
+  # without publishing those paths in the Universal image.
+  rm -f "$RESOURCES/runtime/bin/lada" "$RESOURCES/runtime/bin/lada-cli"
+  sysconfig_data="$RESOURCES/runtime/lib/python3.12/_sysconfigdata__darwin_darwin.py"
+  if [[ -f "$sysconfig_data" ]]; then
+    sed -i '' \
+      -e "s|$PYTHON_SOURCE|/opt/mioh/python3.12|g" \
+      -e "s|$HOME|/Users/example|g" \
+      "$sysconfig_data"
+  fi
 fi
 mkdir -p "$FFMPEG_CACHE"
 if [[ ! -x "$FFMPEG_CACHE/ffmpeg" ]]; then
@@ -232,16 +243,37 @@ MODEL_TOOLS_SOURCE="$PACKAGE_DIR/model-tools"
 if [[ "$COREAI_DISTRIBUTION" == "portable" && -d "$MODEL_TOOLS_SOURCE" ]]; then
   mkdir -p "$RESOURCES/model-tools/scripts"
   ditto "$MODEL_TOOLS_SOURCE" "$RESOURCES/model-tools"
-  ditto "$ROOT/scripts/apple" "$RESOURCES/model-tools/scripts/apple"
-  # RF-DETR remains a local research prototype. Keep it out of the shipped
-  # application and model-tools bundle until it is deliberately reintroduced.
-  find "$RESOURCES/model-tools/scripts/apple" \
-    -maxdepth 1 -type f -iname '*rfdetr*' -delete
-  # Upscaler models and their download tooling ship only with Mioh Upscaler.
-  find "$RESOURCES/model-tools/scripts/apple" \
-    -maxdepth 1 -type f -name 'download_adcsr_coreai.sh' -delete
-  find "$RESOURCES/model-tools/scripts/apple" \
-    -type d -name __pycache__ -prune -exec rm -rf {} +
+  # Ship only conversion entry points and their local imports. The development
+  # scripts directory also contains experiments and media-specific diagnostics
+  # which must never be included in a public application.
+  portable_apple_scripts=(
+    __init__.py
+    basicvsrpp_coreai_kernels.py
+    benchmark_basicvsrpp_variable_coreai.py
+    export_basicvsrpp_coreai.py
+    export_basicvsrpp_variable_chunk6.py
+    export_v4_fast_coreai.py
+    export_v4_fast_coreml.py
+    export_realesrgan_coreai.py
+    export_realesrgan_coreml.py
+    export_srvgg_coreai.py
+    export_srvgg_coreml.py
+    export_spandrel_coreai.py
+    export_spandrel_coreml.py
+    export_swinir_coreml.py
+    swiftvr_imports.py
+    export_swiftvr_components_coreml.py
+    export_swiftvr_dit_group_coreml.py
+    probe_swiftvr_dit_block_coreml.py
+    probe_swiftvr_reae_coreml.py
+    probe_swiftvr_reae_state_coreml.py
+    probe_swiftvr_reae_decoder_state_coreml.py
+  )
+  mkdir -p "$RESOURCES/model-tools/scripts/apple"
+  for script in "${portable_apple_scripts[@]}"; do
+    cp "$ROOT/scripts/apple/$script" \
+      "$RESOURCES/model-tools/scripts/apple/$script"
+  done
   cp "$ROOT/scripts/download_nomos_roi_enhancers.py" \
     "$RESOURCES/model-tools/scripts/download_nomos_roi_enhancers.py"
 chmod +x \

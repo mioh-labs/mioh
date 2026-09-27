@@ -987,7 +987,8 @@ class StandaloneAppOptionTests(unittest.TestCase):
             '  COREML_DETECTION_ASSETS+=(',
             build_script,
         )
-        self.assertIn("-iname '*rfdetr*' -delete", build_script)
+        portable_scripts = build_script.split("portable_apple_scripts=(", 1)[1].split(")", 1)[0]
+        self.assertNotIn("export_rfdetr_seg_coreai.py", portable_scripts)
         self.assertIn(
             '"$RESOURCES/runtime/lib/python3.12/site-packages/rfdetr"',
             build_script,
@@ -1206,6 +1207,15 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn('APP_BASENAME="mioh-universal"', script)
         self.assertIn('DMG_BASENAME="mioh-universal-0.14.3-017-unsigned"', script)
         self.assertIn('exec "$PACKAGE_DIR/build_app.sh"', script)
+
+    def test_universal_bundle_allowlists_conversion_scripts(self):
+        script = BUILD_SCRIPT.read_text()
+        self.assertIn("portable_apple_scripts=(", script)
+        self.assertIn("export_basicvsrpp_variable_chunk6.py", script)
+        self.assertIn("export_swiftvr_dit_group_coreml.py", script)
+        self.assertNotIn('ditto "$ROOT/scripts/apple"', script)
+        self.assertIn('rm -f "$RESOURCES/runtime/bin/lada"', script)
+        self.assertIn('sysconfig_data="$RESOURCES/runtime/lib/python3.12/', script)
 
     def test_portable_swift_build_omits_architecture_override(self):
         source = APP_SOURCE.read_text()
