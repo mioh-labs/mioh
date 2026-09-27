@@ -6,6 +6,35 @@ mioh is a macOS-focused fork of [Lada](https://github.com/ladaapp/lada) for vide
 
 This repository is the public source/distribution repository for the macOS build. The only app build intended for public distribution here is the **mioh universal macOS build**.
 
+<br>
+
+<div align="center">
+
+<h1>💛 Support mioh 💛</h1>
+
+<h3>Help keep Apple Silicon development, testing,<br>and model packaging moving.</h3>
+
+<br>
+
+<a href="https://ko-fi.com/miohlabs">
+  <img src="https://img.shields.io/badge/Support%20mioh%20on%20Ko--fi-FF5E5B?style=for-the-badge&logo=kofi&logoColor=white" alt="Support mioh on Ko-fi" width="460">
+</a>
+
+<br>
+<br>
+
+<p><b>☕ If mioh helps your workflow, a small donation makes a real difference. ☕</b></p>
+
+<p><a href="https://ko-fi.com/miohlabs"><b>ko-fi.com/miohlabs</b></a></p>
+
+<sub>Thank you for supporting independent development. 🙏</sub>
+
+</div>
+
+<br>
+
+---
+
 ## Download
 
 The universal build should be published as a GitHub Release asset:
@@ -36,22 +65,6 @@ build/macos-standalone-universal/mioh-universal-0.14.3-016-unsigned.dmg
 
 See [packaging/macOS/README.md](packaging/macOS/README.md) for full build
 notes, model download/export steps, and requirements.
-
-<div align="center">
-
-## 💛 Support mioh
-
-### Help keep Apple Silicon development, testing, and model packaging moving.
-
-[Support mioh on Ko-fi](https://ko-fi.com/miohlabs)
-
-<br>
-
-**If mioh helps your workflow, a small donation makes a real difference.**
-
-Thank you for supporting independent development.
-
-</div>
 
 ## Models are not included
 
