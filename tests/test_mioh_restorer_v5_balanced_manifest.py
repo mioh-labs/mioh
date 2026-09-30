@@ -95,14 +95,14 @@ def test_sampled_clip_source_ids_can_be_grouped(tmp_path: Path) -> None:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     path = tmp_path / "sample.json"
-    path.write_text('{"name":"private-work-id.mkv"}', encoding="utf-8")
+    path.write_text('{"name":"private-work-id-t456.mkv"}', encoding="utf-8")
     assert module.metadata_source_id(path, strip_sampled_timestamp=True) == "private-work-id"
-    path.write_text('{"name":"private-work-id.mkv"}', encoding="utf-8")
+    path.write_text('{"name":"fc2-000000-t456.mkv"}', encoding="utf-8")
     assert module.metadata_source_id(
         path,
         strip_sampled_timestamp=True,
         canonicalize_private_source_id=True,
-    ) == "private-work-id"
+    ) == "private-work-000000"
 
 
 def test_hq_training_rejects_sub_256_manifest_before_model_start(tmp_path: Path) -> None:

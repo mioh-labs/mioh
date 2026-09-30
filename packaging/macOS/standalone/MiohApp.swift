@@ -93,6 +93,9 @@ struct NativeExportConfiguration: Codable, Sendable {
   let blendFeather: Float
   /// Paste the restoration only over the detected mosaic, not the whole crop.
   var restoreMaskOnly: Bool? = nil
+  /// "labelField" gives every mosaic pixel one owner (CELF); nil keeps the
+  /// per-detection restoration.
+  var multiMosaicMode: String? = nil
   let sharpenStrength: Float
   let detailBoost: Float
   let textureMix: Float
@@ -163,6 +166,7 @@ struct NativeExportConfiguration: Codable, Sendable {
     case contextFraction
     case blendFeather
     case restoreMaskOnly
+    case multiMosaicMode
     case sharpenStrength
     case detailBoost
     case textureMix
@@ -223,6 +227,9 @@ private struct NativePreviewLaunchConfiguration: Encodable {
   let blendFeather: Float
   /// Paste the restoration only over the detected mosaic, not the whole crop.
   var restoreMaskOnly: Bool? = nil
+  /// "labelField" gives every mosaic pixel one owner (CELF); nil keeps the
+  /// per-detection restoration.
+  var multiMosaicMode: String? = nil
   let sharpenStrength: Float
   let detailBoost: Float
   let textureMix: Float
@@ -703,6 +710,7 @@ struct MiohUserDefaultsSnapshot: Codable {
   var detailBoost: Double
   var blendFeather: Double
   var restoreMaskOnly: Bool?
+  var multiMosaicMode: String?
   var textureMix: Double
   var smoothStrength: Double
   var effectUpscale: Int
@@ -794,6 +802,7 @@ struct MiohUserDefaultsSnapshot: Codable {
       detailBoost: 0.0,
       blendFeather: 1.0,
       restoreMaskOnly: true,
+      multiMosaicMode: "perDetection",
       textureMix: 0.0,
       smoothStrength: 0.0,
       effectUpscale: 1,
@@ -927,6 +936,10 @@ final class RestorationRunner: ObservableObject {
   /// Paste the restoration only over the detected mosaic (not faces or other
   /// unmosaicked parts of the crop).
   @Published var restoreMaskOnly = true
+  /// How overlapping mosaics are restored: "perDetection" (each detection,
+  /// the established behaviour) or "labelField" (CELF: one owner per mosaic
+  /// pixel, see MosaicLabelFieldTracker.swift).
+  @Published var multiMosaicMode = "perDetection"
   @Published var textureMix = 0.0
   @Published var smoothStrength = 0.0
   @Published var effectUpscale = 1
@@ -1867,6 +1880,7 @@ final class RestorationRunner: ObservableObject {
       confidenceThreshold: detection.confidenceThreshold,
       blendFeather: Float(blendFeather),
       restoreMaskOnly: restoreMaskOnly,
+      multiMosaicMode: multiMosaicMode == "labelField" ? "labelField" : nil,
       sharpenStrength: Float(sharpenStrength),
       detailBoost: Float(detailBoost),
       textureMix: Float(textureMix),
@@ -3158,6 +3172,7 @@ final class RestorationRunner: ObservableObject {
       detailBoost: detailBoost,
       blendFeather: blendFeather,
       restoreMaskOnly: restoreMaskOnly,
+      multiMosaicMode: multiMosaicMode,
       textureMix: textureMix,
       smoothStrength: smoothStrength,
       effectUpscale: effectUpscale,
@@ -3263,6 +3278,7 @@ final class RestorationRunner: ObservableObject {
     detailBoost = min(max(snapshot.detailBoost, 0), 1)
     blendFeather = min(max(snapshot.blendFeather, 0), 3)
     restoreMaskOnly = snapshot.restoreMaskOnly ?? true
+    multiMosaicMode = snapshot.multiMosaicMode == "labelField" ? "labelField" : "perDetection"
     textureMix = min(max(snapshot.textureMix, 0), 1)
     smoothStrength = min(max(snapshot.smoothStrength, 0), 1)
     effectUpscale = min(max(snapshot.effectUpscale, 1), 4)
@@ -3468,6 +3484,7 @@ final class RestorationRunner: ObservableObject {
       confidenceThreshold: detection.confidenceThreshold,
       blendFeather: Float(effectiveBlendFeather),
       restoreMaskOnly: restoreMaskOnly,
+      multiMosaicMode: multiMosaicMode == "labelField" ? "labelField" : nil,
       sharpenStrength: Float(effectiveSharpenStrength),
       detailBoost: Float(effectiveDetailBoost),
       textureMix: Float(effectiveTextureMix),
@@ -4344,6 +4361,15 @@ struct ContentView: View {
           .font(.caption)
           .foregroundStyle(.secondary)
         Toggle("顔モザイクを検出", isOn: $runner.detectFaceMosaics)
+      }
+      Section("複数モザイク") {
+        Picker("複数モザイクの扱い", selection: $runner.multiMosaicMode) {
+          Text("検出ごと（従来）").tag("perDetection")
+          Text("画素ごとの持ち主（CELF）").tag("labelField")
+        }
+        Text("CELFは、重なったモザイクの画素ひとつひとつに持ち主を決めて1つずつ復元します。検出の枠がまとまったり分かれたりしても、モザイクごとの範囲と縮尺が変わらず、同じ場所を二重に貼りません。")
+          .font(.caption)
+          .foregroundStyle(.secondary)
       }
     }.formStyle(.grouped)
   }

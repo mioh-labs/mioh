@@ -1,9 +1,9 @@
 # mioh ユーザーマニュアル
 
-バージョン 0.14.3-017
+バージョン 0.14.3-018
 
 対象: mioh-universal for macOS
-改訂日: 2026年9月27日
+改訂日: 2026年9月30日
 
 ## 1. miohについて
 
@@ -23,7 +23,7 @@ miohは、動画内のモザイク領域を検出し、復元モデルで処理�
 
 ## 2. インストールと起動
 
-1. [miohのv0.14.3-017リリース](https://github.com/mioh-labs/mioh/releases/tag/v0.14.3-017)から`mioh-universal-0.14.3-017-unsigned.dmg`を入手します。
+1. [miohのv0.14.3-018リリース](https://github.com/mioh-labs/mioh/releases/tag/v0.14.3-018)から`mioh-universal-0.14.3-018-unsigned.dmg`を入手します。
 2. `mioh-universal.app`を`Applications`へドラッグします。
 3. 次節のモデルダウンロードと変換を完了します。
 4. Applicationsフォルダからmiohを起動します。
@@ -107,13 +107,13 @@ uv run --no-project --python 3.12 --with reportlab \
 zsh packaging/macOS/standalone/build_universal_app.sh
 ```
 
-成果物は`build/macos-standalone-universal/mioh-universal.app`と`build/macos-standalone-universal/mioh-universal-0.14.3-017-unsigned.dmg`です。ビルドはモデルなしの配布物を作成します。モデルを使うMacでは、アプリのインストール後に2.1節のダウンロード・変換を行ってください。ビルド用スクリプトはアプリ本体とCore AIヘルパーを別々のmacOSターゲット向けにコンパイルします。
+成果物は`build/macos-standalone-universal/mioh-universal.app`と`build/macos-standalone-universal/mioh-universal-0.14.3-018-unsigned.dmg`です。ビルドはモデルなしの配布物を作成します。モデルを使うMacでは、アプリのインストール後に2.1節のダウンロード・変換を行ってください。ビルド用スクリプトはアプリ本体とCore AIヘルパーを別々のmacOSターゲット向けにコンパイルします。
 
 ビルド後は次を確認します。`hdiutil verify`の成功に加え、アプリ内のPythonと2本のモデルツールが存在することが重要です。
 
 ```zsh
 APP=build/macos-standalone-universal/mioh-universal.app
-DMG=build/macos-standalone-universal/mioh-universal-0.14.3-017-unsigned.dmg
+DMG=build/macos-standalone-universal/mioh-universal-0.14.3-018-unsigned.dmg
 test -x "$APP/Contents/Resources/runtime/bin/python3.12"
 test -f "$APP/Contents/Resources/model-tools/download-mioh-models.zsh"
 test -f "$APP/Contents/Resources/model-tools/convert-mioh-models.zsh"
@@ -276,6 +276,8 @@ VR検出モデルの重みはUniversal版やGitHub Releaseには同梱せず、�
 「空検出先読み」は一時的に検出が途切れたとき、同じシーンの追跡を継続するフレーム数です。大きくすると短い検出抜けに強くなりますが、別の領域へ誤って追従する場合があります。
 
 「顔モザイクを検出」は顔のモザイクも処理対象へ含めます。通常はオフです。
+
+「複数モザイクの扱い」は初期値の「検出ごと（従来）」と「画素ごとの持ち主（CELF）」から選びます。CELFは重なった検出に含まれるモザイク画素の担当を追跡し、複数の領域を個別に復元する試験的な方式です。まず短い区間で画質と処理時間を確認してください。検出モデル自体は切り替わりません。
 
 <!-- pagebreak -->
 
@@ -488,9 +490,9 @@ ROIエンハンサー強度、テクスチャ、ディテール、シャープ�
 | 復元 | 自動選択、最大クリップ長自動、Temporal overlap 8、クロスフェードオン |
 | 合成 | シャープ0、ディテール0、境界フェザー1、テクスチャ0、スムージング0、1x |
 | ROIエンハンサー | none、倍率4x、強度0、タイル0 |
-| 検出 | v2-coreml、空検出先読み10、顔モザイクオフ |
+| 検出 | v2-coreml、空検出先読み10、顔モザイクオフ、複数モザイクは検出ごと |
 | 出力 | HEVC Apple GPU balanced、ビットレート倍率3.0 |
 | メモリ | 掃除間隔1、空き4GB、MPS比率0.46 |
 | 再生 | バッファ8秒、通常、SBS左右、左目、視野角60度 |
 
-本マニュアルのインストール・ビルド・モデル導入手順はmioh-universal 0.14.3-017の配布スクリプトを基準にしています。画面項目は配布版や選択したモデルにより異なる場合があります。
+本マニュアルのインストール・ビルド・モデル導入手順はmioh-universal 0.14.3-018の配布スクリプトを基準にしています。画面項目は配布版や選択したモデルにより異なる場合があります。

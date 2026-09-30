@@ -149,6 +149,7 @@ xcrun swiftc \
   -framework ImageIO \
   "$PACKAGE_DIR/SwiftVRNativeClip.swift" \
   "$PACKAGE_DIR/SwiftVRInlineEnhancer.swift" \
+  "$PACKAGE_DIR/MosaicLabelFieldTracker.swift" \
   "$PACKAGE_DIR/NativePreviewPipeline.swift" \
   -o "$RESOURCES/bin/mioh-native-coreai-preview"
 xcrun swiftc \

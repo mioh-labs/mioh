@@ -76,6 +76,11 @@ private struct NativePreviewConfiguration: Decodable {
   /// not over the whole crop rectangle. Absent (older configurations) keeps
   /// the whole-crop paste.
   let restoreMaskOnly: Bool?
+  /// How overlapping mosaics become restoration ROIs. Absent or
+  /// "perDetection" restores each detection (the established behaviour);
+  /// "labelField" gives every mosaic pixel one owner (CELF, see
+  /// MosaicLabelFieldTracker.swift).
+  let multiMosaicMode: String?
   let sharpenStrength: Float?
   let detailBoost: Float?
   let textureMix: Float?
@@ -1282,6 +1287,15 @@ private struct Detection {
   let maskHeight: Int
   let maskProjection: DetectionMaskProjection
   let maskThreshold: Float
+  /// Set when a merged detection is split per mosaic: only this part of the
+  /// mask belongs to the detection.
+  var maskClip: IntBox? = nil
+  /// The part of a split mask that went to the other mosaic.
+  var maskExclude: IntBox? = nil
+
+  var area: Int {
+    max(0, right - left + 1) * max(0, bottom - top + 1)
+  }
 }
 
 private struct DetectionCandidate {
@@ -1615,8 +1629,7 @@ private final class CoreAIDetector: NativeDetecting {
         )
       )
     }
-    let retained = Self.nonMaximumSuppression(
-      decoded, threshold: iouThreshold)
+    let retained = nonMaximumSuppression(decoded, threshold: iouThreshold)
     let sourceWidth = Float(CVPixelBufferGetWidth(source))
     let sourceHeight = Float(CVPixelBufferGetHeight(source))
     let sourceWidthInt = Int(sourceWidth)
@@ -1738,41 +1751,17 @@ private final class CoreAIDetector: NativeDetecting {
     }
   }
 
-  fileprivate static func nonMaximumSuppression(
+  private func nonMaximumSuppression(
     _ candidates: [DetectionCandidate],
     threshold: Float
   ) -> [DetectionCandidate] {
     let sorted = candidates.sorted { $0.confidence > $1.confidence }
     var kept: [DetectionCandidate] = []
     for candidate in sorted {
-      let conflicts = kept.filter {
+      if kept.contains(where: {
         $0.classIndex == candidate.classIndex
           && Self.iou($0, candidate) > threshold
-      }
-      // A nearly tied, substantially wider candidate may cover mosaic that
-      // the top-scoring tight box clips away. Keep that distinct outer extent
-      // while still suppressing near-identical candidates around either box.
-      let isDistinctExpansion = !conflicts.isEmpty
-        && conflicts.allSatisfy { prior in
-          let priorLeft = prior.x - prior.width * 0.5
-          let priorTop = prior.y - prior.height * 0.5
-          let priorRight = prior.x + prior.width * 0.5
-          let priorBottom = prior.y + prior.height * 0.5
-          let left = candidate.x - candidate.width * 0.5
-          let top = candidate.y - candidate.height * 0.5
-          let right = candidate.x + candidate.width * 0.5
-          let bottom = candidate.y + candidate.height * 0.5
-          let extensionDistance = max(
-            priorLeft - left, priorTop - top,
-            right - priorRight, bottom - priorBottom
-          )
-          return candidate.confidence >= prior.confidence - 0.03
-            && candidate.width * candidate.height
-              >= prior.width * prior.height * 1.15
-            && extensionDistance
-              >= max(12, min(prior.width, prior.height) * 0.15)
-        }
-      if !conflicts.isEmpty && !isDistinctExpansion {
+      }) {
         continue
       }
       kept.append(candidate)
@@ -2192,10 +2181,199 @@ private final class RFDETRDetector: NativeDetecting {
   }
 }
 
+/// CELF: a detector mask sampled at the centre of every 4 px cell of its box.
+private func labelFieldObservation(
+  _ detection: Detection, sourceWidth: Int, sourceHeight: Int
+) -> LabelFieldObservation? {
+  guard detection.maskWidth > 0, detection.maskHeight > 0,
+    detection.detectorMask.count == detection.maskWidth * detection.maskHeight
+  else { return nil }
+  let startX: Float
+  let countX: Float
+  let startY: Float
+  let countY: Float
+  switch detection.maskProjection {
+  case .yoloLetterbox:
+    let scale = min(
+      Float(detectorSize) / Float(sourceHeight),
+      Float(detectorSize) / Float(sourceWidth))
+    let padX = (Float(detectorSize) - Float(sourceWidth) * scale) / 2
+    let padY = (Float(detectorSize) - Float(sourceHeight) * scale) / 2
+    let left = Int(round(padX - 0.1))
+    let top = Int(round(padY - 0.1))
+    startX = Float(left)
+    countX = Float(detectorSize - Int(round(padX + 0.1)) - left)
+    startY = Float(top)
+    countY = Float(detectorSize - Int(round(padY + 0.1)) - top)
+  case .directResize:
+    startX = 0
+    countX = Float(detection.maskWidth)
+    startY = 0
+    countY = Float(detection.maskHeight)
+  }
+  let cellSize = MosaicLabelFieldTracker.cellSize
+  let gridWidth = (sourceWidth + cellSize - 1) / cellSize
+  let gridHeight = (sourceHeight + cellSize - 1) / cellSize
+  let top = max(0, detection.top / cellSize)
+  let bottom = min(gridHeight - 1, detection.bottom / cellSize)
+  let left = max(0, detection.left / cellSize)
+  let right = min(gridWidth - 1, detection.right / cellSize)
+  guard top <= bottom, left <= right else { return nil }
+  var cells: [Int] = []
+  for cy in top...bottom {
+    let py = min(sourceHeight - 1, cy * cellSize + cellSize / 2)
+    let maskY = min(detection.maskHeight - 1, max(0, Int(
+      (startY + (Float(py) + 0.5) * countY / Float(sourceHeight) - 0.5).rounded())))
+    for cx in left...right {
+      let px = min(sourceWidth - 1, cx * cellSize + cellSize / 2)
+      let maskX = min(detection.maskWidth - 1, max(0, Int(
+        (startX + (Float(px) + 0.5) * countX / Float(sourceWidth) - 0.5).rounded())))
+      if detection.detectorMask[maskY * detection.maskWidth + maskX]
+        > detection.maskThreshold
+      {
+        cells.append(cy * gridWidth + cx)
+      }
+    }
+  }
+  return LabelFieldObservation(
+    box: LabelFieldBox(
+      left: detection.left, top: detection.top,
+      right: detection.right, bottom: detection.bottom),
+    cells: cells)
+}
+
+/// CELF: 8-bit luma (BT.601 video range, like a decoded Y plane) of a
+/// rectangle of a BGRA frame.
+private func labelFieldLuma(_ buffer: CVPixelBuffer, _ box: LabelFieldBox) -> [UInt8] {
+  guard CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_32BGRA,
+    CVPixelBufferLockBaseAddress(buffer, .readOnly) == kCVReturnSuccess
+  else { return [] }
+  defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+  guard let base = CVPixelBufferGetBaseAddress(buffer)?
+    .assumingMemoryBound(to: UInt8.self)
+  else { return [] }
+  let rowBytes = CVPixelBufferGetBytesPerRow(buffer)
+  var luma = [UInt8](repeating: 0, count: box.width * box.height)
+  for y in 0..<box.height {
+    let row = base.advanced(by: (box.top + y) * rowBytes + box.left * 4)
+    for x in 0..<box.width {
+      let blue = Int(row[x * 4])
+      let green = Int(row[x * 4 + 1])
+      let red = Int(row[x * 4 + 2])
+      luma[y * box.width + x] = UInt8(min(255, ((66 * red + 129 * green + 25 * blue + 128) >> 8) + 16))
+    }
+  }
+  return luma
+}
+
+/// CELF: a 64x36 luma thumbnail for cut detection.
+private func labelFieldThumbnail(_ buffer: CVPixelBuffer) -> [UInt8]? {
+  let width = CVPixelBufferGetWidth(buffer)
+  let height = CVPixelBufferGetHeight(buffer)
+  guard width >= 64, height >= 36,
+    CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_32BGRA,
+    CVPixelBufferLockBaseAddress(buffer, .readOnly) == kCVReturnSuccess
+  else { return nil }
+  defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+  guard let base = CVPixelBufferGetBaseAddress(buffer)?
+    .assumingMemoryBound(to: UInt8.self)
+  else { return nil }
+  let rowBytes = CVPixelBufferGetBytesPerRow(buffer)
+  var thumbnail = [UInt8](repeating: 0, count: 64 * 36)
+  for y in 0..<36 {
+    let row = base.advanced(by: ((y * height) / 36 + height / 72) * rowBytes)
+    for x in 0..<64 {
+      let pixel = row.advanced(by: ((x * width) / 64 + width / 128) * 4)
+      thumbnail[y * 64 + x] = UInt8(
+        (Int(pixel[0]) * 29 + Int(pixel[1]) * 150 + Int(pixel[2]) * 77) >> 8)
+    }
+  }
+  return thumbnail
+}
+
+/// CELF: a mosaic the detector misses for up to `maximumGap` frames keeps
+/// its cells (moved along with the track) instead of flashing unrestored,
+/// as long as the track is seen again after the gap inside this batch; the
+/// two frames before a track appears get its first cells.
+private func fillLabelFieldGaps(_ frames: inout [DetectedFrame], maximumGap: Int) {
+  var presence: [Int: [Int]] = [:]
+  for (index, frame) in frames.enumerated() {
+    guard let boxes = frame.labelField?.boxes else { continue }
+    for id in boxes.keys { presence[id, default: []].append(index) }
+  }
+  var additions: [Int: [Int: [(cell: Int, weight: Float)]]] = [:]
+  for id in presence.keys.sorted() {
+    let seen = presence[id]!
+    for (before, after) in zip(seen, seen.dropFirst())
+    where after - before > 1 && after - before - 1 <= maximumGap {
+      guard let first = frames[before].labelField, let last = frames[after].labelField,
+        let firstBox = first.boxes[id], let lastBox = last.boxes[id]
+      else { continue }
+      let cells = first.cells(of: id)
+      let span = Double(after - before)
+      for gap in (before + 1)..<after {
+        let t = Double(gap - before) / span
+        let dx = Int(((Double(lastBox.left + lastBox.right) - Double(firstBox.left + firstBox.right))
+          / 2 * t / Double(first.cellSize)).rounded())
+        let dy = Int(((Double(lastBox.top + lastBox.bottom) - Double(firstBox.top + firstBox.bottom))
+          / 2 * t / Double(first.cellSize)).rounded())
+        additions[gap, default: [:]][id] = cells.compactMap { entry in
+          let x = entry.cell % first.gridWidth + dx
+          let y = entry.cell / first.gridWidth + dy
+          guard x >= 0, x < first.gridWidth, y >= 0, y < first.gridHeight else { return nil }
+          return (cell: y * first.gridWidth + x, weight: entry.weight)
+        }
+      }
+    }
+  }
+  // The detector also reacts a frame or two late when a mosaic comes out
+  // from behind something: those frames get the cells it has once detected
+  // (the tracker holds a vanishing mosaic the same way).
+  let leadIn = 2
+  for id in presence.keys.sorted() {
+    let seen = presence[id]!
+    for (offset, first) in seen.enumerated()
+    where first > 0 && (offset == 0 || seen[offset - 1] < first - 1) {
+      guard let field = frames[first].labelField else { continue }
+      let cells = field.cells(of: id)
+      for earlier in max(0, first - leadIn)..<first
+      where additions[earlier]?[id] == nil
+        && !(frames[earlier].labelField?.boxes.keys.contains(id) ?? false)
+      {
+        additions[earlier, default: [:]][id] = cells
+      }
+    }
+  }
+  // A track can also keep existing while the detector drops only part of
+  // its mosaic for a few frames. A cell the same track covers before and
+  // after such a gap stays covered through it.
+  for id in presence.keys.sorted() {
+    var lastCovered: [Int: Int] = [:]
+    for index in presence[id]! {
+      guard let field = frames[index].labelField else { continue }
+      for entry in field.cells(of: id) where entry.weight >= 0.99 {
+        if let previous = lastCovered[entry.cell], index - previous > 1,
+          index - previous - 1 <= maximumGap
+        {
+          for gap in (previous + 1)..<index {
+            additions[gap, default: [:]][id, default: []].append((cell: entry.cell, weight: 1))
+          }
+        }
+        lastCovered[entry.cell] = index
+      }
+    }
+  }
+  for (index, filling) in additions {
+    guard let field = frames[index].labelField else { continue }
+    frames[index].labelField = field.filling(filling)
+  }
+}
+
 private struct DetectedFrame {
   let frame: DecodedFrame
   let detections: [Detection]
-  let trackedROIs: [NativeTrackedROI]
+  /// CELF only: the owner of every mosaic cell in this frame.
+  var labelField: LabelFieldFrame? = nil
 }
 
 private struct DetectedBatch {
@@ -2220,64 +2398,6 @@ private struct IntBox: Hashable {
 
   var width: Int { right - left + 1 }
   var height: Int { bottom - top + 1 }
-  var area: Int { width * height }
-  var centerX: Float { Float(left + right) * 0.5 }
-  var centerY: Float { Float(top + bottom) * 0.5 }
-
-  func contains(x: Float, y: Float) -> Bool {
-    x >= Float(left) && x <= Float(right)
-      && y >= Float(top) && y <= Float(bottom)
-  }
-
-  func intersectionArea(_ other: IntBox) -> Int {
-    max(0, min(right, other.right) - max(left, other.left) + 1)
-      * max(0, min(bottom, other.bottom) - max(top, other.top) + 1)
-  }
-
-  func moved(dx: Int, dy: Int, imageWidth: Int, imageHeight: Int) -> IntBox {
-    let shiftX = min(max(dx, -left), imageWidth - 1 - right)
-    let shiftY = min(max(dy, -top), imageHeight - 1 - bottom)
-    return IntBox(
-      left: left + shiftX, top: top + shiftY,
-      right: right + shiftX, bottom: bottom + shiftY
-    )
-  }
-
-  func resizedToward(_ observed: IntBox, imageWidth: Int, imageHeight: Int)
-    -> IntBox
-  {
-    // Move with the observation, grow as soon as coverage needs it, and
-    // shrink slowly so a one-frame detector wobble cannot resize the crop.
-    let newWidth = observed.width >= width
-      ? observed.width : max(observed.width, Int(ceil(Float(width) * 0.85)))
-    let newHeight = observed.height >= height
-      ? observed.height : max(observed.height, Int(ceil(Float(height) * 0.85)))
-    let left = Int(round(observed.centerX - Float(newWidth - 1) * 0.5))
-    let top = Int(round(observed.centerY - Float(newHeight - 1) * 0.5))
-    return IntBox(
-      left: left, top: top, right: left + newWidth - 1,
-      bottom: top + newHeight - 1
-    ).moved(dx: 0, dy: 0, imageWidth: imageWidth, imageHeight: imageHeight)
-  }
-
-  func expanded(by pixels: Int, imageWidth: Int, imageHeight: Int) -> IntBox {
-    IntBox(
-      left: max(0, left - pixels), top: max(0, top - pixels),
-      right: min(imageWidth - 1, right + pixels),
-      bottom: min(imageHeight - 1, bottom + pixels)
-    )
-  }
-
-  func capped(side: Int, imageWidth: Int, imageHeight: Int) -> IntBox {
-    let width = min(self.width, side)
-    let height = min(self.height, side)
-    let left = Int(round(centerX - Float(width - 1) * 0.5))
-    let top = Int(round(centerY - Float(height - 1) * 0.5))
-    return IntBox(
-      left: left, top: top,
-      right: left + width - 1, bottom: top + height - 1
-    ).moved(dx: 0, dy: 0, imageWidth: imageWidth, imageHeight: imageHeight)
-  }
 
   func overlaps(_ other: IntBox) -> Bool {
     left < other.right && other.left < right
@@ -2292,547 +2412,14 @@ private struct IntBox: Hashable {
       bottom: max(bottom, other.bottom)
     )
   }
-}
 
-/// A detector observation may support several existing objects when its box
-/// joins them. The ownership boxes split that one mask without making its
-/// large bounding rectangle the restoration ROI for every object.
-private struct NativeTrackedROI {
-  let id: Int
-  let box: IntBox
-  let preferredBox: IntBox
-  let detections: [Detection]
-  let carriedDetections: [Detection]
-  let ownershipBoxes: [IntBox]
-  let ownershipAnchors: [IntBox]
-  let ownerIndex: Int
-  let maskOffsetX: Int
-  let maskOffsetY: Int
-}
-
-private func mosaicOwnerIndex(
-  x: Int, y: Int, anchors: [IntBox]
-) -> Int? {
-  guard !anchors.isEmpty else { return nil }
-  func distance(_ box: IntBox) -> Int {
-    let dx = max(0, max(box.left - x, x - box.right))
-    let dy = max(0, max(box.top - y, y - box.bottom))
-    return dx * dx + dy * dy
-  }
-  // Distance to the existing ROI edge splits the gap midway between two
-  // objects. Inside overlapping ROIs, prefer the smaller established ROI.
-  return anchors.indices.min { lhs, rhs in
-    let leftDistance = distance(anchors[lhs])
-    let rightDistance = distance(anchors[rhs])
-    if leftDistance != rightDistance {
-      return leftDistance < rightDistance
-    }
-    if leftDistance == 0 && anchors[lhs].area != anchors[rhs].area {
-      return anchors[lhs].area < anchors[rhs].area
-    }
-    let leftX = (Float(x) - anchors[lhs].centerX)
-      / Float(max(1, anchors[lhs].width))
-    let leftY = (Float(y) - anchors[lhs].centerY)
-      / Float(max(1, anchors[lhs].height))
-    let rightX = (Float(x) - anchors[rhs].centerX)
-      / Float(max(1, anchors[rhs].width))
-    let rightY = (Float(y) - anchors[rhs].centerY)
-      / Float(max(1, anchors[rhs].height))
-    let leftCenterDistance = leftX * leftX + leftY * leftY
-    let rightCenterDistance = rightX * rightX + rightY * rightY
-    return leftCenterDistance == rightCenterDistance
-      ? lhs < rhs : leftCenterDistance < rightCenterDistance
-  }
-}
-
-/// Runs once, in decoded-frame order, before restoration batches are sent to
-/// parallel workers. It tracks a variable number of objects across batches.
-private final class NativeROITracker {
-  private struct Track {
-    let id: Int
-    var box: IntBox
-    var preferredBox: IntBox
-    var velocityX: Float = 0
-    var velocityY: Float = 0
-    var lastSupportFrame: Int
-    var lastMergedBox: IntBox? = nil
-    var lastDetections: [Detection] = []
-    var maskAnchorBox: IntBox? = nil
-    var memoryDetections: [Detection] = []
-    var memoryBox: IntBox? = nil
-    var memoryOffsetX = 0
-    var memoryOffsetY = 0
-    var memoryAge = 0
-    var ownershipBoxes: [IntBox] = []
-    var ownershipAnchors: [IntBox] = []
-    var ownerIndex = 0
-    let classIndex: Int
-  }
-
-  private var tracks: [Track] = []
-  private var previousSource: CVPixelBuffer?
-  private var nextID = 0
-  private var frameIndex = 0
-  private let maxMissingFrames: Int
-
-  init(maxMissingFrames: Int) {
-    self.maxMissingFrames = max(1, maxMissingFrames)
-  }
-
-  /// Estimate translation in source-image coordinates before any crop or
-  /// restoration is chosen. The restoration model's flow is only available
-  /// later, inside the already-selected 256px crop.
-  private func sourceMotions(to current: CVPixelBuffer) -> [(Int, Int)?] {
-    guard let previous = previousSource,
-      CVPixelBufferGetPixelFormatType(previous) == kCVPixelFormatType_32BGRA,
-      CVPixelBufferGetPixelFormatType(current) == kCVPixelFormatType_32BGRA,
-      CVPixelBufferGetWidth(previous) == CVPixelBufferGetWidth(current),
-      CVPixelBufferGetHeight(previous) == CVPixelBufferGetHeight(current),
-      CVPixelBufferLockBaseAddress(previous, .readOnly) == kCVReturnSuccess
-    else { return Array(repeating: nil, count: tracks.count) }
-    defer { CVPixelBufferUnlockBaseAddress(previous, .readOnly) }
-    guard CVPixelBufferLockBaseAddress(current, .readOnly) == kCVReturnSuccess
-    else { return Array(repeating: nil, count: tracks.count) }
-    defer { CVPixelBufferUnlockBaseAddress(current, .readOnly) }
-    guard let oldBase = CVPixelBufferGetBaseAddress(previous),
-      let newBase = CVPixelBufferGetBaseAddress(current)
-    else { return Array(repeating: nil, count: tracks.count) }
-    let old = oldBase.assumingMemoryBound(to: UInt8.self)
-    let new = newBase.assumingMemoryBound(to: UInt8.self)
-    let oldStride = CVPixelBufferGetBytesPerRow(previous)
-    let newStride = CVPixelBufferGetBytesPerRow(current)
-    let width = CVPixelBufferGetWidth(current)
-    let height = CVPixelBufferGetHeight(current)
-    return tracks.map { track in
-      let expectedX = Int(round(track.velocityX))
-      let expectedY = Int(round(track.velocityY))
-      var points: [(Int, Int)] = []
-      for row in 1...6 {
-        for column in 1...6 {
-          let x = track.box.left + track.box.width * column / 7
-          let y = track.box.top + track.box.height * row / 7
-          if x >= 0, x < width, y >= 0, y < height {
-            points.append((x, y))
-          }
-        }
-      }
-      guard points.count >= 12 else { return nil }
-      func cost(dx: Int, dy: Int) -> Float {
-        var total = 0
-        var count = 0
-        for (x, y) in points {
-          let newX = x + dx
-          let newY = y + dy
-          guard newX >= 0, newX < width, newY >= 0, newY < height
-          else { continue }
-          let oldIndex = y * oldStride + x * 4
-          let newIndex = newY * newStride + newX * 4
-          for channel in 0..<3 {
-            total += abs(Int(old[oldIndex + channel]) - Int(new[newIndex + channel]))
-          }
-          count += 1
-        }
-        guard count >= 12 else { return .infinity }
-        return Float(total) / Float(count * 3)
-          + Float(abs(dx - expectedX) + abs(dy - expectedY)) * 0.15
-      }
-      var bestX = expectedX
-      var bestY = expectedY
-      var bestCost = cost(dx: bestX, dy: bestY)
-      for dy in stride(from: expectedY - 24, through: expectedY + 24, by: 8) {
-        for dx in stride(from: expectedX - 24, through: expectedX + 24, by: 8) {
-          let candidate = cost(dx: dx, dy: dy)
-          if candidate < bestCost {
-            bestCost = candidate
-            bestX = dx
-            bestY = dy
-          }
-        }
-      }
-      let coarseX = bestX
-      let coarseY = bestY
-      for dy in (coarseY - 4)...(coarseY + 4) {
-        for dx in (coarseX - 4)...(coarseX + 4) {
-          let candidate = cost(dx: dx, dy: dy)
-          if candidate < bestCost {
-            bestCost = candidate
-            bestX = dx
-            bestY = dy
-          }
-        }
-      }
-      return bestCost < 45 ? (bestX, bestY) : nil
-    }
-  }
-
-  private func maskMarked(
-    _ detection: Detection, x: Int, y: Int,
-    imageWidth: Int, imageHeight: Int
-  ) -> Bool {
-    guard detection.maskWidth > 0, detection.maskHeight > 0,
-      detection.detectorMask.count
-        == detection.maskWidth * detection.maskHeight
-    else { return false }
-    let maskX: Int
-    let maskY: Int
-    switch detection.maskProjection {
-    case .yoloLetterbox:
-      let scale = min(
-        Float(detectorSize) / Float(imageWidth),
-        Float(detectorSize) / Float(imageHeight)
-      )
-      let padX = (Float(detectorSize) - Float(imageWidth) * scale) * 0.5
-      let padY = (Float(detectorSize) - Float(imageHeight) * scale) * 0.5
-      maskX = Int(round((Float(x) + 0.5) * scale + padX - 0.5))
-      maskY = Int(round((Float(y) + 0.5) * scale + padY - 0.5))
-    case .directResize:
-      maskX = Int((Float(x) + 0.5) * Float(detection.maskWidth)
-        / Float(imageWidth))
-      maskY = Int((Float(y) + 0.5) * Float(detection.maskHeight)
-        / Float(imageHeight))
-    }
-    guard maskX >= 0, maskX < detection.maskWidth,
-      maskY >= 0, maskY < detection.maskHeight
-    else { return false }
-    return detection.detectorMask[maskY * detection.maskWidth + maskX]
-      > detection.maskThreshold
-  }
-
-  private func maskSupports(
-    _ detection: Detection, near anchor: IntBox,
-    imageWidth: Int, imageHeight: Int
-  ) -> Bool {
-    let detectionArea = max(1,
-      (detection.right - detection.left + 1)
-        * (detection.bottom - detection.top + 1))
-    let broad = detectionArea >= anchor.area * 5 / 4
-    let nearby = broad
-      ? anchor.expanded(
-        by: 24, imageWidth: imageWidth, imageHeight: imageHeight)
-      : anchor
-    let left = max(0, nearby.left, detection.left)
-    let top = max(0, nearby.top, detection.top)
-    let right = min(imageWidth - 1, nearby.right, detection.right)
-    let bottom = min(imageHeight - 1, nearby.bottom, detection.bottom)
-    guard left <= right, top <= bottom else { return false }
-    let stepX = max(1, (right - left + 1) / 12)
-    let stepY = max(1, (bottom - top + 1) / 12)
-    var marked = 0
-    for y in stride(from: top, through: bottom, by: stepY) {
-      for x in stride(from: left, through: right, by: stepX)
-      where maskMarked(
-        detection, x: x, y: y,
-        imageWidth: imageWidth, imageHeight: imageHeight)
-      {
-        marked += 1
-        if marked >= 2 { return true }
-      }
-    }
-    return false
-  }
-
-  private func mergedROI(
-    predicted: IntBox, detection: Detection,
-    seeds: [IntBox], ownerIndex: Int,
-    imageWidth: Int, imageHeight: Int
-  ) -> IntBox {
-    // A joined detector mask can extend farther than the previous small ROI.
-    // Inspect the entire observed box so pixels between the old ROIs are not
-    // silently dropped; assign each marked pixel to its nearest prior track.
-    let search = IntBox(
-      left: max(0, detection.left), top: max(0, detection.top),
-      right: min(imageWidth - 1, detection.right),
-      bottom: min(imageHeight - 1, detection.bottom)
-    )
-    var extent: IntBox?
-    for y in search.top...search.bottom {
-      for x in search.left...search.right {
-        guard maskMarked(
-          detection, x: x, y: y,
-          imageWidth: imageWidth, imageHeight: imageHeight
-        ) else { continue }
-        let nearest = mosaicOwnerIndex(x: x, y: y, anchors: seeds)
-        guard nearest == ownerIndex else { continue }
-        let point = IntBox(left: x, top: y, right: x, bottom: y)
-        extent = extent.map { $0.union(point) } ?? point
-      }
-    }
-    guard let extent else { return predicted }
-    let expandedExtent = extent.expanded(
-      by: 4, imageWidth: imageWidth, imageHeight: imageHeight)
-    return predicted.union(expandedExtent)
-  }
-
-  func update(
-    detections: [Detection], source: CVPixelBuffer
-  ) -> [NativeTrackedROI] {
-    let imageWidth = CVPixelBufferGetWidth(source)
-    let imageHeight = CVPixelBufferGetHeight(source)
-    let frame = frameIndex
-    frameIndex += 1
-    tracks.removeAll { frame - $0.lastSupportFrame > maxMissingFrames }
-    let motions = sourceMotions(to: source)
-    previousSource = source
-    let boxes = detections.map {
-      IntBox(left: $0.left, top: $0.top, right: $0.right, bottom: $0.bottom)
-    }
-    // Predict every surviving object's position from its own recent motion.
-    for index in tracks.indices {
-      let dx = motions[index]?.0 ?? Int(round(tracks[index].velocityX))
-      let dy = motions[index]?.1 ?? Int(round(tracks[index].velocityY))
-      tracks[index].box = tracks[index].box.moved(
-        dx: dx,
-        dy: dy,
-        imageWidth: imageWidth, imageHeight: imageHeight
-      )
-      tracks[index].preferredBox = tracks[index].preferredBox.moved(
-        dx: dx, dy: dy,
-        imageWidth: imageWidth, imageHeight: imageHeight
-      )
-      tracks[index].memoryBox = tracks[index].memoryBox?.moved(
-        dx: dx, dy: dy,
-        imageWidth: imageWidth, imageHeight: imageHeight
-      )
-      tracks[index].memoryOffsetX += dx
-      tracks[index].memoryOffsetY += dy
-    }
-    var supporters = [[Int]](repeating: [], count: detections.count)
-    var mergedCandidates = Set<Int>()
-    for detectionIndex in detections.indices {
-      let box = boxes[detectionIndex]
-      supporters[detectionIndex] = tracks.indices.filter { index in
-        tracks[index].classIndex == detections[detectionIndex].classIndex
-          && maskSupports(
-            detections[detectionIndex],
-            near: tracks[index].preferredBox,
-            imageWidth: imageWidth, imageHeight: imageHeight)
-      }
-      if supporters[detectionIndex].count > 1,
-        let largest = supporters[detectionIndex]
-          .map({ tracks[$0].preferredBox.area }).max(),
-        Float(box.area) >= Float(largest) * 1.25
-      {
-        mergedCandidates.insert(detectionIndex)
-      }
-    }
-
-    var matchedTracks = Set<Int>()
-    var usedDetections = Set<Int>()
-    var result: [NativeTrackedROI] = []
-    var frameDetections = [[Detection]](repeating: [], count: tracks.count)
-    var ownershipGroups = tracks.indices.map { Set([$0]) }
-    // Fine detections take precedence. A track can own only one fine
-    // detection; broader observations may subsequently support many tracks.
-    // Prefer the smaller observation when confidence is comparable in this
-    // already-thresholded detector output, preserving a tight previous ROI.
-    for detectionIndex in detections.indices.sorted(by: {
-      boxes[$0].area == boxes[$1].area
-        ? detections[$0].confidence > detections[$1].confidence
-        : boxes[$0].area < boxes[$1].area
-    }) where !mergedCandidates.contains(detectionIndex) {
-      let box = boxes[detectionIndex]
-      let best = tracks.indices.filter { index in
-        !matchedTracks.contains(index)
-          && tracks[index].classIndex == detections[detectionIndex].classIndex
-          && box.intersectionArea(tracks[index].preferredBox) > 0
-      }.max { lhs, rhs in
-        let left = Float(box.intersectionArea(tracks[lhs].preferredBox))
-          / Float(max(1, min(box.area, tracks[lhs].preferredBox.area)))
-        let right = Float(box.intersectionArea(tracks[rhs].preferredBox))
-          / Float(max(1, min(box.area, tracks[rhs].preferredBox.area)))
-        return left < right
-      }
-      guard let index = best else { continue }
-      let previous = tracks[index].box
-      let adjusted = previous.resizedToward(
-        box, imageWidth: imageWidth, imageHeight: imageHeight)
-      tracks[index].box = adjusted
-      if box.area <= tracks[index].preferredBox.area * 2
-        && box.width <= 640 && box.height <= 640
-      {
-        tracks[index].preferredBox = tracks[index].preferredBox
-          .resizedToward(box, imageWidth: imageWidth, imageHeight: imageHeight)
-          .capped(side: 640, imageWidth: imageWidth, imageHeight: imageHeight)
-      }
-      tracks[index].velocityX = max(-48, min(48,
-        0.5 * tracks[index].velocityX
-          + 0.5 * (Float(motions[index]?.0 ?? Int(round(tracks[index].velocityX)))
-            + adjusted.centerX - previous.centerX)))
-      tracks[index].velocityY = max(-48, min(48,
-        0.5 * tracks[index].velocityY
-          + 0.5 * (Float(motions[index]?.1 ?? Int(round(tracks[index].velocityY)))
-            + adjusted.centerY - previous.centerY)))
-      tracks[index].lastSupportFrame = frame
-      tracks[index].lastMergedBox = nil
-      matchedTracks.insert(index)
-      usedDetections.insert(detectionIndex)
-      frameDetections[index].append(detections[detectionIndex])
-    }
-
-    // Every remaining observation that covers a prior track belongs to that
-    // track (or several tracks), even when those tracks already received fine
-    // detections. Otherwise a broad duplicate becomes a new giant ROI.
-    for detectionIndex in detections.indices where !usedDetections.contains(detectionIndex) {
-      let group = supporters[detectionIndex]
-      guard !group.isEmpty else { continue }
-      let mergedBox = boxes[detectionIndex]
-      for index in group {
-        if motions[index] == nil,
-          let prior = tracks[index].lastMergedBox
-        {
-          let dx = Int(round(mergedBox.centerX - prior.centerX
-            - tracks[index].velocityX))
-          let dy = Int(round(mergedBox.centerY - prior.centerY
-            - tracks[index].velocityY))
-          tracks[index].box = tracks[index].box.moved(
-            dx: dx, dy: dy,
-            imageWidth: imageWidth, imageHeight: imageHeight
-          )
-          tracks[index].preferredBox = tracks[index].preferredBox.moved(
-            dx: dx, dy: dy,
-            imageWidth: imageWidth, imageHeight: imageHeight
-          )
-        }
-        tracks[index].lastSupportFrame = frame
-        tracks[index].lastMergedBox = mergedBox
-        matchedTracks.insert(index)
-      }
-      let seeds = group.map { tracks[$0].preferredBox }
-      for (ownerIndex, index) in group.enumerated() {
-        tracks[index].box = mergedROI(
-          predicted: tracks[index].box,
-          detection: detections[detectionIndex],
-          seeds: seeds, ownerIndex: ownerIndex,
-          imageWidth: imageWidth, imageHeight: imageHeight
-        )
-        if let motion = motions[index] {
-          tracks[index].velocityX = Float(motion.0)
-          tracks[index].velocityY = Float(motion.1)
-        }
-        frameDetections[index].append(detections[detectionIndex])
-      }
-      if group.count > 1 {
-        var connected = Set(group)
-        for index in group { connected.formUnion(ownershipGroups[index]) }
-        for index in connected { ownershipGroups[index] = connected }
-      }
-      usedDetections.insert(detectionIndex)
-    }
-
-    for detectionIndex in detections.indices where !usedDetections.contains(detectionIndex) {
-      let id = nextID
-      nextID += 1
-      let box = boxes[detectionIndex]
-      tracks.append(Track(
-        id: id, box: box,
-        preferredBox: box.capped(
-          side: 640, imageWidth: imageWidth, imageHeight: imageHeight),
-        lastSupportFrame: frame,
-        lastDetections: [detections[detectionIndex]],
-        maskAnchorBox: box, ownershipBoxes: [box],
-        classIndex: detections[detectionIndex].classIndex
-      ))
-      let index = tracks.count - 1
-      matchedTracks.insert(index)
-      frameDetections.append([detections[detectionIndex]])
-      ownershipGroups.append(Set([index]))
-    }
-    var carriedByTrack: [Int: ([Detection], Int, Int)] = [:]
-    for index in tracks.indices where matchedTracks.contains(index) {
-      let currentBoxes = frameDetections[index].map {
-        IntBox(left: $0.left, top: $0.top,
-          right: $0.right, bottom: $0.bottom)
-      }
-      guard let first = currentBoxes.first else { continue }
-      let currentSupport = currentBoxes.dropFirst().reduce(first) {
-        $0.union($1)
-      }
-      if let remembered = tracks[index].memoryBox,
-        !tracks[index].memoryDetections.isEmpty,
-        tracks[index].memoryAge < 2
-      {
-        let retreat = max(12, min(remembered.width, remembered.height) / 20)
-        if currentSupport.left > remembered.left + retreat
-          || currentSupport.top > remembered.top + retreat
-          || currentSupport.right < remembered.right - retreat
-          || currentSupport.bottom < remembered.bottom - retreat
-        {
-          tracks[index].box = tracks[index].box.union(remembered)
-          carriedByTrack[index] = (
-            tracks[index].memoryDetections,
-            tracks[index].memoryOffsetX,
-            tracks[index].memoryOffsetY
-          )
-          tracks[index].memoryAge += 1
-        }
-      }
-      if carriedByTrack[index] == nil {
-        tracks[index].memoryDetections = frameDetections[index]
-        tracks[index].memoryBox = tracks[index].preferredBox
-        tracks[index].memoryOffsetX = 0
-        tracks[index].memoryOffsetY = 0
-        tracks[index].memoryAge = 0
-      }
-      tracks[index].lastDetections = frameDetections[index]
-      tracks[index].maskAnchorBox = tracks[index].preferredBox
-    }
-    for index in tracks.indices where matchedTracks.contains(index) {
-      let group = ownershipGroups[index].sorted()
-      let ownership = group.map { tracks[$0].box }
-      let anchors = group.map { tracks[$0].preferredBox }
-      let ownerIndex = group.firstIndex(of: index) ?? 0
-      tracks[index].ownershipBoxes = ownership
-      tracks[index].ownershipAnchors = anchors
-      tracks[index].ownerIndex = ownerIndex
-      let carried = carriedByTrack[index]
-      result.append(NativeTrackedROI(
-        id: tracks[index].id, box: tracks[index].box,
-        preferredBox: tracks[index].preferredBox,
-        detections: frameDetections[index],
-        carriedDetections: carried?.0 ?? [],
-        ownershipBoxes: ownership, ownershipAnchors: anchors,
-        ownerIndex: ownerIndex,
-        maskOffsetX: carried?.1 ?? 0,
-        maskOffsetY: carried?.2 ?? 0
-      ))
-    }
-    // A brief detector gap does not make an existing mosaic disappear. Carry
-    // its last mask with the tracked motion for at most two frames, then stop
-    // rather than painting a stale mask indefinitely over changed content.
-    for index in tracks.indices
-    where !matchedTracks.contains(index)
-      && frame - tracks[index].lastSupportFrame <= 2
-    {
-      guard !tracks[index].lastDetections.isEmpty,
-        let anchor = tracks[index].maskAnchorBox
-      else { continue }
-      let dx = Int(round(tracks[index].box.centerX - anchor.centerX))
-      let dy = Int(round(tracks[index].box.centerY - anchor.centerY))
-      let ownership = tracks[index].ownershipBoxes.map {
-        $0.moved(dx: dx, dy: dy,
-          imageWidth: imageWidth, imageHeight: imageHeight)
-      }
-      let anchors = tracks[index].ownershipAnchors.map {
-        $0.moved(dx: dx, dy: dy,
-          imageWidth: imageWidth, imageHeight: imageHeight)
-      }
-      result.append(NativeTrackedROI(
-        id: tracks[index].id, box: tracks[index].box,
-        preferredBox: tracks[index].preferredBox,
-        detections: [],
-        carriedDetections: tracks[index].lastDetections,
-        ownershipBoxes: ownership, ownershipAnchors: anchors,
-        ownerIndex: tracks[index].ownerIndex,
-        maskOffsetX: dx, maskOffsetY: dy
-      ))
-    }
-    // The current frame may need wider mask coverage, but that broad
-    // observation must not become the next frame's object anchor. Rebuild
-    // coverage from the small tracked ROIs on every frame.
-    for index in tracks.indices {
-      tracks[index].box = tracks[index].preferredBox
-    }
-    return result.sorted { $0.id < $1.id }
+  func intersectionOverUnion(_ other: IntBox) -> Float {
+    let width = min(right, other.right) - max(left, other.left) + 1
+    let height = min(bottom, other.bottom) - max(top, other.top) + 1
+    guard width > 0, height > 0 else { return 0 }
+    let intersection = Float(width * height)
+    return intersection
+      / (Float(self.width * self.height + other.width * other.height) - intersection)
   }
 }
 
@@ -3214,36 +2801,17 @@ private final class FixedRestorerBridge: NativeRestoring, @unchecked Sendable {
   }
 }
 
-private struct NativePriorityROI {
-  let trackedROI: NativeTrackedROI
-  let restorationBox: IntBox
-}
-
 private struct NativeSceneFrame: @unchecked Sendable {
   let batchIndex: Int
   let source: CVPixelBuffer
   let ptsNanoseconds: Int64
   var box: IntBox
   var detections: [Detection]
-  let carriedDetections: [Detection]
-  let ownershipBoxes: [IntBox]
-  var ownershipAnchors: [IntBox] = []
-  let ownerIndex: Int
-  let maskOffsetX: Int
-  let maskOffsetY: Int
-  var higherPriorityROIs: [NativePriorityROI] = []
-
-  func owns(x: Int, y: Int) -> Bool {
-    guard box.contains(x: Float(x), y: Float(y)) else { return false }
-    guard ownershipBoxes.indices.contains(ownerIndex) else { return false }
-    let own = ownershipBoxes[ownerIndex]
-    guard x >= own.left, x <= own.right, y >= own.top, y <= own.bottom
-    else { return false }
-    guard ownershipBoxes.count > 1 else { return true }
-    let anchors = ownershipAnchors.count == ownershipBoxes.count
-      ? ownershipAnchors : ownershipBoxes
-    return mosaicOwnerIndex(x: x, y: y, anchors: anchors) == ownerIndex
-  }
+  /// CELF only: the frame's owner map, this scene's track and the tracks
+  /// whose scenes are composited after this one on the same frame.
+  var labelField: LabelFieldFrame? = nil
+  var labelID: Int32 = 0
+  var laterLabelIDs: [Int32] = []
 }
 
 private struct NativeScene: @unchecked Sendable {
@@ -3256,24 +2824,23 @@ private struct NativeScene: @unchecked Sendable {
     batchIndex: Int,
     source: CVPixelBuffer,
     ptsNanoseconds: Int64,
-    trackedROI: NativeTrackedROI,
-    restorationBox: IntBox,
-    higherPriorityROIs: [NativePriorityROI] = []
+    detection: Detection
   ) {
+    let box = IntBox(
+      left: detection.left,
+      top: detection.top,
+      right: detection.right,
+      bottom: detection.bottom
+    )
+    // trackScenes gives a scene at most one detection per frame.
+    precondition(frames.last.map { $0.batchIndex < batchIndex } ?? true)
     frames.append(
       NativeSceneFrame(
         batchIndex: batchIndex,
         source: source,
         ptsNanoseconds: ptsNanoseconds,
-        box: restorationBox,
-        detections: trackedROI.detections,
-        carriedDetections: trackedROI.carriedDetections,
-        ownershipBoxes: trackedROI.ownershipBoxes,
-        ownershipAnchors: trackedROI.ownershipAnchors,
-        ownerIndex: trackedROI.ownerIndex,
-        maskOffsetX: trackedROI.maskOffsetX,
-        maskOffsetY: trackedROI.maskOffsetY,
-        higherPriorityROIs: higherPriorityROIs
+        box: box,
+        detections: [detection]
       )
     )
   }
@@ -3984,6 +3551,7 @@ private final class NativeFrameProcessor: @unchecked Sendable {
   private let roiExpertMode: Bool
   private let blendFeather: Float
   private let restoreMaskOnly: Bool
+  private let labelFieldMode: Bool
   private let effects: NativeRestoreEffects
   private let detectionEmptyLookahead: Int
   // Crossfade frames use the same un-managed BGRA values as the rest of the
@@ -4010,6 +3578,7 @@ private final class NativeFrameProcessor: @unchecked Sendable {
     roiExpertMode: Bool,
     blendFeather: Float,
     restoreMaskOnly: Bool,
+    labelFieldMode: Bool = false,
     effects: NativeRestoreEffects,
     outputBufferLimit: Int,
     detectionEmptyLookahead: Int
@@ -4022,6 +3591,7 @@ private final class NativeFrameProcessor: @unchecked Sendable {
     self.roiExpertMode = roiExpertMode
     self.blendFeather = max(0, blendFeather)
     self.restoreMaskOnly = restoreMaskOnly
+    self.labelFieldMode = labelFieldMode
     self.effects = effects
     self.outputBufferLimit = max(16, outputBufferLimit)
     outputAllocationAttributes = [
@@ -4098,9 +3668,14 @@ private final class NativeFrameProcessor: @unchecked Sendable {
     async throws -> [CVPixelBuffer] {
     guard !detected.isEmpty else { return [] }
     var outputs = detected.map { $0.frame.pixelBuffer }
-    let scenes = trackScenes(detected)
+    let scenes = labelFieldMode ? labelFieldScenes(detected) : trackScenes(detected)
     lastRestoredSceneCount = scenes.count
-    for scene in scenes {
+    // CELF scenes come in their compositing order already: each frame's
+    // blend weights depend on which scenes are composited after it.
+    let orderedScenes = labelFieldMode ? scenes : scenes.sorted(by: {
+      ($0.frames.first?.batchIndex ?? 0) < ($1.frames.first?.batchIndex ?? 0)
+    })
+    for scene in orderedScenes {
       let (
         restored, originalInput, geometries, masks, compositePlans,
         expertContext
@@ -4115,8 +3690,8 @@ private final class NativeFrameProcessor: @unchecked Sendable {
       // A scene whose largest crop fits the 256px restoration grid was
       // restored at native resolution, so SwiftVR has no lost resolution to
       // rebuild (+1.4% detail measured there, the least of any size). Those
-      // scenes keep the BasicVSR++ result; in one evaluation they were 48% of
-      // the SwiftVR jobs.
+      // scenes keep the BasicVSR++ result; in one validation run they were
+      // about 48% of the SwiftVR jobs.
       let largestCropSide = geometries.map {
         max($0.cropBox.width, $0.cropBox.height)
       }.max() ?? 0
@@ -4245,7 +3820,8 @@ private final class NativeFrameProcessor: @unchecked Sendable {
               try await applySwiftVRFilter(
                 filter, index: ready, region: filterRegion,
                 into: outputs[scene.frames[ready].batchIndex],
-                geometry: geometries[ready], hardMask: masks[ready])
+                geometry: geometries[ready], hardMask: masks[ready],
+                exclusiveWeights: labelFieldMode ? compositePlans[ready].blendMask : nil)
             }
           }
         }
@@ -4255,7 +3831,8 @@ private final class NativeFrameProcessor: @unchecked Sendable {
             try await applySwiftVRFilter(
               filter, index: ready, region: filterRegion,
               into: outputs[scene.frames[ready].batchIndex],
-              geometry: geometries[ready], hardMask: masks[ready])
+              geometry: geometries[ready], hardMask: masks[ready],
+              exclusiveWeights: labelFieldMode ? compositePlans[ready].blendMask : nil)
           }
         }
         // Time spent waiting for SwiftVR counts as restoration.
@@ -4413,221 +3990,449 @@ private final class NativeFrameProcessor: @unchecked Sendable {
     return output
   }
 
-  private func mosaicMarked(
-    _ roi: NativeTrackedROI,
-    observations: [Detection],
-    axes: [(x: NativeSamplingAxis, y: NativeSamplingAxis)],
-    x: Int, y: Int
-  ) -> Bool {
-    for (index, detection) in observations.enumerated() {
-      let offsetX = index >= roi.detections.count ? roi.maskOffsetX : 0
-      let offsetY = index >= roi.detections.count ? roi.maskOffsetY : 0
-      let maskX = x - offsetX
-      let maskY = y - offsetY
-      guard maskX >= 0, maskX < sourceWidth,
-        maskY >= 0, maskY < sourceHeight,
-        detection.maskWidth > 0, detection.maskHeight > 0,
-        detection.detectorMask.count
-          == detection.maskWidth * detection.maskHeight
-      else { continue }
-      let sampleX = axes[index].x.lower[maskX]
-      let sampleY = axes[index].y.lower[maskY]
-      if detection.detectorMask[sampleY * detection.maskWidth + sampleX]
-        > detection.maskThreshold
-      { return true }
-    }
-    return false
-  }
-
-  private func significantMosaicBounds(
-    _ trackedROI: NativeTrackedROI,
-    competing: [NativeTrackedROI],
-    source: CVPixelBuffer
-  ) -> IntBox? {
-    // Work at one quarter of the source resolution. The detector mask can
-    // contain tiny remote islands; a bounding rectangle around every marked
-    // pixel would turn one tracked object into a 1000px crop again.
-    let step = 4
-    let box = trackedROI.box
-    let columns = (box.width + step - 1) / step
-    let rows = (box.height + step - 1) / step
-    guard columns > 0, rows > 0 else { return nil }
-    let observations = trackedROI.detections + trackedROI.carriedDetections
-    let axes = observations.map { maskSamplingAxes(for: $0) }
-    let frame = NativeSceneFrame(
-      batchIndex: 0, source: source, ptsNanoseconds: 0,
-      box: box,
-      detections: trackedROI.detections,
-      carriedDetections: trackedROI.carriedDetections,
-      ownershipBoxes: trackedROI.ownershipBoxes,
-      ownershipAnchors: trackedROI.ownershipAnchors,
-      ownerIndex: trackedROI.ownerIndex,
-      maskOffsetX: trackedROI.maskOffsetX,
-      maskOffsetY: trackedROI.maskOffsetY
-    )
-    let candidates = competing.filter {
-      $0.id != trackedROI.id
-        && $0.preferredBox.intersectionArea(box) > 0
-    }.map { roi in
-      let observations = roi.detections + roi.carriedDetections
-      return (
-        roi: roi,
-        frame: NativeSceneFrame(
-          batchIndex: 0, source: source, ptsNanoseconds: 0,
-          box: roi.box,
-          detections: roi.detections,
-          carriedDetections: roi.carriedDetections,
-          ownershipBoxes: roi.ownershipBoxes,
-          ownershipAnchors: roi.ownershipAnchors,
-          ownerIndex: roi.ownerIndex,
-          maskOffsetX: roi.maskOffsetX,
-          maskOffsetY: roi.maskOffsetY
-        ),
-        observations: observations,
-        axes: observations.map { maskSamplingAxes(for: $0) }
+  /// Tracks every detection as its own scene and restores each separately.
+  /// A scene takes at most one detection per frame, so mosaics that touch or
+  /// overlap (several meeting in one place) are no longer merged into one
+  /// union crop restored at a coarser scale. Each detection joins the scene,
+  /// not yet taken in this frame, whose last box it overlaps most (IoU)
+  /// within the empty-lookahead gap; the rest start new scenes.
+  /// Where mosaics overlap, the detector sometimes adds one large box around
+  /// mosaics that smaller detections already cover, on some frames only.
+  /// Restored separately, that coarse scene painted over the fine ones on
+  /// those frames and the detail level wobbled (0% of isolated frames,
+  /// 13.5% where an overlapping box came and went in one validation). A detection
+  /// whose mosaic lies mostly inside the other detections' boxes adds
+  /// nothing, so it is dropped. Larger detections are judged first, against
+  /// the ones still kept, so one of two duplicates always survives.
+  private func droppingCoveredDetections(_ detections: [Detection]) -> [Detection] {
+    guard detections.count > 1 else { return detections }
+    func box(_ detection: Detection) -> IntBox {
+      IntBox(
+        left: detection.left,
+        top: detection.top,
+        right: detection.right,
+        bottom: detection.bottom
       )
     }
-    var marked = [Bool](repeating: false, count: columns * rows)
-    for row in 0..<rows {
-      let sourceY = min(box.bottom, box.top + row * step + step / 2)
-      for column in 0..<columns {
-        let sourceX = min(box.right, box.left + column * step + step / 2)
-        guard frame.owns(x: sourceX, y: sourceY) else { continue }
-        guard mosaicMarked(
-          trackedROI, observations: observations, axes: axes,
-          x: sourceX, y: sourceY
-        ) else { continue }
-        marked[row * columns + column] = true
+    var kept = Array(repeating: true, count: detections.count)
+    for index in detections.indices.sorted(by: {
+      detections[$0].area > detections[$1].area
+    }) {
+      let others = detections.indices
+        .filter { $0 != index && kept[$0] }
+        .map { box(detections[$0]) }
+      let detection = detections[index]
+      guard !others.isEmpty, detection.maskWidth > 0, detection.maskHeight > 0,
+        detection.detectorMask.count == detection.maskWidth * detection.maskHeight
+      else { continue }
+      let axes = maskSamplingAxes(for: detection)
+      var mosaic = 0
+      var covered = 0
+      let step = 4
+      for y in stride(
+        from: max(0, detection.top), through: min(sourceHeight - 1, detection.bottom),
+        by: step)
+      {
+        let row = axes.y.lower[y] * detection.maskWidth
+        for x in stride(
+          from: max(0, detection.left), through: min(sourceWidth - 1, detection.right),
+          by: step)
+        where detection.detectorMask[row + axes.x.lower[x]] > detection.maskThreshold {
+          mosaic += 1
+          if others.contains(where: {
+            x >= $0.left && x <= $0.right && y >= $0.top && y <= $0.bottom
+          }) {
+            covered += 1
+          }
+        }
+      }
+      if mosaic > 0, Float(covered) >= 0.85 * Float(mosaic) {
+        kept[index] = false
       }
     }
-    var visited = [Bool](repeating: false, count: marked.count)
-    var components: [(count: Int, bounds: IntBox)] = []
-    for start in marked.indices where marked[start] && !visited[start] {
-      visited[start] = true
-      var queue = [start]
-      var cursor = 0
-      var left = start % columns
-      var right = left
-      var top = start / columns
-      var bottom = top
-      while cursor < queue.count {
-        let pixel = queue[cursor]
-        cursor += 1
-        let x = pixel % columns
-        let y = pixel / columns
-        left = min(left, x)
-        right = max(right, x)
-        top = min(top, y)
-        bottom = max(bottom, y)
-        for neighbourY in max(0, y - 1)...min(rows - 1, y + 1) {
-          for neighbourX in max(0, x - 1)...min(columns - 1, x + 1) {
-            let neighbour = neighbourY * columns + neighbourX
-            if marked[neighbour] && !visited[neighbour] {
-              visited[neighbour] = true
-              queue.append(neighbour)
+    return detections.indices.filter { kept[$0] }.map { detections[$0] }
+  }
+
+  /// Sampled share of a box that the detection's mask marks as mosaic.
+  private func mosaicFraction(_ detection: Detection, within box: IntBox) -> Float {
+    guard detection.maskWidth > 0, detection.maskHeight > 0,
+      detection.detectorMask.count == detection.maskWidth * detection.maskHeight
+    else { return 0 }
+    let axes = maskSamplingAxes(for: detection)
+    var samples = 0
+    var mosaic = 0
+    for y in stride(
+      from: max(0, box.top), through: min(sourceHeight - 1, box.bottom), by: 4)
+    {
+      let row = axes.y.lower[y] * detection.maskWidth
+      for x in stride(
+        from: max(0, box.left), through: min(sourceWidth - 1, box.right), by: 4)
+      {
+        samples += 1
+        if let clip = detection.maskClip,
+          x < clip.left || x > clip.right || y < clip.top || y > clip.bottom
+        {
+          continue
+        }
+        if let exclude = detection.maskExclude,
+          x >= exclude.left && x <= exclude.right && y >= exclude.top
+            && y <= exclude.bottom
+        {
+          continue
+        }
+        if detection.detectorMask[row + axes.x.lower[x]] > detection.maskThreshold {
+          mosaic += 1
+        }
+      }
+    }
+    return samples == 0 ? 0 : Float(mosaic) / Float(samples)
+  }
+
+  /// Bounds of the detection's mosaic pixels inside a box, leaving out one
+  /// region.
+  private func mosaicBounds(
+    _ detection: Detection, within box: IntBox, excluding exclude: IntBox
+  ) -> IntBox? {
+    guard detection.maskWidth > 0, detection.maskHeight > 0,
+      detection.detectorMask.count == detection.maskWidth * detection.maskHeight
+    else { return nil }
+    let axes = maskSamplingAxes(for: detection)
+    var bounds: IntBox?
+    for y in stride(
+      from: max(0, box.top), through: min(sourceHeight - 1, box.bottom), by: 4)
+    {
+      let row = axes.y.lower[y] * detection.maskWidth
+      for x in stride(
+        from: max(0, box.left), through: min(sourceWidth - 1, box.right), by: 4)
+      where !(x >= exclude.left && x <= exclude.right && y >= exclude.top
+        && y <= exclude.bottom)
+        && detection.detectorMask[row + axes.x.lower[x]] > detection.maskThreshold
+      {
+        let point = IntBox(
+          left: max(box.left, x - 4), top: max(box.top, y - 4),
+          right: min(box.right, x + 4), bottom: min(box.bottom, y + 4))
+        bounds = bounds.map { $0.union(point) } ?? point
+      }
+    }
+    return bounds
+  }
+
+  /// The detector sometimes boxes two neighbouring mosaics together for
+  /// seconds, then separates them again, so the ROI count changes and each
+  /// mosaic's restoration scale jumps. When a track ends (or starts) where a
+  /// neighbouring track's box grows to take it in, the merged box is split
+  /// back into the two mosaics for as long as the merge lasts: each keeps its
+  /// position relative to the merged box and the part of its mask inside
+  /// that position. A track found again at the split position continues the
+  /// same scene.
+  private func splittingMergedTracks(
+    _ scenes: [NativeScene],
+    detected: [DetectedFrame]
+  ) -> [NativeScene] {
+    guard scenes.count > 1 else { return scenes }
+    var tracks: [[Int: NativeSceneFrame]] = scenes.map { scene in
+      Dictionary(uniqueKeysWithValues: scene.frames.map { ($0.batchIndex, $0) })
+    }
+    func area(_ box: IntBox) -> Float { Float(box.width * box.height) }
+    func inside(_ box: IntBox, _ container: IntBox) -> Float {
+      let width = min(box.right, container.right) - max(box.left, container.left) + 1
+      let height = min(box.bottom, container.bottom) - max(box.top, container.top) + 1
+      guard width > 0, height > 0 else { return 0 }
+      return Float(width * height) / area(box)
+    }
+    func relative(_ box: IntBox, in container: IntBox) -> [Float] {
+      let width = Float(container.width)
+      let height = Float(container.height)
+      return [
+        Float(box.left - container.left) / width,
+        Float(box.top - container.top) / height,
+        Float(box.right - container.left) / width,
+        Float(box.bottom - container.top) / height,
+      ]
+    }
+    func absolute(_ position: [Float], in container: IntBox) -> IntBox {
+      let width = Float(container.width)
+      let height = Float(container.height)
+      return IntBox(
+        left: container.left + Int((position[0] * width).rounded()),
+        top: container.top + Int((position[1] * height).rounded()),
+        right: container.left + Int((position[2] * width).rounded()),
+        bottom: container.top + Int((position[3] * height).rounded())
+      )
+    }
+    func part(
+      _ frame: NativeSceneFrame, _ box: IntBox, excluding exclude: IntBox? = nil
+    ) -> NativeSceneFrame {
+      var detection = frame.detections[0]
+      detection.maskClip = box
+      detection.maskExclude = exclude
+      return NativeSceneFrame(
+        batchIndex: frame.batchIndex,
+        source: frame.source,
+        ptsNanoseconds: frame.ptsNanoseconds,
+        box: box,
+        detections: [detection]
+      )
+    }
+    // One split at a time; each one changes the tracks the next looks at.
+    var splits = 0
+    search: while splits < 4 * scenes.count {
+      for split in tracks.indices where !tracks[split].isEmpty {
+        for host in tracks.indices where host != split && !tracks[host].isEmpty {
+          for step in [1, -1] {
+            let edge = step > 0 ? tracks[split].keys.max()! : tracks[split].keys.min()!
+            let next = edge + step
+            guard next >= 0, next < detected.count, tracks[split][next] == nil,
+              let splitFrame = tracks[split][edge],
+              let hostBefore = tracks[host][edge],
+              let hostMerged = tracks[host][next],
+              hostBefore.detections[0].maskClip == nil,
+              hostMerged.detections[0].maskClip == nil,
+              inside(splitFrame.box, hostMerged.box) >= 0.7,
+              area(hostMerged.box) >= 1.2 * area(hostBefore.box)
+            else { continue }
+            let splitMosaic = mosaicFraction(
+              splitFrame.detections[0], within: splitFrame.box)
+            let splitPosition = relative(splitFrame.box, in: hostMerged.box)
+            let hostPosition = relative(hostBefore.box, in: hostMerged.box)
+            // The host has let go of the other mosaic once its box is back
+            // near the size it had on its own.
+            let hostArea = area(hostBefore.box)
+            var index = next
+            var extended = 0
+            while index >= 0, index < detected.count,
+              tracks[split][index] == nil,
+              let merged = tracks[host][index],
+              merged.detections[0].maskClip == nil,
+              area(merged.box) >= 1.1 * hostArea
+            {
+              // A host box that pulls away from the last split position has
+              // let go of the other mosaic.
+              if let previous = tracks[split][index - step],
+                inside(previous.box, merged.box) < 0.7
+              {
+                break
+              }
+              let splitBox = absolute(splitPosition, in: merged.box)
+              guard
+                mosaicFraction(merged.detections[0], within: splitBox)
+                  >= 0.4 * splitMosaic
+              else { break }
+              // The mosaic is detected on its own again: that track
+              // continues this one.
+              if let rejoin = tracks.indices.first(where: {
+                $0 != split && $0 != host
+                  && tracks[$0][index].map { $0.box.intersectionOverUnion(splitBox) >= 0.3 }
+                    ?? false
+              }) {
+                for (frameIndex, frame) in tracks[rejoin] where tracks[split][frameIndex] == nil {
+                  tracks[split][frameIndex] = frame
+                }
+                tracks[rejoin] = [:]
+                extended += 1
+                break
+              }
+              tracks[split][index] = part(merged, splitBox)
+              // Every mosaic pixel outside the split part stays with the
+              // host, so nothing is left unrestored.
+              tracks[host][index] = part(
+                merged,
+                mosaicBounds(merged.detections[0], within: merged.box, excluding: splitBox)
+                  ?? absolute(hostPosition, in: merged.box),
+                excluding: splitBox
+              )
+              extended += 1
+              index += step
+            }
+            // A track that starts right where the split ended continues it.
+            if index >= 0, index < detected.count, tracks[split][index] == nil,
+              let last = tracks[split][index - step],
+              let rejoin = tracks.indices.first(where: {
+                $0 != split && $0 != host && tracks[$0][index - step] == nil
+                  && tracks[$0][index].map {
+                    $0.box.intersectionOverUnion(last.box) >= 0.3
+                  } ?? false
+              })
+            {
+              for (frameIndex, frame) in tracks[rejoin] where tracks[split][frameIndex] == nil {
+                tracks[split][frameIndex] = frame
+              }
+              tracks[rejoin] = [:]
+              extended += 1
+            }
+            if extended > 0 {
+              splits += 1
+              continue search
             }
           }
         }
       }
-      let extent = IntBox(
-        left: box.left + left * step,
-        top: box.top + top * step,
-        right: min(box.right, box.left + (right + 1) * step - 1),
-        bottom: min(box.bottom, box.top + (bottom + 1) * step - 1)
-      ).expanded(by: step * 2, imageWidth: sourceWidth,
-        imageHeight: sourceHeight)
-      // Transfer a whole connected mosaic to a smaller existing crop only
-      // when that crop contains its complete extent and its own detector
-      // mask covers every sampled pixel. A partial overlap is never enough:
-      // splitting this component would introduce an uncovered seam.
-      let ownRequired = trackedROI.preferredBox.union(extent)
-      let coveredBySmaller = candidates.contains { candidate in
-        let candidateBox = candidate.roi.preferredBox.expanded(
-          by: 24, imageWidth: sourceWidth, imageHeight: sourceHeight)
-        guard candidateBox.left <= extent.left,
-          candidateBox.top <= extent.top,
-          candidateBox.right >= extent.right,
-          candidateBox.bottom >= extent.bottom,
-          candidateBox.area < ownRequired.area
-        else { return false }
-        return queue.allSatisfy { pixel in
-          let pointX = min(box.right,
-            box.left + (pixel % columns) * step + step / 2)
-          let pointY = min(box.bottom,
-            box.top + (pixel / columns) * step + step / 2)
-          return candidate.frame.owns(x: pointX, y: pointY)
-            && mosaicMarked(
-              candidate.roi,
-              observations: candidate.observations,
-              axes: candidate.axes,
-              x: pointX, y: pointY)
+      break
+    }
+    // A split part can lose its mosaic for a frame or two and come back as
+    // a new track at the same place; that track continues it, and the gap
+    // takes the nearer neighbour's detection as in trackScenes.
+    var linked = true
+    while linked {
+      linked = false
+      for first in tracks.indices where !tracks[first].isEmpty {
+        let end = tracks[first].keys.max()!
+        guard let ending = tracks[first][end],
+          let second = tracks.indices.first(where: { index in
+            guard index != first, let start = tracks[index].keys.min(),
+              start > end + 1, start - end <= detectionEmptyLookahead + 1
+            else { return false }
+            return tracks[index][start]!.box.intersectionOverUnion(ending.box) >= 0.3
+          })
+        else { continue }
+        let start = tracks[second].keys.min()!
+        let starting = tracks[second][start]!
+        for gap in (end + 1)..<start {
+          let nearest = gap - end <= start - gap ? ending : starting
+          let item = detected[gap]
+          tracks[first][gap] = NativeSceneFrame(
+            batchIndex: gap,
+            source: item.frame.pixelBuffer,
+            ptsNanoseconds: item.frame.ptsNanoseconds,
+            box: nearest.box,
+            detections: nearest.detections
+          )
         }
-      }
-      if coveredBySmaller { continue }
-      components.append((queue.count, extent))
-    }
-    guard let primary = components.max(by: { lhs, rhs in
-      let leftOverlap = lhs.bounds.intersectionArea(trackedROI.preferredBox)
-      let rightOverlap = rhs.bounds.intersectionArea(trackedROI.preferredBox)
-      if leftOverlap != rightOverlap { return leftOverlap < rightOverlap }
-      return lhs.count < rhs.count
-    }) else { return nil }
-    let minimum = max(8, primary.count / 50)
-    var selected = primary.bounds
-    for component in components.sorted(by: { $0.count > $1.count })
-    where component.count >= minimum && component.bounds != primary.bounds {
-      // Nearby pieces may be one mosaic whose binary mask has a narrow gap.
-      // A remote piece is another mosaic (or a duplicate detector island),
-      // not a reason to grow this object's crop across the whole frame.
-      let nearby = component.bounds.intersectionArea(
-        selected.expanded(by: 32, imageWidth: sourceWidth,
-          imageHeight: sourceHeight)) > 0
-      let joined = selected.union(component.bounds)
-      if nearby && joined.width <= 900 && joined.height <= 900 {
-        selected = joined
+        for (frameIndex, frame) in tracks[second] {
+          tracks[first][frameIndex] = frame
+        }
+        tracks[second] = [:]
+        linked = true
+        break
       }
     }
-    return selected
+    return tracks.filter { !$0.isEmpty }.map { track in
+      var scene = NativeScene()
+      scene.frames = track.keys.sorted().map { track[$0]! }
+      return scene
+    }
+  }
+
+  /// CELF: one scene per tracked mosaic, cropped around its own cells only.
+  private func labelFieldScenes(_ detected: [DetectedFrame]) -> [NativeScene] {
+    var framesByID: [Int32: [NativeSceneFrame]] = [:]
+    for (index, item) in detected.enumerated() {
+      guard let field = item.labelField else { continue }
+      for (id, box) in field.boxes {
+        framesByID[Int32(id), default: []].append(
+          NativeSceneFrame(
+            batchIndex: index,
+            source: item.frame.pixelBuffer,
+            ptsNanoseconds: item.frame.ptsNanoseconds,
+            box: IntBox(left: box.left, top: box.top, right: box.right, bottom: box.bottom),
+            detections: [],
+            labelField: field,
+            labelID: Int32(id)
+          )
+        )
+      }
+    }
+    let order = framesByID.keys.sorted { lhs, rhs in
+      let left = framesByID[lhs]![0].batchIndex
+      let right = framesByID[rhs]![0].batchIndex
+      return left != right ? left < right : lhs < rhs
+    }
+    let rank = Dictionary(uniqueKeysWithValues: order.enumerated().map { ($1, $0) })
+    return order.map { id in
+      var frames = framesByID[id]!.sorted { $0.batchIndex < $1.batchIndex }
+      for index in frames.indices {
+        frames[index].laterLabelIDs = frames[index].labelField!.boxes.keys
+          .map { Int32($0) }
+          .filter { rank[$0].map { $0 > rank[id]! } ?? false }
+      }
+      var scene = NativeScene()
+      scene.frames = frames
+      return scene
+    }
   }
 
   private func trackScenes(_ detected: [DetectedFrame]) -> [NativeScene] {
-    // A broad detector box is mask evidence for the existing object tracks,
-    // not a restoration job in its own right.
-    var scenes: [Int: NativeScene] = [:]
+    var scenes: [NativeScene] = []
     for (frameIndex, item) in detected.enumerated() {
-      let selected = item.trackedROIs.map { trackedROI in
-        let significant = significantMosaicBounds(
-          trackedROI, competing: item.trackedROIs,
-          source: item.frame.pixelBuffer)
-        return NativePriorityROI(
-          trackedROI: trackedROI,
-          restorationBox: significant.map {
-            trackedROI.preferredBox.union($0)
-          } ?? trackedROI.preferredBox)
+      let detections = droppingCoveredDetections(item.detections)
+      let boxes = detections.map {
+        IntBox(left: $0.left, top: $0.top, right: $0.right, bottom: $0.bottom)
       }
-      for selection in selected {
-        let trackedROI = selection.trackedROI
-        let restorationBox = selection.restorationBox
-        let higherPriority = selected.filter { candidate in
-          candidate.trackedROI.id != trackedROI.id
-            && candidate.restorationBox.intersectionArea(restorationBox) > 0
-            && (candidate.restorationBox.area < restorationBox.area
-              || (candidate.restorationBox.area == restorationBox.area
-                && candidate.trackedROI.id < trackedROI.id))
+      var candidates: [(overlap: Float, detection: Int, scene: Int)] = []
+      for (detectionIndex, box) in boxes.enumerated() {
+        for index in scenes.indices {
+          guard let lastBox = scenes[index].lastBox,
+            let lastFrame = scenes[index].lastFrameIndex,
+            lastFrame < frameIndex,
+            frameIndex - lastFrame <= detectionEmptyLookahead + 1,
+            lastBox.overlaps(box)
+          else {
+            continue
+          }
+          candidates.append(
+            (lastBox.intersectionOverUnion(box), detectionIndex, index))
         }
-        var scene = scenes[trackedROI.id] ?? NativeScene()
-        scene.add(
-          batchIndex: frameIndex,
-          source: item.frame.pixelBuffer,
-          ptsNanoseconds: item.frame.ptsNanoseconds,
-          trackedROI: trackedROI,
-          restorationBox: restorationBox,
-          higherPriorityROIs: higherPriority
-        )
-        scenes[trackedROI.id] = scene
+      }
+      // Greedy one-to-one assignment, best overlap first; ties keep the
+      // earlier detection and scene.
+      candidates.sort {
+        ($0.overlap, -$0.detection, -$0.scene) > ($1.overlap, -$1.detection, -$1.scene)
+      }
+      var sceneForDetection: [Int: Int] = [:]
+      var takenScenes = Set<Int>()
+      for candidate in candidates
+      where sceneForDetection[candidate.detection] == nil
+        && !takenScenes.contains(candidate.scene)
+      {
+        sceneForDetection[candidate.detection] = candidate.scene
+        takenScenes.insert(candidate.scene)
+      }
+      for (detectionIndex, detection) in detections.enumerated() {
+        if let index = sceneForDetection[detectionIndex] {
+          scenes[index].add(
+            batchIndex: frameIndex,
+            source: item.frame.pixelBuffer,
+            ptsNanoseconds: item.frame.ptsNanoseconds,
+            detection: detection
+          )
+        } else {
+          var scene = NativeScene()
+          scene.add(
+            batchIndex: frameIndex,
+            source: item.frame.pixelBuffer,
+            ptsNanoseconds: item.frame.ptsNanoseconds,
+            detection: detection
+          )
+          scenes.append(scene)
+        }
       }
     }
-    return scenes.keys.sorted().compactMap { scenes[$0] }
+    // A track that misses a few frames would leave its mosaic unrestored
+    // there and change the ROI count. Its gaps take the nearer neighbour's
+    // detection (the earlier one on a tie), so the count stays fixed.
+    let filledScenes = scenes.filter { !$0.frames.isEmpty }.map { scene in
+      var filled = NativeScene()
+      for (previous, next) in zip(scene.frames, scene.frames.dropFirst()) {
+        filled.frames.append(previous)
+        for gap in (previous.batchIndex + 1)..<next.batchIndex {
+          let nearest =
+            gap - previous.batchIndex <= next.batchIndex - gap ? previous : next
+          let item = detected[gap]
+          filled.frames.append(
+            NativeSceneFrame(
+              batchIndex: gap,
+              source: item.frame.pixelBuffer,
+              ptsNanoseconds: item.frame.ptsNanoseconds,
+              box: nearest.box,
+              detections: nearest.detections
+            )
+          )
+        }
+      }
+      filled.frames.append(scene.frames[scene.frames.count - 1])
+      return filled
+    }
+    return splittingMergedTracks(filledScenes, detected: detected)
   }
 
   private func restore(
@@ -4649,11 +4454,6 @@ private final class NativeFrameProcessor: @unchecked Sendable {
     }
     let maxWidth = cropBoxes.map(\.width).max() ?? 1
     let maxHeight = cropBoxes.map(\.height).max() ?? 1
-    guard maxWidth <= 1024 && maxHeight <= 1024 else {
-      throw NativePreviewError.pixelBuffer(
-        "restoration ROI exceeded bounded crop: \(maxWidth)x\(maxHeight)"
-      )
-    }
     let scaleWidth = Float(restorationSize) / Float(maxWidth)
     let scaleHeight = Float(restorationSize) / Float(maxHeight)
     var geometries: [NativeClipGeometry] = []
@@ -4686,9 +4486,7 @@ private final class NativeFrameProcessor: @unchecked Sendable {
       return created
     }
     let maskAxes = scene.frames.map { frame in
-      (frame.detections + frame.carriedDetections).map {
-        maskSamplingAxes(for: $0)
-      }
+      frame.detections.map { maskSamplingAxes(for: $0) }
     }
     let frameMasks = UnsafeMutablePointer<[Float]?>.allocate(
       capacity: scene.frames.count
@@ -4709,11 +4507,13 @@ private final class NativeFrameProcessor: @unchecked Sendable {
       DispatchQueue.concurrentPerform(iterations: scene.frames.count) {
         index in
         do {
-          maskOutput.baseAddress[index] = Self.makeCropMask(
-            scene.frames[index],
-            cropBox: cropBoxes[index],
-            samplingAxes: maskAxes[index]
-          )
+          maskOutput.baseAddress[index] = scene.frames[index].labelField != nil
+            ? Self.makeLabelFieldCropMask(scene.frames[index], cropBox: cropBoxes[index])
+            : Self.makeCropMask(
+              scene.frames[index],
+              cropBox: cropBoxes[index],
+              samplingAxes: maskAxes[index]
+            )
           try Self.writeModelInput(
             source: scene.frames[index].source,
             axes: inputAxes[index],
@@ -4867,8 +4667,13 @@ private final class NativeFrameProcessor: @unchecked Sendable {
         axes = Self.makeCompositeAxes(geometry: geometry)
         compositeAxisCache[geometry] = axes
       }
-      var blendMask: [Float]
-      if previousGeometry == geometry,
+      let blendMask: [Float]
+      if scene.frames[index].labelField != nil {
+        // CELF: exclusive weights from the owner map (never cached: the
+        // owners change from frame to frame even when the crop does not).
+        blendMask = Self.createLabelFieldBlend(
+          scene.frames[index], cropBox: geometry.cropBox)
+      } else if previousGeometry == geometry,
         previousHardMask == hardMasks[index],
         let previousBlendMask
       {
@@ -4891,53 +4696,6 @@ private final class NativeFrameProcessor: @unchecked Sendable {
         previousGeometry = geometry
         previousHardMask = hardMasks[index]
         previousBlendMask = blendMask
-      }
-      let priority = scene.frames[index].higherPriorityROIs.map { selected in
-        let roi = selected.trackedROI
-        let observations = roi.detections + roi.carriedDetections
-        return (
-          roi: roi,
-          frame: NativeSceneFrame(
-            batchIndex: 0,
-            source: scene.frames[index].source,
-            ptsNanoseconds: scene.frames[index].ptsNanoseconds,
-            box: selected.restorationBox,
-            detections: roi.detections,
-            carriedDetections: roi.carriedDetections,
-            ownershipBoxes: roi.ownershipBoxes,
-            ownershipAnchors: roi.ownershipAnchors,
-            ownerIndex: roi.ownerIndex,
-            maskOffsetX: roi.maskOffsetX,
-            maskOffsetY: roi.maskOffsetY
-          ),
-          observations: observations,
-          axes: observations.map { maskSamplingAxes(for: $0) }
-        )
-      }
-      // Every frame ranks the overlapping crops by its own crop area, not
-      // by a scene-wide maximum. The smaller crop wins only where its own
-      // detector mask really marks the pixel; otherwise the broad crop is
-      // retained so no mosaic pixel is dropped.
-      for y in 0..<geometry.cropBox.height {
-        for x in 0..<geometry.cropBox.width {
-          let pixelIndex = y * geometry.cropBox.width + x
-          guard blendMask[pixelIndex] > 0 else { continue }
-          let sourceX = geometry.cropBox.left + x
-          let sourceY = geometry.cropBox.top + y
-          let coveredByHigherPriority = priority.contains { candidate in
-            candidate.frame.owns(x: sourceX, y: sourceY)
-              && mosaicMarked(
-                candidate.roi,
-                observations: candidate.observations,
-                axes: candidate.axes,
-                x: sourceX, y: sourceY)
-          }
-          if !scene.frames[index].owns(x: sourceX, y: sourceY)
-            || coveredByHigherPriority
-          {
-            blendMask[pixelIndex] = 0
-          }
-        }
       }
       compositePlans.append(
         NativeCompositePlan(
@@ -5247,37 +5005,115 @@ private final class NativeFrameProcessor: @unchecked Sendable {
     return created
   }
 
+  /// CELF: 1 where this scene's track owns the cell (paste zone included).
+  private static func makeLabelFieldCropMask(
+    _ frame: NativeSceneFrame, cropBox: IntBox
+  ) -> [Float] {
+    guard let field = frame.labelField else {
+      return [Float](repeating: 0, count: cropBox.width * cropBox.height)
+    }
+    var mask = [Float](repeating: 0, count: cropBox.width * cropBox.height)
+    for y in 0..<cropBox.height {
+      for x in 0..<cropBox.width
+      where field.pasteOwner(x: cropBox.left + x, y: cropBox.top + y) == frame.labelID {
+        mask[y * cropBox.width + x] = 1
+      }
+    }
+    return mask
+  }
+
+  /// CELF: blend weights that paste every pixel exactly once. Bilinear
+  /// interpolation of the owners at cell centres gives each track a weight
+  /// w and the weights of all tracks plus the untouched source sum to 1.
+  /// Composition is chained (each scene blends over the result so far), so
+  /// a scene uses w / (1 - sum of the weights of the scenes composited
+  /// after it): the final pixel is then sum(w_k R_k) + w_source * source
+  /// whatever the scene order, and no mosaic shows through a seam.
+  private static func createLabelFieldBlend(
+    _ frame: NativeSceneFrame, cropBox: IntBox
+  ) -> [Float] {
+    var blend = [Float](repeating: 0, count: cropBox.width * cropBox.height)
+    guard let field = frame.labelField else { return blend }
+    let own = frame.labelID
+    let later = frame.laterLabelIDs
+    let cell = Float(field.cellSize)
+    func axis(_ start: Int, _ count: Int, _ cells: Int)
+      -> (lower: [Int], upper: [Int], fraction: [Float])
+    {
+      var lower = [Int](repeating: 0, count: count)
+      var upper = lower
+      var fraction = [Float](repeating: 0, count: count)
+      for index in 0..<count {
+        let position = (Float(start + index) + 0.5) / cell - 0.5
+        let base = floor(position)
+        lower[index] = min(cells - 1, max(0, Int(base)))
+        upper[index] = min(cells - 1, max(0, Int(base) + 1))
+        fraction[index] = position - base
+      }
+      return (lower, upper, fraction)
+    }
+    let xs = axis(cropBox.left, cropBox.width, field.gridWidth)
+    let ys = axis(cropBox.top, cropBox.height, field.gridHeight)
+    do {
+      for y in 0..<cropBox.height {
+        let top = ys.lower[y]
+        let bottom = ys.upper[y]
+        let fy = ys.fraction[y]
+        for x in 0..<cropBox.width {
+          let fx = xs.fraction[x]
+          let corners = (
+            (field.ownerAndWeight(cellX: xs.lower[x], cellY: top), (1 - fx) * (1 - fy)),
+            (field.ownerAndWeight(cellX: xs.upper[x], cellY: top), fx * (1 - fy)),
+            (field.ownerAndWeight(cellX: xs.lower[x], cellY: bottom), (1 - fx) * fy),
+            (field.ownerAndWeight(cellX: xs.upper[x], cellY: bottom), fx * fy)
+          )
+          var mine: Float = 0
+          var after: Float = 0
+          for ((owner, coverage), weight) in [corners.0, corners.1, corners.2, corners.3] {
+            if owner == own {
+              mine += weight * coverage
+            } else if owner != 0 && later.contains(owner) {
+              after += weight * coverage
+            }
+          }
+          if mine > 0 {
+            blend[y * cropBox.width + x] = min(1, mine / max(mine, 1 - after))
+          }
+        }
+      }
+    }
+    return blend
+  }
+
   private static func makeCropMask(
     _ frame: NativeSceneFrame,
     cropBox: IntBox,
     samplingAxes: [(x: NativeSamplingAxis, y: NativeSamplingAxis)]
   ) -> [Float] {
     var mask = [Float](repeating: 0, count: cropBox.width * cropBox.height)
-    guard !samplingAxes.isEmpty else { return mask }
-    let observations = frame.detections + frame.carriedDetections
     for y in 0..<cropBox.height {
       let sourceY = cropBox.top + y
       for x in 0..<cropBox.width {
         let sourceX = cropBox.left + x
-        guard frame.owns(x: sourceX, y: sourceY) else { continue }
-        for (observationIndex, pair) in zip(observations, samplingAxes).enumerated() {
-          let (detection, axes) = pair
-          let carried = observationIndex >= frame.detections.count
-          let maskSourceX = sourceX - (carried ? frame.maskOffsetX : 0)
-          let maskSourceY = sourceY - (carried ? frame.maskOffsetY : 0)
-          guard maskSourceX >= 0, maskSourceX < axes.x.lower.count,
-            maskSourceY >= 0, maskSourceY < axes.y.lower.count
-          else { continue }
+        for (detection, axes) in zip(frame.detections, samplingAxes) {
           guard detection.maskWidth > 0, detection.maskHeight > 0,
             detection.detectorMask.count
-              == detection.maskWidth * detection.maskHeight
+              == detection.maskWidth * detection.maskHeight,
+            detection.maskClip.map({
+              sourceX >= $0.left && sourceX <= $0.right
+                && sourceY >= $0.top && sourceY <= $0.bottom
+            }) ?? true,
+            !(detection.maskExclude.map({
+              sourceX >= $0.left && sourceX <= $0.right
+                && sourceY >= $0.top && sourceY <= $0.bottom
+            }) ?? false)
           else { continue }
-          let upperRow = axes.y.lower[maskSourceY] * detection.maskWidth
-          let lowerRow = axes.y.upper[maskSourceY] * detection.maskWidth
-          let leftX = axes.x.lower[maskSourceX]
-          let rightX = axes.x.upper[maskSourceX]
-          let fx = axes.x.fraction[maskSourceX]
-          let fy = axes.y.fraction[maskSourceY]
+          let upperRow = axes.y.lower[sourceY] * detection.maskWidth
+          let lowerRow = axes.y.upper[sourceY] * detection.maskWidth
+          let leftX = axes.x.lower[sourceX]
+          let rightX = axes.x.upper[sourceX]
+          let fx = axes.x.fraction[sourceX]
+          let fy = axes.y.fraction[sourceY]
           let upper =
             detection.detectorMask[upperRow + leftX] * (1 - fx)
             + detection.detectorMask[upperRow + rightX] * fx
@@ -6500,11 +6336,14 @@ private final class NativeFrameProcessor: @unchecked Sendable {
   /// weights SwiftVR itself was blended in with.
   private func applySwiftVRFilter(
     _ filter: SwiftVRTemporalNoiseFilter, index: Int, region: IntBox,
-    into frame: CVPixelBuffer, geometry: NativeClipGeometry, hardMask: [Float]
+    into frame: CVPixelBuffer, geometry: NativeClipGeometry, hardMask: [Float],
+    exclusiveWeights: [Float]? = nil
   ) async throws {
     let filtered = try await filter.filtered(index)
     let crop = geometry.cropBox
-    let weights = Self.createEnhancerBlendMask(
+    // CELF: the scene's own exclusive weights, so the filtered pixels never
+    // spill onto a neighbouring mosaic's restoration.
+    let weights = exclusiveWeights ?? Self.createEnhancerBlendMask(
       hardMask, width: crop.width, height: crop.height, featherFraction: 0.04)
     Self.blend(filtered, region: region, into: frame, crop: crop, weights: weights)
   }
@@ -6927,7 +6766,6 @@ private final class NativeFrameProcessor: @unchecked Sendable {
     }
   }
 
-
   /// Blend weights that cover only the detected mosaic. The whole-crop
   /// blend (createBlendMask) set the inner 95% of the crop rectangle to 1, so
   /// everything the crop contained, faces included, was replaced by the
@@ -7002,10 +6840,7 @@ private final class NativeFrameProcessor: @unchecked Sendable {
         // 0 on a fading crop side, 1 from `fade` pixels inward.
         let edgeWeight = fade > 0 ? falloff(fade - min(edge, fade)) : 1
         let index = y * width + x
-        // A marked pixel on an internal tile edge must still be restored.
-        // Fading the hard mask itself makes the mosaic flash at that edge.
-        blend[index] = mask[index] > 0.5
-          ? 1 : falloff(distance[index] - margin) * edgeWeight
+        blend[index] = falloff(distance[index] - margin) * edgeWeight
       }
     }
     return blend
@@ -7579,7 +7414,6 @@ private enum NativeExportSupport {
   }
 }
 
-#if !MIOH_ROI_TRACKER_TEST
 @main
 private struct NativePreviewPipeline {
   static func main() async {
@@ -7874,6 +7708,7 @@ private struct NativePreviewPipeline {
           roiExpertMode: config.roiExpertMode ?? false,
           blendFeather: config.blendFeather ?? 1,
           restoreMaskOnly: config.restoreMaskOnly ?? false,
+          labelFieldMode: config.multiMosaicMode == "labelField",
           effects: restoreEffects,
           outputBufferLimit: perProcessorOutputLimit,
           detectionEmptyLookahead: config.detectionEmptyLookahead ?? 0
@@ -8210,9 +8045,6 @@ private struct NativePreviewPipeline {
             var localDecodedFrames = 0
             var localDetectedFrames = 0
             var localDetectionSeconds = 0.0
-            let roiTracker = NativeROITracker(
-              maxMissingFrames: config.detectionEmptyLookahead ?? 0
-            )
             var batchIndex = 0
             var newFramesSinceYield = 0
             let detectionMaskReuseSkipFrames = min(
@@ -8223,6 +8055,11 @@ private struct NativePreviewPipeline {
               1,
               config.detectionEmptyLookahead ?? 0
             )
+            let labelFieldTracker = config.multiMosaicMode == "labelField"
+              ? MosaicLabelFieldTracker(
+                width: video.width, height: video.height,
+                feather: Double(config.blendFeather ?? 1))
+              : nil
             var lookaheadWindow: [DecodedFrame] = []
             lookaheadWindow.reserveCapacity(emptyLookaheadFrames)
             var preRestorationFrameRateGate: PTSFrameRateGate? =
@@ -8237,6 +8074,9 @@ private struct NativePreviewPipeline {
 
             func yieldPending() {
               guard !pending.isEmpty, newFramesSinceYield > 0 else { return }
+              if labelFieldTracker != nil {
+                fillLabelFieldGaps(&pending, maximumGap: 10)
+              }
               availableBatchSlots.wait()
               if control.shouldStop() {
                 availableBatchSlots.signal()
@@ -8281,16 +8121,21 @@ private struct NativePreviewPipeline {
               if !detections.isEmpty {
                 localDetectedFrames += 1
               }
-              let tracked = roiTracker.update(
-                detections: detections,
-                source: frame.pixelBuffer
-              )
+              // CELF runs here, once per frame in decode order, so tracks
+              // carry across batches and parallel lanes.
+              let labelField = labelFieldTracker.map { tracker in
+                tracker.update(
+                  observations: detections.compactMap {
+                    labelFieldObservation(
+                      $0, sourceWidth: video.width, sourceHeight: video.height)
+                  },
+                  luma: { labelFieldLuma(frame.pixelBuffer, $0) },
+                  thumbnail: labelFieldThumbnail(frame.pixelBuffer)
+                )
+              }
               pending.append(
                 DetectedFrame(
-                  frame: frame,
-                  detections: detections,
-                  trackedROIs: tracked
-                )
+                  frame: frame, detections: detections, labelField: labelField)
               )
               newFramesSinceYield += 1
               if pending.count == config.temporalBatchFrames {
@@ -8633,186 +8478,3 @@ private struct NativePreviewPipeline {
     ])
   }
 }
-#endif
-
-#if MIOH_ROI_TRACKER_TEST
-@main
-private struct NativeROITrackerHarness {
-  static func main() {
-    var source: CVPixelBuffer?
-    let status = CVPixelBufferCreate(
-      kCFAllocatorDefault, 100, 100, kCVPixelFormatType_32BGRA,
-      [kCVPixelBufferIOSurfacePropertiesKey as String: [:]] as CFDictionary,
-      &source
-    )
-    precondition(status == kCVReturnSuccess && source != nil)
-    let frame = source!
-
-    func detection(_ box: IntBox, maskParts: [IntBox]? = nil) -> Detection {
-      var mask = [Float](repeating: 0, count: 100 * 100)
-      for part in maskParts ?? [box] {
-        for y in part.top...part.bottom {
-          for x in part.left...part.right { mask[y * 100 + x] = 1 }
-        }
-      }
-      return Detection(
-        left: box.left, top: box.top, right: box.right,
-        bottom: box.bottom, confidence: 0.9, classIndex: 1,
-        detectorMask: mask, maskWidth: 100, maskHeight: 100,
-        maskProjection: .directResize, maskThreshold: 0.5
-      )
-    }
-    func candidate(x: Float, width: Float, confidence: Float)
-      -> DetectionCandidate
-    {
-      DetectionCandidate(
-        x: x, y: 367, width: width, height: 265,
-        confidence: confidence, classIndex: 1, coefficients: []
-      )
-    }
-    let retained = CoreAIDetector.nonMaximumSuppression([
-      candidate(x: 162, width: 279, confidence: 0.745),
-      candidate(x: 195, width: 344, confidence: 0.744),
-      candidate(x: 195, width: 342, confidence: 0.682),
-    ], threshold: 0.7)
-    precondition(retained.count == 2)
-    precondition(retained[1].width == 344)
-    let first = IntBox(left: 10, top: 20, right: 20, bottom: 30)
-    let second = IntBox(left: 40, top: 20, right: 50, bottom: 30)
-    precondition(mosaicOwnerIndex(x: 30, y: 25,
-      anchors: [first, second]) == 0)
-    precondition(mosaicOwnerIndex(x: 31, y: 25,
-      anchors: [first, second]) == 1)
-    precondition(mosaicOwnerIndex(x: 45, y: 25,
-      anchors: [IntBox(left: 8, top: 18, right: 53, bottom: 33), second]) == 1)
-    let tracker = NativeROITracker(maxMissingFrames: 10)
-    let separate = tracker.update(
-      detections: [detection(first), detection(second)], source: frame)
-    precondition(separate.count == 2 && separate.map(\.id) == [0, 1])
-    let merged = tracker.update(
-      detections: [detection(
-        IntBox(left: 8, top: 18, right: 53, bottom: 33),
-        maskParts: [first, second]
-      )], source: frame)
-    precondition(merged.count == 2 && merged.map(\.id) == [0, 1])
-    precondition(merged.allSatisfy { $0.box.width < 30 })
-    precondition(merged[0].preferredBox == first)
-    precondition(merged[1].preferredBox == second)
-    precondition(merged.allSatisfy { $0.ownershipBoxes.count == 2 })
-    let joined = tracker.update(
-      detections: [detection(
-        IntBox(left: 8, top: 18, right: 53, bottom: 33),
-        maskParts: [IntBox(left: 10, top: 20, right: 50, bottom: 30)]
-      )], source: frame)
-    precondition(joined.count == 2)
-    precondition(joined[0].preferredBox == first)
-    precondition(joined[1].preferredBox == second)
-    for x in 10...50 {
-      let covering = joined.filter {
-        $0.box.contains(x: Float(x), y: 25)
-          && NativeSceneFrame(
-            batchIndex: 0, source: frame, ptsNanoseconds: 0,
-            box: $0.box, detections: $0.detections,
-            carriedDetections: $0.carriedDetections,
-            ownershipBoxes: $0.ownershipBoxes,
-            ownerIndex: $0.ownerIndex,
-            maskOffsetX: 0, maskOffsetY: 0
-          ).owns(x: x, y: 25)
-      }
-      precondition(covering.count == 1)
-    }
-    let duplicates = NativeROITracker(maxMissingFrames: 10)
-    _ = duplicates.update(
-      detections: [detection(first), detection(second)], source: frame)
-    let fineAndBroad = duplicates.update(
-      detections: [
-        detection(first), detection(second),
-        detection(IntBox(left: 8, top: 18, right: 53, bottom: 33),
-          maskParts: [first, second]),
-      ], source: frame)
-    precondition(fineAndBroad.count == 2)
-    precondition(fineAndBroad.map(\.id) == [0, 1])
-    precondition(fineAndBroad.allSatisfy { $0.detections.count == 2 })
-    precondition(fineAndBroad[0].preferredBox == first)
-    precondition(fineAndBroad[1].preferredBox == second)
-    let edgeOverlap = NativeROITracker(maxMissingFrames: 10)
-    _ = edgeOverlap.update(
-      detections: [detection(first), detection(second)], source: frame)
-    let sharedEdge = edgeOverlap.update(
-      detections: [detection(
-        IntBox(left: 8, top: 29, right: 53, bottom: 60),
-        maskParts: [
-          IntBox(left: 10, top: 29, right: 20, bottom: 30),
-          IntBox(left: 40, top: 29, right: 50, bottom: 30),
-        ])], source: frame)
-    precondition(sharedEdge.count == 2)
-    precondition(sharedEdge.allSatisfy { $0.detections.count == 1 })
-    let afterBroad = edgeOverlap.update(detections: [], source: frame)
-    precondition(afterBroad.count == 2)
-    precondition(afterBroad.allSatisfy {
-      $0.box.width <= $0.preferredBox.width
-        && $0.box.height <= $0.preferredBox.height
-    })
-    let shrinking = NativeROITracker(maxMissingFrames: 10)
-    let broadBox = IntBox(left: 10, top: 20, right: 50, bottom: 50)
-    _ = shrinking.update(detections: [detection(broadBox)], source: frame)
-    let shortBox = IntBox(left: 10, top: 20, right: 30, bottom: 50)
-    let shortObservation = shrinking.update(
-      detections: [detection(shortBox)], source: frame)
-    precondition(shortObservation.count == 1)
-    precondition(shortObservation[0].box.right >= broadBox.right)
-    precondition(shortObservation[0].carriedDetections.count == 1)
-    let recovered = shrinking.update(
-      detections: [detection(broadBox)], source: frame)
-    precondition(recovered.count == 1)
-    precondition(recovered[0].carriedDetections.isEmpty)
-    let third = IntBox(left: 70, top: 20, right: 80, bottom: 30)
-    let split = tracker.update(
-      detections: [detection(first), detection(second), detection(third)],
-      source: frame)
-    precondition(split.count == 3 && split.map(\.id) == [0, 1, 2])
-    let gapOne = tracker.update(detections: [], source: frame)
-    let gapTwo = tracker.update(detections: [], source: frame)
-    let gapThree = tracker.update(detections: [], source: frame)
-    precondition(gapOne.count == 3 && gapTwo.count == 3)
-    precondition(gapThree.isEmpty)
-    func patternedFrame(dx: Int, dy: Int) -> CVPixelBuffer {
-      var buffer: CVPixelBuffer?
-      precondition(CVPixelBufferCreate(
-        kCFAllocatorDefault, 100, 100, kCVPixelFormatType_32BGRA,
-        [kCVPixelBufferIOSurfacePropertiesKey as String: [:]] as CFDictionary,
-        &buffer
-      ) == kCVReturnSuccess)
-      let result = buffer!
-      precondition(CVPixelBufferLockBaseAddress(result, []) == kCVReturnSuccess)
-      let stride = CVPixelBufferGetBytesPerRow(result)
-      let pixels = CVPixelBufferGetBaseAddress(result)!
-        .assumingMemoryBound(to: UInt8.self)
-      memset(pixels, 0, stride * 100)
-      for y in 20...34 {
-        for x in 10...24 {
-          let index = (y + dy) * stride + (x + dx) * 4
-          pixels[index] = UInt8((x * 37 + y * 13) % 256)
-          pixels[index + 1] = UInt8((x * 11 + y * 29) % 256)
-          pixels[index + 2] = UInt8((x * 19 + y * 17) % 256)
-          pixels[index + 3] = 255
-        }
-      }
-      CVPixelBufferUnlockBaseAddress(result, [])
-      return result
-    }
-    let moving = NativeROITracker(maxMissingFrames: 10)
-    let oldBox = IntBox(left: 10, top: 20, right: 24, bottom: 34)
-    let oldROI = moving.update(
-      detections: [detection(oldBox)],
-      source: patternedFrame(dx: 0, dy: 0))
-    let predictedROI = moving.update(
-      detections: [], source: patternedFrame(dx: 5, dy: 3))
-    precondition(oldROI.count == 1 && predictedROI.count == 1)
-    precondition(predictedROI[0].id == oldROI[0].id)
-    precondition(predictedROI[0].box.left == oldBox.left + 5)
-    precondition(predictedROI[0].box.top == oldBox.top + 3)
-    print("NativeROITracker: merge, split, dynamic count, short gap passed")
-  }
-}
-#endif

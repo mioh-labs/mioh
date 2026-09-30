@@ -62,6 +62,20 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn("? Self.createMaskOnlyBlend(", pipeline)
         self.assertIn(": Self.createBlendMask(", pipeline)
 
+    def test_multi_mosaic_mode_keeps_per_detection_default(self):
+        app = APP_SOURCE.read_text()
+        pipeline = NATIVE_PIPELINE_SOURCE.read_text()
+        build = (NATIVE_PIPELINE_SOURCE.parent / "build_app.sh").read_text()
+        tracker = (NATIVE_PIPELINE_SOURCE.parent / "MosaicLabelFieldTracker.swift").read_text()
+        # The established per-detection path stays the default; CELF is opt-in.
+        self.assertIn('@Published var multiMosaicMode = "perDetection"', app)
+        self.assertIn('multiMosaicMode: "perDetection",', app)
+        self.assertIn('multiMosaicMode == "labelField" ? "labelField" : nil', app)
+        self.assertIn('labelFieldMode: config.multiMosaicMode == "labelField"', pipeline)
+        self.assertIn("labelFieldMode ? labelFieldScenes(detected) : trackScenes(detected)", pipeline)
+        self.assertIn("final class MosaicLabelFieldTracker", tracker)
+        self.assertIn('"$PACKAGE_DIR/MosaicLabelFieldTracker.swift"', build)
+
     def test_native_swift_pipeline_supports_complete_file_export(self):
         app = APP_SOURCE.read_text()
         batch = BATCH_SOURCE.read_text()
@@ -109,7 +123,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
             'case "count":',
             "requestedSegmentSeconds",
             "writerSegmentSeconds",
-            "roiTracker.update(",
+            "detectionEmptyLookahead + 1",
             "allDetections.filter { $0.classIndex == 0 }",
         ]:
             self.assertIn(contract, pipeline)
@@ -1205,7 +1219,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn('COREAI_DISTRIBUTION="portable"', script)
         self.assertIn('build/macos-standalone-universal', script)
         self.assertIn('APP_BASENAME="mioh-universal"', script)
-        self.assertIn('DMG_BASENAME="mioh-universal-0.14.3-017-unsigned"', script)
+        self.assertIn('DMG_BASENAME="mioh-universal-0.14.3-018-unsigned"', script)
         self.assertIn('exec "$PACKAGE_DIR/build_app.sh"', script)
 
     def test_universal_bundle_allowlists_conversion_scripts(self):

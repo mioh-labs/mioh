@@ -805,6 +805,10 @@ final class RemoteControlServer: ObservableObject {
         ["value": $0.rawValue, "label": $0.label]
       },
       "mergeEncoders": ["copy", "h264", "hevc"],
+      "multiMosaicModes": [
+        ["value": "perDetection", "label": "検出ごと（従来）"],
+        ["value": "labelField", "label": "画素ごとの持ち主（CELF）"],
+      ],
     ]
   }
 
@@ -1015,6 +1019,7 @@ final class RemoteControlServer: ObservableObject {
       runner.restorationModels.contains(value.previewRestorationModel ?? ""),
       runner.previewDetectionModels.contains(value.previewDetectionModel ?? ""),
       PreviewHLSQuality(rawValue: value.previewHLSQuality ?? "") != nil,
+      ["perDetection", "labelField"].contains(value.multiMosaicMode ?? "perDetection"),
       ["通常", "VR180", "360"].contains(value.previewProjectionMode ?? ""),
       ["Mono", "SBS 左右", "上下"].contains(value.previewVideoLayout ?? ""),
       ["左目", "右目"].contains(value.previewEye ?? ""),
@@ -2482,7 +2487,8 @@ private enum RemoteControlHTML {
         ['ROIエンハンサー',[['roiEnhancer','方式','select','roiEnhancers'],['roiEnhancerModel','モデル','roiModel'],['roiEnhancerScale','倍率','number',1,8,1],['roiEnhancerStrength','強度','range',0,1,0.05],['roiEnhancerPasses','PiperSR反復','number',1,10,1],['swiftVRFrameSmoothing','SwiftVR枠のなめらかさ','number',0,30,1],['swiftVRStabilizationRadius','SwiftVRなじませ範囲','number',1,8,1],['swiftVRTemporalFilter','SwiftVR揺らぎ低減','range',0,1,0.05],['roiEnhancerTile','タイル','number',0,1024,32]]]
       ]],
       ['detection',[
-        ['検出モデル',[['detectionModel','モデル','select','detectionModels'],['customDetectionModel','モデルパス','modelValue'],['detectionEmptyLookahead','無検出時の判定間隔','number',0,300,1],['detectionMaskReuseSkipFrames','検出後スキップ','number',0,8,1],['detectFaceMosaics','顔モザイクを検出','bool']]]
+        ['検出モデル',[['detectionModel','モデル','select','detectionModels'],['customDetectionModel','モデルパス','modelValue'],['detectionEmptyLookahead','無検出時の判定間隔','number',0,300,1],['detectionMaskReuseSkipFrames','検出後スキップ','number',0,8,1],['detectFaceMosaics','顔モザイクを検出','bool']]],
+        ['複数モザイク',[['multiMosaicMode','複数モザイクの扱い','select','multiMosaicModes']]]
       ]],
       ['output',[
         ['エンコーダー',[['encodingMode','設定方法','select','encodingModes'],['encodingPreset','プリセット','select','encodingPresets'],['encoder','エンコーダー','text'],['bitrateMultiplier','ビットレート倍率','number',0.1,100,0.1],['mp4FastStart','MP4 Fast Start','bool']]],

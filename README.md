@@ -39,9 +39,9 @@ This repository is the public source/distribution repository for the macOS build
 
 The universal build should be published as a GitHub Release asset:
 
-- `mioh-universal-0.14.3-017-unsigned.dmg`
+- `mioh-universal-0.14.3-018-unsigned.dmg`
 
-This 017 build is published under the `v0.14.3-017` release.
+This 018 build is published under the `v0.14.3-018` release. CELF tracking for overlapping mosaics is optional; per-detection restoration remains the default.
 
 Large DMG files are not stored directly in git. See [releases/README.md](releases/README.md).
 
@@ -62,7 +62,7 @@ The build creates:
 
 ```text
 build/macos-standalone-universal/mioh-universal.app
-build/macos-standalone-universal/mioh-universal-0.14.3-017-unsigned.dmg
+build/macos-standalone-universal/mioh-universal-0.14.3-018-unsigned.dmg
 ```
 
 See [packaging/macOS/README.md](packaging/macOS/README.md) for full build

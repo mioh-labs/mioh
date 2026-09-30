@@ -1930,6 +1930,7 @@ final class RealtimePlayerController: ObservableObject {
       "sharpen=\(runner.previewRealtimeOptimization ? 0 : runner.sharpenStrength)",
       "detail=\(runner.previewRealtimeOptimization ? 0 : runner.detailBoost)",
       "feather=\(runner.blendFeather)",
+      "multiMosaic=\(runner.multiMosaicMode)",
       "texture=\(runner.previewRealtimeOptimization ? 0 : runner.textureMix)",
       "smooth=\(runner.previewRealtimeOptimization ? 0 : runner.smoothStrength)",
       "upscale=\(runner.previewRealtimeOptimization ? 1 : runner.effectUpscale)",
