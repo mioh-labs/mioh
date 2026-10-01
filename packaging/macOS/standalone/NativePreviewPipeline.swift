@@ -152,6 +152,72 @@ private enum NativePreviewError: LocalizedError {
   }
 }
 
+/// Only numeric context and error identities are logged. Localized NSError
+/// descriptions and arbitrary userInfo can contain source titles, paths or URLs.
+private enum NativeDecodeDiagnostics {
+  static func failure(
+    _ error: Error,
+    stage: String,
+    decodedFrames: Int = 0,
+    lastPTS: Int64? = nil,
+    readerStatus: Int? = nil,
+    readerError: Error? = nil,
+    sidecarStatus: Int? = nil,
+    sidecarError: Error? = nil
+  ) -> NativePreviewError {
+    var nodes: [[String: Any]] = []
+    var seen = Set<ObjectIdentifier>()
+    var truncated = false
+    func visit(_ error: NSError, at path: String, depth: Int = 0) {
+      guard depth < 8, nodes.count < 16 else {
+        truncated = true
+        return
+      }
+      guard seen.insert(ObjectIdentifier(error)).inserted else { return }
+      // System error domains are identifiers, not free-text diagnostics.
+      let domain = error.domain
+      let safeDomain = domain.count <= 128
+        && domain.range(of: #"^[A-Za-z0-9_.-]+$"#, options: .regularExpression) != nil
+        ? domain : "[redacted-domain]"
+      nodes.append(["source": path, "domain": safeDomain, "code": error.code])
+      if let underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError {
+        visit(underlying, at: path + ".underlying", depth: depth + 1)
+      }
+      if let underlying = error.userInfo[NSMultipleUnderlyingErrorsKey] as? [NSError] {
+        for (index, child) in underlying.prefix(16).enumerated() {
+          visit(child, at: path + ".underlying[\(index)]", depth: depth + 1)
+        }
+        if underlying.count > 16 { truncated = true }
+      }
+    }
+    visit(error as NSError, at: "thrown")
+    if let readerError { visit(readerError as NSError, at: "reader") }
+    if let sidecarError { visit(sidecarError as NSError, at: "sidecar") }
+    let version = ProcessInfo.processInfo.operatingSystemVersion
+    var payload: [String: Any] = [
+      "stage": stage,
+      "decoded_frames": decodedFrames,
+      "last_decoded_pts_ns": lastPTS.map { $0 as Any } ?? NSNull(),
+      "last_decoded_seconds": lastPTS.map { Double($0) / 1_000_000_000 as Any }
+        ?? NSNull(),
+      "errors": nodes,
+      "error_chain_truncated": truncated,
+      "macos": "\(version.majorVersion).\(version.minorVersion).\(version.patchVersion)",
+    ]
+    if let readerStatus { payload["reader_status"] = readerStatus }
+    if let sidecarStatus { payload["sidecar_status"] = sidecarStatus }
+    // These decoder-generated invariant messages are fixed strings, unlike
+    // Foundation's localized descriptions. Preserve them for diagnostics.
+    if let native = error as? NativePreviewError, case .reader(let reason) = native {
+      payload["decoder_reason"] = reason
+    }
+    guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+      let json = String(data: data, encoding: .utf8)
+    else { return .reader("decoder diagnostics could not be serialized") }
+    return .reader(json)
+  }
+}
+
 private enum MiohCoreAIModelLoader {
   static func load(_ modelURL: URL) async throws -> AIModel {
     let options = try specializationOptions()
@@ -985,7 +1051,12 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
   }
 
   func start() throws {
-    let reader = try AVAssetReader(asset: asset)
+    let reader: AVAssetReader
+    do {
+      reader = try AVAssetReader(asset: asset)
+    } catch {
+      throw NativeDecodeDiagnostics.failure(error, stage: "reader.create")
+    }
     var decodeRange: CMTimeRange?
     if startTime > .zero || endTime != nil {
       let rangeEnd = endTime ?? assetDuration
@@ -1021,27 +1092,40 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
     var compressedReader: AVAssetReader?
     var compressedProvider: SampleProvider?
     if malformedH264NALLength != nil {
-      let sidecarReader = try AVAssetReader(asset: asset)
-      if let decodeRange {
-        sidecarReader.timeRange = decodeRange
+      do {
+        let sidecarReader = try AVAssetReader(asset: asset)
+        compressedReader = sidecarReader
+        if let decodeRange {
+          sidecarReader.timeRange = decodeRange
+        }
+        let sidecarOutput = AVAssetReaderTrackOutput(
+          track: track,
+          outputSettings: nil
+        )
+        let provider = sidecarReader.outputProvider(for: sidecarOutput)
+        try sidecarReader.start()
+        compressedProvider = provider
+        orderingReader = sidecarReader
+      } catch {
+        let diagnostic = NativeDecodeDiagnostics.failure(
+          error, stage: "sidecar.start", readerStatus: reader.status.rawValue,
+          readerError: reader.error, sidecarStatus: compressedReader?.status.rawValue,
+          sidecarError: compressedReader?.error
+        )
+        compressedReader?.cancelReading()
+        throw diagnostic
       }
-      let sidecarOutput = AVAssetReaderTrackOutput(
-        track: track,
-        outputSettings: nil
-      )
-      let provider = sidecarReader.outputProvider(for: sidecarOutput)
-      try sidecarReader.start()
-      compressedReader = sidecarReader
-      compressedProvider = provider
-      orderingReader = sidecarReader
     }
     do {
       try reader.start()
     } catch {
-      compressedReader?.cancelReading()
-      throw NativePreviewError.reader(
-        "reader start failed: \(error.localizedDescription)"
+      let diagnostic = NativeDecodeDiagnostics.failure(
+        error, stage: "reader.start", readerStatus: reader.status.rawValue,
+        readerError: reader.error, sidecarStatus: compressedReader?.status.rawValue,
+        sidecarError: compressedReader?.error
       )
+      compressedReader?.cancelReading()
+      throw diagnostic
     }
     self.reader = reader
     let nalLength = malformedH264NALLength
@@ -1049,6 +1133,9 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
     task = Task.detached(priority: .userInitiated) { [ring] in
       var reorderBuffer = MalformedH264FrameReorderBuffer()
       var failure: Error?
+      var failureStage = "decoded.validation"
+      var decodedFrames = 0
+      var lastDecodedPTS: Int64?
       var decodedReachedEnd = false
       var droppedSyntheticTail = false
       var pairedSampleCount = 0
@@ -1090,9 +1177,8 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
           }
           return nil
         } catch {
-          throw NativePreviewError.reader(
-            "H.264 display-order sidecar failed: \(error.localizedDescription)"
-          )
+          failureStage = "sidecar.next"
+          throw error
         }
       }
 
@@ -1101,6 +1187,7 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
         do {
           readySample = try await decodedProvider.next()
         } catch {
+          failureStage = "decoded.next"
           failure = error
           break
         }
@@ -1138,6 +1225,8 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
             ptsNanoseconds: ptsNanoseconds
           )
         }
+        decodedFrames += 1
+        lastDecodedPTS = ptsNanoseconds
         // Drop the image AVAssetReader synthesizes for a leading empty edit;
         // it has no compressed sample to pair with.
         if nalLength != nil, syntheticHeadEnd > 0,
@@ -1157,8 +1246,10 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
               // mismatch or drop a run of valid decoded frames.
               let atDeclaredTail = decodeEndNanoseconds
                 - frame.ptsNanoseconds <= 250_000_000
+              failureStage = "decoded.tail_next"
               let noAdditionalDecodedFrame = try await decodedProvider.next()
                 == nil
+              failureStage = "decoded.validation"
               if atDeclaredTail,
                 compressedReader?.status == .completed,
                 noAdditionalDecodedFrame,
@@ -1236,17 +1327,21 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
         )
       }
       if failure == nil, compressedReader?.status == .failed {
-        failure = NativePreviewError.reader(
-          compressedReader?.error?.localizedDescription
-            ?? "H.264 display-order sidecar failed"
-        )
+        failureStage = "sidecar.status"
+        failure = compressedReader?.error
+          ?? NativePreviewError.reader("H.264 display-order sidecar failed")
+      }
+      if failure == nil, reader.status == .failed {
+        failureStage = "reader.status"
+        failure = reader.error ?? NativePreviewError.reader("decode failed")
       }
       if let failure {
-        ring.complete(failure)
-      } else if reader.status == .failed {
         ring.complete(
-          NativePreviewError.reader(
-            reader.error?.localizedDescription ?? "decode failed"
+          NativeDecodeDiagnostics.failure(
+            failure, stage: failureStage, decodedFrames: decodedFrames,
+            lastPTS: lastDecodedPTS, readerStatus: reader.status.rawValue,
+            readerError: reader.error, sidecarStatus: compressedReader?.status.rawValue,
+            sidecarError: compressedReader?.error
           )
         )
       } else {
@@ -7433,7 +7528,7 @@ private struct NativePreviewPipeline {
       emit([
         "kind": "error",
         "generation": generation,
-        "message": "Swiftネイティブプレビューを開始できませんでした",
+        "message": "Swiftネイティブ処理でエラーが発生しました",
         "detail": error.localizedDescription,
       ])
       let message = "mioh-native-coreai-preview: \(error.localizedDescription)\n"

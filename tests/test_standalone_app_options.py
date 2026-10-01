@@ -1325,7 +1325,10 @@ class StandaloneAppOptionTests(unittest.TestCase):
         # The native lane must inspect a separate compressed sidecar and put
         # those zero-copy pixel buffers back into display order.
         self.assertIn("track.load(\n      .requiresFrameReordering", pipeline)
-        self.assertIn("AVAssetReaderTrackOutput(\n        track: track,\n        outputSettings: nil", pipeline)
+        self.assertRegex(
+            pipeline,
+            r"AVAssetReaderTrackOutput\(\s+track: track,\s+outputSettings: nil",
+        )
         self.assertIn("CMSampleBufferGetSampleAttachmentsArray", pipeline)
         self.assertIn("kCMSampleAttachmentKey_DoNotDisplay", pipeline)
         self.assertIn("H264SequenceParameters.maximumReorderFrames", pipeline)
