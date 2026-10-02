@@ -2546,6 +2546,14 @@ final class RealtimePlayerController: ObservableObject {
       let line = String(stdoutBuffer[..<newline])
       stdoutBuffer.removeSubrange(...newline)
       guard let data = line.data(using: .utf8) else { continue }
+      if let diagnostic = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        diagnostic["kind"] as? String == "diagnostic"
+      {
+        if diagnostic["generation"] as? Int == generation {
+          runner?.appendExternalLog("診断: \(line)\n")
+        }
+        continue
+      }
       let decoder = JSONDecoder()
       decoder.keyDecodingStrategy = .convertFromSnakeCase
       do {

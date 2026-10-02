@@ -87,6 +87,8 @@ struct NativeExportConfiguration: Codable, Sendable {
   let temporalOverlap: Int
   let ringCapacity: Int
   let nativeParallelWorkers: Int
+  var decoderBackend: String? = nil
+  var detailedDiagnostics: Bool? = nil
   let confidenceThreshold: Float
   let iouThreshold: Float = 0.7
   let contextFraction: Float = 0.30
@@ -161,6 +163,8 @@ struct NativeExportConfiguration: Codable, Sendable {
     case temporalOverlap
     case ringCapacity
     case nativeParallelWorkers
+    case decoderBackend
+    case detailedDiagnostics
     case confidenceThreshold
     case iouThreshold
     case contextFraction
@@ -195,6 +199,8 @@ struct NativeExportConfiguration: Codable, Sendable {
 }
 
 private struct NativePreviewLaunchConfiguration: Encodable {
+  var decoderBackend: String? = nil
+  var detailedDiagnostics: Bool? = nil
   let input: String
   let outputDirectory: String
   let ffmpegTemporaryDirectory: String?
@@ -667,6 +673,8 @@ struct MiohUserDefaultsSnapshot: Codable {
 
   var parallelWorkers: Int
   var nativeParallelWorkers: Int?
+  var decoderBackend: String? = nil
+  var detailedDiagnostics: Bool? = nil
   var executor: String
   var useSegmentCount: Bool
   var segmentCount: Int
@@ -890,6 +898,8 @@ final class RestorationRunner: ObservableObject {
 
   @Published var parallelWorkers = 1
   @Published var nativeParallelWorkers = 1
+  @Published var decoderBackend = "avfoundationAsync"
+  @Published var detailedDiagnostics = false
   @Published var executor = "process"
   @Published var useSegmentCount = true
   @Published var segmentCount = 4
@@ -1877,6 +1887,8 @@ final class RestorationRunner: ObservableObject {
       temporalOverlap: overlap,
       ringCapacity: max(clipFrames + overlap + 8, 32),
       nativeParallelWorkers: min(max(nativeParallelWorkers, 1), 10),
+      decoderBackend: decoderBackend,
+      detailedDiagnostics: detailedDiagnostics,
       confidenceThreshold: detection.confidenceThreshold,
       blendFeather: Float(blendFeather),
       restoreMaskOnly: restoreMaskOnly,
@@ -2368,6 +2380,8 @@ final class RestorationRunner: ObservableObject {
       temporalOverlap: overlap,
       ringCapacity: max(clipFrames + overlap + 8, 32),
       nativeParallelWorkers: 1,
+      // Remote workers retain their existing reader contract; local diagnostics
+      // do not silently change a cluster's remote input transport.
       confidenceThreshold: detection.confidenceThreshold,
       blendFeather: request.options.blendFeather,
       restoreMaskOnly: true,
@@ -2704,8 +2718,10 @@ final class RestorationRunner: ObservableObject {
       ======================================================================
       Swiftネイティブ書き出し
       ======================================================================
-      入力: \(input.path)
-      出力: \(output.path)
+      入力: \(configuration.detailedDiagnostics == true ? "診断ログでは非表示" : input.path)
+      出力: \(configuration.detailedDiagnostics == true ? "診断ログでは非表示" : output.path)
+      読み込み方式: \(configuration.decoderBackend ?? "avfoundationAsync")
+      詳細診断: \(configuration.detailedDiagnostics == true ? "有効（5秒間隔）" : "無効")
       復元モデル: \(restorationModel)
       検出モデル: \(detectionModel)
       分割: \(splitDescription)
@@ -3132,6 +3148,8 @@ final class RestorationRunner: ObservableObject {
       restorationEngine: restorationEngine,
       parallelWorkers: parallelWorkers,
       nativeParallelWorkers: nativeParallelWorkers,
+      decoderBackend: decoderBackend,
+      detailedDiagnostics: detailedDiagnostics,
       executor: executor,
       useSegmentCount: useSegmentCount,
       segmentCount: segmentCount,
@@ -3231,6 +3249,10 @@ final class RestorationRunner: ObservableObject {
       max(snapshot.nativeParallelWorkers ?? 1, 1),
       10
     )
+    decoderBackend = ["avfoundationAsync", "avfoundationLegacy", "ffmpegSoftware"]
+      .contains(snapshot.decoderBackend ?? "")
+      ? snapshot.decoderBackend! : "avfoundationAsync"
+    detailedDiagnostics = snapshot.detailedDiagnostics ?? false
     useSegmentCount = snapshot.useSegmentCount
     segmentCount = min(max(snapshot.segmentCount, 1), 128)
     segmentDuration = min(max(snapshot.segmentDuration, 10), 3600)
@@ -3456,6 +3478,8 @@ final class RestorationRunner: ObservableObject {
       ? outputDirectory.path
       : ladaTempDirectory
     let configuration = NativePreviewLaunchConfiguration(
+      decoderBackend: decoderBackend,
+      detailedDiagnostics: detailedDiagnostics,
       input: input.isFileURL ? input.path : input.absoluteString,
       outputDirectory: outputDirectory.path,
       ffmpegTemporaryDirectory: ffmpegTemporary,
@@ -3641,6 +3665,9 @@ final class RestorationRunner: ObservableObject {
             )
           }
         }
+        return
+      case "diagnostic":
+        appendLog("診断: \(line)\n")
         return
       case "export_finalizing":
         let message = payload["message"] as? String ?? "音声を結合しています"
@@ -4181,6 +4208,19 @@ struct ContentView: View {
 
   private var processingTab: some View {
     Form {
+      Section("読み込み・診断") {
+        Picker("動画の読み込み方式", selection: $runner.decoderBackend) {
+          Text("AVFoundation 非同期（既定）").tag("avfoundationAsync")
+          Text("AVFoundation 同期（比較用）").tag("avfoundationLegacy")
+          Text("FFmpeg ソフトウェア（比較用）").tag("ffmpegSoftware")
+        }.pickerStyle(.menu).disabled(runner.isRunning)
+        Toggle("詳細な診断ログ（5秒間隔）", isOn: $runner.detailedDiagnostics)
+          .disabled(runner.isRunning)
+        Text("macOS 27以降のSwiftネイティブ書き出し・プレビューに適用。復元モデルは変えず、読み込みだけを比較します。FFmpeg方式はCPU負荷が増える場合があります。")
+          .font(.caption).foregroundStyle(.secondary)
+        Text("診断には区間fps、各工程の時間、バッファ待ち、メモリ・スワップ量を記録します。素材名・元動画パス・FFmpegの生ログは記録しません。")
+          .font(.caption).foregroundStyle(.secondary)
+      }
       Section("並列処理") {
         LabeledContent("実行方式") {
           Text("Swiftネイティブ（段階並列）")

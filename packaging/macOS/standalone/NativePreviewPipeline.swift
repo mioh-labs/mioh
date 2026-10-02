@@ -67,6 +67,8 @@ private struct NativePreviewConfiguration: Decodable {
   let temporalBatchFrames: Int
   let temporalOverlap: Int?
   let ringCapacity: Int
+  let decoderBackend: String?
+  let detailedDiagnostics: Bool?
   let nativeParallelWorkers: Int?
   let confidenceThreshold: Float
   let iouThreshold: Float
@@ -411,9 +413,161 @@ private struct PTSFrameRateGate: Sendable {
   }
 }
 
-/// A bounded producer/consumer ring. CMSampleBuffer-backed CVPixelBuffers are
-/// retained by each slot and released as soon as the corresponding output
-/// frame has been handed to VideoToolbox.
+/// Opt-in, monotonic stage measurements. The timer reports even while a
+/// producer or consumer is blocked; it never reads media paths or metadata.
+private final class NativePipelineDiagnostics: @unchecked Sendable {
+  private let lock = NSLock()
+  private let reportLock = NSLock()
+  private let generation: Int
+  private let backend: String
+  private let started = ProcessInfo.processInfo.systemUptime
+  private var lastReport = ProcessInfo.processInfo.systemUptime
+  private var sequence = 0
+  private var active: [Int: (String, Double)] = [:]
+  private var seconds: [String: Double] = [:]
+  private var maxima: [String: Double] = [:]
+  private var counts: [String: Int] = [:]
+  private var positions: [String: Int64] = [:]
+  private var gauges: [String: Double] = [:]
+  private var previousSeconds: [String: Double] = [:]
+  private var previousCounts: [String: Int] = [:]
+  private var timer: DispatchSourceTimer?
+
+  init(generation: Int, backend: String) {
+    self.generation = generation
+    self.backend = backend
+  }
+
+  func start() {
+    report(event: "start")
+    let source = DispatchSource.makeTimerSource(queue:
+      DispatchQueue(label: "mioh.diagnostics", qos: .utility))
+    source.schedule(deadline: .now() + 5, repeating: 5, leeway: .milliseconds(200))
+    source.setEventHandler { [weak self] in self?.report(event: "interval") }
+    timer = source
+    source.resume()
+  }
+
+  func stop() {
+    timer?.cancel()
+    timer = nil
+    report(event: "stop")
+  }
+
+  func begin(_ stage: String) -> Int {
+    lock.withLock {
+      sequence += 1
+      active[sequence] = (stage, ProcessInfo.processInfo.systemUptime)
+      return sequence
+    }
+  }
+
+  func end(_ token: Int?, stage: String) {
+    guard let token else { return }
+    lock.withLock {
+      guard let (_, start) = active.removeValue(forKey: token) else { return }
+      let elapsed = max(0, ProcessInfo.processInfo.systemUptime - start)
+      seconds[stage, default: 0] += elapsed
+      maxima[stage] = max(maxima[stage] ?? 0, elapsed)
+    }
+  }
+
+  func addSeconds(_ stage: String, _ value: Double) {
+    lock.withLock { seconds[stage, default: 0] += max(0, value) }
+  }
+
+  func frames(_ stage: String, count: Int, pts: Int64? = nil) {
+    lock.withLock {
+      counts[stage, default: 0] += count
+      if let pts { positions[stage] = pts }
+    }
+  }
+
+  func gauge(_ name: String, _ value: Double) {
+    lock.withLock { gauges[name] = value }
+  }
+
+  func report(event: String, extra: [String: Any] = [:]) {
+    reportLock.lock()
+    defer { reportLock.unlock() }
+    let now = ProcessInfo.processInfo.systemUptime
+    var payload: [String: Any] = lock.withLock {
+      let interval = max(0.001, now - lastReport)
+      var rates: [String: Double] = [:]
+      for (name, count) in counts where ["decoded", "detected", "encoded"].contains(name) {
+        rates[name] = Double(count - (previousCounts[name] ?? 0)) / interval
+      }
+      var delta: [String: Double] = [:]
+      for (name, value) in seconds { delta[name] = value - (previousSeconds[name] ?? 0) }
+      var activeTimes: [String: Double] = [:]
+      for (_, (stage, start)) in active {
+        activeTimes[stage] = max(activeTimes[stage] ?? 0, now - start)
+      }
+      previousCounts = counts
+      previousSeconds = seconds
+      lastReport = now
+      return [
+        "kind": "diagnostic", "generation": generation, "event": event,
+        "decoder_backend": backend, "elapsed_seconds": now - started,
+        "interval_seconds": interval, "interval_fps": rates,
+        "frame_counts": counts, "last_pts_ns": positions,
+        "stage_seconds_total": seconds, "stage_seconds_delta": delta,
+        "stage_max_seconds": maxima, "active_stage_seconds": activeTimes,
+        "gauges": gauges,
+      ]
+    }
+    // Never include source URLs, NSError descriptions, command lines or raw
+    // subprocess stderr. Metrics are process/system values and fixed keys only.
+    payload["memory"] = Self.memorySnapshot()
+    payload["thermal_state"] = ProcessInfo.processInfo.thermalState.rawValue
+    let version = ProcessInfo.processInfo.operatingSystemVersion
+    payload["macos"] = "\(version.majorVersion).\(version.minorVersion).\(version.patchVersion)"
+    #if arch(arm64)
+      payload["process_architecture"] = "arm64"
+    #elseif arch(x86_64)
+      payload["process_architecture"] = "x86_64"
+    #endif
+    for (key, value) in extra { payload[key] = value }
+    emit(payload)
+  }
+
+  static func memorySnapshot() -> [String: Any] {
+    var result: [String: Any] = ["scope": "native_process_and_system"]
+    var usage = rusage()
+    if getrusage(RUSAGE_SELF, &usage) == 0 {
+      result["process_cpu_user_seconds"] = Double(usage.ru_utime.tv_sec)
+        + Double(usage.ru_utime.tv_usec) / 1_000_000
+      result["process_cpu_system_seconds"] = Double(usage.ru_stime.tv_sec)
+        + Double(usage.ru_stime.tv_usec) / 1_000_000
+    }
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size
+      / MemoryLayout<integer_t>.size)
+    let status = withUnsafeMutablePointer(to: &info) { pointer in
+      pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+        task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+      }
+    }
+    if status == KERN_SUCCESS {
+      result["process_footprint_mib"] = Double(info.phys_footprint) / 1_048_576
+      result["process_resident_mib"] = Double(info.resident_size) / 1_048_576
+    }
+    var swap = xsw_usage()
+    var size = MemoryLayout<xsw_usage>.size
+    if sysctlbyname("vm.swapusage", &swap, &size, nil, 0) == 0 {
+      result["system_swap_used_mib"] = Double(swap.xsu_used) / 1_048_576
+    }
+    var pressure: Int32 = 0
+    size = MemoryLayout<Int32>.size
+    if sysctlbyname("kern.memorystatus_vm_pressure_level", &pressure, &size, nil, 0) == 0 {
+      result["system_pressure_level"] = pressure
+    }
+    return result
+  }
+}
+
+/// A bounded producer/consumer ring. Each slot retains its CVPixelBuffer
+/// until it is handed to the consumer.
 private final class PixelBufferRing: @unchecked Sendable {
   private let condition = NSCondition()
   private var slots: [DecodedFrame?]
@@ -423,14 +577,19 @@ private final class PixelBufferRing: @unchecked Sendable {
   private var finished = false
   private var stopped = false
   private var failure: Error?
+  private let diagnostics: NativePipelineDiagnostics?
 
-  init(capacity: Int) {
+  init(capacity: Int, diagnostics: NativePipelineDiagnostics? = nil) {
     slots = Array(repeating: nil, count: max(2, capacity))
+    self.diagnostics = diagnostics
+    diagnostics?.gauge("ring_capacity", Double(slots.count))
   }
 
   func push(_ frame: DecodedFrame) -> Bool {
     condition.lock()
     defer { condition.unlock() }
+    let wait = count == slots.count ? diagnostics?.begin("ring_full_wait") : nil
+    defer { diagnostics?.end(wait, stage: "ring_full_wait") }
     while count == slots.count && !stopped {
       condition.wait()
     }
@@ -438,6 +597,7 @@ private final class PixelBufferRing: @unchecked Sendable {
     slots[writeIndex] = frame
     writeIndex = (writeIndex + 1) % slots.count
     count += 1
+    diagnostics?.gauge("ring_buffered_frames", Double(count))
     condition.broadcast()
     return true
   }
@@ -445,6 +605,8 @@ private final class PixelBufferRing: @unchecked Sendable {
   func pop() throws -> DecodedFrame? {
     condition.lock()
     defer { condition.unlock() }
+    let wait = count == 0 ? diagnostics?.begin("ring_empty_wait") : nil
+    defer { diagnostics?.end(wait, stage: "ring_empty_wait") }
     while count == 0 && !finished && !stopped {
       condition.wait()
     }
@@ -456,6 +618,7 @@ private final class PixelBufferRing: @unchecked Sendable {
     slots[readIndex] = nil
     readIndex = (readIndex + 1) % slots.count
     count -= 1
+    diagnostics?.gauge("ring_buffered_frames", Double(count))
     condition.broadcast()
     return frame
   }
@@ -473,6 +636,7 @@ private final class PixelBufferRing: @unchecked Sendable {
     stopped = true
     slots = Array(repeating: nil, count: slots.count)
     count = 0
+    diagnostics?.gauge("ring_buffered_frames", 0)
     condition.broadcast()
     condition.unlock()
   }
@@ -895,10 +1059,63 @@ private struct MalformedH264FrameReorderBuffer {
   }
 }
 
+private enum NativeDecoderBackend: String {
+  case avfoundationAsync, avfoundationLegacy, ffmpegSoftware
+
+  static func resolve(_ value: String?) throws -> Self {
+    guard let value else { return .avfoundationAsync }
+    guard let backend = Self(rawValue: value) else {
+      throw NativePreviewError.invalidConfiguration("unknown decoderBackend")
+    }
+    return backend
+  }
+}
+
+/// Only the acquisition API differs. Both AVFoundation paths use identical
+/// output settings, timestamp validation, backpressure and H.264 recovery.
+private final class NativeSampleSource: @unchecked Sendable {
+  typealias Sample = CMReadySampleBuffer<CMSampleBuffer.DynamicContent>
+  private let reader: AVAssetReader
+  private let output: AVAssetReaderTrackOutput
+  private let provider: AVAssetReaderOutput.Provider<Sample>?
+
+  init(reader: AVAssetReader, output: AVAssetReaderTrackOutput,
+       backend: NativeDecoderBackend) {
+    self.reader = reader
+    self.output = output
+    if backend == .avfoundationLegacy {
+      provider = nil
+      reader.add(output)
+    } else {
+      provider = reader.outputProvider(for: output)
+    }
+  }
+
+  func start() throws {
+    if provider != nil { try reader.start() }
+    else if !reader.startReading() {
+      throw reader.error ?? NativePreviewError.reader("legacy reader start failed")
+    }
+  }
+
+  func next() async throws -> Sample? {
+    if let provider { return try await provider.next() }
+    return try autoreleasepool {
+      guard let buffer = output.copyNextSampleBuffer() else {
+        if reader.status == .failed {
+          throw reader.error ?? NativePreviewError.reader("legacy reader failed")
+        }
+        return nil
+      }
+      return Sample(unsafeBuffer: buffer)
+    }
+  }
+}
+
 private final class ContinuousVideoDecoder: @unchecked Sendable {
   private typealias DynamicSample =
     CMReadySampleBuffer<CMSampleBuffer.DynamicContent>
-  private typealias SampleProvider = AVAssetReaderOutput.Provider<DynamicSample>
+  private typealias SampleProvider = NativeSampleSource
 
   private let asset: AVURLAsset
   // AVAssetResourceLoader.delegate is weak. This owner must stay alive until
@@ -907,6 +1124,12 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
   private let track: AVAssetTrack
   private let assetDuration: CMTime
   private let ring: PixelBufferRing
+  private let backend: NativeDecoderBackend
+  private let diagnostics: NativePipelineDiagnostics?
+  private let input: URL
+  private let ffmpeg: URL?
+  private let expectedFFmpegSize: (Int, Int)
+  private var ffmpegReader: NativeFFmpegReader?
   private let startTime: CMTime
   private let endTime: CMTime?
   // Some malformed H.264 files contain B-slices while declaring PTS == DTS.
@@ -935,8 +1158,19 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
     expectedRemoteSHA256: String? = nil,
     startNanoseconds: Int64,
     endNanoseconds: Int64? = nil,
+    backend: NativeDecoderBackend = .avfoundationAsync,
+    ffmpeg: URL? = nil,
+    diagnostics: NativePipelineDiagnostics? = nil,
     ring: PixelBufferRing
   ) async throws {
+    self.backend = backend
+    self.diagnostics = diagnostics
+    self.input = input
+    self.ffmpeg = ffmpeg
+    if backend == .ffmpegSoftware, !input.isFileURL {
+      throw NativePreviewError.invalidConfiguration(
+        "FFmpeg diagnostic decoder supports local files only")
+    }
     if input.isFileURL {
       remoteResourceLoader = nil
       asset = AVURLAsset(url: input)
@@ -959,6 +1193,10 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
       throw NativePreviewError.missingVideoTrack
     }
     self.track = track
+    let transform = try await track.load(.preferredTransform)
+    let natural = try await track.load(.naturalSize).applying(transform)
+    expectedFFmpegSize = (max(1, Int(abs(natural.width).rounded())),
+                          max(1, Int(abs(natural.height).rounded())))
     assetDuration = try await asset.load(.duration)
     self.ring = ring
     var leadingEmptyEdit = CMTime.zero
@@ -972,7 +1210,7 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
       .requiresFrameReordering
     )
     let formats = try await track.load(.formatDescriptions)
-    if !requiresFrameReordering,
+    if backend != .ffmpegSoftware, !requiresFrameReordering,
       let format = formats.first,
       CMFormatDescriptionGetMediaSubType(format) == kCMVideoCodecType_H264
     {
@@ -1027,6 +1265,13 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
     } else {
       endTime = nil
     }
+    diagnostics?.report(event: "stream_info", extra: [
+      "codec_subtype": formats.first.map { CMFormatDescriptionGetMediaSubType($0) } ?? 0,
+      "requires_frame_reordering": requiresFrameReordering,
+      "leading_empty_edit_ns": leadingEmptyEditNanoseconds,
+      "decode_start_ns": max(0, startNanoseconds),
+      "decode_end_ns": endNanoseconds.map { $0 as Any } ?? NSNull(),
+    ])
   }
 
   func description() async throws -> VideoDescription {
@@ -1051,6 +1296,18 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
   }
 
   func start() throws {
+    if backend == .ffmpegSoftware {
+      guard let ffmpeg else {
+        throw NativePreviewError.invalidConfiguration("FFmpeg decoder requires ffmpeg")
+      }
+      let source = NativeFFmpegReader(
+        executable: ffmpeg, input: input, start: startTime, end: endTime,
+        expectedSize: expectedFFmpegSize,
+        ring: ring, diagnostics: diagnostics)
+      ffmpegReader = source
+      try source.start()
+      return
+    }
     let reader: AVAssetReader
     do {
       reader = try AVAssetReader(asset: asset)
@@ -1087,7 +1344,7 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
     )
     // Provider.next() vends a Sendable ready sample whose decoded IOSurface
     // stays in Swift/CoreVideo without the deprecated copy-next bridge.
-    let decodedProvider = reader.outputProvider(for: output)
+    let decodedProvider = NativeSampleSource(reader: reader, output: output, backend: backend)
 
     var compressedReader: AVAssetReader?
     var compressedProvider: SampleProvider?
@@ -1102,8 +1359,9 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
           track: track,
           outputSettings: nil
         )
-        let provider = sidecarReader.outputProvider(for: sidecarOutput)
-        try sidecarReader.start()
+        let provider = NativeSampleSource(
+          reader: sidecarReader, output: sidecarOutput, backend: backend)
+        try provider.start()
         compressedProvider = provider
         orderingReader = sidecarReader
       } catch {
@@ -1117,7 +1375,7 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
       }
     }
     do {
-      try reader.start()
+      try decodedProvider.start()
     } catch {
       let diagnostic = NativeDecodeDiagnostics.failure(
         error, stage: "reader.start", readerStatus: reader.status.rawValue,
@@ -1130,7 +1388,7 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
     self.reader = reader
     let nalLength = malformedH264NALLength
     let syntheticHeadEnd = leadingEmptyEditNanoseconds
-    task = Task.detached(priority: .userInitiated) { [ring] in
+    task = Task.detached(priority: .userInitiated) { [ring, diagnostics, backend] in
       var reorderBuffer = MalformedH264FrameReorderBuffer()
       var failure: Error?
       var failureStage = "decoded.validation"
@@ -1185,6 +1443,8 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
       while !Task.isCancelled {
         let readySample: DynamicSample?
         do {
+          let token = diagnostics?.begin("decode")
+          defer { diagnostics?.end(token, stage: "decode") }
           readySample = try await decodedProvider.next()
         } catch {
           failureStage = "decoded.next"
@@ -1227,6 +1487,7 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
         }
         decodedFrames += 1
         lastDecodedPTS = ptsNanoseconds
+        diagnostics?.frames("decoded", count: 1, pts: ptsNanoseconds)
         // Drop the image AVAssetReader synthesizes for a leading empty edit;
         // it has no compressed sample to pair with.
         if nalLength != nil, syntheticHeadEnd > 0,
@@ -1336,6 +1597,11 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
         failure = reader.error ?? NativePreviewError.reader("decode failed")
       }
       if let failure {
+        diagnostics?.report(event: "decode_failure", extra: [
+          "decoder_backend": backend.rawValue,
+          "reader_status": reader.status.rawValue,
+          "stage": failureStage,
+        ])
         ring.complete(
           NativeDecodeDiagnostics.failure(
             failure, stage: failureStage, decodedFrames: decodedFrames,
@@ -1351,6 +1617,8 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
   }
 
   func stop() async {
+    await ffmpegReader?.stop()
+    ffmpegReader = nil
     task?.cancel()
     reader?.cancelReading()
     orderingReader?.cancelReading()
@@ -1360,6 +1628,283 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
     task = nil
     reader = nil
     orderingReader = nil
+  }
+}
+
+/// FFmpeg's showinfo side channel supplies each frame's *integer* PTS and
+/// time base. Never infer timestamps from nominal FPS (VFR and seeks must not
+/// drift), and never forward stderr, which can contain filenames/metadata.
+private final class NativeFFmpegReader: @unchecked Sendable {
+  struct Stamp {
+    let index: Int
+    let pts: Int64
+    let width: Int
+    let height: Int
+  }
+  private let process = Process()
+  private let pixels = Pipe()
+  private let messages = Pipe()
+  private let condition = NSCondition()
+  private let ring: PixelBufferRing
+  private let diagnostics: NativePipelineDiagnostics?
+  private let expectedSize: (Int, Int)
+  private var stamps: [Stamp] = []
+  private var messageEnded = false
+  private var cancelled = false
+  private var metadataFailed = false
+  private var task: Task<Void, Never>?
+  private let stderrDone = DispatchGroup()
+
+  init(executable: URL, input: URL, start: CMTime, end: CMTime?,
+       expectedSize: (Int, Int),
+       ring: PixelBufferRing, diagnostics: NativePipelineDiagnostics?) {
+    self.ring = ring
+    self.diagnostics = diagnostics
+    self.expectedSize = expectedSize
+    process.executableURL = executable
+    // Passthrough prevents FFmpeg from duplicating/dropping VFR frames.
+    // Keep the file's presentation timeline, including a nonzero track start.
+    // Seek to the preceding keyframe, then trim using absolute decoded PTS.
+    // FFmpeg's accurate input seek can add the stream offset to its discard
+    // boundary even with seek_timestamp. start_at_zero would shift the video
+    // relative to the original audio, so neither is used here.
+    var arguments = ["-hide_banner", "-nostdin", "-nostats", "-loglevel", "info",
+      "-xerror", "-err_detect", "explode", "-hwaccel", "none", "-threads", "2",
+      "-copyts", "-seek_timestamp", "1"]
+    if start > .zero {
+      arguments += ["-noaccurate_seek", "-ss", String(format: "%.9f", start.seconds)]
+    }
+    arguments += ["-i", input.path, "-map", "0:v:0", "-an", "-sn", "-dn"]
+    // Match the track's display size (including rotation and pixel aspect
+    // ratio) before passing frames to the existing restoration/encoder path.
+    var filters = "scale=\(expectedSize.0):\(expectedSize.1),setsar=1,format=bgra,trim=start=\(String(format: "%.9f", start.seconds))"
+    if let end { filters += ",trim=end=\(String(format: "%.9f", end.seconds))" }
+    filters += ",showinfo=checksum=0"
+    arguments += ["-vf", filters, "-fps_mode", "passthrough", "-c:v", "rawvideo",
+      "-threads:v", "1", "-pix_fmt", "bgra", "-f", "rawvideo", "pipe:1"]
+    process.arguments = arguments
+    process.standardInput = FileHandle.nullDevice
+    process.standardOutput = pixels
+    process.standardError = messages
+  }
+
+  private static func captures(_ pattern: String, _ line: String) -> [String]? {
+    guard let regex = try? NSRegularExpression(pattern: pattern),
+      let match = regex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line))
+    else { return nil }
+    return (1..<match.numberOfRanges).compactMap {
+      Range(match.range(at: $0), in: line).map { String(line[$0]) }
+    }
+  }
+
+  static func parseStamp(_ line: String, timeBase: (Int32, Int32)) -> Stamp? {
+    guard line.hasPrefix("[Parsed_showinfo_"), line.contains("fmt:bgra"),
+      let numbers = captures(#"\bn:\s*(\d+)\s+pts:\s*(-?\d+)\s+pts_time:"#, line),
+      let dimensions = captures(#"\bs:(\d+)x(\d+)\b"#, line),
+      let index = Int(numbers[0]), let value = Int64(numbers[1]),
+      let width = Int(dimensions[0]), let height = Int(dimensions[1]),
+      (1...16384).contains(width), (1...16384).contains(height),
+      timeBase.0 > 0, timeBase.1 > 0
+    else { return nil }
+    let multiplied = value.multipliedReportingOverflow(by: Int64(timeBase.0))
+    guard !multiplied.overflow else { return nil }
+    let pts = CMTimeConvertScale(CMTime(value: multiplied.partialValue, timescale: timeBase.1),
+      timescale: 1_000_000_000, method: .roundHalfAwayFromZero)
+    guard pts.isNumeric else { return nil }
+    return Stamp(index: index, pts: pts.value, width: width, height: height)
+  }
+
+  private func readMessages() {
+    defer {
+      condition.lock()
+      messageEnded = true
+      condition.broadcast()
+      condition.unlock()
+    }
+    var pending = Data()
+    var droppingLongLine = false
+    var timeBase: (Int32, Int32)?
+    var bytes = [UInt8](repeating: 0, count: 4096)
+    while true {
+      // FileHandle.read(upToCount:) may wait to fill the requested amount.
+      // That deadlocks this side channel when FFmpeg is waiting for us to
+      // drain the corresponding raw frame. POSIX read returns available bytes.
+      let amount = bytes.withUnsafeMutableBytes {
+        Darwin.read(messages.fileHandleForReading.fileDescriptor, $0.baseAddress!, $0.count)
+      }
+      if amount < 0 && errno == EINTR { continue }
+      if amount <= 0 {
+        if amount < 0 {
+          condition.lock(); metadataFailed = true; condition.broadcast(); condition.unlock()
+        }
+        return
+      }
+      for byte in bytes.prefix(amount) {
+        if byte != 10 {
+          if !droppingLongLine { pending.append(byte) }
+          if pending.count > 65_536 { pending.removeAll(keepingCapacity: true); droppingLongLine = true }
+          continue
+        }
+        let line = String(decoding: pending, as: UTF8.self)
+        pending.removeAll(keepingCapacity: true)
+        if droppingLongLine { droppingLongLine = false; continue }
+        guard line.hasPrefix("[Parsed_showinfo_") else { continue }
+        if let values = Self.captures(#"config in time_base:\s*(\d+)/(\d+)"#, line),
+          let numerator = Int32(values[0]), let denominator = Int32(values[1]) {
+          timeBase = (numerator, denominator)
+        }
+        guard line.contains("pts_time:") else { continue }
+        guard let timeBase, let stamp = Self.parseStamp(line, timeBase: timeBase) else {
+          condition.lock(); metadataFailed = true; condition.broadcast(); condition.unlock()
+          continue
+        }
+        condition.lock()
+        while stamps.count >= 16 && !cancelled { condition.wait() }
+        if cancelled { condition.unlock(); return }
+        stamps.append(stamp)
+        condition.broadcast()
+        condition.unlock()
+      }
+    }
+  }
+
+  private func nextStamp() throws -> Stamp? {
+    condition.lock()
+    defer { condition.unlock() }
+    while stamps.isEmpty && !messageEnded && !cancelled && !metadataFailed { condition.wait() }
+    if cancelled { return nil }
+    if metadataFailed { throw NativePreviewError.reader("FFmpeg timestamp metadata is invalid") }
+    guard !stamps.isEmpty else { return nil }
+    let next = stamps.removeFirst()
+    condition.broadcast()
+    return next
+  }
+
+  private func readPixels(_ stamp: Stamp) throws -> CVPixelBuffer {
+    var buffer: CVPixelBuffer?
+    let result = CVPixelBufferCreate(kCFAllocatorDefault, stamp.width, stamp.height,
+      kCVPixelFormatType_32BGRA, [
+        kCVPixelBufferMetalCompatibilityKey as String: true,
+        kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+      ] as CFDictionary, &buffer)
+    guard result == kCVReturnSuccess, let buffer else {
+      throw NativePreviewError.reader("FFmpeg pixel allocation failed: \(result)")
+    }
+    CVPixelBufferLockBaseAddress(buffer, [])
+    defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+    guard let base = CVPixelBufferGetBaseAddress(buffer) else {
+      throw NativePreviewError.reader("FFmpeg pixel buffer has no base address")
+    }
+    let rowBytes = stamp.width * 4
+    let stride = CVPixelBufferGetBytesPerRow(buffer)
+    // Copy packed rawvideo into CoreVideo's potentially padded rows. Neither
+    // buffering nor memory consumption grows with the duration of the input.
+    let chunks = stride == rowBytes ? 1 : stamp.height
+    let chunkBytes = stride == rowBytes ? rowBytes * stamp.height : rowBytes
+    for row in 0..<chunks {
+      var readCount = 0
+      while readCount < chunkBytes {
+        let amount = Darwin.read(pixels.fileHandleForReading.fileDescriptor,
+          base.advanced(by: row * stride + readCount), chunkBytes - readCount)
+        if amount < 0 && errno == EINTR { continue }
+        guard amount > 0 else {
+          throw NativePreviewError.reader("FFmpeg returned an incomplete decoded frame")
+        }
+        readCount += amount
+      }
+    }
+    return buffer
+  }
+
+  func start() throws {
+    do { try process.run() }
+    catch { throw NativeDecodeDiagnostics.failure(error, stage: "ffmpeg.start") }
+    // Close the parent's copies so EOF arrives even if the child fails.
+    try? pixels.fileHandleForWriting.close()
+    try? messages.fileHandleForWriting.close()
+    diagnostics?.gauge("ffmpeg_pid", Double(process.processIdentifier))
+    stderrDone.enter()
+    DispatchQueue.global(qos: .utility).async { [self] in
+      defer { stderrDone.leave() }
+      readMessages()
+    }
+    task = Task.detached(priority: .userInitiated) { [self] in
+      var count = 0
+      var lastPTS: Int64?
+      var dimensions: (Int, Int)?
+      do {
+        while !Task.isCancelled {
+          let token = diagnostics?.begin("decode")
+          let frame: DecodedFrame?
+          do {
+            defer { diagnostics?.end(token, stage: "decode") }
+            if let stamp = try nextStamp() {
+              guard stamp.index == count else {
+                throw NativePreviewError.reader("FFmpeg frame/timestamp sequence mismatch")
+              }
+              guard (stamp.width, stamp.height) == expectedSize else {
+                throw NativePreviewError.reader("FFmpeg dimensions disagree with the video track")
+              }
+              if let lastPTS, stamp.pts <= lastPTS {
+                throw NativePreviewError.reader("FFmpeg presentation timestamps are not increasing")
+              }
+              if let dimensions, dimensions != (stamp.width, stamp.height) {
+                throw NativePreviewError.reader("FFmpeg frame dimensions changed")
+              }
+              dimensions = (stamp.width, stamp.height)
+              frame = try autoreleasepool {
+                DecodedFrame(pixelBuffer: try readPixels(stamp), ptsNanoseconds: stamp.pts)
+              }
+            } else { frame = nil }
+          }
+          guard let frame else { break }
+          count += 1
+          lastPTS = frame.ptsNanoseconds
+          diagnostics?.frames("decoded", count: 1, pts: frame.ptsNanoseconds)
+          if !ring.push(frame) { break }
+        }
+        if !isCancelled {
+          process.waitUntilExit()
+          guard process.terminationStatus == 0 else {
+            throw NativePreviewError.reader("FFmpeg software decoder exited: \(process.terminationStatus)")
+          }
+        }
+        ring.complete()
+      } catch {
+        diagnostics?.report(event: "decode_failure", extra: ["stage": "ffmpeg.read"])
+        let diagnostic = NativeDecodeDiagnostics.failure(error, stage: "ffmpeg.read",
+          decodedFrames: count, lastPTS: lastPTS)
+        cancelProcess()
+        ring.complete(diagnostic)
+      }
+    }
+  }
+
+  private var isCancelled: Bool { condition.withLock { cancelled } }
+
+  private func cancelProcess() {
+    condition.lock(); cancelled = true; condition.broadcast(); condition.unlock()
+    if process.isRunning {
+      process.terminate()
+      // Termination must also release a reader blocked on stdout/stderr.
+      DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2) { [process] in
+        if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+      }
+    }
+  }
+
+  func stop() async {
+    task?.cancel()
+    cancelProcess()
+    ring.stop()
+    await task?.value
+    if process.isRunning { process.waitUntilExit() }
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      stderrDone.notify(queue: .global(qos: .utility)) { continuation.resume() }
+    }
+    try? pixels.fileHandleForReading.close()
+    try? messages.fileHandleForReading.close()
+    task = nil
   }
 }
 
@@ -7145,14 +7690,18 @@ private final class PreviewControl: @unchecked Sendable {
   }
 }
 
+private let nativeEmitLock = NSLock()
+
 private func emit(_ payload: [String: Any]) {
   guard let data = try? JSONSerialization.data(withJSONObject: payload),
     let line = String(data: data, encoding: .utf8)
   else {
     return
   }
-  print(line)
-  fflush(stdout)
+  nativeEmitLock.withLock {
+    print(line)
+    fflush(stdout)
+  }
 }
 
 private enum NativeExportSupport {
@@ -7538,6 +8087,12 @@ private struct NativePreviewPipeline {
   }
 
   private static func run(config: NativePreviewConfiguration) async throws {
+    let backend = try NativeDecoderBackend.resolve(config.decoderBackend)
+    let diagnostics = (config.detailedDiagnostics ?? false)
+      ? NativePipelineDiagnostics(generation: config.generation, backend: backend.rawValue) : nil
+    diagnostics?.start()
+    defer { diagnostics?.stop() }
+    let setupToken = diagnostics?.begin("setup")
     guard config.temporalBatchFrames > 0,
       config.temporalBatchFrames <= maximumTemporalBatchFrames,
       config.ringCapacity >= config.temporalBatchFrames
@@ -7600,27 +8155,43 @@ private struct NativePreviewPipeline {
     } else {
       sourceURL = URL(fileURLWithPath: config.input)
     }
-    let preparedInput = try await NativeExportSupport.prepareInput(
-      source: sourceURL,
-      ffmpeg: ffmpegURL,
-      directory: ffmpegTemporaryDirectory
-    )
+    let preparedInput: (url: URL, temporary: URL?)
+    if backend == .ffmpegSoftware {
+      guard sourceURL.isFileURL else {
+        throw NativePreviewError.invalidConfiguration("FFmpeg diagnostic decoder supports local files only")
+      }
+      preparedInput = (sourceURL, nil)
+    } else {
+      preparedInput = try await NativeExportSupport.prepareInput(
+        source: sourceURL, ffmpeg: ffmpegURL, directory: ffmpegTemporaryDirectory)
+    }
     defer {
       if let temporary = preparedInput.temporary {
         try? FileManager.default.removeItem(at: temporary)
       }
     }
 
-    let ring = PixelBufferRing(capacity: config.ringCapacity)
+    let ring = PixelBufferRing(capacity: config.ringCapacity, diagnostics: diagnostics)
     let decoder = try await ContinuousVideoDecoder(
       input: preparedInput.url,
       expectedRemoteByteCount: config.inputByteCount,
       expectedRemoteSHA256: config.inputSHA256,
       startNanoseconds: config.startNanoseconds,
       endNanoseconds: config.decodeEndNanoseconds,
+      backend: backend,
+      ffmpeg: ffmpegURL,
+      diagnostics: diagnostics,
       ring: ring
     )
     let video = try await decoder.description()
+    diagnostics?.report(event: "source_info", extra: [
+      "width": video.width, "height": video.height,
+      "source_fps": Double(video.fpsNumerator) / Double(video.fpsDenominator),
+      "duration_seconds": video.durationSeconds,
+      "temporal_batch_frames": config.temporalBatchFrames,
+      "parallel_workers": config.nativeParallelWorkers ?? 1,
+      "h264_display_order_recovery": decoder.repairsMalformedH264DisplayOrder,
+    ])
     let sourceFPS = Double(video.fpsNumerator) / Double(video.fpsDenominator)
     let maximumTargetRate: (numerator: Int, denominator: Int)? =
       config.maximumFPS.flatMap { maximum in
@@ -7851,12 +8422,14 @@ private struct NativePreviewPipeline {
         ? Double.greatestFiniteMagnitude
         : config.bufferLimitSeconds
     )
-    let wallStart = Date()
+    let wallStart = ProcessInfo.processInfo.systemUptime
+    diagnostics?.end(setupToken, stage: "setup")
     swiftVR?.shouldStop = { control.shouldStop() }
     control.runReader()
     emit([
       "kind": "ready",
       "generation": config.generation,
+      "decoder_backend": backend.rawValue,
       "duration": video.durationSeconds,
       "fps": Double(outputFPSNumerator) / Double(outputFPSDenominator),
       "source_fps": sourceFPS,
@@ -8027,6 +8600,8 @@ private struct NativePreviewPipeline {
           return accepted && belongsToCoreOutput(frame.ptsNanoseconds)
         }
         pendingEncoding = Task.detached(priority: .userInitiated) {
+          let token = diagnostics?.begin("encode")
+          defer { diagnostics?.end(token, stage: "encode") }
           var completedSegments: [SegmentEvent] = []
           var encodingNextSequence = startingSequence
           for frame in acceptedFrames {
@@ -8047,6 +8622,7 @@ private struct NativePreviewPipeline {
               completedSegments.append(segment)
               encodingNextSequence = segment.sequence + 1
             }
+            diagnostics?.frames("encoded", count: 1, pts: frame.ptsNanoseconds)
           }
           return (completedSegments, encodingNextSequence)
         }
@@ -8057,7 +8633,7 @@ private struct NativePreviewPipeline {
             100,
             max(0, position / max(0.001, video.durationSeconds) * 100)
           )
-          let elapsed = max(0.001, Date().timeIntervalSince(wallStart))
+          let elapsed = max(0.001, ProcessInfo.processInfo.systemUptime - wallStart)
           let throughput = Double(encodedFrames) / elapsed
           let eta = percent > 0
             ? elapsed * max(0, 100 - percent) / percent
@@ -8081,8 +8657,20 @@ private struct NativePreviewPipeline {
         nextProcessorIndex = (nextProcessorIndex + 1) % processors.count
         let batch = detectedBatch.frames
         let task = Task.detached(priority: .userInitiated) {
+          let token = diagnostics?.begin("restore_batch")
+          let beforePreparation = processor.preparationSeconds
+          let beforeRestoration = processor.restorationSeconds
+          let beforeComposition = processor.compositionSeconds
+          defer {
+            diagnostics?.end(token, stage: "restore_batch")
+            diagnostics?.addSeconds("prepare", processor.preparationSeconds - beforePreparation)
+            diagnostics?.addSeconds("restore_and_enhance", processor.restorationSeconds - beforeRestoration)
+            diagnostics?.addSeconds("compose", processor.compositionSeconds - beforeComposition)
+          }
           let outputs = try await processor.process(batch,
             skipPrefix: detectedBatch.skipPrefix)
+          diagnostics?.frames("restored_batches", count: 1)
+          diagnostics?.frames("restored_scenes", count: processor.lastRestoredSceneCount)
           return NativeProcessedBatch(
             outputs: outputs,
             restoredSceneCount: processor.lastRestoredSceneCount
@@ -8172,7 +8760,9 @@ private struct NativePreviewPipeline {
               if labelFieldTracker != nil {
                 fillLabelFieldGaps(&pending, maximumGap: 10)
               }
+              let waitToken = diagnostics?.begin("restore_capacity_wait")
               availableBatchSlots.wait()
+              diagnostics?.end(waitToken, stage: "restore_capacity_wait")
               if control.shouldStop() {
                 availableBatchSlots.signal()
                 return
@@ -8195,6 +8785,8 @@ private struct NativePreviewPipeline {
             func inferDetections(
               _ frame: DecodedFrame
             ) async throws -> [Detection] {
+              let token = diagnostics?.begin("detect")
+              defer { diagnostics?.end(token, stage: "detect") }
               let detectionStart = Date()
               let allDetections = try await detector.detect(
                 frame.pixelBuffer,
@@ -8204,6 +8796,9 @@ private struct NativePreviewPipeline {
               localDetectionSeconds += Date().timeIntervalSince(
                 detectionStart
               )
+              diagnostics?.frames("detected", count: 1, pts: frame.ptsNanoseconds)
+              diagnostics?.frames("detection_boxes", count: allDetections.count)
+              diagnostics?.gauge("last_detection_boxes", Double(allDetections.count))
               return (config.detectFaceMosaics ?? false)
                 ? allDetections.filter { $0.classIndex == 0 }
                 : allDetections
@@ -8443,6 +9038,7 @@ private struct NativePreviewPipeline {
               nextSequence = segment.sequence + 1
             }
             encodedFrames += 1
+            diagnostics?.frames("encoded", count: 1, pts: frame.ptsNanoseconds)
           }
           deferredCrossfadeTail.removeAll(keepingCapacity: false)
         }
@@ -8460,6 +9056,8 @@ private struct NativePreviewPipeline {
             )
           }
           let finalOutput = URL(fileURLWithPath: outputFile)
+          let finalizingToken = diagnostics?.begin("finalize")
+          defer { diagnostics?.end(finalizingToken, stage: "finalize") }
           if config.isWorker {
             emit([
               "kind": "export_finalizing",
@@ -8505,7 +9103,7 @@ private struct NativePreviewPipeline {
             )
           }
         }
-        let elapsed = max(0.001, Date().timeIntervalSince(wallStart))
+        let elapsed = max(0.001, ProcessInfo.processInfo.systemUptime - wallStart)
         emit([
           "kind": "native_stats",
           "generation": config.generation,

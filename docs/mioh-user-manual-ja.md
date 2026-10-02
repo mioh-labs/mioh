@@ -1,9 +1,9 @@
 # mioh ユーザーマニュアル
 
-バージョン 0.14.3-018
+バージョン 0.14.3-019
 
 対象: mioh-universal for macOS
-改訂日: 2026年9月30日
+改訂日: 2026年10月2日
 
 ## 1. miohについて
 
@@ -23,7 +23,7 @@ miohは、動画内のモザイク領域を検出し、復元モデルで処理�
 
 ## 2. インストールと起動
 
-1. [miohのv0.14.3-018リリース](https://github.com/mioh-labs/mioh/releases/tag/v0.14.3-018)から`mioh-universal-0.14.3-018-unsigned.dmg`を入手します。
+1. [miohのv0.14.3-019リリース](https://github.com/mioh-labs/mioh/releases/tag/v0.14.3-019)から`mioh-universal-0.14.3-019-unsigned.dmg`を入手します。
 2. `mioh-universal.app`を`Applications`へドラッグします。
 3. 次節のモデルダウンロードと変換を完了します。
 4. Applicationsフォルダからmiohを起動します。
@@ -107,13 +107,13 @@ uv run --no-project --python 3.12 --with reportlab \
 zsh packaging/macOS/standalone/build_universal_app.sh
 ```
 
-成果物は`build/macos-standalone-universal/mioh-universal.app`と`build/macos-standalone-universal/mioh-universal-0.14.3-018-unsigned.dmg`です。ビルドはモデルなしの配布物を作成します。モデルを使うMacでは、アプリのインストール後に2.1節のダウンロード・変換を行ってください。ビルド用スクリプトはアプリ本体とCore AIヘルパーを別々のmacOSターゲット向けにコンパイルします。
+成果物は`build/macos-standalone-universal/mioh-universal.app`と`build/macos-standalone-universal/mioh-universal-0.14.3-019-unsigned.dmg`です。ビルドはモデルなしの配布物を作成します。モデルを使うMacでは、アプリのインストール後に2.1節のダウンロード・変換を行ってください。ビルド用スクリプトはアプリ本体とCore AIヘルパーを別々のmacOSターゲット向けにコンパイルします。
 
 ビルド後は次を確認します。`hdiutil verify`の成功に加え、アプリ内のPythonと2本のモデルツールが存在することが重要です。
 
 ```zsh
 APP=build/macos-standalone-universal/mioh-universal.app
-DMG=build/macos-standalone-universal/mioh-universal-0.14.3-018-unsigned.dmg
+DMG=build/macos-standalone-universal/mioh-universal-0.14.3-019-unsigned.dmg
 test -x "$APP/Contents/Resources/runtime/bin/python3.12"
 test -f "$APP/Contents/Resources/model-tools/download-mioh-models.zsh"
 test -f "$APP/Contents/Resources/model-tools/convert-mioh-models.zsh"
@@ -162,6 +162,22 @@ shasum -a 256 "$DMG"
 | 既存結果を上書き | オフ | 同名の出力を保護します。 |
 
 ## 5. 分割タブ
+
+### 読み込み・診断
+
+macOS 27以降のSwiftネイティブ書き出し・プレビューでは、動画の読み込み方式を選べます。macOS 26のMPS処理とクラスタワーカーには適用されません。検出・復元モデルやROIの処理は変更しません。
+
+| 方式 | 説明 |
+| --- | --- |
+| AVFoundation 非同期（既定） | 従来の読み込み方式です。通常はこちらを使います。 |
+| AVFoundation 同期（比較用） | 同じAppleデコーダーを、従来の同期APIから利用して比較します。ソフトウェアデコードを強制するものではありません。 |
+| FFmpeg ソフトウェア（比較用） | 同梱FFmpegでフレームをCPUデコードします。ローカルファイルのみ対応し、CPU負荷や色変換結果が異なる場合があります。動画情報の取得にはAVFoundationも使用します。 |
+
+「詳細な診断ログ」をオンにすると、5秒ごとに区間fps、工程別時間、バッファ待ち、CPU時間、メモリ・スワップ量を記録します。既定はオフです。選択は次回の処理開始から適用され、エラー時に別方式へ自動で切り替えることはありません。
+
+新しい診断JSONには素材名・元動画パス・FFmpegの生ログを含めません。ただし既存ログ全体の匿名化を保証する機能ではありません。ログを共有する前には内容を確認してください。
+
+### 分割・並列
 
 長編動画を複数セグメントへ分けて処理し、最後に結合します。
 
@@ -461,6 +477,12 @@ SwiftVRだけで失敗する場合は、アプリに導入スクリプトがあ�
 
 「強制的に再分割」がオフであること、一時ファイルが残っていること、入力・分割条件・保存先が前回と同じであることを確認してください。
 
+### Cannot Decodeで停止する
+
+「分割」タブで詳細な診断ログを有効にし、同じ動画・同じ復元設定で読み込み方式だけを切り替えて比較します。エラー直前の数回分とエラー行を保存してください。診断の区間fpsは直前の記録からの速度であり、進捗表示の累計平均fpsとは異なります。
+
+AVFoundationの-11821はデコード失敗ですが、動画破損が確定したことを意味しません。VideoToolboxのkVTVideoDecoderBadDataErrは-12909であり、-12137ではありません。別方式で成功しても、それだけで入力が正常またはOSのバグと断定はできません。
+
 ### 出力の境界が目立つ
 
 境界フェザーを少し増やし、Temporal overlapを8から15の範囲で増やします。シャープやディテールが強すぎないかも確認してください。
@@ -486,6 +508,7 @@ ROIエンハンサー強度、テクスチャ、ディテール、シャープ�
 | 分類 | 初期値 |
 | --- | --- |
 | 並列 | ネイティブ1レーン、4分割 |
+| 読み込み・診断 | AVFoundation非同期、詳細診断オフ |
 | デバイス | MPS、FP16、自動最適化オン |
 | 復元 | 自動選択、最大クリップ長自動、Temporal overlap 8、クロスフェードオン |
 | 合成 | シャープ0、ディテール0、境界フェザー1、テクスチャ0、スムージング0、1x |
@@ -495,4 +518,4 @@ ROIエンハンサー強度、テクスチャ、ディテール、シャープ�
 | メモリ | 掃除間隔1、空き4GB、MPS比率0.46 |
 | 再生 | バッファ8秒、通常、SBS左右、左目、視野角60度 |
 
-本マニュアルのインストール・ビルド・モデル導入手順はmioh-universal 0.14.3-018の配布スクリプトを基準にしています。画面項目は配布版や選択したモデルにより異なる場合があります。
+本マニュアルのインストール・ビルド・モデル導入手順はmioh-universal 0.14.3-019の配布スクリプトを基準にしています。画面項目は配布版や選択したモデルにより異なる場合があります。

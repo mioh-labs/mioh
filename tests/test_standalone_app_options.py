@@ -91,7 +91,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
             '"lada-coreai-runner"',
             '"lada-basicvsrpp-variable-runner"',
             "Swiftネイティブ書き出し",
-            "出力: \\(output.path)",
+            'configuration.detailedDiagnostics == true ? "診断ログでは非表示" : output.path',
             '"進捗: %3d%%',
             "書き出し完了",
             "ffmpegTemporaryDirectory:",
@@ -1219,7 +1219,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn('COREAI_DISTRIBUTION="portable"', script)
         self.assertIn('build/macos-standalone-universal', script)
         self.assertIn('APP_BASENAME="mioh-universal"', script)
-        self.assertIn('DMG_BASENAME="mioh-universal-0.14.3-018-unsigned"', script)
+        self.assertIn('DMG_BASENAME="mioh-universal-0.14.3-019-unsigned"', script)
         self.assertIn('exec "$PACKAGE_DIR/build_app.sh"', script)
 
     def test_universal_bundle_allowlists_conversion_scripts(self):

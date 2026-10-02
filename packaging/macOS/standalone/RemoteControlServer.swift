@@ -782,6 +782,11 @@ final class RemoteControlServer: ObservableObject {
     return [
       "restorationEngines": engines,
       "executors": ["process", "thread"],
+      "decoderBackends": [
+        ["id": "avfoundationAsync", "label": "AVFoundation 非同期（既定）"],
+        ["id": "avfoundationLegacy", "label": "AVFoundation 同期（比較用）"],
+        ["id": "ffmpegSoftware", "label": "FFmpeg ソフトウェア（比較用）"],
+      ],
       "devices": ["mps"],
       "encodingModes": ["auto", "preset", "custom"],
       "encodingPresets": runner.encodingPresets,
@@ -982,6 +987,8 @@ final class RemoteControlServer: ObservableObject {
         || value.restorationEngine == "native"),
       (1...16).contains(value.parallelWorkers),
       (1...10).contains(value.nativeParallelWorkers ?? 1),
+      ["avfoundationAsync", "avfoundationLegacy", "ffmpegSoftware"]
+        .contains(value.decoderBackend ?? "avfoundationAsync"),
       ["process", "thread"].contains(value.executor),
       allowedDevices.contains(value.device),
       (1...128).contains(value.segmentCount),
@@ -2478,6 +2485,7 @@ private enum RemoteControlHTML {
         ['実行',[['restorationEngine','実行エンジン','select','restorationEngines'],['device','デバイス','select','devices'],['fp16','FP16','bool'],['autoOptimize','自動最適化','bool'],['overwrite','既存結果を上書き','bool']]]
       ]],
       ['processing',[
+        ['読み込み・診断（macOS 27以降のローカルSwift処理）',[['decoderBackend','動画の読み込み方式','select','decoderBackends'],['detailedDiagnostics','詳細な診断ログ（5秒間隔）','bool']]],
         ['並列処理',[['parallelWorkers','旧並列数','number',1,16,1],['nativeParallelWorkers','ネイティブ並列数','number',1,10,1],['executor','旧実行方式','select','executors']]],
         ['セグメント',[['noSplit','分割しない','bool'],['useSegmentCount','分割方法','boolSelect'],['segmentCount','分割数','number',1,128,1],['segmentDuration','長さ（秒）','number',10,3600,10],['mergeEncoder','結合エンコーダー','text'],['deleteSegments','処理済みセグメントを削除','bool'],['keepTemp','一時ファイルを保持','bool'],['forceSplit','強制的に再分割','bool']]]
       ]],
