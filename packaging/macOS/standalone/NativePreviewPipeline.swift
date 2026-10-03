@@ -310,11 +310,65 @@ private struct VideoDescription {
   let height: Int
   let fpsNumerator: Int
   let fpsDenominator: Int
+  let averageFPS: Double
   let durationSeconds: Double
   let estimatedDataRate: Double
 }
 
 private enum SourceFrameRate {
+  /// A few long sample durations lower the track average without changing
+  /// its normal cadence. Verify that cadence from compressed samples before
+  /// deciding that a request would require frame interpolation. This reads
+  /// at most 128 samples and does not start a pixel-buffer decoder.
+  static func probe(
+    asset: AVAsset, track: AVAssetTrack, averageFPS: Double
+  ) async throws -> (numerator: Int, denominator: Int) {
+    let reader = try AVAssetReader(asset: asset)
+    defer { reader.cancelReading() }
+    let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+    let provider = reader.outputProvider(for: output)
+    try reader.start()
+    var durations: [CMTime] = []
+    while durations.count < 128, let sample = try await provider.next() {
+      durations.append(sample.withUnsafeSampleBuffer {
+        CMSampleBufferGetNumSamples($0) == 1 ? CMSampleBufferGetDuration($0) : .invalid
+      })
+    }
+    return measured(averageFPS: averageFPS, durations: durations)
+  }
+
+  static func measured(
+    averageFPS: Double, durations: [CMTime]
+  ) -> (numerator: Int, denominator: Int) {
+    let fallback = rational(averageFPS)
+    guard averageFPS.isFinite, averageFPS > 0 else { return fallback }
+    struct Rate: Hashable {
+      let numerator: Int
+      let denominator: Int
+    }
+    var counts: [Rate: Int] = [:]
+    var validCount = 0
+    for duration in durations where duration.isNumeric && duration.value > 0 {
+      // The inverse duration is an exact rational, not a rounded decimal.
+      guard duration.timescale > 0, duration.value <= Int64(Int32.max) else {
+        continue
+      }
+      let divisor = greatestCommonDivisor(Int(duration.timescale), Int(duration.value))
+      let rate = Rate(numerator: Int(duration.timescale) / divisor,
+                      denominator: Int(duration.value) / divisor)
+      counts[rate, default: 0] += 1
+      validCount += 1
+    }
+    // Genuine VFR, short clips, and a cadence far from the track average
+    // retain the existing average-rate policy. A single unusually short
+    // sample (including an edit-list boundary) cannot raise the source rate.
+    guard validCount >= 24, let dominant = counts.max(by: { $0.value < $1.value }),
+      dominant.value * 10 >= validCount * 9 else { return fallback }
+    let cadence = Double(dominant.key.numerator) / Double(dominant.key.denominator)
+    guard abs(cadence - averageFPS) <= averageFPS * 0.01 else { return fallback }
+    return (dominant.key.numerator, dominant.key.denominator)
+  }
+
   static func rational(_ fps: Double) -> (numerator: Int, denominator: Int) {
     guard fps.isFinite, fps > 0 else { return (1, 1) }
     let ntscWhole = max(1, Int((fps * 1.001).rounded()))
@@ -1279,16 +1333,19 @@ private final class ContinuousVideoDecoder: @unchecked Sendable {
     let natural = try await track.load(.naturalSize).applying(transform)
     let frameRate = try await track.load(.nominalFrameRate)
     let estimatedDataRate = try await track.load(.estimatedDataRate)
-    // nominalFrameRate is the track average. minFrameDuration looks more
-    // precise but reports the shortest observed gap, so a VFR clip comes back
-    // well above its real rate; it is not usable here.
+    // nominalFrameRate includes long holds/gaps. Use the verified normal
+    // cadence for FPS validation and encoder timing; source PTS still pass
+    // through unchanged. minFrameDuration alone is not a cadence estimate.
     let fps = max(1.0, Double(frameRate))
-    let rate = SourceFrameRate.rational(fps)
+    let rate = (try? await SourceFrameRate.probe(
+      asset: asset, track: track, averageFPS: fps
+    )) ?? SourceFrameRate.rational(fps)
     let description = VideoDescription(
       width: max(1, Int(abs(natural.width).rounded())),
       height: max(1, Int(abs(natural.height).rounded())),
       fpsNumerator: rate.numerator,
       fpsDenominator: rate.denominator,
+      averageFPS: fps,
       durationSeconds: assetDuration.seconds,
       estimatedDataRate: Double(estimatedDataRate)
     )
@@ -8187,6 +8244,7 @@ private struct NativePreviewPipeline {
     diagnostics?.report(event: "source_info", extra: [
       "width": video.width, "height": video.height,
       "source_fps": Double(video.fpsNumerator) / Double(video.fpsDenominator),
+      "source_average_fps": video.averageFPS,
       "duration_seconds": video.durationSeconds,
       "temporal_batch_frames": config.temporalBatchFrames,
       "parallel_workers": config.nativeParallelWorkers ?? 1,
@@ -8433,6 +8491,7 @@ private struct NativePreviewPipeline {
       "duration": video.durationSeconds,
       "fps": Double(outputFPSNumerator) / Double(outputFPSDenominator),
       "source_fps": sourceFPS,
+      "source_average_fps": video.averageFPS,
       "fps_conversion_stage": targetRate == nil
         ? "none"
         : ((config.preFPSConversion ?? false) ? "before_restore" : "after_restore"),
