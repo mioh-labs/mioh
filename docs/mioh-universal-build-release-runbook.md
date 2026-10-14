@@ -251,7 +251,10 @@ git fetch origin main
 git add -- <explicit-reviewed-paths>
 git diff --cached --check
 git commit -m "<concise description>"
-git push origin main
+# Release work may live on a dedicated branch while GitHub publishes it as
+# main. Push the reviewed commit currently checked out, rather than a stale
+# local branch named main.
+git push origin HEAD:main
 ```
 
 The release must not contain a VR detector checkpoint. Publish a new
