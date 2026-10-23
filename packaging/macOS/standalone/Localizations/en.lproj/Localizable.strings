@@ -209,3 +209,9 @@
 "待受中（トークンをKeychainへ保存できませんでした）" = "Listening (the token could not be saved to Keychain)";
 "ポート番号が正しくありません" = "The port number is invalid";
 "起動失敗" = "Startup failed";
+"同じ名前のファイルがあります。上書きされます" = "A file with the same name exists. It will be overwritten";
+"同じ名前のファイルがあります。開始時に置き換えるか確認します" = "A file with the same name exists. You will be asked whether to replace it when starting";
+"同じ名前のファイルがあります" = "A file with the same name exists";
+"置き換える" = "Replace";
+"キャンセル" = "Cancel";
+"「%@」は既に存在します。置き換えますか？" = "“%@” already exists. Do you want to replace it?";

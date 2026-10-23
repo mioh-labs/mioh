@@ -18,10 +18,13 @@ enum MacNativeExportBatchPlanner {
     "mpg", "mpeg", "wmv", "asf",
   ]
 
+  /// `fileName`: the output file name the user typed for a single-file input (nil/blank = default
+  /// "<input name>-UC.<input extension>"). Folder batches always use the default per file.
   static func plan(
     input: URL,
     selectedOutput: URL,
     overwrite: Bool,
+    fileName: String? = nil,
     fileManager: FileManager = .default
   ) throws -> MacNativeExportBatchPlan {
     let inputValues = try input.resourceValues(forKeys: [
@@ -34,7 +37,7 @@ enum MacNativeExportBatchPlanner {
       return MacNativeExportBatchPlan(
         items: [MacNativeExportBatchItem(
           input: input,
-          output: resolvedOutputFile(input: input, selectedOutput: selectedOutput)
+          output: resolvedOutputFile(input: input, selectedOutput: selectedOutput, fileName: fileName)
         )],
         discoveredCount: 1,
         skippedOutputs: [],
@@ -90,7 +93,7 @@ enum MacNativeExportBatchPlanner {
     )
   }
 
-  static func resolvedOutputFile(input: URL, selectedOutput: URL) -> URL {
+  static func resolvedOutputFile(input: URL, selectedOutput: URL, fileName: String? = nil) -> URL {
     var isDirectory: ObjCBool = false
     let exists = FileManager.default.fileExists(
       atPath: selectedOutput.path,
@@ -101,11 +104,31 @@ enum MacNativeExportBatchPlanner {
       || selectedOutput.pathExtension.isEmpty
     guard selectedDirectory else { return selectedOutput }
 
+    if let name = cleanedFileName(fileName, input: input) {
+      return selectedOutput.appendingPathComponent(name)
+    }
+    return selectedOutput.appendingPathComponent(defaultFileName(input: input))
+  }
+
+  /// "<input name>-UC.<input extension>"
+  static func defaultFileName(input: URL) -> String {
     let stem = input.deletingPathExtension().lastPathComponent
     let ext = input.pathExtension.isEmpty ? "mp4" : input.pathExtension
-    return selectedOutput
-      .appendingPathComponent("\(stem)-UC")
-      .appendingPathExtension(ext)
+    return "\(stem)-UC.\(ext)"
+  }
+
+  /// A typed file name kept inside the output folder (no "/", ":" or control characters, no leading
+  /// dots); the input's extension is added when the name has none. nil = use the default name.
+  static func cleanedFileName(_ fileName: String?, input: URL) -> String? {
+    var name = String((fileName ?? "").unicodeScalars.map {
+      CharacterSet.controlCharacters.contains($0) || $0 == "/" || $0 == ":" ? "_" : Character($0)
+    }).trimmingCharacters(in: .whitespacesAndNewlines)
+    while name.hasPrefix(".") { name.removeFirst() }
+    guard !name.isEmpty, name.utf8.count <= 250 else { return nil }
+    if (name as NSString).pathExtension.isEmpty {
+      name += "." + (input.pathExtension.isEmpty ? "mp4" : input.pathExtension)
+    }
+    return name
   }
 
   private static func resolvedOutputDirectory(

@@ -62,6 +62,22 @@ struct MacNativeExportBatchHarness {
       filePlan.skippedOutputs.isEmpty
     else { throw HarnessError.filePlan }
 
+    // A typed output file name (single-file input): used as is inside the output folder, the input's
+    // extension added when missing, no path separators; blank = default; folder batches keep defaults.
+    let typed = try MacNativeExportBatchPlanner.plan(
+      input: a, selectedOutput: output, overwrite: true, fileName: "my result.mov"
+    )
+    guard typed.items.map(\.output.lastPathComponent) == ["my result.mov"],
+      MacNativeExportBatchPlanner.resolvedOutputFile(input: a, selectedOutput: output, fileName: "renamed")
+        .lastPathComponent == "renamed.mp4",
+      MacNativeExportBatchPlanner.resolvedOutputFile(input: a, selectedOutput: output, fileName: "  ")
+        .lastPathComponent == "A movie-UC.mp4",
+      MacNativeExportBatchPlanner.resolvedOutputFile(input: a, selectedOutput: output, fileName: "../x/y.mp4")
+        .deletingLastPathComponent().standardizedFileURL == output.standardizedFileURL,
+      try MacNativeExportBatchPlanner.plan(input: input, selectedOutput: output, overwrite: true)
+        .items.map(\.output.lastPathComponent) == ["A movie-UC.mp4", "b-UC.MKV"]
+    else { throw HarnessError.typedName }
+
     print("Mac native export batch harness passed")
   }
 
@@ -69,5 +85,6 @@ struct MacNativeExportBatchHarness {
     case directoryPlan
     case overwritePlan
     case filePlan
+    case typedName
   }
 }

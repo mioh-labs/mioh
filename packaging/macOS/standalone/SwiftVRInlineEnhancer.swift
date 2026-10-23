@@ -155,6 +155,9 @@ final class SwiftVRSceneEnhancer: @unchecked Sendable {
   var shouldStop: () -> Bool = { false }
   private let model: URL
   private let compiledCache: URL
+  /// Keep grouped DiT outputs in their native FP16 format. The opt-out is
+  /// for precision regression benchmarks, not a change to ROI scheduling.
+  private let preserveDiTPrecision: Bool
   /// Export lanes take turns: a lane holds the turn while SwiftVR produces
   /// its scene, and the other lanes keep detecting, restoring, compositing
   /// and encoding meanwhile. Running two scenes at once would double the
@@ -168,10 +171,11 @@ final class SwiftVRSceneEnhancer: @unchecked Sendable {
 
   init(
     model: URL, strength: Float, scale: Int, temporalFilter: Float, stabilizationRadius: Int,
-    frameSmoothing: Int
+    frameSmoothing: Int, preserveDiTPrecision: Bool = true
   ) throws {
     try SwiftVRROIAssets.validate(model, scale: scale)
     self.scale = scale
+    self.preserveDiTPrecision = preserveDiTPrecision
     self.stabilizationRadius = max(1, min(8, stabilizationRadius))
     self.frameSmoothing = max(0, min(30, frameSmoothing))
     self.model = model
@@ -191,7 +195,7 @@ final class SwiftVRSceneEnhancer: @unchecked Sendable {
   /// without waiting for it; frames arrive through the returned output.
   /// `restored` holds the scene's frames as consecutive planar RGB 256px
   /// FP16 images, exactly the BasicVSR++ result that is composited. Returns
-  /// nil when the export is being stopped.
+  /// nil for a one-frame fragment or when the export is being stopped.
   func enhance(restored: [Float16], frameCount: Int) async throws -> SwiftVRSceneOutput? {
     let plane = 3 * 256 * 256
     guard frameCount > 0, restored.count >= frameCount * plane else {
@@ -199,14 +203,17 @@ final class SwiftVRSceneEnhancer: @unchecked Sendable {
         NSLocalizedDescriptionKey: "SwiftVR scene input is incomplete"
       ])
     }
+    // A confirmed track can still leave a one-frame fragment at a batch
+    // boundary. Keep BasicVSR++ there rather than running 28 padded frames.
+    guard frameCount > 1 else { return nil }
     await turn.acquire()
     if shouldStop() {
       turn.release()
       return nil
     }
     let output = SwiftVRSceneOutput(side: outputSide)
-    let (model, compiledCache, scale, shouldStop, turn) =
-      (model, compiledCache, scale, shouldStop, turn)
+    let (model, compiledCache, scale, preserveDiTPrecision, shouldStop, turn) =
+      (model, compiledCache, scale, preserveDiTPrecision, shouldStop, turn)
     Self.queue.async {
       defer { turn.release() }
       do {
@@ -215,6 +222,7 @@ final class SwiftVRSceneEnhancer: @unchecked Sendable {
             root: model, compiledCache: compiledCache, input: input,
             frames: frameCount, scale: scale,
             deliver: { output.deliver($0, $1) },
+            preserveDiTPrecision: preserveDiTPrecision,
             shouldStop: { shouldStop() || output.isCancelled })
         }
         output.finish(nil)
@@ -301,7 +309,7 @@ final class SwiftVRSceneOutput: @unchecked Sendable {
 }
 
 /// Apple's temporal noise filter (VideoToolbox, macOS 26) over one scene's
-/// composited SwiftVR frames. SwiftVR re-synthesizes texture every frame and
+/// composited SwiftVR or ROI Distill frames. SwiftVR re-synthesizes texture every frame and
 /// amplifies small changes in its input into flicker; the filter compares
 /// each frame with its motion-compensated neighbours (one before, two after).
 /// The export blends the result back only where SwiftVR was blended in.
@@ -309,6 +317,60 @@ final class SwiftVRSceneOutput: @unchecked Sendable {
 /// The filter accepts only compressed 4:2:0 formats, so each rectangle passes
 /// from the 8-bit BGRA frame through 8-bit full-range 4:2:0 and back.
 final class SwiftVRTemporalNoiseFilter {
+  static func supports(width: Int, height: Int) -> Bool {
+    guard VTTemporalNoiseFilterConfiguration.isSupported,
+      let minimum = VTTemporalNoiseFilterConfiguration.minimumDimensions,
+      let maximum = VTTemporalNoiseFilterConfiguration.maximumDimensions
+    else { return false }
+    return width >= Int(minimum.width) && height >= Int(minimum.height)
+      && width <= Int(maximum.width) && height <= Int(maximum.height)
+      && width.isMultiple(of: 2) && height.isMultiple(of: 2)
+  }
+
+  static func blendWeights(enhancer: [Float], ownership: [Float]) -> [Float] {
+    precondition(enhancer.count == ownership.count)
+    return zip(enhancer, ownership).map { $0 * $1 }
+  }
+
+  /// Shared masked writeback. A zero weight never touches the destination,
+  /// including its alpha channel. Coordinates are in the original frame.
+  static func blend(
+    _ filtered: CVPixelBuffer, left: Int, top: Int, into frame: CVPixelBuffer,
+    cropLeft: Int, cropTop: Int, cropWidth: Int, cropHeight: Int, weights: [Float]
+  ) {
+    precondition(weights.count == cropWidth * cropHeight)
+    CVPixelBufferLockBaseAddress(filtered, .readOnly)
+    CVPixelBufferLockBaseAddress(frame, [])
+    defer {
+      CVPixelBufferUnlockBaseAddress(frame, [])
+      CVPixelBufferUnlockBaseAddress(filtered, .readOnly)
+    }
+    let sourceRow = CVPixelBufferGetBytesPerRow(filtered)
+    let targetRow = CVPixelBufferGetBytesPerRow(frame)
+    let source = CVPixelBufferGetBaseAddress(filtered)!.assumingMemoryBound(to: UInt8.self)
+    let target = CVPixelBufferGetBaseAddress(frame)!.assumingMemoryBound(to: UInt8.self)
+    let firstY = max(cropTop, top), lastY = min(cropTop + cropHeight, top + CVPixelBufferGetHeight(filtered)) - 1
+    let firstX = max(cropLeft, left), lastX = min(cropLeft + cropWidth, left + CVPixelBufferGetWidth(filtered)) - 1
+    guard firstY <= lastY, firstX <= lastX else { return }
+    DispatchQueue.concurrentPerform(iterations: lastY - firstY + 1) { row in
+      let y = firstY + row
+      let weightRow = (y - cropTop) * cropWidth
+      let sourceLine = source + (y - top) * sourceRow
+      let targetLine = target + y * targetRow
+      for x in firstX...lastX {
+        let weight = weights[weightRow + x - cropLeft]
+        guard weight > 0 else { continue }
+        for channel in 0..<3 {
+          let current = Float(targetLine[x * 4 + channel])
+          let value = Float(sourceLine[(x - left) * 4 + channel])
+          targetLine[x * 4 + channel] = UInt8(
+            max(0, min(255, (current + weight * (value - current)).rounded())))
+        }
+      }
+    }
+  }
+
+
   let previousCount: Int
   let nextCount: Int
   private let width: Int
@@ -351,7 +413,8 @@ final class SwiftVRTemporalNoiseFilter {
 
   /// Hands over the rectangle at (`left`, `top`) of composited BGRA frame
   /// `index`.
-  func add(_ index: Int, from frame: CVPixelBuffer, left: Int, top: Int) throws {
+  func add(_ index: Int, from frame: CVPixelBuffer, left: Int, top: Int,
+           presentationTimeStamp: CMTime? = nil) throws {
     let packed = try buffer(packedPool)
     CVPixelBufferLockBaseAddress(frame, .readOnly)
     CVPixelBufferLockBaseAddress(packed, [])
@@ -368,7 +431,7 @@ final class SwiftVRTemporalNoiseFilter {
     guard VTPixelTransferSessionTransferImage(transfer, from: packed, to: yuv) == noErr
     else { throw Self.failure("could not convert a frame to 4:2:0") }
     guard let processorFrame = VTFrameProcessorFrame(
-      buffer: yuv, presentationTimeStamp: time(index))
+      buffer: yuv, presentationTimeStamp: presentationTimeStamp ?? time(index))
     else { throw Self.failure("rejected a frame") }
     frames[index] = processorFrame
   }
@@ -389,7 +452,7 @@ final class SwiftVRTemporalNoiseFilter {
     }
     let destination = try buffer(destinationPool)
     guard let destinationFrame = VTFrameProcessorFrame(
-      buffer: destination, presentationTimeStamp: time(index)),
+      buffer: destination, presentationTimeStamp: source.presentationTimeStamp),
       let parameters = VTTemporalNoiseFilterParameters(
         sourceFrame: source, nextFrames: next, previousFrames: previous,
         destinationFrame: destinationFrame, filterStrength: strength,

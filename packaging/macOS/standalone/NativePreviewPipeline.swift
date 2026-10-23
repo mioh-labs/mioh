@@ -69,6 +69,8 @@ private struct NativePreviewConfiguration: Decodable {
   let ringCapacity: Int
   let decoderBackend: String?
   let detailedDiagnostics: Bool?
+  let exportDetectionMasks: Bool?
+  let overwriteDetectionMasks: Bool?
   let nativeParallelWorkers: Int?
   let confidenceThreshold: Float
   let iouThreshold: Float
@@ -91,15 +93,20 @@ private struct NativePreviewConfiguration: Decodable {
   let roiEnhancerModel: String?
   let roiEnhancerStrength: Float?
   let roiEnhancerScale: Int?
-  let roiEnhancerPasses: Int?
   let roiExpertMode: Bool?
-  /// SwiftVR only: Apple temporal noise filter strength; 0 or absent is off.
+  /// SwiftVR and ROI Distill: Apple temporal noise filter; 0 or absent is off.
   let swiftVRTemporalFilter: Float?
   /// SwiftVR only: frames on each side that the stabilization blends; 1 if absent.
   let swiftVRStabilizationRadius: Int?
-  /// SwiftVR only: frames over which SwiftVR's view of the crop is averaged;
+  /// SwiftVR and ROI Distill: frames over which the crop view is averaged;
   /// 0 or 1 is off, absent is 0 (configurations written before it).
   let swiftVRFrameSmoothing: Int?
+  /// ROI Refine: ROI Distill model (roi-distill-x2.mlmodelc) layered on refined scenes whose largest crop side
+  /// exceeds `roiRefineDistillMinimumCrop` source pixels (default 512). Absent: no Distill layer.
+  let roiRefineDistillModel: String?
+  let roiRefineDistillMinimumCrop: Int?
+  /// Largest internal LTX canvas. Absent defaults to 512; 1024 is an explicit opt-in.
+  let roiRefineMaximumWindowSide: Int?
   let detectionEmptyLookahead: Int?
   let detectionMaskReuseSkipFrames: Int?
   let detectFaceMosaics: Bool?
@@ -412,6 +419,8 @@ private struct DecodedFrame: @unchecked Sendable {
 private struct ProcessedFrame: @unchecked Sendable {
   let pixelBuffer: CVPixelBuffer
   let ptsNanoseconds: Int64
+  var celfCrossfadePrevious: LabelFieldFrame? = nil
+  var crossfadeLaterWeight: Float? = nil
 }
 
 /// Frame rates are never converted between the integer and NTSC families.
@@ -605,6 +614,11 @@ private final class NativePipelineDiagnostics: @unchecked Sendable {
     if status == KERN_SUCCESS {
       result["process_footprint_mib"] = Double(info.phys_footprint) / 1_048_576
       result["process_resident_mib"] = Double(info.resident_size) / 1_048_576
+      // The ROI Refine server runs as a child process; count it so the totals match what the export uses.
+      if let child = ROIRefineChildMemory.footprintMiB() {
+        result["child_footprint_mib"] = child
+        result["total_footprint_mib"] = Double(info.phys_footprint) / 1_048_576 + child
+      }
     }
     var swap = xsw_usage()
     var size = MemoryLayout<xsw_usage>.size
@@ -2013,6 +2027,134 @@ private protocol NativeDetecting: AnyObject {
   ) async throws -> [Detection]
 }
 
+/// Temporal o2 model. All calls are made by the ordered detection lane.
+private final class CelfNetCoreMLDetector: NativeDetecting {
+  private let model: MLModel
+  private let compiledURL: URL?
+  private var previousRGB: [Float]?
+  private var previousLabels = [Int](repeating: 0, count: 960 * 544)
+  private var previousSourceSize: [Int]?
+
+  init(modelURL: URL) async throws {
+    let url: URL
+    if modelURL.pathExtension == "mlpackage" {
+      url = try await MLModel.compileModel(at: modelURL)
+      compiledURL = url
+    } else { url = modelURL; compiledURL = nil }
+    let configuration = MLModelConfiguration()
+    // FP32 o2: GPU is about 4.4ms; CPU+ANE falls back to a ~29ms path.
+    configuration.computeUnits = .cpuAndGPU
+    model = try MLModel(contentsOf: url, configuration: configuration)
+    guard model.modelDescription.inputDescriptionsByName["image"]?
+      .multiArrayConstraint?.shape.map(\.intValue) == [1, 9, 544, 960],
+      model.modelDescription.outputDescriptionsByName["objects"]?
+      .multiArrayConstraint?.shape.map(\.intValue) == [1, 11, 136, 240]
+    else { throw NativePreviewError.detector("invalid CELF-Net model contract") }
+  }
+
+  deinit {
+    if let compiledURL { try? FileManager.default.removeItem(at: compiledURL) }
+  }
+
+  private func rgb(_ source: CVPixelBuffer) throws -> [Float] {
+    guard CVPixelBufferGetPixelFormatType(source) == kCVPixelFormatType_32BGRA else {
+      throw NativePreviewError.pixelBuffer("CELF-Net requires BGRA decoded frames")
+    }
+    CVPixelBufferLockBaseAddress(source, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(source, .readOnly) }
+    guard let base = CVPixelBufferGetBaseAddress(source) else {
+      throw NativePreviewError.pixelBuffer("CELF-Net frame base address unavailable")
+    }
+    let sw = CVPixelBufferGetWidth(source), sh = CVPixelBufferGetHeight(source)
+    let rowBytes = CVPixelBufferGetBytesPerRow(source)
+    let bytes = base.assumingMemoryBound(to: UInt8.self)
+    let plane = 960 * 544
+    var result = [Float](repeating: 114 / 255, count: 3 * plane)
+    // INTER_AREA box averaging, including exact 2x2 sampling for 1080p.
+    // Round the resized RGB to uint8 before normalization, as in training.
+    let scaleX = Double(sw) / 960, scaleY = Double(sh) / 540
+    for y in 0..<540 {
+      let y0 = Double(y) * scaleY, y1 = Double(y + 1) * scaleY
+      for x in 0..<960 {
+        let x0 = Double(x) * scaleX, x1 = Double(x + 1) * scaleX
+        var r: Double = 0, g: Double = 0, b: Double = 0
+        for sy in Int(y0)..<min(sh, Int(ceil(y1))) {
+          let wy = min(y1, Double(sy + 1)) - max(y0, Double(sy))
+          for sx in Int(x0)..<min(sw, Int(ceil(x1))) {
+            let weight = wy * (min(x1, Double(sx + 1)) - max(x0, Double(sx)))
+            let p = sy * rowBytes + 4 * sx
+            b += Double(bytes[p]) * weight
+            g += Double(bytes[p + 1]) * weight
+            r += Double(bytes[p + 2]) * weight
+          }
+        }
+        let area = scaleX * scaleY, p = (y + 2) * 960 + x
+        result[p] = Float((r / area).rounded()) / 255
+        result[plane + p] = Float((g / area).rounded()) / 255
+        result[2 * plane + p] = Float((b / area).rounded()) / 255
+      }
+    }
+    return result
+  }
+
+  func detect(
+    _ source: CVPixelBuffer, confidenceThreshold: Float, iouThreshold _: Float
+  ) async throws -> [Detection] {
+    let sw = CVPixelBufferGetWidth(source), sh = CVPixelBufferGetHeight(source)
+    if previousSourceSize != [sw, sh] {
+      previousRGB = nil
+      previousLabels = [Int](repeating: 0, count: 960 * 544)
+    }
+    let current = try rgb(source)
+    let values = current + (previousRGB ?? current) + CelfNetObjectDecoder.prior(previousLabels)
+    let input = try MLMultiArray(shape: [1, 9, 544, 960], dataType: .float32)
+    values.withUnsafeBufferPointer { pointer in
+      input.dataPointer.assumingMemoryBound(to: Float.self).update(from: pointer.baseAddress!, count: values.count)
+    }
+    let prediction = try await model.prediction(from: MLDictionaryFeatureProvider(dictionary: ["image": input]))
+    guard let array = prediction.featureValue(for: "objects")?.multiArrayValue,
+      array.dataType == .float32, array.shape.map(\.intValue) == [1, 11, 136, 240]
+    else { throw NativePreviewError.detector("invalid CELF-Net output") }
+    let strides = array.strides.map(\.intValue)
+    let pointer = array.dataPointer.assumingMemoryBound(to: Float.self)
+    var output = [Float](repeating: 0, count: 11 * 136 * 240)
+    for c in 0..<11 {
+      for y in 0..<136 {
+        for x in 0..<240 {
+          output[(c * 136 + y) * 240 + x] = pointer[c * strides[1] + y * strides[2] + x * strides[3]]
+        }
+      }
+    }
+    guard output.allSatisfy(\.isFinite) else {
+      throw NativePreviewError.detector("non-finite CELF-Net output")
+    }
+    let objects = CelfNetObjectDecoder.decode(output, confidence: confidenceThreshold)
+    previousLabels = CelfNetObjectDecoder.inputLabels(objects)
+    previousRGB = current; previousSourceSize = [sw, sh]
+    return objects.compactMap { object in
+      var mask = [Float](repeating: 0, count: 960 * 540)
+      var left = 960, top = 540, right = -1, bottom = -1
+      for p in object.pixels {
+        let xx = (p % 240) * 4, yy = (p / 240) * 4 - 2
+        for y in max(0, yy)..<min(540, yy + 4) {
+          for x in xx..<(xx + 4) { mask[y * 960 + x] = 1 }
+          top = min(top, y); bottom = max(bottom, y)
+          left = min(left, xx); right = max(right, xx + 3)
+        }
+      }
+      guard right >= left, bottom >= top else { return nil }
+      return Detection(
+        left: max(0, min(sw - 1, Int(Float(left) * Float(sw) / 960))),
+        top: max(0, min(sh - 1, Int(Float(top) * Float(sh) / 540))),
+        right: max(0, min(sw - 1, Int(ceil(Float(right + 1) * Float(sw) / 960)) - 1)),
+        bottom: max(0, min(sh - 1, Int(ceil(Float(bottom + 1) * Float(sh) / 540)) - 1)),
+        confidence: object.score, classIndex: 0, detectorMask: mask,
+        maskWidth: 960, maskHeight: 540, maskProjection: .directResize, maskThreshold: 0.5
+      )
+    }
+  }
+}
+
 private final class CoreAIDetector: NativeDetecting {
   private let function: InferenceFunction?
   private let coreMLModel: MLModel?
@@ -2878,6 +3020,35 @@ private final class RFDETRDetector: NativeDetecting {
   }
 }
 
+/// Export the detector's exact binary region, independently of scene/ROI
+/// selection. Do not mistake a restoration crop rectangle for a mosaic mask.
+private func detectionMaskJSONRegion(
+  _ detection: Detection, width: Int, height: Int
+) throws -> DetectionMaskJSONRegion {
+  let left = max(0, detection.left)
+  let top = max(0, detection.top)
+  let right = min(width - 1, detection.right)
+  let bottom = min(height - 1, detection.bottom)
+  let samplingRect: [Int]
+  switch detection.maskProjection {
+  case .yoloLetterbox:
+    let scale = min(Float(detectorSize) / Float(height), Float(detectorSize) / Float(width))
+    let padX = (Float(detectorSize) - Float(width) * scale) / 2
+    let padY = (Float(detectorSize) - Float(height) * scale) / 2
+    let x = Int(round(padX - 0.1))
+    let y = Int(round(padY - 0.1))
+    samplingRect = [x, y, detectorSize - Int(round(padX + 0.1)) - x,
+                    detectorSize - Int(round(padY + 0.1)) - y]
+  case .directResize:
+    samplingRect = [0, 0, detection.maskWidth, detection.maskHeight]
+  }
+  return try DetectionMaskJSONRegion.project(
+    values: detection.detectorMask, maskWidth: detection.maskWidth, maskHeight: detection.maskHeight,
+    sourceWidth: width, sourceHeight: height, samplingRect: samplingRect,
+    bbox: [left, top, right - left + 1, bottom - top + 1],
+    threshold: detection.maskThreshold, confidence: detection.confidence, classIndex: detection.classIndex)
+}
+
 /// CELF: a detector mask sampled at the centre of every 4 px cell of its box.
 private func labelFieldObservation(
   _ detection: Detection, sourceWidth: Int, sourceHeight: Int
@@ -3069,6 +3240,8 @@ private func fillLabelFieldGaps(_ frames: inout [DetectedFrame], maximumGap: Int
 private struct DetectedFrame {
   let frame: DecodedFrame
   let detections: [Detection]
+  var detectionStatus: String = "model"
+  var observationPTS: Int64? = nil
   /// CELF only: the owner of every mosaic cell in this frame.
   var labelField: LabelFieldFrame? = nil
 }
@@ -3609,146 +3782,53 @@ private struct NativeExpertROIContext {
 /// native 2x/4x resolution until composition; only one high-resolution frame
 /// is retained at a time.
 private final class NativeROIEnhancer {
-  private let function: InferenceFunction?
-  private var coreMLModel: MLModel?
-  private var compiledModelURL: URL?
-  private var inputName: String?
-  private var outputName: String?
-  private var inputWidth: Int
-  private var inputHeight: Int
+  /// ROI Distill: 5-frame Core ML model, 256px restoration -> 512px.
+  private let distilledEnhancer: DistilledROIEnhancer
   private let scale: Int
   private let strength: Float
-  private let directReplacement: Bool
-  private let iterationCount: Int
-  private let imageContext = CIContext(options: [
-    .workingColorSpace: NSNull(),
-    .outputColorSpace: NSNull(),
-    .cacheIntermediates: false,
-  ])
-  private var sourcePool: CVPixelBufferPool?
-  private var modelInputPool: CVPixelBufferPool?
-  private var modelOutputPool: CVPixelBufferPool?
-  private var legacyOutputPool: CVPixelBufferPool?
+  let frameSmoothing: Int
+  private(set) var temporalFilter: Float = 0
 
-  init(modelURL: URL, scale: Int, strength: Float, passes: Int) async throws {
+  init(modelURL: URL, scale: Int, strength: Float, frameSmoothing: Int = 0,
+       temporalFilter: Float = 0) async throws {
     self.scale = max(1, min(8, scale))
     self.strength = max(0, min(1, strength))
-    let replacesRestoration = modelURL.deletingPathExtension()
-      .lastPathComponent == "PiperSR_2x_256"
-    let passCount = replacesRestoration ? min(max(passes, 1), 10) : 1
-    directReplacement = replacesRestoration
-    iterationCount = passCount
-    inputWidth = restorationSize
-    inputHeight = restorationSize
-    inputName = nil
-    outputName = nil
-    sourcePool = nil
-    modelInputPool = nil
-    modelOutputPool = nil
-    legacyOutputPool = nil
-    coreMLModel = nil
-    compiledModelURL = nil
-
-    if ["aimodel", "aimodelc"].contains(
-      modelURL.pathExtension.lowercased()
-    ) {
-      // Repeated passes are implemented only for Core ML image models.
-      // Refuse instead of silently running a single pass.
-      guard passCount == 1 else {
-        throw NativePreviewError.invalidConfiguration(
-          "ROI enhancer passes > 1 require the Core ML PiperSR model"
-        )
-      }
-      let model = try await MiohCoreAIModelLoader.load(modelURL)
-      guard let loadedFunction = try model.loadFunction(named: "main") else {
-        throw NativePreviewError.restorer(
-          "ROI enhancer main function is missing"
-        )
-      }
-      function = loadedFunction
-      return
-    }
-
-    function = nil
+    self.frameSmoothing = max(0, min(30, frameSmoothing))
     let loadURL: URL
     if modelURL.pathExtension.lowercased() == "mlpackage" {
       loadURL = try await Task.detached(priority: .userInitiated) {
         try MLModel.compileModel(at: modelURL)
       }.value
-      compiledModelURL = loadURL
     } else {
       loadURL = modelURL
     }
     let configuration = MLModelConfiguration()
-    configuration.computeUnits = .cpuAndNeuralEngine
+    configuration.computeUnits = DistilledROIEnhancer.computeUnits
     let loaded = try MLModel(contentsOf: loadURL, configuration: configuration)
-    let imageInputs = loaded.modelDescription.inputDescriptionsByName.filter {
-      $0.value.type == .image
-    }
-    let imageOutputs = loaded.modelDescription.outputDescriptionsByName.filter {
-      $0.value.type == .image
-    }
-    guard let input = imageInputs.first,
-      let output = imageOutputs.first,
-      let constraint = input.value.imageConstraint,
-      let outputConstraint = output.value.imageConstraint
-    else {
+    guard loaded.modelDescription.inputDescriptionsByName["frames"]?.type == .multiArray else {
       throw NativePreviewError.invalidConfiguration(
-        "ROI enhancer must expose one image input and one image output"
-      )
+        "ROI enhancer must be the ROI Distill model (frames input)")
     }
-    coreMLModel = loaded
-    inputName = input.key
-    outputName = output.key
-    inputWidth = constraint.pixelsWide
-    inputHeight = constraint.pixelsHigh
-    guard inputWidth > 0, inputHeight > 0,
-      outputConstraint.pixelsWide > 0,
-      outputConstraint.pixelsHigh > 0
-    else {
-      throw NativePreviewError.invalidConfiguration(
-        "ROI enhancer image dimensions are invalid"
-      )
+    distilledEnhancer = try DistilledROIEnhancer(model: loaded, scale: self.scale)
+    let requestedFilter = self.strength > 0 ? max(0, min(1, temporalFilter)) : 0
+    if requestedFilter > 0, !VTTemporalNoiseFilterConfiguration.isSupported {
+      FileHandle.standardError.write(Data(
+        "ROI Distill: Apple temporal noise filter unavailable on this Mac; kept off\n".utf8))
+    } else {
+      self.temporalFilter = requestedFilter
     }
-    sourcePool = try Self.makePool(
-      width: restorationSize,
-      height: restorationSize
-    )
-    modelInputPool = (inputWidth == restorationSize
-      && inputHeight == restorationSize)
-      ? nil
-      : try Self.makePool(width: inputWidth, height: inputHeight)
-    modelOutputPool = try Self.makePool(
-      width: outputConstraint.pixelsWide,
-      height: outputConstraint.pixelsHigh
-    )
-    legacyOutputPool = try Self.makePool(
-      width: restorationSize,
-      height: restorationSize
-    )
-  }
-
-  deinit {
-    if let sourcePool { CVPixelBufferPoolFlush(sourcePool, .excessBuffers) }
-    if let modelInputPool {
-      CVPixelBufferPoolFlush(modelInputPool, .excessBuffers)
-    }
-    if let modelOutputPool {
-      CVPixelBufferPoolFlush(modelOutputPool, .excessBuffers)
-    }
-    if let legacyOutputPool {
-      CVPixelBufferPoolFlush(legacyOutputPool, .excessBuffers)
-    }
-    coreMLModel = nil
-    if let compiledModelURL {
-      try? FileManager.default.removeItem(at: compiledModelURL)
-    }
+    // Model-load notice only, not one message per ROI/scene.
+    FileHandle.standardError.write(Data(
+      "ROI Distill: 5-frame x2 Core ML enabled (Neural Engine + CPU; GPU disabled); Apple temporal noise filter \(self.temporalFilter)\n".utf8))
   }
 
   func enhanceFrame(
     restored: [Float16],
     offset: Int,
-    mask: [Float]
+    mask: [Float],
+    frameIndices: [Int],
+    temporalInput: [Float16]? = nil,
+    mapTemporalOutput: (([Float16], Int) -> [Float16])? = nil
   ) async throws -> NativeEnhancerFrame? {
     let plane = restorationSize * restorationSize
     let frameElements = plane * 3
@@ -3757,264 +3837,23 @@ private final class NativeROIEnhancer {
       mask.count == plane,
       mask.contains(where: { $0 > 0.5 })
     else { return nil }
-
-    let output: NativeEnhancerOutput
-    if let function {
-      output = try await enhanceCoreAI(
-        function: function,
-        restored: restored,
-        offset: offset
-      )
-    } else {
-      output = try enhanceCoreML(restored: restored, offset: offset)
+    guard offset >= 0, offset.isMultiple(of: frameElements) else {
+      throw NativePreviewError.restorer("ROI Distill: invalid centre frame offset")
     }
-    // PiperSR is an alternative ROI restoration, not a residual detail pass.
-    // Keep the first restoration only as the blend base; sample PiperSR's
-    // native 512px output directly when the ROI is placed into the frame.
-    let lowResolution: [Float16]
-    if directReplacement {
-      lowResolution = Array(restored[offset..<(offset + frameElements)])
-    } else {
-      lowResolution = try Self.makeLowResolution(
-        output: output,
-        restored: restored,
-        offset: offset,
-        mask: mask,
-        strength: strength
-      )
-    }
+    let pixels = try distilledEnhancer.enhance(
+      restored: temporalInput ?? restored, centre: offset / frameElements, frameIndices: frameIndices)
+    let output = NativeEnhancerOutput(
+      pixels: mapTemporalOutput?(pixels, DistilledROIEnhancer.outputSide) ?? pixels,
+      width: DistilledROIEnhancer.outputSide,
+      height: DistilledROIEnhancer.outputSide,
+      legacyLowResolution: nil)
     return NativeEnhancerFrame(
       output: output,
-      lowResolution: lowResolution,
+      lowResolution: try Self.makeLowResolution(
+        output: output, restored: restored, offset: offset, mask: mask, strength: strength),
       strength: strength,
-      directReplacement: directReplacement
+      directReplacement: false
     )
-  }
-
-  private func enhanceCoreAI(
-    function: InferenceFunction,
-    restored: [Float16],
-    offset: Int
-  ) async throws -> NativeEnhancerOutput {
-    let plane = restorationSize * restorationSize
-    let frameElements = plane * 3
-    var input = NDArray(
-      shape: [1, 3, restorationSize, restorationSize],
-      scalarType: .float16
-    )
-    let inputView = input.mutableView(as: Float16.self)
-    _ = inputView.withUnsafeMutablePointer { destination, _, _ in
-      restored.withUnsafeBytes { source in
-        memcpy(
-          destination,
-          source.baseAddress!.advanced(
-            by: offset * MemoryLayout<Float16>.stride
-          ),
-          frameElements * MemoryLayout<Float16>.stride
-        )
-      }
-    }
-    var outputs = try await function.run(inputs: ["image": input])
-    guard let output = outputs.remove("enhanced")?.ndArray else {
-      throw NativePreviewError.restorer(
-        "Core AI ROI enhancer output is missing"
-      )
-    }
-    let outputSize = restorationSize * scale
-    let expectedShape = [1, 3, outputSize, outputSize]
-    let view = output.view(as: Float16.self)
-    guard view.isContiguous else {
-      throw NativePreviewError.restorer(
-        "Core AI ROI enhancer output is not contiguous"
-      )
-    }
-    return try view.withUnsafePointer { pointer, shape, _ in
-      let actualShape = (0..<shape.count).map { shape[$0] }
-      guard actualShape == expectedShape else {
-        throw NativePreviewError.restorer(
-          "Core AI ROI enhancer output shape \(actualShape), expected \(expectedShape)"
-        )
-      }
-      let highPlane = outputSize * outputSize
-      var pixels = [Float16](repeating: 0, count: highPlane * 3)
-      _ = pixels.withUnsafeMutableBytes { destination in
-        memcpy(
-          destination.baseAddress!,
-          pointer,
-          highPlane * 3 * MemoryLayout<Float16>.stride
-        )
-      }
-      for index in pixels.indices {
-        let value = Float(pixels[index])
-        if !value.isFinite {
-          pixels[index] = 0
-        } else if value < 0 {
-          pixels[index] = 0
-        } else if value > 1 {
-          pixels[index] = 1
-        }
-      }
-      return NativeEnhancerOutput(
-        pixels: pixels,
-        width: outputSize,
-        height: outputSize,
-        legacyLowResolution: nil
-      )
-    }
-  }
-
-  private func enhanceCoreML(restored: [Float16], offset: Int) throws
-    -> NativeEnhancerOutput
-  {
-      guard let model = coreMLModel,
-      let inputName,
-      let outputName,
-      let sourcePool,
-      let legacyOutputPool
-    else {
-      throw NativePreviewError.restorer(
-        "Core ML ROI enhancer backend is unavailable"
-      )
-    }
-    return try autoreleasepool {
-      let source = try Self.allocate(from: sourcePool, label: "enhancer input")
-      try Self.writePlanarRGB(
-        restored,
-        offset: offset,
-        to: source
-      )
-      var modelInput: CVPixelBuffer
-      if let modelInputPool {
-        modelInput = try Self.allocate(
-          from: modelInputPool,
-          label: "enhancer resized input"
-        )
-        let image = CIImage(cvPixelBuffer: source).transformed(
-          by: CGAffineTransform(
-            scaleX: CGFloat(inputWidth) / CGFloat(restorationSize),
-            y: CGFloat(inputHeight) / CGFloat(restorationSize)
-          )
-        )
-        imageContext.render(
-          image,
-          to: modelInput,
-          bounds: CGRect(x: 0, y: 0, width: inputWidth, height: inputHeight),
-          colorSpace: nil
-        )
-      } else {
-        modelInput = source
-      }
-      var enhanced: CVPixelBuffer?
-      for pass in 0..<iterationCount {
-        let output = try autoreleasepool { () throws -> CVPixelBuffer in
-          let provider = try MLDictionaryFeatureProvider(dictionary: [
-            inputName: MLFeatureValue(pixelBuffer: modelInput)
-          ])
-          let prediction = try model.prediction(from: provider)
-          guard let output = prediction.featureValue(
-            for: outputName
-          )?.imageBufferValue else {
-            throw NativePreviewError.restorer(
-              "Core ML ROI enhancer image output is missing"
-            )
-          }
-          return output
-        }
-        enhanced = output
-        if pass + 1 < iterationCount {
-          let outputWidth = CVPixelBufferGetWidth(output)
-          let outputHeight = CVPixelBufferGetHeight(output)
-          guard outputWidth > 0, outputHeight > 0 else {
-            throw NativePreviewError.restorer(
-              "PiperSR feedback image dimensions are invalid"
-            )
-          }
-          // PiperSR is fixed at 256→512. Keep each pass on that contract:
-          // 512→256 feedback, then the final 512px output goes to composition.
-          // Feed back at the model's own input size. The 256px source pool is
-          // only correct when that size is the restoration grid.
-          let feedback = try Self.allocate(
-            from: modelInputPool ?? sourcePool,
-            label: "PiperSR feedback input"
-          )
-          let feedbackImage = CIImage(cvPixelBuffer: output).transformed(
-            by: CGAffineTransform(
-              scaleX: CGFloat(inputWidth) / CGFloat(outputWidth),
-              y: CGFloat(inputHeight) / CGFloat(outputHeight)
-            )
-          )
-          imageContext.render(
-            feedbackImage,
-            to: feedback,
-            bounds: CGRect(x: 0, y: 0, width: inputWidth, height: inputHeight),
-            colorSpace: nil
-          )
-          modelInput = feedback
-        }
-      }
-      guard let enhanced else {
-        throw NativePreviewError.restorer(
-          "Core ML ROI enhancer produced no image"
-        )
-      }
-      let outputWidth = CVPixelBufferGetWidth(enhanced)
-      let outputHeight = CVPixelBufferGetHeight(enhanced)
-      guard outputWidth > 0, outputHeight > 0 else {
-        throw NativePreviewError.restorer(
-          "Core ML ROI enhancer output dimensions are invalid"
-        )
-      }
-      let legacyOutput = try Self.allocate(
-        from: legacyOutputPool,
-        label: "enhancer legacy 256px output"
-      )
-      let legacyImage = CIImage(cvPixelBuffer: enhanced).transformed(
-        by: CGAffineTransform(
-          scaleX: CGFloat(restorationSize) / CGFloat(outputWidth),
-          y: CGFloat(restorationSize) / CGFloat(outputHeight)
-        )
-      )
-      imageContext.render(
-        legacyImage,
-        to: legacyOutput,
-        bounds: CGRect(
-          x: 0,
-          y: 0,
-          width: restorationSize,
-          height: restorationSize
-        ),
-        colorSpace: nil
-      )
-      let readable: CVPixelBuffer
-      if CVPixelBufferGetPixelFormatType(enhanced)
-        == kCVPixelFormatType_32BGRA
-      {
-        readable = enhanced
-      } else {
-        guard let modelOutputPool else {
-          throw NativePreviewError.restorer(
-            "Core ML ROI enhancer output pool is unavailable"
-          )
-        }
-        let converted = try Self.allocate(
-          from: modelOutputPool,
-          label: "enhancer native-size output"
-        )
-        imageContext.render(
-          CIImage(cvPixelBuffer: enhanced),
-          to: converted,
-          bounds: CGRect(x: 0, y: 0, width: outputWidth, height: outputHeight),
-          colorSpace: nil
-        )
-        readable = converted
-      }
-      return NativeEnhancerOutput(
-        pixels: try Self.readPlanarRGB(from: readable),
-        width: outputWidth,
-        height: outputHeight,
-        legacyLowResolution: try Self.readPlanarRGB(from: legacyOutput)
-      )
-    }
   }
 
   /// Reconstruct the legacy 256px enhancer result for the existing effect
@@ -4100,122 +3939,6 @@ private final class NativeROIEnhancer {
     }
     return result
   }
-
-  private static func makePool(width: Int, height: Int) throws
-    -> CVPixelBufferPool
-  {
-    let poolAttributes: [String: Any] = [
-      kCVPixelBufferPoolMinimumBufferCountKey as String: 1,
-      kCVPixelBufferPoolMaximumBufferAgeKey as String: 1,
-    ]
-    let pixelAttributes: [String: Any] = [
-      kCVPixelBufferPixelFormatTypeKey as String:
-        Int(kCVPixelFormatType_32BGRA),
-      kCVPixelBufferWidthKey as String: width,
-      kCVPixelBufferHeightKey as String: height,
-      kCVPixelBufferMetalCompatibilityKey as String: true,
-      kCVPixelBufferIOSurfacePropertiesKey as String: [:],
-    ]
-    var pool: CVPixelBufferPool?
-    let status = CVPixelBufferPoolCreate(
-      kCFAllocatorDefault,
-      poolAttributes as CFDictionary,
-      pixelAttributes as CFDictionary,
-      &pool
-    )
-    guard status == kCVReturnSuccess, let pool else {
-      throw NativePreviewError.pixelBuffer(
-        "ROI enhancer pool creation returned \(status)"
-      )
-    }
-    return pool
-  }
-
-  private static func allocate(
-    from pool: CVPixelBufferPool,
-    label: String
-  ) throws -> CVPixelBuffer {
-    var buffer: CVPixelBuffer?
-    let status = CVPixelBufferPoolCreatePixelBuffer(
-      kCFAllocatorDefault,
-      pool,
-      &buffer
-    )
-    guard status == kCVReturnSuccess, let buffer else {
-      throw NativePreviewError.pixelBuffer(
-        "\(label) allocation returned \(status)"
-      )
-    }
-    return buffer
-  }
-
-  private static func writePlanarRGB(
-    _ source: [Float16],
-    offset: Int,
-    to pixelBuffer: CVPixelBuffer
-  ) throws {
-    CVPixelBufferLockBaseAddress(pixelBuffer, [])
-    defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
-    guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else {
-      throw NativePreviewError.pixelBuffer(
-        "ROI enhancer input base address unavailable"
-      )
-    }
-    let width = CVPixelBufferGetWidth(pixelBuffer)
-    let height = CVPixelBufferGetHeight(pixelBuffer)
-    guard width == restorationSize, height == restorationSize else {
-      throw NativePreviewError.pixelBuffer(
-        "ROI enhancer source buffer must be 256x256"
-      )
-    }
-    let rowBytes = CVPixelBufferGetBytesPerRow(pixelBuffer)
-    let pixels = base.assumingMemoryBound(to: UInt8.self)
-    let plane = restorationSize * restorationSize
-    for y in 0..<restorationSize {
-      let row = pixels.advanced(by: y * rowBytes)
-      for x in 0..<restorationSize {
-        let pixel = y * restorationSize + x
-        row[x * 4] = UInt8(
-          max(0, min(255, Int((Float(source[offset + 2 * plane + pixel]) * 255).rounded())))
-        )
-        row[x * 4 + 1] = UInt8(
-          max(0, min(255, Int((Float(source[offset + plane + pixel]) * 255).rounded())))
-        )
-        row[x * 4 + 2] = UInt8(
-          max(0, min(255, Int((Float(source[offset + pixel]) * 255).rounded())))
-        )
-        row[x * 4 + 3] = 255
-      }
-    }
-  }
-
-  private static func readPlanarRGB(from pixelBuffer: CVPixelBuffer) throws
-    -> [Float16]
-  {
-    CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-    defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
-    guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else {
-      throw NativePreviewError.pixelBuffer(
-        "ROI enhancer output base address unavailable"
-      )
-    }
-    let rowBytes = CVPixelBufferGetBytesPerRow(pixelBuffer)
-    let pixels = base.assumingMemoryBound(to: UInt8.self)
-    let width = CVPixelBufferGetWidth(pixelBuffer)
-    let height = CVPixelBufferGetHeight(pixelBuffer)
-    let plane = width * height
-    var result = [Float16](repeating: 0, count: plane * 3)
-    for y in 0..<height {
-      let row = pixels.advanced(by: y * rowBytes)
-      for x in 0..<width {
-        let pixel = y * width + x
-        result[pixel] = Float16(Float(row[x * 4 + 2]) / 255)
-        result[plane + pixel] = Float16(Float(row[x * 4 + 1]) / 255)
-        result[2 * plane + pixel] = Float16(Float(row[x * 4]) / 255)
-      }
-    }
-    return result
-  }
 }
 
 private struct NativeRestoreEffects {
@@ -4245,6 +3968,7 @@ private final class NativeFrameProcessor: @unchecked Sendable {
   private let restorer: any NativeRestoring
   private let roiEnhancer: NativeROIEnhancer?
   private let swiftVR: SwiftVRSceneEnhancer?
+  private let roiRefiner: ROIRefineSceneEnhancer?
   private let roiExpertMode: Bool
   private let blendFeather: Float
   private let restoreMaskOnly: Bool
@@ -4272,6 +3996,7 @@ private final class NativeFrameProcessor: @unchecked Sendable {
     restorer: any NativeRestoring,
     roiEnhancer: NativeROIEnhancer?,
     swiftVR: SwiftVRSceneEnhancer?,
+    roiRefiner: ROIRefineSceneEnhancer? = nil,
     roiExpertMode: Bool,
     blendFeather: Float,
     restoreMaskOnly: Bool,
@@ -4285,6 +4010,7 @@ private final class NativeFrameProcessor: @unchecked Sendable {
     self.restorer = restorer
     self.roiEnhancer = roiEnhancer
     self.swiftVR = swiftVR
+    self.roiRefiner = roiRefiner
     self.roiExpertMode = roiExpertMode
     self.blendFeather = max(0, blendFeather)
     self.restoreMaskOnly = restoreMaskOnly
@@ -4361,11 +4087,75 @@ private final class NativeFrameProcessor: @unchecked Sendable {
     return pool
   }
 
+  /// Scenes the detector produced from something that is not a mosaic are not restored, so they neither paste a
+  /// BasicVSR++ patch into a clean picture nor cost a ROI Refine scene. Measured on a 10-minute stretch without
+  /// mosaics (28 false scenes) and a stretch with real ones (9 scenes), these three rules removed 87% of the false
+  /// detected frames and kept 689 of 691 real ones:
+  /// - one frame long, with no detection at all in the frames before and after (frames at the batch edges are
+  ///   kept: their neighbour may be in the next batch);
+  /// - never reaching confidence 0.5 (false scenes peaked around 0.3, real ones at 0.6-0.96);
+  /// - small, in a corner and not moving: a studio logo or watermark (a real mosaic moves with its subject).
+  private static func droppingFalseDetectionScenes(_ scenes: [NativeScene], detected: [DetectedFrame])
+    -> [NativeScene]
+  {
+    guard let first = detected.first else { return scenes }
+    let width = Float(CVPixelBufferGetWidth(first.frame.pixelBuffer))
+    let height = Float(CVPixelBufferGetHeight(first.frame.pixelBuffer))
+    func empty(_ index: Int) -> Bool? {
+      detected.indices.contains(index) ? detected[index].detections.isEmpty : nil
+    }
+    /// Highest confidence among the frame's detections that overlap this scene's box.
+    func confidence(_ frame: NativeSceneFrame) -> Float {
+      guard detected.indices.contains(frame.batchIndex) else { return 1 }
+      let box = frame.box
+      return detected[frame.batchIndex].detections.filter {
+        $0.left <= box.right && $0.right >= box.left && $0.top <= box.bottom && $0.bottom >= box.top
+      }.map(\.confidence).max() ?? 0
+    }
+    func cornerLogo(_ scene: NativeScene) -> Bool {
+      let boxes = scene.frames.map(\.box)
+      guard let left = boxes.map(\.left).min(), let right = boxes.map(\.right).max(),
+        let top = boxes.map(\.top).min(), let bottom = boxes.map(\.bottom).max()
+      else { return false }
+      let nearSide = Float(left) < 0.1 * width || Float(right) > 0.9 * width
+      let nearEnd = Float(top) < 0.1 * height || Float(bottom) > 0.9 * height
+      let sizes = boxes.map { Float(max($0.width, $0.height)) }.sorted()
+      let small = sizes[sizes.count / 2] < 0.15 * height
+      let xs = boxes.map { Float($0.left + $0.right) / 2 }, ys = boxes.map { Float($0.top + $0.bottom) / 2 }
+      let still = max(xs.max()! - xs.min()!, ys.max()! - ys.min()!) <= 0.01 * width
+      return nearSide && nearEnd && small && still
+    }
+    var isolated = 0, weak = 0, logos = 0
+    let kept = scenes.filter { scene in
+      if scene.frames.count == 1, let index = scene.frames.first?.batchIndex,
+        empty(index - 1) == true, empty(index + 1) == true
+      {
+        isolated += 1
+        return false
+      }
+      if (scene.frames.map(confidence).max() ?? 0) < 0.5 {
+        weak += 1
+        return false
+      }
+      if cornerLogo(scene) {
+        logos += 1
+        return false
+      }
+      return true
+    }
+    if isolated + weak + logos > 0 {
+      FileHandle.standardError.write(Data(
+        "Detection: ignored \(isolated) isolated one-frame, \(weak) low-confidence (< 0.5) and \(logos) still corner (logo) scene(s)\n".utf8))
+    }
+    return kept
+  }
+
   func process(_ detected: [DetectedFrame], skipPrefix: Int = 0)
     async throws -> [CVPixelBuffer] {
     guard !detected.isEmpty else { return [] }
     var outputs = detected.map { $0.frame.pixelBuffer }
-    let scenes = labelFieldMode ? labelFieldScenes(detected) : trackScenes(detected)
+    let scenes = Self.droppingFalseDetectionScenes(
+      labelFieldMode ? labelFieldScenes(detected) : trackScenes(detected), detected: detected)
     lastRestoredSceneCount = scenes.count
     // CELF scenes come in their compositing order already: each frame's
     // blend weights depend on which scenes are composited after it.
@@ -4389,15 +4179,168 @@ private final class NativeFrameProcessor: @unchecked Sendable {
       // rebuild (+1.4% detail measured there, the least of any size). Those
       // scenes keep the BasicVSR++ result; in one validation run they were
       // about 48% of the SwiftVR jobs.
+      // A confirmed track may be truncated to one frame at a batch edge.
+      // It keeps BasicVSR++ instead of starting a 28-frame padded SwiftVR job.
       let largestCropSide = geometries.map {
         max($0.cropBox.width, $0.cropBox.height)
       }.max() ?? 0
       let runsSwiftVR = swiftVR != nil && largestCropSide > restorationSize
+        && scene.frames.count > 1
       if swiftVR != nil, !runsSwiftVR {
+        let reason = scene.frames.count == 1
+          ? "one-frame scene; keep BasicVSR++ without a padded SwiftVR job"
+          : "largest crop \(largestCropSide)px <= \(restorationSize)px"
         FileHandle.standardError.write(Data(
-          "SwiftVR: skipped a \(scene.frames.count)-frame scene (largest crop \(largestCropSide)px <= \(restorationSize)px)\n".utf8))
+          "SwiftVR: skipped a \(scene.frames.count)-frame scene (\(reason))\n".utf8))
       }
       let enhancementStart = Date()
+      // ROI Refine redraws the whole scene's ROI at 512px (LTX-2.3 IC-LoRA in a resident server), then each
+      // frame replaces the BasicVSR++ ROI through the direct-replacement path, like SwiftVR. A one-frame
+      // fragment keeps BasicVSR++.
+      if let roiRefiner, scene.frames.count > 1 {
+        // Like SwiftVR, the model may see the scene through crop views smoothed over neighbouring frames (the
+        // detector crop grows and shrinks by up to ~8% a frame); its output is mapped back to each frame's view.
+        let refinerViews = roiRefiner.frameSmoothing > 1
+          ? Self.smoothedSwiftVRViews(geometries, window: roiRefiner.frameSmoothing)
+          : nil
+        let refinerInput = refinerViews.map {
+          Self.reframeForSwiftVR(
+            restored, views: $0, geometries: geometries,
+            sources: scene.frames.map { detected[$0.batchIndex].frame.pixelBuffer })
+        } ?? restored
+        let modelMasks = geometries.indices.map {
+          Self.modelMask(cropMask: masks[$0], geometry: geometries[$0])
+        }
+        let refinerMasks = refinerViews.map {
+          ROIEnhancerFrameSmoothing.reframeMasks(modelMasks, views: $0)
+        } ?? modelMasks
+        // the 256px crops stretch the scene's largest crop width and height to 256 separately
+        let cropWidth = geometries.map(\.cropBox.width).max() ?? 1
+        let cropHeight = geometries.map(\.cropBox.height).max() ?? 1
+        var refinedViews = try await roiRefiner.refine(
+          restored: refinerInput, masks: refinerMasks, frameCount: scene.frames.count,
+          aspect: Double(max(cropWidth, 1)) / Double(max(cropHeight, 1)),
+          cropSide: max(cropWidth, cropHeight))
+        restorationSeconds += Date().timeIntervalSince(enhancementStart)
+        let compositionStart = Date()
+        let side = roiRefiner.outputSide(cropSide: max(cropWidth, cropHeight))
+        let refinedFrameElements = 3 * side * side
+        // Order: ROI Distill is layered while the frames are still in the smoothed crop views the refine saw (so
+        // its input does not jump with the detector crop), then the frames go back to each frame's own view, then
+        // the stabilization blends neighbours, the Distill detail included.
+        // A crop shown at more than 512 px is refined at 512: ROI Distill adds its detail on top (its output minus
+        // the refined frame reduced to its 256 input and brought back up).
+        // Each stage replaces `refined`, so at most two copies of the scene (~270 MiB each for 180 frames at 512)
+        // are alive at once, instead of one per stage until the scene ends.
+        let distillCrop = max(cropWidth, cropHeight)
+        var refined: [[Float16]]? = refinedViews.map { pixels in
+          scene.frames.indices.map { index in
+            Array(pixels[(index * refinedFrameElements)..<((index + 1) * refinedFrameElements)])
+          }
+        }
+        refinedViews = nil
+        if let frames = refined, side == DistilledROIEnhancer.outputSide,
+          distillCrop > roiRefiner.distillMinimumCrop
+        {
+          refined = nil
+          refined = try roiRefiner.layerDistill(frames, frameIndices: scene.frames.map(\.batchIndex))
+        }
+        if let frames = refined, let refinerViews {
+          refined = nil
+          refined = frames.indices.map { Self.mapSwiftVRFrameBack(frames[$0], side: side, view: refinerViews[$0]) }
+        }
+        if let frames = refined, roiRefiner.stabilizationRadius > 1 {
+          refined = nil
+          refined = frames.indices.map { index in
+            let neighbours = max(0, index - roiRefiner.stabilizationRadius)
+              ... min(frames.count - 1, index + roiRefiner.stabilizationRadius)
+            return Self.stabilizeSwiftVRFrame(
+              center: index, frames: neighbours.map { (index: $0, pixels: frames[$0]) },
+              restored: restored, side: side)
+          }
+        }
+        // The refined ROI comes out slightly brighter/darker and shifted in colour against its surroundings,
+        // which showed as a step at the paste edge that moved with the detector crop every frame. Like SwiftVR,
+        // it keeps its detail and takes the coarse colour of the BasicVSR++ restoration.
+        if let frames = refined {
+          refined = nil
+          refined = frames.indices.map {
+            Self.matchSwiftVRColour(frames[$0], restored: restored, center: $0, side: side)
+          }
+        }
+        // The generated detail varies a little from frame to frame. Like ROI Distill, the Apple temporal noise
+        // filter runs on the composited frames (native coordinates, one session per contiguous run) and is
+        // written back only inside the enhancer mask.
+        let filterRuns = refined != nil && roiRefiner.temporalFilter > 0
+          ? try ROIEnhancerTemporalWindow.contiguousRuns(frameIndices: scene.frames.map(\.batchIndex))
+          : []
+        var filters: [(run: Range<Int>, filter: SwiftVRTemporalNoiseFilter, region: IntBox)] = []
+        for run in filterRuns where run.count > 1 {
+          if let region = Self.roiDistillFilterRegion(
+            Array(geometries[run]), frame: outputs[scene.frames[run.lowerBound].batchIndex])
+          {
+            filters.append((run, try SwiftVRTemporalNoiseFilter(
+              width: region.width, height: region.height, strength: roiRefiner.temporalFilter), region))
+          }
+        }
+        func applyFilter(_ entry: (run: Range<Int>, filter: SwiftVRTemporalNoiseFilter, region: IntBox), _ ready: Int)
+          async throws
+        {
+          try await applySwiftVRFilter(
+            entry.filter, index: ready, region: entry.region,
+            into: outputs[scene.frames[ready].batchIndex],
+            geometry: geometries[ready], hardMask: masks[ready],
+            exclusiveWeights: compositePlans[ready].blendMask,
+            featherFraction: 0, restrictToEnhancerMask: true)
+        }
+        for index in scene.frames.indices {
+          let offset = index * restoredFrameElements
+          let base = Array(restored[offset..<(offset + restoredFrameElements)])
+          let enhancedFrame = refined.map { pixels in
+            NativeEnhancerFrame(
+              output: NativeEnhancerOutput(
+                pixels: pixels[index],
+                width: side,
+                height: side,
+                legacyLowResolution: nil
+              ),
+              lowResolution: base,
+              strength: roiRefiner.strength,
+              directReplacement: true,
+              featherFraction: 0.10  // wider than the 0.04 default: hides what remains of the edge step
+            )
+          }
+          let frameIndex = scene.frames[index].batchIndex
+          outputs[frameIndex] = try composite(
+            source: outputs[frameIndex],
+            restored: base,
+            enhancerBase: enhancedFrame == nil ? nil : base,
+            restorationBase: enhancedFrame == nil ? nil : base,
+            restoredOffset: 0,
+            geometry: geometries[index],
+            hardMask: masks[index],
+            plan: compositePlans[index],
+            enhancedFrame: enhancedFrame,
+            expertContext: expertContext,
+            expertFrameIndex: index
+          )
+          if let entry = filters.first(where: { $0.run.contains(index) }) {
+            try entry.filter.add(
+              index, from: outputs[frameIndex], left: entry.region.left, top: entry.region.top,
+              presentationTimeStamp: CMTime(
+                value: detected[frameIndex].frame.ptsNanoseconds, timescale: 1_000_000_000))
+            let ready = index - entry.filter.nextCount
+            if ready >= entry.run.lowerBound { try await applyFilter(entry, ready) }
+            if index == entry.run.upperBound - 1 {
+              for tail in max(entry.run.lowerBound, index - entry.filter.nextCount + 1)...index {
+                try await applyFilter(entry, tail)
+              }
+            }
+          }
+        }
+        compositionSeconds += Date().timeIntervalSince(compositionStart)
+        continue
+      }
       // SwiftVR sees each frame through a view that moves with the detector
       // crop, which grows and shrinks by up to ~8% a frame. SwiftVR redraws
       // its added outlines at every shift, so they looked thicker and
@@ -4548,52 +4491,120 @@ private final class NativeFrameProcessor: @unchecked Sendable {
         // compositor samples only native ROI pixels, so there is no full-size
         // high-resolution residual pass and memory does not scale with scene
         // length.
-        for index in scene.frames.indices {
-          let offset = index * restoredFrameElements
-          let restorationBase = Array(
-            restored[offset..<(offset + restoredFrameElements)]
-          )
-          let originalFrame = Array(
-            originalInput[offset..<(offset + restoredFrameElements)]
-          )
-          let enhancementStart = Date()
-          let modelMask = Self.modelMask(
-            cropMask: masks[index],
-            geometry: geometries[index]
-          )
-          let enhancedFrame = try await roiEnhancer.enhanceFrame(
-            restored: restored,
-            offset: offset,
-            mask: modelMask
-          )
-          restorationSeconds += Date().timeIntervalSince(enhancementStart)
-          let lowEnhanced = enhancedFrame?.lowResolution ?? restorationBase
-          let lowOutput = effects.isEnabled
-            ? Self.applyRestoreEffects(
-              restored: lowEnhanced,
-              original: originalFrame,
-              geometries: [geometries[index]],
-              cropMasks: [masks[index]],
-              effects: effects
+        let enhancerFrameIndices = scene.frames.map(\.batchIndex)
+        let enhancerViews = roiEnhancer.frameSmoothing > 1
+          ? Self.smoothedSwiftVRViews(
+              geometries, window: roiEnhancer.frameSmoothing, frameIndices: enhancerFrameIndices)
+          : nil
+        let smoothedInput = enhancerViews.map {
+          Self.reframeForSwiftVR(
+            restored, views: $0, geometries: geometries,
+            sources: scene.frames.map { detected[$0.batchIndex].frame.pixelBuffer },
+            preserveIdentity: true)
+        }
+        // Filter native composited coordinates, not the moving 512px model
+        // grid. One session per contiguous run/object; no fabricated context
+        // or bridging detection gaps. The filter retains only its neighbours.
+        let filterRuns = try ROIEnhancerTemporalWindow.contiguousRuns(
+          frameIndices: enhancerFrameIndices)
+        for filterRun in filterRuns {
+          let filterRegion = roiEnhancer.temporalFilter > 0 && filterRun.count > 1
+            ? Self.roiDistillFilterRegion(
+                Array(geometries[filterRun]), frame: outputs[scene.frames[filterRun.lowerBound].batchIndex])
+            : nil
+          let filter = try filterRegion.map {
+            try SwiftVRTemporalNoiseFilter(
+              width: $0.width, height: $0.height, strength: roiEnhancer.temporalFilter)
+          }
+          let lookahead = filter?.nextCount ?? 0
+          var filterInputs = Set<Int>()
+          for index in filterRun {
+            let offset = index * restoredFrameElements
+            let restorationBase = Array(
+              restored[offset..<(offset + restoredFrameElements)]
             )
-            : lowEnhanced
+            let originalFrame = Array(
+              originalInput[offset..<(offset + restoredFrameElements)]
+            )
+            let enhancementStart = Date()
+            let modelMask = Self.modelMask(
+              cropMask: masks[index],
+              geometry: geometries[index]
+            )
+            let enhancedFrame = try await roiEnhancer.enhanceFrame(
+              restored: restored,
+              offset: offset,
+              mask: modelMask,
+              frameIndices: enhancerFrameIndices,
+              temporalInput: smoothedInput,
+              mapTemporalOutput: enhancerViews.map { views in
+                { pixels, side in
+                  ROIEnhancerFrameSmoothing.mapResidualBack(
+                    pixels, side: side, original: restored, smoothed: smoothedInput!,
+                    offset: offset, view: views[index], mask: nil)
+                }
+              }
+            )
+            restorationSeconds += Date().timeIntervalSince(enhancementStart)
+            let lowEnhanced = enhancedFrame?.lowResolution ?? restorationBase
+            let lowOutput = effects.isEnabled
+              ? Self.applyRestoreEffects(
+                restored: lowEnhanced,
+                original: originalFrame,
+                geometries: [geometries[index]],
+                cropMasks: [masks[index]],
+                effects: effects
+              )
+              : lowEnhanced
 
-          let compositionStart = Date()
-          let frameIndex = scene.frames[index].batchIndex
-          outputs[frameIndex] = try composite(
-            source: outputs[frameIndex],
-            restored: lowOutput,
-            enhancerBase: enhancedFrame?.lowResolution,
-            restorationBase: enhancedFrame == nil ? nil : restorationBase,
-            restoredOffset: 0,
-            geometry: geometries[index],
-            hardMask: masks[index],
-            plan: compositePlans[index],
-            enhancedFrame: enhancedFrame,
-            expertContext: expertContext,
-            expertFrameIndex: index
-          )
-          compositionSeconds += Date().timeIntervalSince(compositionStart)
+            let compositionStart = Date()
+            let frameIndex = scene.frames[index].batchIndex
+            outputs[frameIndex] = try composite(
+              source: outputs[frameIndex],
+              restored: lowOutput,
+              enhancerBase: enhancedFrame?.lowResolution,
+              restorationBase: enhancedFrame == nil ? nil : restorationBase,
+              restoredOffset: 0,
+              geometry: geometries[index],
+              hardMask: masks[index],
+              plan: compositePlans[index],
+              enhancedFrame: enhancedFrame,
+              expertContext: expertContext,
+              expertFrameIndex: index
+            )
+            if let filter, let filterRegion {
+              if enhancedFrame != nil {
+                try filter.add(index, from: outputs[frameIndex],
+                  left: filterRegion.left, top: filterRegion.top,
+                  presentationTimeStamp: CMTime(
+                    value: detected[frameIndex].frame.ptsNanoseconds, timescale: 1_000_000_000))
+                filterInputs.insert(index)
+              }
+              let ready = index - lookahead
+              if ready >= filterRun.lowerBound, filterInputs.contains(ready) {
+                try await applySwiftVRFilter(
+                  filter, index: ready, region: filterRegion,
+                  into: outputs[scene.frames[ready].batchIndex],
+                  geometry: geometries[ready], hardMask: masks[ready],
+                  exclusiveWeights: compositePlans[ready].blendMask,
+                  featherFraction: 0, restrictToEnhancerMask: true)
+              }
+            }
+            compositionSeconds += Date().timeIntervalSince(compositionStart)
+          }
+          if let filter, let filterRegion {
+            let flushStart = Date()
+            for ready in max(filterRun.lowerBound, filterRun.upperBound - lookahead)..<filterRun.upperBound
+            where filterInputs.contains(ready) {
+              try await applySwiftVRFilter(
+                filter, index: ready, region: filterRegion,
+                into: outputs[scene.frames[ready].batchIndex],
+                geometry: geometries[ready], hardMask: masks[ready],
+                exclusiveWeights: compositePlans[ready].blendMask,
+                featherFraction: 0, restrictToEnhancerMask: true)
+            }
+            compositionSeconds += Date().timeIntervalSince(flushStart)
+          }
         }
         continue
       }
@@ -6991,7 +7002,8 @@ private final class NativeFrameProcessor: @unchecked Sendable {
   /// The rectangle around every crop of a scene, inside the frame, where the
   /// SwiftVR temporal noise filter runs.
   private static func swiftVRFilterRegion(
-    _ geometries: [NativeClipGeometry], frame: CVPixelBuffer
+    _ geometries: [NativeClipGeometry], frame: CVPixelBuffer,
+    minimumWidth: Int = 160, minimumHeight: Int = 64
   ) -> IntBox? {
     guard let first = geometries.first else { return nil }
     let frameWidth = CVPixelBufferGetWidth(frame)
@@ -7020,13 +7032,24 @@ private final class NativeFrameProcessor: @unchecked Sendable {
         }
       }
     }
-    fit(&left, &right, minimum: 160, limit: frameWidth)
-    fit(&top, &bottom, minimum: 64, limit: frameHeight)
+    fit(&left, &right, minimum: minimumWidth, limit: frameWidth)
+    fit(&top, &bottom, minimum: minimumHeight, limit: frameHeight)
     let box = IntBox(left: left, top: top, right: right, bottom: bottom)
-    guard box.width >= 160, box.height >= 64,
+    guard box.width >= minimumWidth, box.height >= minimumHeight,
       box.width.isMultiple(of: 2), box.height.isMultiple(of: 2)
     else { return nil }
     return box
+  }
+
+  private static func roiDistillFilterRegion(
+    _ geometries: [NativeClipGeometry], frame: CVPixelBuffer
+  ) -> IntBox? {
+    guard let minimum = VTTemporalNoiseFilterConfiguration.minimumDimensions,
+      let region = swiftVRFilterRegion(geometries, frame: frame,
+      minimumWidth: max(160, Int(minimum.width)), minimumHeight: max(64, Int(minimum.height))),
+      SwiftVRTemporalNoiseFilter.supports(width: region.width, height: region.height)
+    else { return nil }
+    return region
   }
 
   /// Blends the filtered rectangle back into a composited frame with the
@@ -7034,14 +7057,21 @@ private final class NativeFrameProcessor: @unchecked Sendable {
   private func applySwiftVRFilter(
     _ filter: SwiftVRTemporalNoiseFilter, index: Int, region: IntBox,
     into frame: CVPixelBuffer, geometry: NativeClipGeometry, hardMask: [Float],
-    exclusiveWeights: [Float]? = nil
+    exclusiveWeights: [Float]? = nil, featherFraction: Float = 0.04,
+    restrictToEnhancerMask: Bool = false
   ) async throws {
     let filtered = try await filter.filtered(index)
     let crop = geometry.cropBox
     // CELF: the scene's own exclusive weights, so the filtered pixels never
     // spill onto a neighbouring mosaic's restoration.
-    let weights = exclusiveWeights ?? Self.createEnhancerBlendMask(
-      hardMask, width: crop.width, height: crop.height, featherFraction: 0.04)
+    let enhancerMask = Self.createEnhancerBlendMask(
+      hardMask, width: crop.width, height: crop.height, featherFraction: featherFraction)
+    let weights: [Float]
+    if restrictToEnhancerMask, let exclusiveWeights {
+      weights = SwiftVRTemporalNoiseFilter.blendWeights(enhancer: enhancerMask, ownership: exclusiveWeights)
+    } else {
+      weights = exclusiveWeights ?? enhancerMask
+    }
     Self.blend(filtered, region: region, into: frame, crop: crop, weights: weights)
   }
 
@@ -7049,80 +7079,33 @@ private final class NativeFrameProcessor: @unchecked Sendable {
     _ filtered: CVPixelBuffer, region: IntBox, into frame: CVPixelBuffer,
     crop: IntBox, weights: [Float]
   ) {
-    CVPixelBufferLockBaseAddress(filtered, .readOnly)
-    CVPixelBufferLockBaseAddress(frame, [])
-    defer {
-      CVPixelBufferUnlockBaseAddress(frame, [])
-      CVPixelBufferUnlockBaseAddress(filtered, .readOnly)
-    }
-    let sourceRow = CVPixelBufferGetBytesPerRow(filtered)
-    let targetRow = CVPixelBufferGetBytesPerRow(frame)
-    let source = CVPixelBufferGetBaseAddress(filtered)!.assumingMemoryBound(to: UInt8.self)
-    let target = CVPixelBufferGetBaseAddress(frame)!.assumingMemoryBound(to: UInt8.self)
-    let top = max(crop.top, region.top), bottom = min(crop.bottom, region.bottom)
-    let left = max(crop.left, region.left), right = min(crop.right, region.right)
-    guard top <= bottom, left <= right else { return }
-    DispatchQueue.concurrentPerform(iterations: bottom - top + 1) { row in
-      let y = top + row
-      let weightRow = (y - crop.top) * crop.width
-      let sourceLine = source + (y - region.top) * sourceRow
-      let targetLine = target + y * targetRow
-      for x in left...right {
-        let weight = weights[weightRow + x - crop.left]
-        guard weight > 0 else { continue }
-        for channel in 0..<3 {
-          let current = Float(targetLine[x * 4 + channel])
-          let value = Float(sourceLine[(x - region.left) * 4 + channel])
-          targetLine[x * 4 + channel] = UInt8(
-            max(0, min(255, (current + weight * (value - current)).rounded())))
-        }
-      }
-    }
+    SwiftVRTemporalNoiseFilter.blend(filtered, left: region.left, top: region.top,
+      into: frame, cropLeft: crop.left, cropTop: crop.top,
+      cropWidth: crop.width, cropHeight: crop.height, weights: weights)
   }
 
   /// How one frame's restoration grid and SwiftVR's smoothed view both see
   /// the frame, per axis: grid = scale * frame + offset (pixel centres).
-  private struct SwiftVRView {
-    let scaleX: Float
-    let offsetX: Float
-    let scaleY: Float
-    let offsetY: Float
-    let smoothScaleX: Float
-    let smoothOffsetX: Float
-    let smoothScaleY: Float
-    let smoothOffsetY: Float
-  }
+  private typealias SwiftVRView = ROIEnhancerSmoothedView
 
   /// Averages each frame's grid placement over `window` frames of the scene.
   private static func smoothedSwiftVRViews(
-    _ geometries: [NativeClipGeometry], window: Int
+    _ geometries: [NativeClipGeometry], window: Int, frameIndices: [Int]? = nil
   ) -> [SwiftVRView] {
     // Matches makeModelInputAxes: grid centre g samples frame
     // cropStart + (g - pad + 0.5) * crop / resized - 0.5.
-    let placements = geometries.map { geometry -> (Float, Float, Float, Float) in
+    let placements = geometries.map { geometry -> ROIEnhancerGridPlacement in
       let scaleX = Float(geometry.resizedWidth) / Float(geometry.cropBox.width)
       let scaleY = Float(geometry.resizedHeight) / Float(geometry.cropBox.height)
-      return (
-        scaleX,
-        Float(geometry.padLeft) - 0.5 - (Float(geometry.cropBox.left) - 0.5) * scaleX,
-        scaleY,
-        Float(geometry.padTop) - 0.5 - (Float(geometry.cropBox.top) - 0.5) * scaleY
+      return ROIEnhancerGridPlacement(
+        scaleX: scaleX,
+        offsetX: Float(geometry.padLeft) - 0.5 - (Float(geometry.cropBox.left) - 0.5) * scaleX,
+        scaleY: scaleY,
+        offsetY: Float(geometry.padTop) - 0.5 - (Float(geometry.cropBox.top) - 0.5) * scaleY
       )
     }
-    let half = max(0, window / 2)
-    return placements.indices.map { index in
-      let range = max(0, index - half)...min(placements.count - 1, index + half)
-      let count = Float(range.count)
-      let mean = range.reduce((Float(0), Float(0), Float(0), Float(0))) {
-        ($0.0 + placements[$1].0, $0.1 + placements[$1].1,
-         $0.2 + placements[$1].2, $0.3 + placements[$1].3)
-      }
-      let own = placements[index]
-      return SwiftVRView(
-        scaleX: own.0, offsetX: own.1, scaleY: own.2, offsetY: own.3,
-        smoothScaleX: mean.0 / count, smoothOffsetX: mean.1 / count,
-        smoothScaleY: mean.2 / count, smoothOffsetY: mean.3 / count)
-    }
+    return ROIEnhancerFrameSmoothing.views(
+      placements: placements, window: window, frameIndices: frameIndices)
   }
 
   /// Resamples each 256px restoration grid into its smoothed view. Outside
@@ -7131,12 +7114,17 @@ private final class NativeFrameProcessor: @unchecked Sendable {
   /// in over 4 grid pixels at the crop edge.
   private static func reframeForSwiftVR(
     _ restored: [Float16], views: [SwiftVRView], geometries: [NativeClipGeometry],
-    sources: [CVPixelBuffer]
+    sources: [CVPixelBuffer], preserveIdentity: Bool = false
   ) -> [Float16] {
     let side = restorationSize
     let plane = side * side
     var output = restored
     for (frame, view) in views.enumerated() {
+      if preserveIdentity,
+        view.scaleX == view.smoothScaleX, view.offsetX == view.smoothOffsetX,
+        view.scaleY == view.smoothScaleY, view.offsetY == view.smoothOffsetY {
+        continue
+      }
       let geometry = geometries[frame]
       // Smoothed grid -> frame (pixel centres) -> this frame's grid.
       let frameXs = (0..<side).map { (Float($0) - view.smoothOffsetX) / view.smoothScaleX }
@@ -7210,24 +7198,7 @@ private final class NativeFrameProcessor: @unchecked Sendable {
   private static func mapSwiftVRFrameBack(
     _ pixels: [Float16], side: Int, view: SwiftVRView
   ) -> [Float16] {
-    let factor = Float(side) / Float(restorationSize)
-    // Output pixel u covers grid (u + 0.5) / factor - 0.5.
-    let xs = (0..<side).map { u -> Float in
-      let grid = (Float(u) + 0.5) / factor - 0.5
-      let smooth = (grid - view.offsetX) / view.scaleX * view.smoothScaleX
-        + view.smoothOffsetX
-      return (smooth + 0.5) * factor - 0.5
-    }
-    let ys = (0..<side).map { v -> Float in
-      let grid = (Float(v) + 0.5) / factor - 0.5
-      let smooth = (grid - view.offsetY) / view.scaleY * view.smoothScaleY
-        + view.smoothOffsetY
-      return (smooth + 0.5) * factor - 0.5
-    }
-    var output = pixels
-    resample(pixels, sourceOffset: 0, sourceSide: side, xs: xs, ys: ys,
-      into: &output, targetOffset: 0, targetSide: side)
-    return output
+    ROIEnhancerFrameSmoothing.mapBack(pixels, side: side, view: view)
   }
 
   /// Bilinear resampling of a planar RGB square at the given source
@@ -7236,34 +7207,9 @@ private final class NativeFrameProcessor: @unchecked Sendable {
     _ source: [Float16], sourceOffset: Int, sourceSide: Int, xs: [Float], ys: [Float],
     into output: inout [Float16], targetOffset: Int, targetSide: Int
   ) {
-    let sourcePlane = sourceSide * sourceSide
-    let targetPlane = targetSide * targetSide
-    let taps = { (position: Float) -> (Int, Int, Float) in
-      let clamped = max(0, min(Float(sourceSide - 1), position))
-      let lower = Int(clamped)
-      return (lower, min(sourceSide - 1, lower + 1), clamped - Float(lower))
-    }
-    let xTaps = xs.map(taps)
-    let yTaps = ys.map(taps)
-    source.withUnsafeBufferPointer { input in
-      output.withUnsafeMutableBufferPointer { target in
-        DispatchQueue.concurrentPerform(iterations: targetSide) { y in
-          let (y0, y1, wy) = yTaps[y]
-          for channel in 0..<3 {
-            let plane = sourceOffset + channel * sourcePlane
-            let row = targetOffset + channel * targetPlane + y * targetSide
-            for x in 0..<targetSide {
-              let (x0, x1, wx) = xTaps[x]
-              let upper = Float(input[plane + y0 * sourceSide + x0]) * (1 - wx)
-                + Float(input[plane + y0 * sourceSide + x1]) * wx
-              let lower = Float(input[plane + y1 * sourceSide + x0]) * (1 - wx)
-                + Float(input[plane + y1 * sourceSide + x1]) * wx
-              target[row + x] = Float16(upper * (1 - wy) + lower * wy)
-            }
-          }
-        }
-      }
-    }
+    ROIEnhancerFrameSmoothing.resample(
+      source, sourceOffset: sourceOffset, sourceSide: sourceSide, xs: xs, ys: ys,
+      into: &output, targetOffset: targetOffset, targetSide: targetSide)
   }
 
   private static func stabilizeSwiftVRFrame(
@@ -8171,6 +8117,10 @@ private struct NativePreviewPipeline {
   }
 
   private static func run(config: NativePreviewConfiguration) async throws {
+    if config.exportDetectionMasks == true, !config.isExport || config.isWorker {
+      throw NativePreviewError.invalidConfiguration(
+        "detection mask JSON requires a local export, not preview/cluster workers")
+    }
     let backend = try NativeDecoderBackend.resolve(config.decoderBackend)
     let diagnostics = (config.detailedDiagnostics ?? false)
       ? NativePipelineDiagnostics(generation: config.generation, backend: backend.rawValue) : nil
@@ -8328,6 +8278,23 @@ private struct NativePreviewPipeline {
     }
     let outputFPSNumerator = targetRate?.numerator ?? video.fpsNumerator
     let outputFPSDenominator = targetRate?.denominator ?? video.fpsDenominator
+    let maskJSON: DetectionMaskJSONWriter?
+    if config.exportDetectionMasks == true {
+      guard let outputFile = config.outputFile else {
+        throw NativePreviewError.invalidConfiguration("detection mask JSON requires outputFile")
+      }
+      maskJSON = try DetectionMaskJSONWriter(
+        outputVideo: URL(fileURLWithPath: outputFile), width: video.width, height: video.height,
+        sourceFPSNumerator: video.fpsNumerator, sourceFPSDenominator: video.fpsDenominator,
+        outputFPSNumerator: outputFPSNumerator, outputFPSDenominator: outputFPSDenominator,
+        emptyLookahead: config.detectionBackend == "celfnet" ? 1 : max(1, config.detectionEmptyLookahead ?? 0),
+        maskReuseSkipFrames: config.detectionBackend == "celfnet" ? 0 : min(max(config.detectionMaskReuseSkipFrames ?? 0, 0), 8),
+        multiMosaicMode: config.multiMosaicMode ?? "perDetection",
+        overwrite: config.overwriteDetectionMasks ?? false)
+    } else {
+      maskJSON = nil
+    }
+    defer { try? maskJSON?.finish(complete: false) }
     let requestedSegmentSeconds: Double
     if config.isExport {
       switch config.splitMode ?? "duration" {
@@ -8352,7 +8319,11 @@ private struct NativePreviewPipeline {
       ? min(maximumInternalExportSegmentSeconds, requestedSegmentSeconds)
       : requestedSegmentSeconds
     let detector: any NativeDetecting
-    if config.detectionBackend == "rfdetr" {
+    if config.detectionBackend == "celfnet" {
+      detector = try await CelfNetCoreMLDetector(
+        modelURL: URL(fileURLWithPath: config.detectionModel)
+      )
+    } else if config.detectionBackend == "rfdetr" {
       detector = try await RFDETRDetector(
         modelURL: URL(fileURLWithPath: config.detectionModel),
         resolution: config.detectionInputSize ?? 576,
@@ -8400,6 +8371,36 @@ private struct NativePreviewPipeline {
       swiftVR = nil
     }
     defer { swiftVR?.close() }
+    let roiRefinerAsset: URL? = (config.roiEnhancerStrength ?? 0) > 0
+      ? config.roiEnhancerModel.flatMap { path in
+          let url = URL(fileURLWithPath: path)
+          return ROIRefinePack.isRoot(url) ? url : nil
+        }
+      : nil
+    let roiRefiner: ROIRefineSceneEnhancer?
+    if let roiRefinerAsset {
+      // Like SwiftVR: seconds per scene, local exports only, direct replacement (no Expert ROI blend).
+      guard config.isExport, !config.isWorker else {
+        throw NativePreviewError.invalidConfiguration("ROI Refine requires a local export")
+      }
+      guard config.roiExpertMode != true else {
+        throw NativePreviewError.invalidConfiguration("ROI Refine requires Expert ROI to be off")
+      }
+      roiRefiner = try await ROIRefineSceneEnhancer(
+        pack: roiRefinerAsset,
+        strength: config.roiEnhancerStrength ?? 1,
+        temporalFilter: config.swiftVRTemporalFilter ?? 0,
+        stabilizationRadius: config.swiftVRStabilizationRadius ?? 1,
+        frameSmoothing: config.swiftVRFrameSmoothing ?? 0,
+        framesPerSecond: Double(outputFPSNumerator) / Double(outputFPSDenominator),
+        distillModel: config.roiRefineDistillModel.map { URL(fileURLWithPath: $0) },
+        distillMinimumCrop: config.roiRefineDistillMinimumCrop ?? 512,
+        maximumWindowSide: config.roiRefineMaximumWindowSide ?? 512
+      )
+    } else {
+      roiRefiner = nil
+    }
+    defer { roiRefiner?.close() }
     // SwiftVR keeps the configured lanes: they take turns running it.
     let nativeParallelWorkers = config.isExport && !config.isWorker
       ? min(max(config.nativeParallelWorkers ?? 1, 1), 10)
@@ -8437,14 +8438,15 @@ private struct NativePreviewPipeline {
         )
       }
       let roiEnhancer: NativeROIEnhancer?
-      if let modelPath = config.roiEnhancerModel, swiftVRAsset == nil,
+      if let modelPath = config.roiEnhancerModel, swiftVRAsset == nil, roiRefinerAsset == nil,
         (config.roiEnhancerStrength ?? 0) > 0
       {
         roiEnhancer = try await NativeROIEnhancer(
           modelURL: URL(fileURLWithPath: modelPath),
           scale: config.roiEnhancerScale ?? 4,
           strength: config.roiEnhancerStrength ?? 0,
-          passes: config.roiEnhancerPasses ?? 1
+          frameSmoothing: config.swiftVRFrameSmoothing ?? 0,
+          temporalFilter: config.swiftVRTemporalFilter ?? 0
         )
       } else {
         roiEnhancer = nil
@@ -8456,6 +8458,7 @@ private struct NativePreviewPipeline {
           restorer: restorer,
           roiEnhancer: roiEnhancer,
           swiftVR: swiftVR,
+          roiRefiner: roiRefiner,
           roiExpertMode: config.roiExpertMode ?? false,
           blendFeather: config.blendFeather ?? 1,
           restoreMaskOnly: config.restoreMaskOnly ?? false,
@@ -8530,7 +8533,7 @@ private struct NativePreviewPipeline {
       "output_buffer_limit": perProcessorOutputLimit
         * nativeParallelWorkers,
       "native_parallel_workers": nativeParallelWorkers,
-      "detection_mask_reuse_skip_frames": min(
+      "detection_mask_reuse_skip_frames": config.detectionBackend == "celfnet" ? 0 : min(
         max(config.detectionMaskReuseSkipFrames ?? 0, 0),
         8
       ),
@@ -8561,6 +8564,26 @@ private struct NativePreviewPipeline {
         : targetRate.map {
           PTSFrameRateGate(numerator: $0.numerator, denominator: $0.denominator)
         }
+      // Bounded by one processed clip plus its deferred crossfade tail. Keep
+      // CELF's gap-filled state until this exact frame reaches output, rather
+      // than recording the earlier tracker-only state in the detection task.
+      var maskExportFrames: [Int64: DetectedFrame] = [:]
+
+      func appendMaskJSON(_ frame: ProcessedFrame) throws {
+        guard let maskJSON else { return }
+        guard let item = maskExportFrames.removeValue(forKey: frame.ptsNanoseconds) else {
+          throw NativePreviewError.export("missing detection mask metadata for output frame")
+        }
+        try maskJSON.append(
+          ptsNanoseconds: frame.ptsNanoseconds, detectionStatus: item.detectionStatus,
+          observationPTS: item.observationPTS,
+          regions: try item.detections.map {
+            try detectionMaskJSONRegion($0, width: video.width, height: video.height)
+          },
+          celf: DetectionMaskJSONCELF.capture(item.labelField, width: video.width, height: video.height),
+          celfCrossfadePrevious: DetectionMaskJSONCELF.capture(frame.celfCrossfadePrevious, width: video.width, height: video.height),
+          crossfadeLaterWeight: frame.crossfadeLaterWeight)
+      }
 
       @inline(__always)
       func belongsToCoreOutput(_ ptsNanoseconds: Int64) -> Bool {
@@ -8592,6 +8615,16 @@ private struct NativePreviewPipeline {
         let detectedBatch = pending.detectedBatch
         let batch = detectedBatch.frames
         let outputs = result.outputs
+        var previousCELF: [Int64: LabelFieldFrame] = [:]
+        if maskJSON != nil {
+          for (index, item) in batch.enumerated() {
+            let pts = item.frame.ptsNanoseconds
+            if let earlier = maskExportFrames[pts]?.labelField { previousCELF[pts] = earlier }
+            if index >= detectedBatch.skipPrefix || maskExportFrames[pts] != nil {
+              maskExportFrames[pts] = item
+            }
+          }
+        }
         restoredBatches += result.restoredSceneCount
         if let encodingTask = pendingEncoding {
           let (segments, completedNextSequence) = try await encodingTask.value
@@ -8621,7 +8654,9 @@ private struct NativePreviewPipeline {
                       / Float(matchedCount + 1)
                   ),
                   ptsNanoseconds:
-                    deferredCrossfadeTail[index].ptsNanoseconds
+                    deferredCrossfadeTail[index].ptsNanoseconds,
+                  celfCrossfadePrevious: previousCELF[deferredCrossfadeTail[index].ptsNanoseconds],
+                  crossfadeLaterWeight: Float(index + 1) / Float(matchedCount + 1)
                 )
               )
             }
@@ -8683,8 +8718,11 @@ private struct NativePreviewPipeline {
           } else {
             accepted = true
           }
-          return accepted && belongsToCoreOutput(frame.ptsNanoseconds)
+          let keep = accepted && belongsToCoreOutput(frame.ptsNanoseconds)
+          if !keep { maskExportFrames.removeValue(forKey: frame.ptsNanoseconds) }
+          return keep
         }
+        for frame in acceptedFrames { try appendMaskJSON(frame) }
         pendingEncoding = Task.detached(priority: .userInitiated) {
           let token = diagnostics?.begin("encode")
           defer { diagnostics?.end(token, stage: "encode") }
@@ -8822,11 +8860,11 @@ private struct NativePreviewPipeline {
             var localDetectionSeconds = 0.0
             var batchIndex = 0
             var newFramesSinceYield = 0
-            let detectionMaskReuseSkipFrames = min(
+            let detectionMaskReuseSkipFrames = config.detectionBackend == "celfnet" ? 0 : min(
               max(config.detectionMaskReuseSkipFrames ?? 0, 0),
               8
             )
-            let emptyLookaheadFrames = max(
+            let emptyLookaheadFrames = config.detectionBackend == "celfnet" ? 1 : max(
               1,
               config.detectionEmptyLookahead ?? 0
             )
@@ -8898,8 +8936,12 @@ private struct NativePreviewPipeline {
 
             func appendDetectedFrame(
               _ frame: DecodedFrame,
-              detections: [Detection]
+              detections: [Detection],
+              detectionStatus: String = "model",
+              observationPTS: Int64? = nil
             ) {
+              // Keep every model result, including a single-frame observation.
+              // Temporal confirmation must not discard a restoration ROI.
               if !detections.isEmpty {
                 localDetectedFrames += 1
               }
@@ -8917,7 +8959,10 @@ private struct NativePreviewPipeline {
               }
               pending.append(
                 DetectedFrame(
-                  frame: frame, detections: detections, labelField: labelField)
+                  frame: frame, detections: detections,
+                  detectionStatus: detectionStatus,
+                  observationPTS: detectionStatus == "empty_lookahead" ? nil : (observationPTS ?? frame.ptsNanoseconds),
+                  labelField: labelField)
               )
               newFramesSinceYield += 1
               if pending.count == config.temporalBatchFrames {
@@ -8957,8 +9002,9 @@ private struct NativePreviewPipeline {
                   lookaheadWindow[lastIndex]
                 )
                 if firstDetections.isEmpty && lastDetections.isEmpty {
-                  for frame in lookaheadWindow {
-                    appendDetectedFrame(frame, detections: [])
+                  for index in lookaheadWindow.indices {
+                    appendDetectedFrame(lookaheadWindow[index], detections: [],
+                      detectionStatus: index == 0 || index == lastIndex ? "model" : "empty_lookahead")
                   }
                   lookaheadWindow.removeAll(keepingCapacity: true)
                   return
@@ -8977,13 +9023,17 @@ private struct NativePreviewPipeline {
                   sampleIndex += sampleStride
                 }
                 var reusedDetections = firstDetections
+                var observationPTS = lookaheadWindow[0].ptsNanoseconds
                 for index in lookaheadWindow.indices {
                   if let exact = sampled[index] {
                     reusedDetections = exact
+                    observationPTS = lookaheadWindow[index].ptsNanoseconds
                   }
                   appendDetectedFrame(
                     lookaheadWindow[index],
-                    detections: reusedDetections
+                    detections: reusedDetections,
+                    detectionStatus: sampled[index] == nil ? "reused" : "model",
+                    observationPTS: observationPTS
                   )
                 }
                 lookaheadWindow.removeAll(keepingCapacity: true)
@@ -9014,8 +9064,9 @@ private struct NativePreviewPipeline {
                 lookaheadWindow[lastIndex]
               )
               if lastDetections.isEmpty {
-                for frame in lookaheadWindow {
-                  appendDetectedFrame(frame, detections: [])
+                for index in lookaheadWindow.indices {
+                  appendDetectedFrame(lookaheadWindow[index], detections: [],
+                    detectionStatus: index == 0 || index == lastIndex ? "model" : "empty_lookahead")
                 }
               } else {
                 for index in lookaheadWindow.indices {
@@ -9118,7 +9169,10 @@ private struct NativePreviewPipeline {
             if var gate = postRestorationFrameRateGate {
               let accepted = gate.accepts(frame.ptsNanoseconds)
               postRestorationFrameRateGate = gate
-              if !accepted { continue }
+              if !accepted {
+                maskExportFrames.removeValue(forKey: frame.ptsNanoseconds)
+                continue
+              }
             }
             guard belongsToCoreOutput(frame.ptsNanoseconds) else { continue }
             if let segment = try await writer.append(
@@ -9129,6 +9183,7 @@ private struct NativePreviewPipeline {
               completedSegments.append(segment)
               nextSequence = segment.sequence + 1
             }
+            try appendMaskJSON(frame)
             encodedFrames += 1
             diagnostics?.frames("encoded", count: 1, pts: frame.ptsNanoseconds)
           }
@@ -9196,6 +9251,14 @@ private struct NativePreviewPipeline {
               sourceEndNanoseconds: config.outputCoreEndNanoseconds
             )
           }
+        }
+        if let maskJSON {
+          guard maskJSON.frameCount == encodedFrames else {
+            throw NativePreviewError.export("detection mask/video frame count mismatch")
+          }
+          try maskJSON.finish(complete: true)
+          emit(["kind": "mask_export_saved", "generation": config.generation,
+                "path": maskJSON.outputURL.path, "frame_count": maskJSON.frameCount])
         }
         let elapsed = max(0.001, ProcessInfo.processInfo.systemUptime - wallStart)
         emit([

@@ -89,6 +89,8 @@ struct NativeExportConfiguration: Codable, Sendable {
   let nativeParallelWorkers: Int
   var decoderBackend: String? = nil
   var detailedDiagnostics: Bool? = nil
+  var exportDetectionMasks: Bool? = nil
+  var overwriteDetectionMasks: Bool? = nil
   let confidenceThreshold: Float
   let iouThreshold: Float = 0.7
   let contextFraction: Float = 0.30
@@ -106,14 +108,18 @@ struct NativeExportConfiguration: Codable, Sendable {
   let roiEnhancerModel: String?
   let roiEnhancerStrength: Float
   let roiEnhancerScale: Int
-  let roiEnhancerPasses: Int
   let roiExpertMode: Bool
-  /// SwiftVR only: Apple temporal noise filter strength (0 turns it off).
+  /// SwiftVR and ROI Distill: Apple temporal noise filter (0 turns it off).
   var swiftVRTemporalFilter: Float? = nil
   /// SwiftVR only: frames on each side blended by the stabilization.
   var swiftVRStabilizationRadius: Int? = nil
-  /// SwiftVR only: frames over which SwiftVR's view of the crop is averaged.
+  /// SwiftVR and ROI Distill: frames over which the crop view is averaged.
   var swiftVRFrameSmoothing: Int? = nil
+  /// ROI Refine: ROI Distill layered on scenes whose crop exceeds roiRefineDistillMinimumCrop source pixels.
+  var roiRefineDistillModel: String? = nil
+  var roiRefineDistillMinimumCrop: Int? = nil
+  /// ROI Refine: largest internal LTX canvas. Defaults to 512; 1024 is an explicit quality/cost opt-in.
+  var roiRefineMaximumWindowSide: Int? = nil
   let detectionEmptyLookahead: Int
   let detectionMaskReuseSkipFrames: Int
   let detectFaceMosaics: Bool
@@ -165,6 +171,8 @@ struct NativeExportConfiguration: Codable, Sendable {
     case nativeParallelWorkers
     case decoderBackend
     case detailedDiagnostics
+    case exportDetectionMasks
+    case overwriteDetectionMasks
     case confidenceThreshold
     case iouThreshold
     case contextFraction
@@ -179,11 +187,13 @@ struct NativeExportConfiguration: Codable, Sendable {
     case roiEnhancerModel
     case roiEnhancerStrength
     case roiEnhancerScale
-    case roiEnhancerPasses
     case roiExpertMode
     case swiftVRTemporalFilter
     case swiftVRStabilizationRadius
     case swiftVRFrameSmoothing
+    case roiRefineDistillModel
+    case roiRefineDistillMinimumCrop
+    case roiRefineMaximumWindowSide
     case detectionEmptyLookahead
     case detectionMaskReuseSkipFrames
     case detectFaceMosaics
@@ -244,7 +254,6 @@ private struct NativePreviewLaunchConfiguration: Encodable {
   let roiEnhancerModel: String?
   let roiEnhancerStrength: Float
   let roiEnhancerScale: Int
-  let roiEnhancerPasses: Int
   let roiExpertMode: Bool
   let detectionEmptyLookahead: Int
   let detectionMaskReuseSkipFrames: Int
@@ -395,6 +404,7 @@ struct PlatformCapabilities {
   let baseDetectionModels = [
     "v2-coreml", "v3.1-fast-coreml", "v3.1-accurate-coreml",
     "v4-fast-coreml", "v4-accurate-coreml", "vr-v2-accurate-coreml",
+    "celfnet-o2-coreml",
   ]
 
   var detectionModels: [String] {
@@ -724,19 +734,23 @@ struct MiohUserDefaultsSnapshot: Codable {
   var effectUpscale: Int
   var roiEnhancer: String
   var roiEnhancerModel: String
+  /// The model each ROI enhancer method used last (built-in name or local path).
+  var roiEnhancerModelsByMethod: [String: String]?
   var roiEnhancerScale: Int
   var roiEnhancerStrength: Double
   var roiEnhancerTile: Int
-  var roiEnhancerPasses: Int?
   var roiExpertMode: Bool?
   var swiftVRTemporalFilter: Double?
   var swiftVRStabilizationRadius: Int?
   var swiftVRFrameSmoothing: Int?
+  var roiRefineDistill: Bool?
+  var roiRefineUse1024Window: Bool?
 
   var detectionModel: String
   var customDetectionModel: String
   var detectionEmptyLookahead: Int
   var detectionMaskReuseSkipFrames: Int?
+  var exportDetectionMasks: Bool?
   var detectFaceMosaics: Bool
 
   var previewBufferLimit: Double
@@ -816,18 +830,21 @@ struct MiohUserDefaultsSnapshot: Codable {
       effectUpscale: 1,
       roiEnhancer: "none",
       roiEnhancerModel: "",
+      roiEnhancerModelsByMethod: nil,
       roiEnhancerScale: 4,
       roiEnhancerStrength: 0.0,
       roiEnhancerTile: 0,
-      roiEnhancerPasses: 1,
       roiExpertMode: false,
       swiftVRTemporalFilter: 1.0,
       swiftVRStabilizationRadius: 1,
       swiftVRFrameSmoothing: 15,
+      roiRefineDistill: true,
+      roiRefineUse1024Window: false,
       detectionModel: "v2-coreml",
       customDetectionModel: "",
       detectionEmptyLookahead: 10,
       detectionMaskReuseSkipFrames: 0,
+      exportDetectionMasks: false,
       detectFaceMosaics: false,
       previewBufferLimit: 8.0,
       previewRestorationModel: capabilities.previewRestorationModel,
@@ -856,6 +873,8 @@ final class RestorationRunner: ObservableObject {
   @Published var inputURL: URL? {
     didSet {
       guard inputURL != oldValue else { return }
+      outputFileName = ""
+      refreshOutputPathText()
       refreshSourceInfo(for: inputURL)
     }
   }
@@ -865,35 +884,46 @@ final class RestorationRunner: ObservableObject {
   @Published var rangeStartSeconds = 0.0
   @Published var rangeEndSeconds = 0.0
   @Published var outputURL: URL?
-  @Published var progress = 0.0
-  @Published var status = "待機中"
-  @Published var log = ""
-  @Published var isRunning = false {
-    didSet { updateExportActivity() }
-  }
-  /// While work runs, tell macOS it is user-initiated. Without this, App Nap
-  /// throttled mioh and the export processes it launches once the window left
-  /// the foreground: the same SwiftVR export took about 2.3x as long from the
-  /// app as from a shell (209-232 s vs 8-9 min).
-  private var exportActivity: NSObjectProtocol?
+  /// Output file name typed in the 基本 tab; "" = the default "<input name>-UC.<ext>".
+  @Published var outputFileName = ""
 
-  private func updateExportActivity() {
-    if isRunning, exportActivity == nil {
-      exportActivity = ProcessInfo.processInfo.beginActivity(
-        options: [.userInitiated, .idleSystemSleepDisabled],
-        reason: "mioh restoration or export")
-    } else if !isRunning, let activity = exportActivity {
-      ProcessInfo.processInfo.endActivity(activity)
-      exportActivity = nil
+  /// The 出力 row: the full output path (folder + file name) as typed. For a single input file the last
+  /// path component is the file name and the rest the folder, unless the path is a folder: then the
+  /// default file name is used. A folder input (batch) takes a folder.
+  /// Rewritten only when the input or the chosen folder changes, so typing is never overridden.
+  @Published var outputPathText = "" {
+    didSet {
+      guard outputPathText != oldValue else { return }
+      let path = (outputPathText.trimmingCharacters(in: .whitespacesAndNewlines) as NSString).expandingTildeInPath
+      guard !path.isEmpty else {
+        outputURL = nil
+        outputFileName = ""
+        return
+      }
+      // A folder (an existing one, or a path ending in "/") saves under the default file name.
+      var isFolder: ObjCBool = false
+      if inputURL == nil || inputIsDirectory || path.hasSuffix("/")
+        || (FileManager.default.fileExists(atPath: path, isDirectory: &isFolder) && isFolder.boolValue) {
+        outputURL = URL(fileURLWithPath: path, isDirectory: true)
+        outputFileName = ""
+        return
+      }
+      let url = URL(fileURLWithPath: path)
+      outputURL = url.deletingLastPathComponent()
+      let name = url.lastPathComponent
+      outputFileName = inputURL.map { name == MacNativeExportBatchPlanner.defaultFileName(input: $0) } == true ? "" : name
     }
   }
-  @Published var defaultsStatus = "未保存"
+
+  private var inputIsDirectory: Bool {
+    guard let inputURL else { return false }
+    var isDirectory: ObjCBool = false
+    return FileManager.default.fileExists(atPath: inputURL.path, isDirectory: &isDirectory) && isDirectory.boolValue
+  }
 
   var sourceDurationSeconds: Double {
     guard let value = sourceInfo?.durationSeconds,
-      value.isFinite, value > 0,
-      let inputURL,
-      (try? inputURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) != true
+      value.isFinite, value > 0, !inputIsDirectory
     else { return 0 }
     return value
   }
@@ -941,6 +971,59 @@ final class RestorationRunner: ObservableObject {
       sourceDurationSeconds
     )
   }
+
+  /// The output file that already exists for a single-file input (nil when none, or for folder batches).
+  var existingOutputFile: URL? {
+    guard let inputURL, let outputURL, !inputIsDirectory else { return nil }
+    let output = resolvedOutputFile(input: inputURL, selectedOutput: outputURL)
+    var isDirectory: ObjCBool = false
+    return FileManager.default.fileExists(atPath: output.path, isDirectory: &isDirectory) && !isDirectory.boolValue
+      ? output : nil
+  }
+
+  /// Start after the user confirmed replacing this existing output file (this run only).
+  func startReplacing(_ output: URL) {
+    confirmedReplaceOutput = output.standardizedFileURL
+    start()
+  }
+  private var confirmedReplaceOutput: URL?
+
+  func refreshOutputPathText() {
+    guard let outputURL else {
+      outputPathText = ""
+      return
+    }
+    guard let inputURL, !inputIsDirectory else {
+      outputPathText = outputURL.path
+      return
+    }
+    outputPathText = MacNativeExportBatchPlanner.resolvedOutputFile(
+      input: inputURL, selectedOutput: outputURL, fileName: outputFileName
+    ).path
+  }
+  @Published var progress = 0.0
+  @Published var status = "待機中"
+  @Published var log = ""
+  @Published var isRunning = false {
+    didSet { updateExportActivity() }
+  }
+  /// While work runs, tell macOS it is user-initiated. Without this, App Nap
+  /// throttled mioh and the export processes it launches once the window left
+  /// the foreground: the same SwiftVR export took about 2.3x as long from the
+  /// app as from a shell (209-232 s vs 8-9 min).
+  private var exportActivity: NSObjectProtocol?
+
+  private func updateExportActivity() {
+    if isRunning, exportActivity == nil {
+      exportActivity = ProcessInfo.processInfo.beginActivity(
+        options: [.userInitiated, .idleSystemSleepDisabled],
+        reason: "mioh restoration or export")
+    } else if !isRunning, let activity = exportActivity {
+      ProcessInfo.processInfo.endActivity(activity)
+      exportActivity = nil
+    }
+  }
+  @Published var defaultsStatus = "未保存"
 
   @Published var tempDirectory = "/tmp"
   @Published var ffmpegTempDirectory = ""
@@ -1010,10 +1093,12 @@ final class RestorationRunner: ObservableObject {
   @Published var effectUpscale = 1
   @Published var roiEnhancer = "none"
   @Published var roiEnhancerModel = ""
+  /// Last model (built-in name or local file/folder) per ROI enhancer method, so
+  /// switching the method brings back where that method's model was.
+  @Published var roiEnhancerModelsByMethod: [String: String] = [:]
   @Published var roiEnhancerScale = 4
   @Published var roiEnhancerStrength = 0.0
   @Published var roiEnhancerTile = 0
-  @Published var roiEnhancerPasses = 1
   @Published var roiExpertMode = false
   /// Strength of the temporal noise filter on SwiftVR's frames (0 = off).
   @Published var swiftVRTemporalFilter = 1.0
@@ -1021,11 +1106,16 @@ final class RestorationRunner: ObservableObject {
   @Published var swiftVRStabilizationRadius = 1
   /// Frames over which SwiftVR's view of the crop is averaged (0 = off).
   @Published var swiftVRFrameSmoothing = 15
+  /// ROI Refine: layer ROI Distill on crops over 512 px (refine draws at 512).
+  @Published var roiRefineDistill = true
+  /// Permit the expensive 1024px internal LTX canvas. Off caps automatic selection at 512px.
+  @Published var roiRefineUse1024Window = false
 
   @Published var detectionModel: String
   @Published var customDetectionModel = ""
   @Published var detectionEmptyLookahead = 10
   @Published var detectionMaskReuseSkipFrames = 0
+  @Published var exportDetectionMasks = false
   @Published var detectFaceMosaics = false
 
   @Published var previewBufferLimit = 8.0
@@ -1267,22 +1357,20 @@ final class RestorationRunner: ObservableObject {
       }
     }
   }
-  let enhancerModels = ["none", "realesrgan", "mewzoom", "swinir", "spandrel", "pipersr", "swiftvr"]
+  let enhancerModels = ["none", "swiftvr", "roi-distill", "roi-refine"]
+  static func enhancerDisplayName(_ method: String) -> String {
+    ["none": "なし", "swiftvr": "SwiftVR", "roi-distill": "ROI Distill", "roi-refine": "ROI Refine"][method] ?? method
+  }
   private let knownROIEnhancerModelNames: Set<String> = [
-    "realesrgan-x2", "realesrgan-x2-coreai",
-    "realesrgan-x4", "realesrgan-x4-coreml", "realesrgan-x4-coreai",
-    "realesr-general-x4v3-coreml", "realesr-general-x4v3-coreai",
-    "mewzoom-x4-coreml", "mewzoom-x4-coreml-512",
-    "swinir-x4-coreml", "swinir-real-x4-coreml",
-    "nomos-webphoto-realplksr-x4",
-    "nomos-webphoto-realplksr-x4-coreml",
-    "nomos-webphoto-realplksr-x4-coreai",
-    "nomos-uni-span-x4", "nomos-uni-compact-x2",
-    "pipersr-coreml",
+    "roi-distill-x2-coreml",
   ]
 
   var roiEnhancerModelOptions: [ROIEnhancerModelOption] {
     roiEnhancerModelOptions(for: roiEnhancer, includingSelectedModel: true)
+  }
+
+  var roiEnhancerSupportsFrameSmoothing: Bool {
+    roiEnhancer == "swiftvr" || roiEnhancer == "roi-distill" || roiEnhancer == "roi-refine"
   }
 
   /// The same model catalogue is used by SwiftUI and the authenticated Web
@@ -1294,103 +1382,16 @@ final class RestorationRunner: ObservableObject {
   ) -> [ROIEnhancerModelOption] {
     var options: [ROIEnhancerModelOption]
     switch enhancer {
-    case "swiftvr":
+    case "roi-distill":
+      options = [
+        ROIEnhancerModelOption(
+          name: "roi-distill-x2-coreml",
+          label: "ROI Distill 12ブロック（step 19000）— Core ML / ANE（2x）",
+          scale: 2
+        ),
+      ]
+    case "swiftvr", "roi-refine":
       options = [] // The large local model pack is selected as a directory.
-    case "pipersr":
-      options = [
-        ROIEnhancerModelOption(
-          name: "pipersr-coreml",
-          label: "PiperSR 256 — Core ML / ANE (2x)",
-          scale: 2
-        ),
-      ]
-    case "realesrgan":
-      options = [
-        ROIEnhancerModelOption(
-          name: "realesrgan-x2-coreai",
-          label: "Real-ESRGAN x2plus — Core AI (2x)",
-          scale: 2
-        ),
-        ROIEnhancerModelOption(
-          name: "realesrgan-x4-coreai",
-          label: "Real-ESRGAN x4plus — Core AI (4x)",
-          scale: 4
-        ),
-        ROIEnhancerModelOption(
-          name: "realesrgan-x4-coreml",
-          label: "Real-ESRGAN x4plus — Core ML (4x)",
-          scale: 4
-        ),
-        ROIEnhancerModelOption(
-          name: "realesr-general-x4v3-coreai",
-          label: "Real-ESRGAN Compact — Core AI (4x)",
-          scale: 4
-        ),
-        ROIEnhancerModelOption(
-          name: "realesr-general-x4v3-coreml",
-          label: "Real-ESRGAN Compact — Core ML (4x)",
-          scale: 4
-        ),
-        ROIEnhancerModelOption(
-          name: "realesrgan-x2",
-          label: "Real-ESRGAN x2plus — PyTorch (2x)",
-          scale: 2
-        ),
-        ROIEnhancerModelOption(
-          name: "realesrgan-x4",
-          label: "Real-ESRGAN x4plus — PyTorch (4x)",
-          scale: 4
-        ),
-      ]
-    case "mewzoom":
-      options = [
-        ROIEnhancerModelOption(
-          name: "mewzoom-x4-coreml",
-          label: "MewZoom 256 — Core ML (4x)",
-          scale: 4
-        ),
-        ROIEnhancerModelOption(
-          name: "mewzoom-x4-coreml-512",
-          label: "MewZoom 512 — Core ML (4x)",
-          scale: 4
-        ),
-      ]
-    case "swinir":
-      options = [
-        ROIEnhancerModelOption(
-          name: "swinir-real-x4-coreml",
-          label: "SwinIR Real — Core ML (4x)",
-          scale: 4
-        ),
-      ]
-    case "spandrel":
-      options = [
-        ROIEnhancerModelOption(
-          name: "nomos-webphoto-realplksr-x4-coreai",
-          label: "Nomos WebPhoto RealPLKSR — Core AI (4x)",
-          scale: 4
-        ),
-        ROIEnhancerModelOption(
-          name: "nomos-webphoto-realplksr-x4-coreml",
-          label: "Nomos WebPhoto RealPLKSR — Core ML (4x)",
-          scale: 4
-        ),
-        ROIEnhancerModelOption(
-          name: "nomos-webphoto-realplksr-x4",
-          label: "Nomos WebPhoto RealPLKSR — Spandrel (4x)",
-          scale: 4
-        ),
-        ROIEnhancerModelOption(
-          name: "nomos-uni-span-x4",
-          label: "Nomos Uni SPAN — Spandrel (4x)",
-          scale: 4
-        ),
-        ROIEnhancerModelOption(
-          name: "nomos-uni-compact-x2",
-          label: "Nomos Uni Compact — Spandrel (2x)",
-          scale: 2
-        ),
-      ]
     default:
       options = []
     }
@@ -1426,7 +1427,12 @@ final class RestorationRunner: ObservableObject {
     panel.canChooseDirectories = true
     panel.canCreateDirectories = true
     panel.allowsMultipleSelection = false
-    if panel.runModal() == .OK { outputURL = panel.url }
+    panel.directoryURL = outputURL
+    if panel.runModal() == .OK {
+      outputURL = panel.url
+      outputFileName = ""       // a chosen folder saves under the default file name
+      refreshOutputPathText()
+    }
   }
 
   func choosePath(_ keyPath: ReferenceWritableKeyPath<RestorationRunner, String>) {
@@ -1443,13 +1449,30 @@ final class RestorationRunner: ObservableObject {
     panel.canChooseFiles = true
     panel.canChooseDirectories = true
     panel.allowsMultipleSelection = false
+    if let remembered = roiEnhancerModelsByMethod[roiEnhancer], remembered.hasPrefix("/") {
+      // Open the chooser where this method's model was last time.
+      panel.directoryURL = URL(fileURLWithPath: remembered).deletingLastPathComponent()
+    }
     guard panel.runModal() == .OK, let path = panel.url?.path else { return }
     roiEnhancerModel = path
+    applyROIEnhancerScale(forCustomPath: path)
+    rememberROIEnhancerModel()
+  }
+
+  private func applyROIEnhancerScale(forCustomPath path: String) {
+    let normalized = URL(fileURLWithPath: path).lastPathComponent.lowercased()
+    if roiEnhancer == "roi-distill" {
+      roiEnhancerScale = 2
+      return
+    }
     if roiEnhancer == "swiftvr" {
       roiEnhancerScale = roiEnhancerScale == 2 ? 2 : 4
       return
     }
-    let normalized = panel.url?.lastPathComponent.lowercased() ?? ""
+    if roiEnhancer == "roi-refine" {
+      roiEnhancerScale = 2
+      return
+    }
     if normalized.contains("x2") || normalized.hasPrefix("2x") {
       roiEnhancerScale = 2
     } else if normalized.contains("x4") || normalized.hasPrefix("4x") {
@@ -1457,9 +1480,35 @@ final class RestorationRunner: ObservableObject {
     }
   }
 
+  private func rememberROIEnhancerModel() {
+    let model = roiEnhancerModel.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard roiEnhancer != "none", !model.isEmpty else { return }
+    roiEnhancerModelsByMethod[roiEnhancer] = model
+  }
+
+  /// The model this method used last, if it is still available: a built-in
+  /// option of this method, or a local file/folder that still exists.
+  private func rememberedROIEnhancerModel(for enhancer: String) -> String? {
+    guard let model = roiEnhancerModelsByMethod[enhancer], !model.isEmpty else { return nil }
+    if roiEnhancerModelOptions(for: enhancer).contains(where: { $0.name == model }) { return model }
+    if model.hasPrefix("/"), FileManager.default.fileExists(atPath: model) { return model }
+    return nil
+  }
+
   func selectROIEnhancer(_ enhancer: String) {
+    rememberROIEnhancerModel()
     roiEnhancer = enhancer
+    if let remembered = rememberedROIEnhancerModel(for: enhancer) {
+      roiEnhancerModel = remembered
+      if let option = roiEnhancerModelOptions(for: enhancer).first(where: { $0.name == remembered }) {
+        roiEnhancerScale = option.scale
+      } else {
+        applyROIEnhancerScale(forCustomPath: remembered)
+      }
+      return
+    }
     synchronizeROIEnhancerModel(forceDefault: true)
+    if enhancer == "roi-distill" || enhancer == "roi-refine" { roiEnhancerScale = 2 }
     if enhancer == "swiftvr" {
       roiEnhancerScale = roiEnhancerScale == 2 ? 2 : 4
     }
@@ -1470,9 +1519,11 @@ final class RestorationRunner: ObservableObject {
     if let option = roiEnhancerModelOptions.first(where: { $0.name == model }) {
       roiEnhancerScale = option.scale
     }
+    rememberROIEnhancerModel()
   }
 
   func start() {
+    defer { confirmedReplaceOutput = nil }
     guard let inputURL, let outputURL else { return }
     do {
       normalizeModelSelections()
@@ -1481,7 +1532,8 @@ final class RestorationRunner: ObservableObject {
       let plan = try MacNativeExportBatchPlanner.plan(
         input: inputURL,
         selectedOutput: outputURL,
-        overwrite: overwrite
+        overwrite: overwrite,
+        fileName: outputFileName
       )
       try launchNativeExportPlan(plan, resources: resources)
     } catch {
@@ -1499,7 +1551,8 @@ final class RestorationRunner: ObservableObject {
   ) -> URL {
     MacNativeExportBatchPlanner.resolvedOutputFile(
       input: input,
-      selectedOutput: selectedOutput
+      selectedOutput: selectedOutput,
+      fileName: outputFileName
     )
   }
 
@@ -1786,7 +1839,8 @@ final class RestorationRunner: ObservableObject {
           + "設定を無視せず停止しました"
       )
     }
-    if FileManager.default.fileExists(atPath: output.path), !overwrite {
+    if FileManager.default.fileExists(atPath: output.path), !overwrite,
+      output.standardizedFileURL != confirmedReplaceOutput {
       throw RunnerError.unsupportedFeature(
         "出力ファイルが存在します: \(output.path)\n"
           + "置き換える場合は「基本」タブの「既存結果を上書き」を有効にしてください"
@@ -1958,6 +2012,8 @@ final class RestorationRunner: ObservableObject {
       nativeParallelWorkers: min(max(nativeParallelWorkers, 1), 10),
       decoderBackend: decoderBackend,
       detailedDiagnostics: detailedDiagnostics,
+      exportDetectionMasks: exportDetectionMasks,
+      overwriteDetectionMasks: overwrite,
       confidenceThreshold: detection.confidenceThreshold,
       blendFeather: Float(blendFeather),
       restoreMaskOnly: restoreMaskOnly,
@@ -1970,15 +2026,18 @@ final class RestorationRunner: ObservableObject {
       roiEnhancerModel: nativeEnhancer?.url.path,
       roiEnhancerStrength: nativeEnhancer == nil ? 0 : Float(roiEnhancerStrength),
       roiEnhancerScale: nativeEnhancer?.scale ?? max(1, roiEnhancerScale),
-      roiEnhancerPasses: roiEnhancer == "pipersr"
-        ? min(max(roiEnhancerPasses, 1), 10) : 1,
       roiExpertMode: roiExpertMode,
-      swiftVRTemporalFilter: roiEnhancer == "swiftvr"
+      swiftVRTemporalFilter: roiEnhancer != "none"
         ? Float(min(max(swiftVRTemporalFilter, 0), 1)) : nil,
-      swiftVRStabilizationRadius: roiEnhancer == "swiftvr"
+      swiftVRStabilizationRadius: roiEnhancer == "swiftvr" || roiEnhancer == "roi-refine"
         ? min(max(swiftVRStabilizationRadius, 1), 8) : nil,
-      swiftVRFrameSmoothing: roiEnhancer == "swiftvr"
+      swiftVRFrameSmoothing: roiEnhancerSupportsFrameSmoothing
         ? min(max(swiftVRFrameSmoothing, 0), 30) : nil,
+      roiRefineDistillModel: roiEnhancer == "roi-refine" && roiRefineDistill
+        ? existingPath(resources.appendingPathComponent("models/roi-distill-x2.mlmodelc")) : nil,
+      roiRefineDistillMinimumCrop: roiEnhancer == "roi-refine" && roiRefineDistill ? 512 : nil,
+      roiRefineMaximumWindowSide: roiEnhancer == "roi-refine"
+        ? (roiRefineUse1024Window ? 1024 : 512) : nil,
       detectionEmptyLookahead: max(0, detectionEmptyLookahead),
       detectionMaskReuseSkipFrames: min(
         max(detectionMaskReuseSkipFrames, 0),
@@ -2120,8 +2179,6 @@ final class RestorationRunner: ObservableObject {
     // push the expression past the type checker's budget.
     let enhancerStrength: Float = enhancerIdentifier == nil
       ? 0 : Float(roiEnhancerStrength)
-    let enhancerPasses: Int? = roiEnhancer == "pipersr"
-      ? min(max(roiEnhancerPasses, 1), 10) : 1
     let codec: String = encodingPreset.hasPrefix("h264") ? "h264" : "hevc"
     let clampedEffectUpscale: Int = max(1, min(4, effectUpscale))
     let enhancerScale: Int = max(1, min(8, roiEnhancerScale))
@@ -2149,7 +2206,6 @@ final class RestorationRunner: ObservableObject {
       roiEnhancerAssetSHA256: enhancerDigest,
       roiEnhancerStrength: enhancerStrength,
       roiEnhancerScale: enhancerScale,
-      roiEnhancerPasses: enhancerPasses,
       videoCodec: codec,
       bitrateMultiplier: bitrateMultiplier,
       mp4FastStart: mp4FastStart,
@@ -2464,8 +2520,6 @@ final class RestorationRunner: ObservableObject {
         ? 0 : request.options.roiEnhancerStrength,
       roiEnhancerScale: enhancer?.scale
         ?? max(1, request.options.roiEnhancerScale),
-      roiEnhancerPasses: request.options.roiEnhancerModelIdentifier == "pipersr-coreml"
-        ? min(max(request.options.roiEnhancerPasses ?? 1, 1), 10) : 1,
       roiExpertMode: false,
       detectionEmptyLookahead: request.options.detectionEmptyLookahead,
       detectionMaskReuseSkipFrames:
@@ -2805,8 +2859,12 @@ final class RestorationRunner: ObservableObject {
       スムージング: \(String(format: "%.2f", configuration.smoothStrength))
       エフェクト倍率: \(configuration.effectUpscale)x
       ROIエンハンサー: \(configuration.roiEnhancerModel == nil ? "無効" : "有効（\(roiEnhancerModel)、強度 \(String(format: "%.2f", configuration.roiEnhancerStrength))）")
+      枠のなめらかさ: \(configuration.swiftVRFrameSmoothing ?? 0)フレーム
+      大きいROIのDistill重ね: \(configuration.roiRefineDistillModel == nil ? "なし" : "512px超に適用")
+      揺らぎ低減: \(String(format: "%.2f", configuration.swiftVRTemporalFilter ?? 0))（Apple時間方向ノイズ補正）
       空検出先読み: \(configuration.detectionEmptyLookahead)フレーム
       検出後スキップ: \(configuration.detectionMaskReuseSkipFrames)フレーム
+      検出マスクJSON保存: \(configuration.exportDetectionMasks == true ? "有効（出力動画の隣に .masks.json）" : "無効")
       顔モザイク検出: \(configuration.detectFaceMosaics ? "有効" : "無効")
       FPS変換: \(configuration.targetFPS == nil ? "なし" : "\(targetFPSDescription)fps（\(configuration.preFPSConversion ? "復元前" : "復元後")）")
       エンコーダー: \(codec) VideoToolbox
@@ -2898,6 +2956,16 @@ final class RestorationRunner: ObservableObject {
     let base = model
       .replacingOccurrences(of: "-coreai", with: "")
       .replacingOccurrences(of: "-coreml", with: "")
+    if model == "celfnet-o2-coreml" {
+      for suffix in [".mlmodelc", ".mlpackage"] {
+        if let asset = firstModelAsset(
+          in: models, prefixes: ["celfnet-o2-epoch09"], suffix: suffix
+        ) {
+          return (asset, "celfnet", 960, 0, 0, 0, 0, 0.5, "cpuAndGPU")
+        }
+      }
+      return nil
+    }
     if base == "jasna-v6" || base == "jasna-v6-large" {
       let large = base == "jasna-v6-large"
       let stem = large
@@ -3002,6 +3070,10 @@ final class RestorationRunner: ObservableObject {
   /// Core ML and legacy PyTorch labels resolve to the equivalent Core ML
   /// export. This keeps the user's chosen model semantics in the native
   /// pipeline.
+  private func existingPath(_ url: URL) -> String? {
+    FileManager.default.fileExists(atPath: url.path) ? url.path : nil
+  }
+
   private func nativeROIEnhancerAsset(
     resources: URL,
     model: String,
@@ -3010,6 +3082,11 @@ final class RestorationRunner: ObservableObject {
     let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return nil }
     let custom = URL(fileURLWithPath: trimmed)
+    if FileManager.default.fileExists(atPath: custom.appendingPathComponent(
+      "roi-refine-pack.json").path) {
+      // A ROI Refine pack: 256px BasicVSR++ ROI redrawn at 512px.
+      return (custom, 2)
+    }
     if FileManager.default.fileExists(atPath: custom.appendingPathComponent(
       "reae-stateful-encoder-28f-1024-fp32.mlpackage").path),
       FileManager.default.fileExists(atPath: custom.appendingPathComponent(
@@ -3032,55 +3109,10 @@ final class RestorationRunner: ObservableObject {
     let coreAIPrefixes: [String]
     let coreMLPrefixes: [String]
     switch trimmed {
-    case "pipersr-coreml":
+    case "roi-distill-x2-coreml":
       scale = 2
       coreAIPrefixes = []
-      coreMLPrefixes = ["PiperSR_2x_256"]
-    case "realesrgan-x2-coreai":
-      scale = 2
-      coreAIPrefixes = ["RealESRGAN_x2plus-256-fp16"]
-      coreMLPrefixes = ["RealESRGAN_x2plus_256"]
-    case "realesrgan-x2":
-      scale = 2
-      coreAIPrefixes = []
-      coreMLPrefixes = ["RealESRGAN_x2plus_256"]
-    case "realesrgan-x4-coreai":
-      scale = 4
-      coreAIPrefixes = ["RealESRGAN_x4plus-256-fp16"]
-      coreMLPrefixes = ["RealESRGAN_x4plus_256"]
-    case "realesrgan-x4", "realesrgan-x4-coreml":
-      scale = 4
-      coreAIPrefixes = []
-      coreMLPrefixes = ["RealESRGAN_x4plus_256"]
-    case "realesr-general-x4v3-coreai":
-      scale = 4
-      coreAIPrefixes = ["realesr-general-x4v3-256-fp16"]
-      coreMLPrefixes = ["realesr-general-x4v3_256"]
-    case "realesr-general-x4v3-coreml":
-      scale = 4
-      coreAIPrefixes = []
-      coreMLPrefixes = ["realesr-general-x4v3_256"]
-    case "mewzoom-x4-coreml":
-      scale = 4
-      coreAIPrefixes = []
-      coreMLPrefixes = ["MewZoom-V1-4X-Unet_256"]
-    case "mewzoom-x4-coreml-512":
-      scale = 4
-      coreAIPrefixes = []
-      coreMLPrefixes = ["MewZoom-V1-4X-Unet_512"]
-    case "swinir-x4-coreml", "swinir-real-x4-coreml":
-      scale = 4
-      coreAIPrefixes = []
-      coreMLPrefixes = ["swinir-real-x4_256"]
-    case "nomos-webphoto-realplksr-x4-coreai":
-      scale = 4
-      coreAIPrefixes = ["4xNomosWebPhoto_RealPLKSR-256-fp16"]
-      coreMLPrefixes = ["4xNomosWebPhoto_RealPLKSR_256"]
-    case "nomos-webphoto-realplksr-x4",
-      "nomos-webphoto-realplksr-x4-coreml":
-      scale = 4
-      coreAIPrefixes = []
-      coreMLPrefixes = ["4xNomosWebPhoto_RealPLKSR_256"]
+      coreMLPrefixes = ["roi-distill-x2"]
     default:
       return nil
     }
@@ -3266,18 +3298,21 @@ final class RestorationRunner: ObservableObject {
       effectUpscale: effectUpscale,
       roiEnhancer: roiEnhancer,
       roiEnhancerModel: roiEnhancerModel,
+      roiEnhancerModelsByMethod: roiEnhancerModelsByMethod,
       roiEnhancerScale: roiEnhancerScale,
       roiEnhancerStrength: roiEnhancerStrength,
       roiEnhancerTile: roiEnhancerTile,
-      roiEnhancerPasses: roiEnhancerPasses,
       roiExpertMode: roiExpertMode,
       swiftVRTemporalFilter: swiftVRTemporalFilter,
       swiftVRStabilizationRadius: swiftVRStabilizationRadius,
       swiftVRFrameSmoothing: swiftVRFrameSmoothing,
+      roiRefineDistill: roiRefineDistill,
+      roiRefineUse1024Window: roiRefineUse1024Window,
       detectionModel: detectionModel,
       customDetectionModel: customDetectionModel,
       detectionEmptyLookahead: detectionEmptyLookahead,
       detectionMaskReuseSkipFrames: detectionMaskReuseSkipFrames,
+      exportDetectionMasks: exportDetectionMasks,
       detectFaceMosaics: detectFaceMosaics,
       previewBufferLimit: previewBufferLimit,
       previewRestorationModel: previewRestorationModel,
@@ -3305,6 +3340,7 @@ final class RestorationRunner: ObservableObject {
   func apply(defaults snapshot: MiohUserDefaultsSnapshot) {
     inputURL = snapshot.inputPath.flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
     outputURL = snapshot.outputPath.flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
+    refreshOutputPathText()
     tempDirectory = snapshot.tempDirectory
     ffmpegTempDirectory = snapshot.ffmpegTempDirectory
     ladaTempDirectory = snapshot.ladaTempDirectory
@@ -3376,16 +3412,19 @@ final class RestorationRunner: ObservableObject {
     effectUpscale = min(max(snapshot.effectUpscale, 1), 4)
     roiEnhancer = enhancerModels.contains(snapshot.roiEnhancer) ? snapshot.roiEnhancer : "none"
     roiEnhancerModel = snapshot.roiEnhancerModel
+    roiEnhancerModelsByMethod = snapshot.roiEnhancerModelsByMethod ?? [:]
     roiEnhancerScale = min(max(snapshot.roiEnhancerScale, 1), 8)
+    if roiEnhancer == "roi-distill" { roiEnhancerScale = 2 }
     roiEnhancerStrength = min(max(snapshot.roiEnhancerStrength, 0), 1)
     roiEnhancerTile = min(max(snapshot.roiEnhancerTile, 0), 1024)
-    roiEnhancerPasses = min(max(snapshot.roiEnhancerPasses ?? 1, 1), 10)
     // Expert ROI is hidden from the GUI (its code stays), so a previously
     // saved "on" must not keep applying invisibly.
     roiExpertMode = false
     swiftVRTemporalFilter = min(max(snapshot.swiftVRTemporalFilter ?? 1, 0), 1)
     swiftVRStabilizationRadius = min(max(snapshot.swiftVRStabilizationRadius ?? 1, 1), 8)
     swiftVRFrameSmoothing = min(max(snapshot.swiftVRFrameSmoothing ?? 15, 0), 30)
+    roiRefineDistill = snapshot.roiRefineDistill ?? true
+    roiRefineUse1024Window = snapshot.roiRefineUse1024Window ?? false
 
     detectionModel = detectionModels.contains(snapshot.detectionModel) ? snapshot.detectionModel : "v2-coreml"
     customDetectionModel = snapshot.customDetectionModel
@@ -3395,6 +3434,7 @@ final class RestorationRunner: ObservableObject {
       8
     )
     detectFaceMosaics = snapshot.detectFaceMosaics
+    exportDetectionMasks = snapshot.exportDetectionMasks ?? false
 
     previewBufferLimit = min(max(snapshot.previewBufferLimit, 1), 60)
     previewRestorationModel = previewRestorationModels.contains(
@@ -3463,7 +3503,7 @@ final class RestorationRunner: ObservableObject {
     let selectedPreviewDetectionModel = previewDetectionModel
     try rejectUnsupportedCoreAIModel(selectedPreviewDetectionModel)
     let skipsCompositeParameters = previewRealtimeOptimization
-    let effectiveEnhancerStrength = skipsCompositeParameters || roiEnhancer == "swiftvr"
+    let effectiveEnhancerStrength = skipsCompositeParameters || roiEnhancer == "swiftvr" || roiEnhancer == "roi-refine"
       ? 0
       : roiEnhancerStrength
     let effectiveUpscale = skipsCompositeParameters ? 1 : effectUpscale
@@ -3587,8 +3627,6 @@ final class RestorationRunner: ObservableObject {
       roiEnhancerModel: nativeEnhancer?.url.path,
       roiEnhancerStrength: nativeEnhancer == nil ? 0 : Float(effectiveEnhancerStrength),
       roiEnhancerScale: nativeEnhancer?.scale ?? max(1, roiEnhancerScale),
-      roiEnhancerPasses: roiEnhancer == "pipersr"
-        ? min(max(roiEnhancerPasses, 1), 10) : 1,
       roiExpertMode: roiExpertMode,
       detectionEmptyLookahead: max(0, detectionEmptyLookahead),
       detectionMaskReuseSkipFrames: min(
@@ -3743,6 +3781,11 @@ final class RestorationRunner: ObservableObject {
         let message = payload["message"] as? String ?? "音声を結合しています"
         status = message
         appendLog("\n\(message)...\n")
+        return
+      case "mask_export_saved":
+        let count = payload["frame_count"] as? Int ?? 0
+        let path = payload["path"] as? String ?? ""
+        appendLog("検出マスクJSON保存完了: \(count)フレーム\n\(detailedDiagnostics ? "保存先は出力動画の隣です。" : path)\n")
         return
       case "segment":
         return
@@ -4138,6 +4181,7 @@ struct ContentView: View {
   @ObservedObject private var remoteControl = MiohAppState.shared.remoteControl
   @ObservedObject private var remoteStreaming = MiohAppState.shared.remoteStreaming
   @ObservedObject private var cluster = MiohAppState.shared.cluster
+  @State private var replaceOutputCandidate: URL?
 
   var body: some View {
     VStack(spacing: 0) {
@@ -4272,7 +4316,17 @@ struct ContentView: View {
             .padding(.top, 8)
           }
         }
-        PathRow(title: "出力", icon: "externaldrive", url: runner.outputURL, action: runner.chooseOutput)
+        PathSettingRow(title: "出力", value: $runner.outputPathText, action: runner.chooseOutput)
+        if runner.existingOutputFile != nil {
+          Label(
+            runner.overwrite
+              ? L("同じ名前のファイルがあります。上書きされます")
+              : L("同じ名前のファイルがあります。開始時に置き換えるか確認します"),
+            systemImage: "exclamationmark.triangle.fill"
+          )
+          .font(.caption)
+          .foregroundStyle(.orange)
+        }
         PathSettingRow(title: "一時フォルダ", value: $runner.tempDirectory) { runner.choosePath(\.tempDirectory) }
         PathSettingRow(title: "FFmpeg一時フォルダ", value: $runner.ffmpegTempDirectory) { runner.choosePath(\.ffmpegTempDirectory) }
         PathSettingRow(title: "mioh一時フォルダ", value: $runner.ladaTempDirectory) { runner.choosePath(\.ladaTempDirectory) }
@@ -4391,16 +4445,21 @@ struct ContentView: View {
           get: { runner.roiEnhancer },
           set: { runner.selectROIEnhancer($0) }
         )) {
-          ForEach(runner.enhancerModels, id: \.self) { Text($0).tag($0) }
+          ForEach(runner.enhancerModels, id: \.self) { Text(RestorationRunner.enhancerDisplayName($0)).tag($0) }
         }
         if runner.roiEnhancer != "none" {
+          if runner.roiEnhancer == "roi-distill" {
+            Text("実験用のSwiftVR蒸留モデル。復元済みの同じROIの前後2フレームを使い、256pxから512pxへ補強します。5フレーム入力のCore MLモデルを選択してください。既存SwiftVRとは別処理で、画質改善は未承認です。")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+          }
           if runner.roiEnhancer == "swiftvr" {
             Text("書き出し専用。BasicVSR++で復元した各シーンをその場でSwiftVRにかけて合成します（1シーン数秒〜十数秒）。モデルフォルダを選択してください。")
               .font(.caption)
               .foregroundStyle(.secondary)
           }
-          if runner.roiEnhancer == "pipersr" {
-            Text("PiperSR by Ben Racicot / ModelPiper。256px ROIを512pxへ復元し、その出力を直接貼り戻します（境界フェザーのみ維持）。単一フレーム型のため時間方向の復元は行いません。")
+          if runner.roiEnhancer == "roi-refine" {
+            Text("書き出し専用。BasicVSR++で復元した各シーンのROIを、LTX-2.3（Sulphur 2）のIC-LoRAで512pxに描き直して合成します。33フレームずつ、モザイクの範囲だけを描き直します（33フレームで約17秒、メモリ約15GB）。描かれるのはそれらしい細部で、元の細部の再現ではありません。描き直しパックのフォルダを選択してください。")
               .font(.caption)
               .foregroundStyle(.secondary)
           }
@@ -4421,6 +4480,14 @@ struct ContentView: View {
               .help("一覧にない対応モデルを選択")
             }
           }
+          if runner.roiEnhancerModel.hasPrefix("/") {
+            Text("モデルの場所: \(runner.roiEnhancerModel)")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+              .textSelection(.enabled)
+              .lineLimit(2)
+              .truncationMode(.middle)
+          }
         }
         if runner.roiEnhancer == "swiftvr" {
           Picker("倍率", selection: $runner.roiEnhancerScale) {
@@ -4431,36 +4498,38 @@ struct ContentView: View {
           Text("ROIの大きさに関係なく、すべてのシーンをこの倍率で処理します。2xは出力512pxで、4x（1024px）より大幅に速くなります。")
             .font(.caption)
             .foregroundStyle(.secondary)
-          integerSliderField("枠のなめらかさ", value: $runner.swiftVRFrameSmoothing, range: 0...30, step: 1)
-          Text("SwiftVRに渡す切り出し枠の位置と大きさを、このフレーム数で平均してなめらかにします。枠の伸び縮みで輪郭が太く・細く揺れるのを抑えます。BasicVSR++の復元は変わりません。0でオフ。")
-            .font(.caption)
-            .foregroundStyle(.secondary)
           integerSliderField("なじませ範囲", value: $runner.swiftVRStabilizationRadius, range: 1...8, step: 1)
           Text("SwiftVRの結果を前後何フレームまで混ぜるか。BasicVSR++の結果が似ている所だけを混ぜるので、広げても動いた所は混ざらず、止まった場面ほどチラつきが減ります。1が従来どおり。")
             .font(.caption)
             .foregroundStyle(.secondary)
+        }
+        if runner.roiEnhancer != "none" {
           doubleSliderField("揺らぎ低減", value: $runner.swiftVRTemporalFilter, range: 0...1, step: 0.05)
-          Text("SwiftVRの結果に、前後のフレームを使うAppleの時間方向ノイズ除去をかけて、質感のチラつきを抑えます。0でオフ。上げるほどチラつきが減り、ごく細かいざらつきも減ります。")
+          Text("エンハンサーの合成結果に、前後のフレームを使うAppleの時間方向ノイズ除去をかけて、質感のチラつきを抑えます。検出マスクの内側だけに適用します。0でオフ。強くすると細かいざらつきも減ります。")
             .font(.caption)
             .foregroundStyle(.secondary)
-        } else {
-          LabeledContent("倍率") { Stepper(value: $runner.roiEnhancerScale, in: 1...8) { Text("\(runner.roiEnhancerScale)x") } }
-            .disabled(runner.roiEnhancer == "none")
+          if runner.roiEnhancer == "roi-refine" {
+            Toggle("1024pxの内部計算窓を使う", isOn: $runner.roiRefineUse1024Window)
+            Text("オフではROIに応じて256〜512pxを自動選択します。オンでは512pxを超えるROIを1024pxで描き、1024pxのまま合成します（ROI Distillの重ねは使いません）。実測で約6倍遅く、今のLoRAでは細部の差はほぼありません。")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+            Toggle("大きいROIにROI Distillを重ねる", isOn: $runner.roiRefineDistill)
+            Text("ROI Refineは512pxで描き直すので、それより大きいROI（元の切り出しが512px超）は解像度が足りません。ROI Refineの結果にROI Distillの細部を上乗せします（処理時間は約1割増え、細部は約3割増えます）。")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+            integerSliderField("なじませ範囲", value: $runner.swiftVRStabilizationRadius, range: 1...8, step: 1)
+            Text("ROI Refineの結果を前後何フレームまで混ぜるか。BasicVSR++の結果が似ている所だけを混ぜるので、動いた所は混ざらず、止まった場面ほど細部の揺らぎが減ります。1でオフ。")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+          }
+          if runner.roiEnhancerSupportsFrameSmoothing {
+            integerSliderField("枠のなめらかさ", value: $runner.swiftVRFrameSmoothing, range: 0...30, step: 1)
+            Text("エンハンサーに渡す切り出し枠の位置と大きさを、前後のフレームで平均してなめらかにします。結果は元の枠へ戻して貼り付けます。BasicVSR++の復元と検出マスクは変わりません。0でオフ。")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+          }
         }
         doubleSliderField("強度", value: $runner.roiEnhancerStrength, range: 0...1, step: 0.05).disabled(runner.roiEnhancer == "none")
-        if runner.roiEnhancer == "pipersr" {
-          LabeledContent("PiperSR反復") {
-            Stepper(value: $runner.roiEnhancerPasses, in: 1...10) {
-              Text("\(runner.roiEnhancerPasses)回")
-            }
-          }
-          Text("2回目以降は512px出力を256pxへ縮小して再入力します。出力は常に512pxで、反復を増やすと処理時間と過強調の危険が増えます。")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-        }
-        if runner.roiEnhancer != "swiftvr" {
-          integerSliderField("タイル", value: $runner.roiEnhancerTile, range: 0...1024, step: 32).disabled(runner.roiEnhancer == "none")
-        }
       }
     }.formStyle(.grouped)
   }
@@ -4487,6 +4556,11 @@ struct ContentView: View {
           .font(.caption)
           .foregroundStyle(.secondary)
         Toggle("顔モザイクを検出", isOn: $runner.detectFaceMosaics)
+        Toggle("検出マスクをJSONに保存（学習用）", isOn: $runner.exportDetectionMasks)
+          .disabled(runner.isRunning)
+        Text("書き出し動画の隣に .masks.json を保存します。各フレームの時刻・検出枠・画素単位の検出マスクと、CELF有効時は補正後の持ち主・範囲・重みも記録します。保存とマスク展開に追加の時間・容量が必要です。")
+          .font(.caption)
+          .foregroundStyle(.secondary)
       }
       Section("複数モザイク") {
         Picker("複数モザイクの扱い", selection: $runner.multiMosaicMode) {
@@ -4840,12 +4914,27 @@ struct ContentView: View {
           action: {
             if cluster.useForExport && cluster.role == .coordinator {
               cluster.startExport(using: runner)
+            } else if !runner.overwrite, let existing = runner.existingOutputFile {
+              replaceOutputCandidate = existing
             } else {
               runner.start()
             }
           }
         ) { Label("開始", systemImage: "play.fill") }
           .buttonStyle(.borderedProminent)
+          .alert(
+            L("同じ名前のファイルがあります"),
+            isPresented: Binding(
+              get: { replaceOutputCandidate != nil },
+              set: { if !$0 { replaceOutputCandidate = nil } }
+            ),
+            presenting: replaceOutputCandidate
+          ) { output in
+            Button(L("置き換える"), role: .destructive) { runner.startReplacing(output) }
+            Button(L("キャンセル"), role: .cancel) {}
+          } message: { output in
+            Text(String(format: L("「%@」は既に存在します。置き換えますか？"), output.lastPathComponent))
+          }
           .disabled(
             cluster.useForExport && cluster.role == .coordinator
               ? !cluster.canStartExport(runner: runner)

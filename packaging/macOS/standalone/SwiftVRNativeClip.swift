@@ -145,6 +145,7 @@ private func decodeChunk(
 // nothing uses the GPU meanwhile. Compiled models therefore persist across
 // exports in the shared cache the postprocess supplies.
 private var compiledModels: [URL: URL] = [:]
+private let compiledModelsLock = NSLock()
 // Models are loaded for each use and released afterwards. A loaded DiT block
 // holds far more than its 312 MB of weights (GPU buffers for 7,168 tokens):
 // keeping the stack resident reached 42–63 GB and swapped, while loading on
@@ -154,6 +155,26 @@ private var sharedCompiledRoot = ProcessInfo.processInfo.environment[
   "MIOH_SWIFTVR_COMPILED_CACHE"].map {
     URL(fileURLWithPath: $0, isDirectory: true)
   }
+
+// Each synchronous scene runs on one worker thread. Its cancellation callback
+// and cache directory must not overwrite another scene's context.
+private final class SwiftVRSceneContext {
+  let compiledCache: URL
+  let shouldStop: () -> Bool
+  let concurrentPredictions: Bool
+  let preserveDiTPrecision: Bool
+  init(compiledCache: URL, concurrentPredictions: Bool, preserveDiTPrecision: Bool,
+    shouldStop: @escaping () -> Bool) {
+    self.compiledCache = compiledCache
+    self.concurrentPredictions = concurrentPredictions
+    self.preserveDiTPrecision = preserveDiTPrecision
+    self.shouldStop = shouldStop
+  }
+}
+private let sceneContextKey = "mioh.swiftvr.sceneContext"
+private var currentSceneContext: SwiftVRSceneContext? {
+  Thread.current.threadDictionary[sceneContextKey] as? SwiftVRSceneContext
+}
 
 private func packageFiles(_ package: URL) -> [URL] {
   let data = package.appendingPathComponent("Data/com.apple.CoreML")
@@ -265,14 +286,47 @@ private func contiguous(_ value: MLMultiArray, shape: [Int]) throws -> MLMultiAr
   return result
 }
 
+/// Copy a DiT output in its native FP16 format before releasing the model's
+/// prediction lock. The next group accepts FP16; widening it to FP32 only
+/// makes Core ML narrow it again. FP32 packs retain their existing precision.
+private func copyDiTHidden(_ value: MLMultiArray, shape: [Int],
+  preservePrecision: Bool) throws -> MLMultiArray {
+  guard preservePrecision,
+    value.dataType == .float16 else { return try contiguous(value, shape: shape) }
+  guard value.shape.map(\.intValue) == shape else {
+    throw ClipError.invalid("Unexpected Core ML shape \(value.shape)")
+  }
+  let result = try MLMultiArray(shape: shape.map(NSNumber.init(value:)), dataType: .float16)
+  let strides = value.strides.map(\.intValue)
+  let source = value.dataPointer.assumingMemoryBound(to: Float16.self)
+  let target = result.dataPointer.assumingMemoryBound(to: Float16.self)
+  var expectedStride = 1
+  var isContiguous = true
+  for axis in shape.indices.reversed() {
+    if strides[axis] != expectedStride { isContiguous = false }
+    expectedStride *= shape[axis]
+  }
+  if isContiguous {
+    target.update(from: source, count: value.count)
+  } else {
+    for index in 0..<value.count {
+      target[index] = source[offset(index, shape: shape, strides: strides)]
+    }
+  }
+  return result
+}
+
 private func compiledURL(for package: URL) throws -> URL {
+  compiledModelsLock.lock()
+  defer { compiledModelsLock.unlock() }
+  let cacheRoot = currentSceneContext?.compiledCache ?? sharedCompiledRoot
   let compiled: URL
   if let cached = compiledModels[package] {
     compiled = cached
-  } else if let sharedCompiledRoot {
-    try FileManager.default.createDirectory(at: sharedCompiledRoot,
+  } else if let cacheRoot {
+    try FileManager.default.createDirectory(at: cacheRoot,
       withIntermediateDirectories: true)
-    let cached = sharedCompiledRoot.appendingPathComponent(
+    let cached = cacheRoot.appendingPathComponent(
       compiledCacheName(for: package))
     if !FileManager.default.fileExists(atPath: cached.path) {
       let temporary = try MLModel.compileModel(at: package)
@@ -322,7 +376,7 @@ private func predictFeatures(
 }
 
 /// When the model pack provides the DiT stack as a few multi-layer groups,
-/// the groups load once per worker and stay loaded. A group shares one set of
+/// the groups load once per process and stay loaded. A group shares one set of
 /// GPU working buffers across its layers, so a whole stack fits in memory
 /// where 30 separate resident blocks swapped.
 ///
@@ -332,11 +386,61 @@ private func predictFeatures(
 /// a group, a separate package about 1.5 GB). Export clips reach 180 frames,
 /// and their middle chunks need t6. Older packs carry a t7-only stack in
 /// `native-4x-t7-fp16-grouped`.
-private var residentGroups: [String: [MLModel]] = [:]
+private final class ResidentGroup {
+  let model: MLModel
+  let lock = NSLock()
+  private var activeAsync = 0
+  private(set) var peakAsync = 0
+  init(_ model: MLModel) { self.model = model }
+  func beginAsync() {
+    lock.lock()
+    defer { lock.unlock() }
+    activeAsync += 1
+    peakAsync = max(peakAsync, activeAsync)
+  }
+  func endAsync() {
+    lock.lock()
+    defer { lock.unlock() }
+    activeAsync -= 1
+  }
+}
+
+// Core ML's async prediction API supports concurrent requests on one
+// stateless model. Keep the existing synchronous scene adapter, but submit
+// independently and copy each output after completion before waking
+// the tile worker. No model lock is held while the GPU executes a request.
+private final class ConcurrentPrediction<Value>: @unchecked Sendable {
+  private let finished = DispatchSemaphore(value: 0)
+  private let input: MLFeatureProvider
+  private var result: Result<Value, Error>?
+  init(model: MLModel, input: MLFeatureProvider,
+    convert: @escaping (MLFeatureProvider) throws -> Value) {
+    self.input = input
+    Task.detached(priority: .userInitiated) {
+      do {
+        let output = try await model.prediction(from: input, options: MLPredictionOptions())
+        self.result = Result {
+          try autoreleasepool { try convert(output) }
+        }
+      } catch {
+        self.result = .failure(error)
+      }
+      self.finished.signal()
+    }
+  }
+  func wait() throws -> Value {
+    finished.wait()
+    return try result!.get()
+  }
+}
+private var residentGroups: [String: [ResidentGroup]] = [:]
+private let residentGroupsLock = NSLock()
 
 private func groupedStack(
   _ assetRoot: URL, shapeName: String, geometry: Geometry
-) throws -> [MLModel]? {
+) throws -> [ResidentGroup]? {
+  residentGroupsLock.lock()
+  defer { residentGroupsLock.unlock() }
   let shared = assetRoot.appendingPathComponent(
     "native-\(geometry.packName)-fp16-grouped", isDirectory: true)
   let single = assetRoot.appendingPathComponent(
@@ -362,9 +466,9 @@ private func groupedStack(
     }
     let models = try names.map { name in
       try pooled {
-        try loadModel(
+        ResidentGroup(try loadModel(
           compiled: compiledURL(for: directory.appendingPathComponent(name)),
-          functionName: functionName)
+          functionName: functionName))
       }
     }
     residentGroups[key] = models
@@ -422,11 +526,12 @@ private func progress(_ message: String) {
 #endif
 }
 
-/// Set while the export runs a scene; checked between chunks and DiT groups.
+/// Default for the standalone serial runner. Inline calls use a worker-local
+/// context, checked between chunks and DiT groups.
 private var sceneShouldStop: () -> Bool = { false }
 
 private func checkStop() throws {
-  if sceneShouldStop() { throw CancellationError() }
+  if (currentSceneContext?.shouldStop ?? sceneShouldStop)() { throw CancellationError() }
 }
 
 private func pooled<Result>(_ body: () throws -> Result) rethrows -> Result {
@@ -811,14 +916,30 @@ private func denoise(
       latentCount: ditCount, side: tokenSide),
   ]
   if let groups = try groupedStack(assetRoot, shapeName: shapeName, geometry: geometry) {
+    // Async callbacks run on another thread; capture the scene's policy here.
+    let preservePrecision = currentSceneContext?.preserveDiTPrecision == true
     for (index, model) in groups.enumerated() {
       var inputs = conditions
       inputs["hidden"] = hidden
       hidden = try pooled {
-        try contiguous(
-          feature(predictFeatures(model, values: inputs), name: "output",
+        if currentSceneContext?.concurrentPredictions == true {
+          model.beginAsync()
+          defer { model.endAsync() }
+          let request = ConcurrentPrediction(model: model.model,
+            input: try MLDictionaryFeatureProvider(dictionary: inputs)) { output in
+              try copyDiTHidden(feature(output, name: "output", source: variant),
+                shape: [1, tokens, 3072], preservePrecision: preservePrecision)
+            }
+          return try request.wait()
+        }
+        // Synchronous MLModel predictions may not overlap on one instance.
+        // Different groups can run for different tiles, sharing the weights.
+        model.lock.lock()
+        defer { model.lock.unlock() }
+        return try copyDiTHidden(
+          feature(predictFeatures(model.model, values: inputs), name: "output",
             source: variant),
-          shape: [1, tokens, 3072]
+          shape: [1, tokens, 3072], preservePrecision: preservePrecision
         )
       }
       try checkStop()
@@ -875,18 +996,25 @@ private func denoise(
 #if MIOH_NATIVE_PREVIEW_PIPELINE
 /// Runs SwiftVR over one scene inside the export process. `input` holds
 /// `frames` planar RGB FP16 256px frames; `deliver` receives each 512px (2x)
-/// or 1024px (4x) frame in order as soon as it is decoded. Calls must not
-/// overlap: the models, the compiled cache and the stop check are
-/// process-wide. Throws `CancellationError` when `shouldStop` turns true
+/// or 1024px (4x) frame in order as soon as it is decoded. Concurrent scenes
+/// share DiT groups. Synchronous predictions are serialized; callers may
+/// enable concurrent predictions through Core ML's asynchronous API,
+/// while cache access is locked and scene callbacks are worker-local.
+/// Throws `CancellationError` when `shouldStop` turns true
 /// between chunks or DiT groups.
 func runSwiftVRScene(
   root: URL, compiledCache: URL, input: UnsafeBufferPointer<Float16>, frames: Int,
   scale: Int, deliver: @escaping (Int, [Float16]) -> Void,
+  concurrentPredictions: Bool = false,
+  preserveDiTPrecision: Bool = false,
   shouldStop: @escaping () -> Bool
 ) throws {
-  sharedCompiledRoot = compiledCache
-  sceneShouldStop = shouldStop
-  defer { sceneShouldStop = { false } }
+  let previous = Thread.current.threadDictionary[sceneContextKey]
+  Thread.current.threadDictionary[sceneContextKey] = SwiftVRSceneContext(
+    compiledCache: compiledCache, concurrentPredictions: concurrentPredictions,
+    preserveDiTPrecision: preserveDiTPrecision,
+    shouldStop: shouldStop)
+  defer { Thread.current.threadDictionary[sceneContextKey] = previous }
   try pooled {
     try SwiftVRNativeClipRunner.runScene(
       root: root, scene: .memory(input: input, frames: frames, deliver: deliver),
@@ -896,6 +1024,10 @@ func runSwiftVRScene(
 
 /// Drops the DiT groups kept loaded between scenes.
 func releaseSwiftVRModels() {
+  residentGroupsLock.lock()
+  defer { residentGroupsLock.unlock() }
+  let peak = residentGroups.values.flatMap { $0 }.map(\.peakAsync).max() ?? 0
+  if peak > 0 { progress("Maximum overlapping DiT requests on one model: \(peak)") }
   residentGroups.removeAll()
 }
 #endif

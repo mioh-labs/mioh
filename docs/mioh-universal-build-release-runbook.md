@@ -71,11 +71,12 @@ Keep these rules when editing the downloader or converter:
 3. Do not distribute the VR detector checkpoint in GitHub Releases or add it
    to the model downloader. The converter may process an existing local copy,
    but the public release contains neither the checkpoint nor a download URL.
-4. Real-ESRGAN conversion must not require `basicsr` in the bundled runtime.
-   It uses the vendored RRDBNet implementation.
-5. SwinIR conversion must not require `timm` in the bundled runtime. The
-   exporter supplies the three helpers used by the pinned official SwinIR
-   source.
+4. The current application exposes only SwiftVR, ROI Distill and ROI Refine
+   as optional ROI enhancers. The Universal DMG must not bundle their private
+   or separately licensed trained weights. Users select a locally prepared
+   model or pack in the application.
+5. Obsolete Real-ESRGAN, SwinIR, Nomos and PiperSR ROI-enhancer download and
+   conversion paths must not be reintroduced into the current model tools.
 6. The variable BasicVSR++ source collection must contain exactly 11
    `.aimodel` assets. The application accepts either this portable source
    collection or a matching architecture-specific `.aimodelc` collection.
@@ -121,9 +122,9 @@ PY=build/macos-standalone-universal/mioh-universal.app/Contents/Resources/runtim
 "$PY" -c 'import importlib.util; print(importlib.util.find_spec("timm"))'
 ```
 
-Both may print `None`; the Real-ESRGAN and SwinIR exporters are deliberately
-self-contained. A dependency fix is not complete until an actual checkpoint
-has produced its final `.mlpackage` with this bundled interpreter.
+Both may print `None`; neither package is required by the current conversion
+workflow. A dependency change is not complete until the standard detector and
+BasicVSR++ conversions have run with the bundled interpreter.
 
 ## Build
 
@@ -291,9 +292,11 @@ On another supported Mac:
    Swift native/Core AI restoration is available.
 6. On macOS 27, confirm the variable BasicVSR++ source collection contains 11
    assets and is selected successfully.
-7. Confirm Real-ESRGAN and SwinIR conversion completes without installing
-   `basicsr` or `timm`.
-8. Open a short video, test playback, seek twice, and perform a short export.
+7. Confirm the ROI-enhancer picker contains only `なし`, SwiftVR, ROI
+   Distill and ROI Refine. Select locally prepared models for any enhancer
+   acceptance test; do not copy those weights into the release DMG.
+8. Open a short video, test playback, seek twice, select a partial processing
+   range, and perform a short export with matching audio duration.
 
 Do not declare the release complete until the clean-machine test has passed.
 

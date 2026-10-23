@@ -150,7 +150,12 @@ xcrun swiftc \
   -framework ImageIO \
   "$PACKAGE_DIR/SwiftVRNativeClip.swift" \
   "$PACKAGE_DIR/SwiftVRInlineEnhancer.swift" \
+  "$PACKAGE_DIR/ROIRefineSceneEnhancer.swift" \
+  "$PACKAGE_DIR/DistilledROIEnhancer.swift" \
+  "$PACKAGE_DIR/ROIEnhancerFrameSmoothing.swift" \
   "$PACKAGE_DIR/MosaicLabelFieldTracker.swift" \
+  "$PACKAGE_DIR/CelfNetObjectDecoder.swift" \
+  "$PACKAGE_DIR/DetectionMaskJSON.swift" \
   "$PACKAGE_DIR/NativePreviewPipeline.swift" \
   -o "$RESOURCES/bin/mioh-native-coreai-preview"
 xcrun swiftc \
@@ -256,13 +261,6 @@ if [[ "$COREAI_DISTRIBUTION" == "portable" && -d "$MODEL_TOOLS_SOURCE" ]]; then
     export_basicvsrpp_variable_chunk6.py
     export_v4_fast_coreai.py
     export_v4_fast_coreml.py
-    export_realesrgan_coreai.py
-    export_realesrgan_coreml.py
-    export_srvgg_coreai.py
-    export_srvgg_coreml.py
-    export_spandrel_coreai.py
-    export_spandrel_coreml.py
-    export_swinir_coreml.py
     swiftvr_imports.py
     export_swiftvr_components_coreml.py
     export_swiftvr_dit_group_coreml.py
@@ -276,8 +274,6 @@ if [[ "$COREAI_DISTRIBUTION" == "portable" && -d "$MODEL_TOOLS_SOURCE" ]]; then
     cp "$ROOT/scripts/apple/$script" \
       "$RESOURCES/model-tools/scripts/apple/$script"
   done
-  cp "$ROOT/scripts/download_nomos_roi_enhancers.py" \
-    "$RESOURCES/model-tools/scripts/download_nomos_roi_enhancers.py"
 chmod +x \
     "$RESOURCES/model-tools/download-mioh-models.zsh" \
     "$RESOURCES/model-tools/convert-mioh-models.zsh" \
@@ -286,21 +282,6 @@ fi
 
 if [[ "$MIOH_MODELESS_DISTRIBUTION" != 1 ]]; then
 
-if [[ "$COREAI_DISTRIBUTION" == "portable" ]]; then
-  MODEL_ASSETS=(
-    RealESRGAN_x2plus_256.mlpackage
-    RealESRGAN_x4plus_256.mlpackage
-    realesr-general-x4v3_256.mlpackage
-    MewZoom-V1-4X-Unet_256.mlpackage
-    swinir-real-x4_256.mlpackage
-    4xNomosWebPhoto_RealPLKSR_256.mlpackage
-  )
-  for asset in "${MODEL_ASSETS[@]}"; do
-    if [[ -e "$ROOT/model_weights/$asset" ]]; then
-      ditto "$ROOT/model_weights/$asset" "$RESOURCES/models/$asset"
-    fi
-  done
-fi
 if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
   RFDETR_SOURCE_ASSETS=(
     rfdetr-v6-576-fp32.aimodel
@@ -326,6 +307,9 @@ if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
     rfdetr-v6-large-768-fp32.mlpackage
   )
 fi
+if [[ -d "$ROOT/model_weights/celfnet-o2-epoch09.mlpackage" ]]; then
+  COREML_DETECTION_ASSETS+=(celfnet-o2-epoch09.mlpackage)
+fi
 mkdir -p "$COMPILED_COREML_MODELS"
 for package in "${COREML_DETECTION_ASSETS[@]}"; do
   source_model="$ROOT/model_weights/$package"
@@ -337,41 +321,19 @@ for package in "${COREML_DETECTION_ASSETS[@]}"; do
   fi
   ditto "$compiled_model" "$RESOURCES/models/$compiled_name"
 done
-
-# ROI enhancers are image-to-image Core ML programs. Ship their compiled
-# form for immediate native use while retaining the source package for the
-# portable model-management workflow. Missing optional models are skipped.
-COREML_ENHANCER_ASSETS=(
-  RealESRGAN_x2plus_256.mlpackage
-  RealESRGAN_x4plus_256.mlpackage
-  realesr-general-x4v3_256.mlpackage
-  MewZoom-V1-4X-Unet_256.mlpackage
-  swinir-real-x4_256.mlpackage
-  4xNomosWebPhoto_RealPLKSR_256.mlpackage
-)
-for package in "${COREML_ENHANCER_ASSETS[@]}"; do
-  source_model="$ROOT/model_weights/$package"
-  [[ -d "$source_model" ]] || continue
-  compiled_name="${package:r}.mlmodelc"
-  compiled_model="$COMPILED_COREML_MODELS/$compiled_name"
-  if [[ ! -d "$compiled_model" || "$source_model" -nt "$compiled_model" ]]; then
-    rm -rf "$compiled_model"
-    xcrun coremlcompiler compile "$source_model" "$COMPILED_COREML_MODELS"
-  fi
-  ditto "$compiled_model" "$RESOURCES/models/$compiled_name"
-done
-
-# PiperSR_2x_256 is the publisher's own 256px→512px Core ML package
-# (Hugging Face ModelPiper/PiperSR-2x), vendored unmodified. It matches the
-# 256px ROI grid directly, so no graph conversion happens at build time.
-PIPERSR_VENDOR="$PACKAGE_DIR/vendor/pipersr"
-PIPERSR_SOURCE="$PIPERSR_VENDOR/PiperSR_2x_256.mlpackage"
-PIPERSR_COMPILED="$COMPILED_COREML_MODELS/PiperSR_2x_256.mlmodelc"
-if [[ ! -d "$PIPERSR_COMPILED" || "$PIPERSR_SOURCE" -nt "$PIPERSR_COMPILED" ]]; then
-  rm -rf "$PIPERSR_COMPILED"
-  xcrun coremlcompiler compile "$PIPERSR_SOURCE" "$COMPILED_COREML_MODELS"
+if [[ -f "$ROOT/model_weights/celfnet-o2-epoch09.provenance.json" ]]; then
+  cp "$ROOT/model_weights/celfnet-o2-epoch09.provenance.json" "$RESOURCES/models/"
 fi
-ditto "$PIPERSR_COMPILED" "$RESOURCES/models/PiperSR_2x_256.mlmodelc"
+
+# Private experimental weights are included only on explicit local builds.
+# Never pick up a Desktop checkpoint or a stale cached model automatically.
+if [[ -n "${MIOH_ROI_DISTILL_COREML_MODEL:-}" ]]; then
+  if [[ ! -d "$MIOH_ROI_DISTILL_COREML_MODEL" || "${MIOH_ROI_DISTILL_COREML_MODEL:e}" != "mlmodelc" ]]; then
+    print -u2 "MIOH_ROI_DISTILL_COREML_MODEL must be an explicitly compiled .mlmodelc directory"
+    exit 2
+  fi
+  ditto "$MIOH_ROI_DISTILL_COREML_MODEL" "$RESOURCES/models/roi-distill-x2.mlmodelc"
+fi
 
 COREAI_DETECTION_STEMS=(
   lada_mosaic_detection_model_v2
@@ -405,10 +367,6 @@ COREAI_MODEL_ASSETS=(
   lada_mosaic_detection_model_v4_fast-fp16.aimodel
   lada_mosaic_detection_model_v4_accurate-fp16.aimodel
   lada_mosaic_detection_model_vr_v2_accurate-fp16.aimodel
-  RealESRGAN_x2plus-256-fp16.aimodel
-  RealESRGAN_x4plus-256-fp16.aimodel
-  realesr-general-x4v3-256-fp16.aimodel
-  4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel
 )
 VARIABLE_COREAI_ASSETS=(
   spatial6 flow6
@@ -476,10 +434,6 @@ if [[ "$COREAI_DISTRIBUTION" == "dedicated" ]]; then
     lada_mosaic_detection_model_v4_fast-fp16.$COREAI_ARCHITECTURE.aimodelc
     lada_mosaic_detection_model_v4_accurate-fp16.$COREAI_ARCHITECTURE.aimodelc
     lada_mosaic_detection_model_vr_v2_accurate-fp16.$COREAI_ARCHITECTURE.aimodelc
-    RealESRGAN_x2plus-256-fp16.$COREAI_ARCHITECTURE.aimodelc
-    RealESRGAN_x4plus-256-fp16.$COREAI_ARCHITECTURE.aimodelc
-    realesr-general-x4v3-256-fp16.$COREAI_ARCHITECTURE.aimodelc
-    4xNomosWebPhoto_RealPLKSR-256-fp16.$COREAI_ARCHITECTURE.aimodelc
   )
   if [[ ! -d "$DEDICATED_PREBUILT_MODELS" ]]; then
     print -u2 "Missing native Dedicated model set: $DEDICATED_PREBUILT_MODELS"
@@ -784,20 +738,6 @@ for model_id, stem in detection_stems.items():
     add(f"{model_id}-coreml", f"{stem}.mlpackage")
 
 optional_assets = {
-    "realesrgan-x2-coreai": "RealESRGAN_x2plus-256-fp16.aimodel",
-    "realesrgan-x2": "RealESRGAN_x2plus_256.mlpackage",
-    "realesrgan-x4-coreai": "RealESRGAN_x4plus-256-fp16.aimodel",
-    "realesrgan-x4": "RealESRGAN_x4plus_256.mlpackage",
-    "realesrgan-x4-coreml": "RealESRGAN_x4plus_256.mlpackage",
-    "realesr-general-x4v3-coreai": "realesr-general-x4v3-256-fp16.aimodel",
-    "realesr-general-x4v3-coreml": "realesr-general-x4v3_256.mlpackage",
-    "mewzoom-x4-coreml": "MewZoom-V1-4X-Unet_256.mlpackage",
-    "mewzoom-x4-coreml-512": "MewZoom-V1-4X-Unet_512.mlpackage",
-    "swinir-x4-coreml": "swinir-real-x4_256.mlpackage",
-    "swinir-real-x4-coreml": "swinir-real-x4_256.mlpackage",
-    "nomos-webphoto-realplksr-x4-coreai": "4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel",
-    "nomos-webphoto-realplksr-x4": "4xNomosWebPhoto_RealPLKSR_256.mlpackage",
-    "nomos-webphoto-realplksr-x4-coreml": "4xNomosWebPhoto_RealPLKSR_256.mlpackage",
     "jasna-v6-coreai": "rfdetr-v6-576-fp32.aimodel",
     "jasna-v6-coreml": "rfdetr-v6-576-fp32.mlpackage",
     "jasna-v6-large-coreai": "rfdetr-v6-large-768-fp32.aimodel",
@@ -817,12 +757,12 @@ destination.write_text(
 PY
 fi
 
-# Both Dedicated and portable distributions use the same PiperSR source
-# package, so append its identity after their different manifest branches.
+# Both Dedicated and portable distributions may carry CELF-Net, so append its
+# identity after their different manifest branches.
 if [[ "$MIOH_MODELESS_DISTRIBUTION" != 1 ]]; then
   "$LADA_STANDALONE_PYTHON_ENV/bin/python" - \
     "$CANONICAL_MODEL_MANIFEST" \
-    "$PACKAGE_DIR/vendor/pipersr/PiperSR_2x_256.mlpackage" <<'PY'
+    "$ROOT/model_weights/celfnet-o2-epoch09.mlpackage" <<'PY'
 import hashlib
 import json
 import sys
@@ -830,35 +770,33 @@ import unicodedata
 from pathlib import Path
 
 destination = Path(sys.argv[1])
-source = Path(sys.argv[2])
-digest = hashlib.sha256()
-entries = []
-for candidate in source.rglob("*"):
-    if candidate.is_symlink():
-        raise SystemExit(f"PiperSR source contains symlink: {candidate}")
-    if candidate.is_file():
-        relative = unicodedata.normalize("NFC", candidate.relative_to(source).as_posix())
-        entries.append((relative, candidate))
-for relative, candidate in sorted(entries, key=lambda item: item[0].encode("utf-8")):
-    digest.update(relative.encode("utf-8"))
-    digest.update(b"\0")
-    with candidate.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    digest.update(b"\0")
 manifest = json.loads(destination.read_text(encoding="utf-8"))
-manifest["models"]["pipersr-coreml"] = {
-    "sha256": digest.hexdigest(),
-    "asset_type": "source-tree",
-    "source_assets": [source.name],
-}
-destination.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+optional = Path(sys.argv[2])
+if optional.is_dir():
+    digest = hashlib.sha256()
+    entries = []
+    for candidate in optional.rglob("*"):
+        if candidate.is_symlink():
+            raise SystemExit(f"CELF-Net source contains symlink: {candidate}")
+        if candidate.is_file():
+            relative = unicodedata.normalize("NFC", candidate.relative_to(optional).as_posix())
+            entries.append((relative, candidate))
+    for relative, candidate in sorted(entries, key=lambda item: item[0].encode("utf-8")):
+        digest.update(relative.encode("utf-8")); digest.update(b"\0")
+        with candidate.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        digest.update(b"\0")
+    manifest["models"]["celfnet-o2-coreml"] = {
+        "sha256": digest.hexdigest(), "asset_type": "source-tree",
+        "source_assets": [optional.name],
+    }
+    destination.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
 fi
 
 cp "$ROOT/LICENSE.md" "$RESOURCES/LICENSE.md"
 ditto "$ROOT/LICENSES" "$RESOURCES/LICENSES"
-cp "$PACKAGE_DIR/vendor/pipersr/MODEL_LICENSE" "$RESOURCES/LICENSES/PiperSR-MODEL-LICENSE.txt"
 
 if [[ -n "${MIOH_PREBUILT_APP_ICON:-}" ]]; then
   ditto "$MIOH_PREBUILT_APP_ICON" "$RESOURCES/AppIcon.icns"
@@ -942,9 +880,6 @@ if [[ "$COREAI_DISTRIBUTION" == "portable" ]]; then
     "$RESOURCES/model-tools/scripts/apple/export_basicvsrpp_variable_chunk6.py"
     "$RESOURCES/model-tools/scripts/apple/export_v4_fast_coreai.py"
     "$RESOURCES/model-tools/scripts/apple/export_v4_fast_coreml.py"
-    "$RESOURCES/model-tools/scripts/apple/export_realesrgan_coreai.py"
-    "$RESOURCES/model-tools/scripts/apple/export_realesrgan_coreml.py"
-    "$RESOURCES/model-tools/scripts/apple/export_swinir_coreml.py"
   )
   for required_file in "${required_portable_files[@]}"; do
     if [[ ! -e "$required_file" ]]; then

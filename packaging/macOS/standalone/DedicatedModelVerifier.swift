@@ -1,5 +1,6 @@
 import CoreAI
 import CoreML
+import CryptoKit
 import Darwin
 import Foundation
 
@@ -41,10 +42,6 @@ private struct DedicatedModelVerifier {
     "lada_mosaic_detection_model_v4_fast-fp16",
     "lada_mosaic_detection_model_v4_accurate-fp16",
     "lada_mosaic_detection_model_vr_v2_accurate-fp16",
-    "RealESRGAN_x2plus-256-fp16",
-    "RealESRGAN_x4plus-256-fp16",
-    "realesr-general-x4v3-256-fp16",
-    "4xNomosWebPhoto_RealPLKSR-256-fp16",
   ]
 
   private static let chunk6Names = [
@@ -65,12 +62,9 @@ private struct DedicatedModelVerifier {
     "lada_mosaic_detection_model_vr_v2_accurate.mlmodelc",
     "rfdetr-v6-576-fp32.mlmodelc",
     "rfdetr-v6-large-768-fp32.mlmodelc",
-    "RealESRGAN_x4plus_256.mlmodelc",
-    "realesr-general-x4v3_256.mlmodelc",
-    "MewZoom-V1-4X-Unet_256.mlmodelc",
-    "swinir-real-x4_256.mlmodelc",
-    "4xNomosWebPhoto_RealPLKSR_256.mlmodelc",
-    "PiperSR_2x_256.mlmodelc",
+  ])
+  private static let optionalCoreMLNames = Set([
+    "celfnet-o2-epoch09.mlmodelc", "roi-distill-x2.mlmodelc",
   ])
 
   static func main() async {
@@ -145,7 +139,7 @@ private struct DedicatedModelVerifier {
         .map(\.lastPathComponent)
     )
     let missingCoreML = coreMLNames.subtracting(actualCoreMLNames).sorted()
-    let unexpectedCoreML = actualCoreMLNames.subtracting(coreMLNames).sorted()
+    let unexpectedCoreML = actualCoreMLNames.subtracting(coreMLNames.union(optionalCoreMLNames)).sorted()
     guard missingCoreML.isEmpty, unexpectedCoreML.isEmpty else {
       throw VerificationError.invalidCollection(
         "Core ML asset set",
@@ -154,10 +148,29 @@ private struct DedicatedModelVerifier {
       )
     }
     let coreMLModels = entries.filter {
-      coreMLNames.contains($0.lastPathComponent)
+      coreMLNames.union(optionalCoreMLNames).contains($0.lastPathComponent)
     }
     for modelURL in coreMLModels {
-      _ = try MLModel(contentsOf: modelURL)
+      let model = try MLModel(contentsOf: modelURL)
+      if modelURL.lastPathComponent == "celfnet-o2-epoch09.mlmodelc" {
+        guard model.modelDescription.inputDescriptionsByName["image"]?
+          .multiArrayConstraint?.shape.map(\.intValue) == [1, 9, 544, 960],
+          model.modelDescription.outputDescriptionsByName["objects"]?
+          .multiArrayConstraint?.shape.map(\.intValue) == [1, 11, 136, 240]
+        else { throw VerificationError.invalidJSON("CELF-Net tensor contract") }
+      }
+      if modelURL.lastPathComponent == "roi-distill-x2.mlmodelc" {
+        let description = model.modelDescription
+        guard Set(description.inputDescriptionsByName.keys) == ["frames"],
+          Set(description.outputDescriptionsByName.keys) == ["enhanced"],
+          description.inputDescriptionsByName["frames"]?.multiArrayConstraint?
+            .shape.map(\.intValue) == [1, 15, 256, 256],
+          description.inputDescriptionsByName["frames"]?.multiArrayConstraint?.dataType == .float32,
+          description.outputDescriptionsByName["enhanced"]?.multiArrayConstraint?
+            .shape.map(\.intValue) == [1, 3, 512, 512],
+          description.outputDescriptionsByName["enhanced"]?.multiArrayConstraint?.dataType == .float32
+        else { throw VerificationError.invalidJSON("ROI Distill tensor contract") }
+      }
     }
 
     for name in [

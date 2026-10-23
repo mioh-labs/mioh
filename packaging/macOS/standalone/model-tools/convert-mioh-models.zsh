@@ -105,40 +105,6 @@ if [[ "$COREML" == 1 ]]; then
     fi
   done
 
-  if [[ -f "$MODELS/RealESRGAN_x4plus.pth" ]]; then
-    run_py "$TOOLS/scripts/apple/export_realesrgan_coreml.py" \
-      --model "$MODELS/RealESRGAN_x4plus.pth" \
-      --output-dir "$MODELS" \
-      --scale 4 \
-      --allow-overwrite
-  fi
-  if [[ -f "$MODELS/RealESRGAN_x2plus.pth" ]]; then
-    run_py "$TOOLS/scripts/apple/export_realesrgan_coreml.py" \
-      --model "$MODELS/RealESRGAN_x2plus.pth" \
-      --output-dir "$MODELS" \
-      --scale 2 \
-      --allow-overwrite
-  fi
-  if [[ -f "$MODELS/realesr-general-x4v3.pth" ]]; then
-    run_py "$TOOLS/scripts/apple/export_srvgg_coreml.py" \
-      --model "$MODELS/realesr-general-x4v3.pth" \
-      --output-dir "$MODELS" \
-      --allow-overwrite
-  fi
-  if [[ -f "$MODELS/003_realSR_BSRGAN_DFO_s64w8_SwinIR-M_x4_GAN.pth" \
-        && -f "$MODELS/3rd_party/SwinIR/models/network_swinir.py" ]]; then
-    run_py "$TOOLS/scripts/apple/export_swinir_coreml.py" \
-      --model "$MODELS/003_realSR_BSRGAN_DFO_s64w8_SwinIR-M_x4_GAN.pth" \
-      --swinir-repo-dir "$MODELS/3rd_party/SwinIR" \
-      --output-dir "$MODELS" \
-      --allow-overwrite
-  fi
-  if [[ -f "$MODELS/4xNomosWebPhoto_RealPLKSR.safetensors" ]]; then
-    run_py "$TOOLS/scripts/apple/export_spandrel_coreml.py" \
-      --model "$MODELS/4xNomosWebPhoto_RealPLKSR.safetensors" \
-      --output-dir "$MODELS" \
-      --allow-overwrite
-  fi
 fi
 
 if [[ "$COREAI" == 1 ]]; then
@@ -173,32 +139,6 @@ if [[ "$COREAI" == 1 ]]; then
     fi
   done
 
-  if [[ -f "$MODELS/RealESRGAN_x2plus.pth" ]]; then
-    run_py "$TOOLS/scripts/apple/export_realesrgan_coreai.py" \
-      --model "$MODELS/RealESRGAN_x2plus.pth" \
-      --scale 2 \
-      --output "$MODELS/RealESRGAN_x2plus-256-fp16.aimodel" \
-      --allow-overwrite
-  fi
-  if [[ -f "$MODELS/RealESRGAN_x4plus.pth" ]]; then
-    run_py "$TOOLS/scripts/apple/export_realesrgan_coreai.py" \
-      --model "$MODELS/RealESRGAN_x4plus.pth" \
-      --scale 4 \
-      --output "$MODELS/RealESRGAN_x4plus-256-fp16.aimodel" \
-      --allow-overwrite
-  fi
-  if [[ -f "$MODELS/realesr-general-x4v3.pth" ]]; then
-    run_py "$TOOLS/scripts/apple/export_srvgg_coreai.py" \
-      --model "$MODELS/realesr-general-x4v3.pth" \
-      --output "$MODELS/realesr-general-x4v3-256-fp16.aimodel" \
-      --allow-overwrite
-  fi
-  if [[ -f "$MODELS/4xNomosWebPhoto_RealPLKSR.safetensors" ]]; then
-    run_py "$TOOLS/scripts/apple/export_spandrel_coreai.py" \
-      --model "$MODELS/4xNomosWebPhoto_RealPLKSR.safetensors" \
-      --output "$MODELS/4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel" \
-      --allow-overwrite
-  fi
 fi
 
 if [[ "$COMPILE_COREAI" == 1 ]]; then

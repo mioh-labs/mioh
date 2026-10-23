@@ -141,43 +141,6 @@ fetch \
   "$(hf_lada lada_mosaic_detection_model_v4_accurate.pt)" \
   "$MODELS/lada_mosaic_detection_model_v4_accurate.pt" \
   "c244d7e49d8f88e264b8dc15f91fb21f5908ad8fb6f300b7bc88462d0801bc1f"
-fetch \
-  "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth" \
-  "$MODELS/RealESRGAN_x2plus.pth" \
-  "49fafd45f8fd7aa8d31ab2a22d14d91b536c34494a5cfe31eb5d89c2fa266abb"
-fetch \
-  "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth" \
-  "$MODELS/RealESRGAN_x4plus.pth" \
-  "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1"
-
-if [[ "$MINIMAL" != 1 ]]; then
-  fetch \
-    "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth" \
-    "$MODELS/realesr-general-x4v3.pth" \
-    "8dc7edb9ac80ccdc30c3a5dca6616509367f05fbc184ad95b731f05bece96292"
-  fetch \
-    "https://github.com/JingyunLiang/SwinIR/releases/download/v0.0/003_realSR_BSRGAN_DFO_s64w8_SwinIR-M_x4_GAN.pth" \
-    "$MODELS/003_realSR_BSRGAN_DFO_s64w8_SwinIR-M_x4_GAN.pth" \
-    "b9afb61e65e04eb7f8aba5095d070bbe9af28df76acd0c9405aeb33b814bcfc6"
-  fetch \
-    "https://raw.githubusercontent.com/JingyunLiang/SwinIR/6545850fbf8df298df73d81f3e8cba638787c8bd/models/network_swinir.py" \
-    "$MODELS/3rd_party/SwinIR/models/network_swinir.py"
-
-  typeset -a NOMOS_FLAGS
-  NOMOS_FLAGS=(--output-dir "$MODELS")
-  if [[ "$FORCE" == 1 ]]; then
-    NOMOS_FLAGS+=(--force)
-  fi
-
-  if ! PYTHONHOME="$RESOURCES/runtime" \
-    PYTHONPATH="$RESOURCES/runtime/lib/python3.12/site-packages" \
-      "$RESOURCES/runtime/bin/python3.12" \
-      "$RESOURCES/model-tools/scripts/download_nomos_roi_enhancers.py" \
-      "${NOMOS_FLAGS[@]}"; then
-    FAILURES+=("Nomos ROI enhancer models")
-  fi
-fi
-
 if (( ${#FAILURES[@]} > 0 )); then
   print -u2 ""
   print -u2 "The following downloads failed:"

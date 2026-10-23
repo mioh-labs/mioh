@@ -45,10 +45,10 @@ EXPECTED_COREAI_SOURCES = (
     "lada_mosaic_detection_model_v4_fast-fp16.aimodel",
     "lada_mosaic_detection_model_v4_accurate-fp16.aimodel",
     "lada_mosaic_detection_model_vr_v2_accurate-fp16.aimodel",
-    "RealESRGAN_x2plus-256-fp16.aimodel",
-    "RealESRGAN_x4plus-256-fp16.aimodel",
-    "realesr-general-x4v3-256-fp16.aimodel",
-    "4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel",
+)
+# ROI enhancers that were removed from mioh (only SwiftVR, ROI Distill and ROI Refine remain).
+REMOVED_ROI_ENHANCER_MARKERS = (
+    "RealESRGAN", "realesr-general", "MewZoom", "swinir", "Nomos", "PiperSR", "roi-texture",
 )
 
 
@@ -99,7 +99,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
             'nativeEnvironment["TMPDIR"]',
         ]:
             self.assertIn(contract, app)
-        self.assertIn('appendingPathComponent("\\(stem)-UC")', batch)
+        self.assertIn('return "\\(stem)-UC.\\(ext)"', batch)
         for contract in [
             "var isExport: Bool",
             "struct DetectedBatch",
@@ -161,6 +161,16 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "nativeExportBatchPending.removeFirst()",
             "未処理の動画はありません。",
             "スキップ（出力済み）",
+            "fileName: outputFileName",
+            'PathSettingRow(title: "出力", value: $runner.outputPathText, action: runner.chooseOutput)',
+            "refreshOutputPathText()",
+            "var existingOutputFile: URL?",
+            "a chosen folder saves under the default file name",
+            "(FileManager.default.fileExists(atPath: path, isDirectory: &isFolder) && isFolder.boolValue)",
+            "runner.startReplacing(output)",
+            "output.standardizedFileURL != confirmedReplaceOutput",
+            "同じ名前のファイルがあります。開始時に置き換えるか確認します",
+            'outputFileName = ""',
         ]:
             self.assertIn(contract, app)
         for contract in [
@@ -184,7 +194,8 @@ class StandaloneAppOptionTests(unittest.TestCase):
             "values.isSymbolicLink != true",
             "videoExtensions.contains(candidate.pathExtension.lowercased())",
             "fileManager.fileExists(atPath: output.path)",
-            "resolvedOutputFile(input: input, selectedOutput: selectedOutput)",
+            "resolvedOutputFile(input: input, selectedOutput: selectedOutput, fileName: fileName)",
+            'return "\\(stem)-UC.\\(ext)"',
         ]:
             self.assertIn(contract, batch)
         self.assertIn("MacNativeExportBatch.swift", build)
@@ -1195,12 +1206,34 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertNotIn("python", dedicated_model_branch.lower())
         self.assertNotIn(".pth", dedicated_model_branch)
 
-    def test_mioh_keeps_only_one_mewzoom_coreml_asset(self):
+    def test_only_swiftvr_distill_and_refine_roi_enhancers_remain(self):
+        source = APP_SOURCE.read_text()
         script = BUILD_SCRIPT.read_text()
-        regular_assets = script.split("MODEL_ASSETS=(", 1)[1].split(")", 1)[0]
+        pipeline = NATIVE_PIPELINE_SOURCE.read_text()
+        verifier = (
+            ROOT / "packaging" / "macOS" / "standalone" / "DedicatedModelVerifier.swift"
+        ).read_text()
 
-        self.assertIn("MewZoom-V1-4X-Unet_256.mlpackage", regular_assets)
-        self.assertNotIn("MewZoom-V1-4X-Unet_512.mlpackage", regular_assets)
+        self.assertIn('let enhancerModels = ["none", "swiftvr", "roi-distill", "roi-refine"]', source)
+        for marker in REMOVED_ROI_ENHANCER_MARKERS:
+            for name, text in [("app", source), ("build", script), ("pipeline", pipeline), ("verifier", verifier)]:
+                self.assertNotIn(marker, text, f"{marker} still in {name}")
+        self.assertNotIn("roiEnhancerPasses", source + pipeline)
+        self.assertFalse((ROOT / "packaging/macOS/standalone/MaskedROITextureEnhancer.swift").exists())
+
+    def test_roi_refine_1024_canvas_is_opt_in_and_defaults_to_512(self):
+        source = APP_SOURCE.read_text()
+        pipeline = NATIVE_PIPELINE_SOURCE.read_text()
+        enhancer = (
+            ROOT / "packaging/macOS/standalone/ROIRefineSceneEnhancer.swift"
+        ).read_text()
+
+        self.assertIn("@Published var roiRefineUse1024Window = false", source)
+        self.assertIn("roiRefineUse1024Window ? 1024 : 512", source)
+        self.assertIn('Toggle("1024pxの内部計算窓を使う"', source)
+        self.assertIn("config.roiRefineMaximumWindowSide ?? 512", pipeline)
+        self.assertIn("maximumWindowSide >= 1024 && cropSide > 512 ? 1024 : 512", enhancer)
+        self.assertIn('"maximumWindowSide": maximumWindowSide', enhancer)
 
     def test_build_uses_python_only_for_model_generation(self):
         script = BUILD_SCRIPT.read_text()
@@ -1305,7 +1338,9 @@ class StandaloneAppOptionTests(unittest.TestCase):
         # Full exports must not be reported as successful when muxing exposes
         # a new video/audio duration skew.
         self.assertIn("validateExportSynchronization(", pipeline)
-        self.assertIn("let addedDrift = abs(outputDifference - sourceDifference)", pipeline)
+        self.assertIn("let addedDrift = selectedRangeDuration == nil", pipeline)
+        self.assertIn("? abs(outputDifference - sourceDifference)", pipeline)
+        self.assertIn(": abs(outputDifference)", pipeline)
         self.assertIn("guard addedDrift <= 0.5", pipeline)
         self.assertIn("音声同期の検証に失敗しました", pipeline)
 
@@ -1756,7 +1791,6 @@ class StandaloneAppOptionTests(unittest.TestCase):
             'doubleSliderField("テクスチャ", value: $runner.textureMix, range: 0...1, step: 0.01)',
             'doubleSliderField("スムージング", value: $runner.smoothStrength, range: 0...1, step: 0.05)',
             'doubleSliderField("強度", value: $runner.roiEnhancerStrength, range: 0...1, step: 0.05)',
-            'integerSliderField("タイル", value: $runner.roiEnhancerTile, range: 0...1024, step: 32)',
         ]
 
         self.assertIn("private func doubleSliderField", source)
@@ -1768,15 +1802,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
             source,
         )
         self.assertIn(
-            'LabeledContent("倍率") { Stepper(value: $runner.roiEnhancerScale, in: 1...8)',
-            source,
-        )
-        self.assertIn(
             'doubleSliderField("強度", value: $runner.roiEnhancerStrength, range: 0...1, step: 0.05).disabled(runner.roiEnhancer == "none")',
-            source,
-        )
-        self.assertIn(
-            'integerSliderField("タイル", value: $runner.roiEnhancerTile, range: 0...1024, step: 32).disabled(runner.roiEnhancer == "none")',
             source,
         )
 
@@ -1869,8 +1895,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn("private final class NativeROIEnhancer", pipeline)
         self.assertIn("try await roiEnhancer.enhanceFrame", pipeline)
         self.assertIn("enhancedFrame: enhancedFrame", pipeline)
-        self.assertIn("lowResolution = try Self.makeLowResolution", pipeline)
-        self.assertIn("enhancer legacy 256px output", pipeline)
+        self.assertIn("lowResolution: try Self.makeLowResolution(", pipeline)
         self.assertIn("base + (highEnhanced - lowEnhanced) * enhancerAmount", pipeline)
         self.assertIn("createEnhancerBlendMask", pipeline)
         self.assertIn("if roiEnhancer == nil, effects.isEnabled", pipeline)
@@ -1878,34 +1903,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertNotIn("makeDetailResidual", pipeline)
         self.assertNotIn("private var reducedPool", pipeline)
         self.assertNotIn('label: "enhancer reduced output"', pipeline)
-        self.assertIn("CVPixelBufferPoolFlush(sourcePool", pipeline)
         self.assertNotIn('guard roiEnhancer == "none"', source)
-
-    def test_pipersr_replaces_roi_from_native_output(self):
-        pipeline = NATIVE_PIPELINE_SOURCE.read_text()
-
-        self.assertIn('== "PiperSR_2x_256"', pipeline)
-        self.assertIn("if directReplacement {", pipeline)
-        self.assertIn("lowResolution = Array(restored[offset..<(offset + frameElements)])", pipeline)
-        self.assertIn("if validEnhancer.directReplacement {", pipeline)
-        self.assertIn("base + (sampleEnhanced(channel) - base)", pipeline)
-        self.assertIn("* validEnhancer.strength * enhancerAmount", pipeline)
-
-    def test_pipersr_repeats_with_bounded_512_to_256_feedback(self):
-        source = APP_SOURCE.read_text()
-        pipeline = NATIVE_PIPELINE_SOURCE.read_text()
-
-        self.assertIn("@Published var roiEnhancerPasses = 1", source)
-        self.assertIn("Stepper(value: $runner.roiEnhancerPasses, in: 1...10)", source)
-        self.assertIn("roiEnhancerPasses: roiEnhancer == \"pipersr\"", source)
-        self.assertIn("let roiEnhancerPasses: Int?", pipeline)
-        self.assertIn("let passCount = replacesRestoration ? min(max(passes, 1), 10) : 1", pipeline)
-        self.assertIn("iterationCount = passCount", pipeline)
-        self.assertIn("for pass in 0..<iterationCount", pipeline)
-        self.assertIn("if pass + 1 < iterationCount", pipeline)
-        self.assertIn('label: "PiperSR feedback input"', pipeline)
-        self.assertIn("modelInput = feedback", pipeline)
-        self.assertIn("passes: config.roiEnhancerPasses ?? 1", pipeline)
 
     def test_universal_model_tools_keep_all_recovered_fixes(self):
         tools = ROOT / "packaging" / "macOS" / "standalone" / "model-tools"
@@ -1914,17 +1912,11 @@ class StandaloneAppOptionTests(unittest.TestCase):
 
         self.assertNotIn("MIOH_RELEASE_TAG", download)
         self.assertNotIn("lada_mosaic_detection_model_vr_v2_accurate.pt", download)
-        self.assertIn("v0.2.5.0/realesr-general-x4v3.pth", download)
-        self.assertIn("network_swinir.py", download)
         self.assertIn("--retry-all-errors", download)
         self.assertNotIn("--continue-at", download)
         self.assertIn("The following downloads failed", download)
 
         self.assertIn("OS_MAJOR=", convert)
-        self.assertIn("export_realesrgan_coreml.py", convert)
-        self.assertIn("export_srvgg_coreml.py", convert)
-        self.assertIn("export_swinir_coreml.py", convert)
-        self.assertIn("export_spandrel_coreml.py", convert)
         self.assertIn("expected 11 assets", convert)
         self.assertIn("basicvsrpp-v1.2-variable-coreai.$ARCHITECTURE.aimodelc", convert)
 
@@ -1937,32 +1929,6 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn('modelExtension == "mlmodelc" || modelExtension == "mlpackage"', pipeline)
         self.assertIn("MLModel.compileModel(at: modelURL)", pipeline)
 
-    def test_spandrel_realplksr_coreai_is_available_in_mioh(self):
-        source = APP_SOURCE.read_text()
-        script = BUILD_SCRIPT.read_text()
-        verifier = (
-            ROOT / "packaging" / "macOS" / "standalone" / "DedicatedModelVerifier.swift"
-        ).read_text()
-
-        self.assertIn('let enhancerModels = ["none", "realesrgan", "mewzoom", "swinir", "spandrel", "pipersr", "swiftvr"]', source)
-        self.assertIn('"nomos-webphoto-realplksr-x4-coreai"', source)
-        self.assertIn('"nomos-webphoto-realplksr-x4-coreml"', source)
-        self.assertIn("4xNomosWebPhoto_RealPLKSR_256.mlpackage", script)
-        self.assertIn("4xNomosWebPhoto_RealPLKSR-256-fp16.aimodel", script)
-        self.assertIn('"4xNomosWebPhoto_RealPLKSR-256-fp16"', verifier)
-
-    def test_pipersr_uses_vendored_256_to_512_coreml_model(self):
-        source = APP_SOURCE.read_text()
-        script = BUILD_SCRIPT.read_text()
-        package = ROOT / "packaging/macOS/standalone/vendor/pipersr/PiperSR_2x_256.mlpackage"
-
-        self.assertIn('case "pipersr":', source)
-        self.assertIn('case "pipersr-coreml":', source)
-        self.assertIn('coreMLPrefixes = ["PiperSR_2x_256"]', source)
-        self.assertIn('PiperSR_2x_256.mlmodelc', script)
-        self.assertTrue((package / "Data/com.apple.CoreML/model.mlmodel").is_file())
-        self.assertTrue((package / "Data/com.apple.CoreML/weights/weight.bin").is_file())
-
     def test_roi_enhancer_model_picker_is_filtered_by_method(self):
         source = APP_SOURCE.read_text()
         script = BUILD_SCRIPT.read_text()
@@ -1971,12 +1937,12 @@ class StandaloneAppOptionTests(unittest.TestCase):
         ).read_text()
 
         self.assertIn("var roiEnhancerModelOptions: [ROIEnhancerModelOption]", source)
-        self.assertIn('case "realesrgan":', source)
-        self.assertIn('"realesrgan-x2-coreai"', source)
+        self.assertIn('case "roi-distill":', source)
+        self.assertIn('"roi-distill-x2-coreml"', source)
         self.assertIn("ForEach(runner.roiEnhancerModelOptions)", source)
         self.assertIn("runner.selectROIEnhancerModel($0)", source)
-        self.assertIn("RealESRGAN_x2plus-256-fp16.aimodel", script)
-        self.assertIn('"RealESRGAN_x2plus-256-fp16"', verifier)
+        self.assertIn("roi-distill-x2.mlmodelc", script)
+        self.assertIn('"roi-distill-x2.mlmodelc"', verifier)
 
 
 if __name__ == "__main__":

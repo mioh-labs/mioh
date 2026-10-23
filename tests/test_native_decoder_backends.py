@@ -36,6 +36,8 @@ class NativeDecoderBackendsTests(unittest.TestCase):
         harness = ROOT / "tests/swift/NativeDecoderBackendsHarness.swift"
         extracted = cls.directory / "decoder.swift"
         extracted.write_text("import Foundation\nimport AVFoundation\nimport CoreVideo\nimport Darwin\n"
+                             "final class LabelFieldFrame {}\n"
+                             "enum ROIRefineChildMemory { static func footprintMiB() -> Double? { nil } }\n"
                              + errors + decoder + harness.read_text())
         cls.binary = cls.directory / "decoder"
         result = subprocess.run([
