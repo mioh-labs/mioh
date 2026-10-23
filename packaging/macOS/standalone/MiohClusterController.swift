@@ -449,6 +449,11 @@ final class MiohClusterController: ObservableObject {
     guard role == .coordinator, serviceActive else {
       throw MiohClusterControllerError.noAuthorizedWorkers
     }
+    guard !runner.usesPartialVideoRange else {
+      throw RunnerError.unsupportedFeature(
+        "処理範囲を指定した書き出しは現在ローカル実行を選択してください"
+      )
+    }
     guard let inputURL = runner.inputURL,
       let outputURL = runner.clusterResolvedOutputFile()
     else {

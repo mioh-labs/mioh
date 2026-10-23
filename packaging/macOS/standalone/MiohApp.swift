@@ -862,6 +862,8 @@ final class RestorationRunner: ObservableObject {
   @Published var sourceInfo: SourceMediaInfo?
   @Published var sourceInfoFailure: String?
   @Published var sourceBatchSummary: String?
+  @Published var rangeStartSeconds = 0.0
+  @Published var rangeEndSeconds = 0.0
   @Published var outputURL: URL?
   @Published var progress = 0.0
   @Published var status = "待機中"
@@ -886,6 +888,59 @@ final class RestorationRunner: ObservableObject {
     }
   }
   @Published var defaultsStatus = "未保存"
+
+  var sourceDurationSeconds: Double {
+    guard let value = sourceInfo?.durationSeconds,
+      value.isFinite, value > 0,
+      let inputURL,
+      (try? inputURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) != true
+    else { return 0 }
+    return value
+  }
+
+  var normalizedRangeStartSeconds: Double {
+    min(max(0, rangeStartSeconds), max(0, sourceDurationSeconds - 0.05))
+  }
+
+  var normalizedRangeEndSeconds: Double {
+    min(max(normalizedRangeStartSeconds + 0.05, rangeEndSeconds), sourceDurationSeconds)
+  }
+
+  var selectedRangeDurationSeconds: Double {
+    max(0, normalizedRangeEndSeconds - normalizedRangeStartSeconds)
+  }
+
+  var usesPartialVideoRange: Bool {
+    sourceDurationSeconds > 0
+      && (normalizedRangeStartSeconds > 0.000_5
+        || normalizedRangeEndSeconds < sourceDurationSeconds - 0.000_5)
+  }
+
+  func selectFullVideoRange() {
+    rangeStartSeconds = 0
+    rangeEndSeconds = sourceDurationSeconds
+  }
+
+  func setRangeStartSeconds(_ value: Double) {
+    guard value.isFinite else { return }
+    rangeStartSeconds = min(max(0, value), max(0, normalizedRangeEndSeconds - 0.05))
+  }
+
+  func setSelectedRangeDurationSeconds(_ value: Double) {
+    guard value.isFinite else { return }
+    let available = sourceDurationSeconds - normalizedRangeStartSeconds
+    guard available > 0 else { return }
+    rangeEndSeconds = normalizedRangeStartSeconds
+      + min(max(min(0.05, available), value), available)
+  }
+
+  func setRangeEndSeconds(_ value: Double) {
+    guard value.isFinite else { return }
+    rangeEndSeconds = min(
+      max(normalizedRangeStartSeconds + 0.05, value),
+      sourceDurationSeconds
+    )
+  }
 
   @Published var tempDirectory = "/tmp"
   @Published var ffmpegTempDirectory = ""
@@ -1176,6 +1231,8 @@ final class RestorationRunner: ObservableObject {
     sourceInfo = nil
     sourceInfoFailure = nil
     sourceBatchSummary = nil
+    rangeStartSeconds = 0
+    rangeEndSeconds = 0
     guard let url else { return }
     if (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
       let candidates = (try? FileManager.default.contentsOfDirectory(
@@ -1202,6 +1259,8 @@ final class RestorationRunner: ObservableObject {
         switch probed {
         case .success(let info):
           self.sourceInfo = info
+          self.rangeStartSeconds = 0
+          self.rangeEndSeconds = max(0, info.durationSeconds)
         case .failure(let message):
           self.sourceInfoFailure = message
         }
@@ -1852,6 +1911,16 @@ final class RestorationRunner: ObservableObject {
       max(0, clipFrames - 1)
     )
     let splitMode = noSplit ? "none" : (useSegmentCount ? "count" : "duration")
+    let selectedCoreStartNanoseconds: Int64? = usesPartialVideoRange
+      ? Int64((normalizedRangeStartSeconds * 1_000_000_000).rounded()) : nil
+    let selectedCoreEndNanoseconds: Int64? = usesPartialVideoRange
+      ? Int64((normalizedRangeEndSeconds * 1_000_000_000).rounded()) : nil
+    // Decode a small lead-in so temporal restoration reaches the selected
+    // first frame with real preceding context. Only the exact half-open core
+    // range is emitted and muxed.
+    let selectedDecodeStartNanoseconds = selectedCoreStartNanoseconds.map {
+      max(0, $0 - 500_000_000)
+    } ?? 0
     let configuration = NativeExportConfiguration(
       input: input.path,
       inputByteCount: nil,
@@ -1872,10 +1941,10 @@ final class RestorationRunner: ObservableObject {
       restorationModels: restoration.url.path,
       restorationRunner: restorationRunner.path,
       restorationFrameCount: restoration.fixedFrameCount,
-      startNanoseconds: 0,
-      decodeEndNanoseconds: nil,
-      outputCoreStartNanoseconds: nil,
-      outputCoreEndNanoseconds: nil,
+      startNanoseconds: selectedDecodeStartNanoseconds,
+      decodeEndNanoseconds: selectedCoreEndNanoseconds,
+      outputCoreStartNanoseconds: selectedCoreStartNanoseconds,
+      outputCoreEndNanoseconds: selectedCoreEndNanoseconds,
       workerMode: false,
       jobID: nil,
       attemptID: nil,
@@ -2720,6 +2789,7 @@ final class RestorationRunner: ObservableObject {
       ======================================================================
       入力: \(configuration.detailedDiagnostics == true ? "診断ログでは非表示" : input.path)
       出力: \(configuration.detailedDiagnostics == true ? "診断ログでは非表示" : output.path)
+      処理範囲: \(configuration.outputCoreStartNanoseconds.flatMap { start in configuration.outputCoreEndNanoseconds.map { end in "\(nativeLogDuration(Double(start) / 1_000_000_000)) 〜 \(nativeLogDuration(Double(end) / 1_000_000_000))（\(nativeLogDuration(Double(end - start) / 1_000_000_000))）" } } ?? "動画全体")
       読み込み方式: \(configuration.decoderBackend ?? "avfoundationAsync")
       詳細診断: \(configuration.detailedDiagnostics == true ? "有効（5秒間隔）" : "無効")
       復元モデル: \(restorationModel)
@@ -4185,6 +4255,22 @@ struct ContentView: View {
             failure: runner.sourceInfoFailure,
             batchSummary: runner.sourceBatchSummary
           )
+        }
+        if let input = runner.inputURL, runner.sourceInfo != nil {
+          DisclosureGroup("処理範囲", isExpanded: .constant(true)) {
+            MiohVideoRangeSelector(
+              url: input,
+              duration: runner.sourceDurationSeconds,
+              start: runner.normalizedRangeStartSeconds,
+              end: runner.normalizedRangeEndSeconds,
+              isDisabled: runner.isRunning || cluster.isRunning,
+              setStart: runner.setRangeStartSeconds,
+              setDuration: runner.setSelectedRangeDurationSeconds,
+              setEnd: runner.setRangeEndSeconds,
+              selectFull: runner.selectFullVideoRange
+            )
+            .padding(.top, 8)
+          }
         }
         PathRow(title: "出力", icon: "externaldrive", url: runner.outputURL, action: runner.chooseOutput)
         PathSettingRow(title: "一時フォルダ", value: $runner.tempDirectory) { runner.choosePath(\.tempDirectory) }

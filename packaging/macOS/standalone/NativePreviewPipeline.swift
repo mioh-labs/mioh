@@ -7908,7 +7908,9 @@ private enum NativeExportSupport {
     output: URL,
     ffmpeg: URL,
     workingDirectory: URL,
-    fastStart: Bool
+    fastStart: Bool,
+    sourceStartNanoseconds: Int64? = nil,
+    sourceEndNanoseconds: Int64? = nil
   ) throws {
     guard !segments.isEmpty else {
       throw NativePreviewError.export("書き出された映像セグメントがありません")
@@ -7936,14 +7938,32 @@ private enum NativeExportSupport {
       .appendingPathExtension("part")
       .appendingPathExtension(ext)
     try? FileManager.default.removeItem(at: part)
+    let selectedRange: (start: Double, duration: Double)? = {
+      guard let start = sourceStartNanoseconds,
+        let end = sourceEndNanoseconds,
+        start >= 0, end > start
+      else { return nil }
+      return (
+        Double(start) / 1_000_000_000,
+        Double(end - start) / 1_000_000_000
+      )
+    }()
     func arguments(audio: [String]) -> [String] {
       var values = [
         "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
         "-f", "concat", "-safe", "0", "-i", manifest.path,
+      ]
+      if let selectedRange {
+        values.append(contentsOf: [
+          "-ss", String(format: "%.9f", selectedRange.start),
+          "-t", String(format: "%.9f", selectedRange.duration),
+        ])
+      }
+      values.append(contentsOf: [
         "-i", source.path,
         "-map", "0:v:0", "-map", "1:a:0?",
         "-c:v", "copy",
-      ]
+      ])
       values.append(contentsOf: audio)
       values.append(contentsOf: ["-map_metadata", "1"])
       if fastStart && ext.lowercased() == "mp4" {
@@ -7979,7 +7999,8 @@ private enum NativeExportSupport {
       source: source,
       output: part,
       ffmpeg: ffmpeg,
-      workingDirectory: workingDirectory
+      workingDirectory: workingDirectory,
+      selectedRangeDuration: selectedRange?.duration
     )
     try? FileManager.default.removeItem(at: output)
     try FileManager.default.moveItem(at: part, to: output)
@@ -7989,7 +8010,8 @@ private enum NativeExportSupport {
     source: URL,
     output: URL,
     ffmpeg: URL,
-    workingDirectory: URL
+    workingDirectory: URL,
+    selectedRangeDuration: Double? = nil
   ) throws {
     guard let sourceVideo = try streamDuration(
       source,
@@ -8016,7 +8038,12 @@ private enum NativeExportSupport {
     }
     let sourceDifference = sourceAudio - sourceVideo
     let outputDifference = outputAudio - outputVideo
-    let addedDrift = abs(outputDifference - sourceDifference)
+    // A partial export trims both streams to the same requested interval, so
+    // compare them directly. Full exports retain the source's pre-existing
+    // A/V duration difference as before.
+    let addedDrift = selectedRangeDuration == nil
+      ? abs(outputDifference - sourceDifference)
+      : abs(outputDifference)
     guard addedDrift <= 0.5 else {
       try? FileManager.default.removeItem(at: output)
       throw NativePreviewError.export(
@@ -8687,10 +8714,16 @@ private struct NativePreviewPipeline {
         }
         encodedFrames += acceptedFrames.count
         if config.isExport, let last = batch.last {
+          let progressStart = Double(config.outputCoreStartNanoseconds ?? 0)
+            / 1_000_000_000
+          let progressEnd = config.outputCoreEndNanoseconds.map {
+            Double($0) / 1_000_000_000
+          } ?? video.durationSeconds
           let position = Double(last.frame.ptsNanoseconds) / 1_000_000_000
           let percent = min(
             100,
-            max(0, position / max(0.001, video.durationSeconds) * 100)
+            max(0, (position - progressStart)
+              / max(0.001, progressEnd - progressStart) * 100)
           )
           let elapsed = max(0.001, ProcessInfo.processInfo.systemUptime - wallStart)
           let throughput = Double(encodedFrames) / elapsed
@@ -9158,7 +9191,9 @@ private struct NativePreviewPipeline {
               output: finalOutput,
               ffmpeg: ffmpegURL,
               workingDirectory: ffmpegTemporaryDirectory,
-              fastStart: config.mp4FastStart ?? false
+              fastStart: config.mp4FastStart ?? false,
+              sourceStartNanoseconds: config.outputCoreStartNanoseconds,
+              sourceEndNanoseconds: config.outputCoreEndNanoseconds
             )
           }
         }
