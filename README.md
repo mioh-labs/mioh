@@ -39,9 +39,13 @@ This repository is the public source/distribution repository for the macOS build
 
 The universal build should be published as a GitHub Release asset:
 
-- `mioh-universal-0.14.3-018-unsigned.dmg`
+- `mioh-universal-0.14.3-020-unsigned.dmg`
 
-This 018 build is published under the `v0.14.3-018` release. CELF tracking for overlapping mosaics is optional; per-detection restoration remains the default.
+This 020 build is published under the `v0.14.3-020` release. It aligns the
+Universal runtime with the current mioh app, including ROI Distill, ROI Refine,
+CELF-Net decoding, temporal ROI smoothing, false-detection suppression,
+detection-mask JSON export, and selectable processing ranges. Model weights are
+not bundled.
 
 Large DMG files are not stored directly in git. See [releases/README.md](releases/README.md).
 
@@ -62,7 +66,7 @@ The build creates:
 
 ```text
 build/macos-standalone-universal/mioh-universal.app
-build/macos-standalone-universal/mioh-universal-0.14.3-018-unsigned.dmg
+build/macos-standalone-universal/mioh-universal-0.14.3-020-unsigned.dmg
 ```
 
 See [packaging/macOS/README.md](packaging/macOS/README.md) for full build
