@@ -41,6 +41,10 @@ final class ROIRefineSceneEnhancer: @unchecked Sendable {
   let distillMinimumCrop: Int
   /// Largest internal LTX canvas requested from the server (512 by default, 1024 only by explicit opt-in).
   let maximumWindowSide: Int
+  /// Clean frames carried into the next 33-frame LTX window (1 fast, 9 quality).
+  let conditionFrames: Int
+  /// Denoising steps per window (1...8); the pack's constants hold every distilled sigma.
+  let steps: Int
   private let pack: URL
   private var process = Process()
   private var input: FileHandle
@@ -53,11 +57,14 @@ final class ROIRefineSceneEnhancer: @unchecked Sendable {
   init(
     pack: URL, strength: Float, temporalFilter: Float = 0, stabilizationRadius: Int = 1, frameSmoothing: Int = 0,
     framesPerSecond: Double, distillModel: URL? = nil, distillMinimumCrop: Int = 512,
-    maximumWindowSide: Int = 512
+    maximumWindowSide: Int = 512, conditionFrames: Int = 9, steps: Int = 2
   ) async throws {
     try ROIRefinePack.validate(pack)
     self.distillMinimumCrop = distillMinimumCrop
-    self.maximumWindowSide = maximumWindowSide >= 1024 ? 1024 : 512
+    self.maximumWindowSide = maximumWindowSide >= 1024
+      ? 1024 : (maximumWindowSide <= 384 ? 384 : 512)
+    self.conditionFrames = conditionFrames <= 1 ? 1 : 9
+    self.steps = min(max(steps, 1), 8)
     if let distillModel {
       let configuration = MLModelConfiguration()
       configuration.computeUnits = DistilledROIEnhancer.computeUnits
@@ -81,7 +88,7 @@ final class ROIRefineSceneEnhancer: @unchecked Sendable {
       .appendingPathComponent("mioh-roi-refine-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
     self.pack = pack
-    (process, input, lines) = try Self.launch(pack)
+    (process, input, lines) = try Self.launch(pack, conditionFrames: self.conditionFrames)
     guard let ready = try await lines.next(), ready.hasPrefix("ready") else {
       process.terminate()
       throw NSError(domain: "ROIRefine", code: 2, userInfo: [
@@ -89,18 +96,20 @@ final class ROIRefineSceneEnhancer: @unchecked Sendable {
       ])
     }
     FileHandle.standardError.write(Data(
-      "ROI Refine: server ready (\(ready)); Core AI DiT + MLX VAE, 33-frame windows, \(framesPerSecond) fps; internal canvas up to \(self.maximumWindowSide) px, Apple temporal noise filter \(self.temporalFilter), stabilization radius \(self.stabilizationRadius), frame smoothing \(self.frameSmoothing), ROI Distill layer \(distill == nil ? "off" : "on crops over \(distillMinimumCrop) px")\n".utf8))
+      "ROI Refine: server ready (\(ready)); Core AI DiT + MLX VAE, 33-frame windows, \(framesPerSecond) fps; internal canvas up to \(self.maximumWindowSide) px, continuation \(self.conditionFrames) frame(s), \(self.steps) step(s), Apple temporal noise filter \(self.temporalFilter), stabilization radius \(self.stabilizationRadius), frame smoothing \(self.frameSmoothing), ROI Distill layer \(distill == nil ? "off" : "on crops over \(distillMinimumCrop) px")\n".utf8))
   }
 
-  private static func launch(_ pack: URL) throws
+  private static func launch(_ pack: URL, conditionFrames: Int) throws
     -> (Process, FileHandle, AsyncLineSequence<FileHandle.AsyncBytes>.AsyncIterator)
   {
     let process = Process(), stdin = Pipe(), stdout = Pipe()
     process.executableURL = pack.appendingPathComponent("bin/ltx-video")
     process.arguments = ["roi-refine-server", "--pack", pack.path]
+    process.environment = ProcessInfo.processInfo.environment.merging(
+      ["LTX_ROI_CONDITION_FRAMES": String(conditionFrames)], uniquingKeysWith: { _, requested in requested })
     process.standardInput = stdin
     process.standardOutput = stdout
-    process.standardError = FileHandle.standardError
+    process.standardError = ROIRefineServerLog.pipe()
     // a dead server must surface as a write error, not SIGPIPE killing the export
     guard MacChildProcessPipe.prepare(stdin.fileHandleForWriting) else {
       throw NSError(domain: "ROIRefine", code: 7, userInfo: [
@@ -143,7 +152,7 @@ final class ROIRefineSceneEnhancer: @unchecked Sendable {
       ])
     }
     Self.stop(process, input: input)
-    (process, input, lines) = try Self.launch(pack)
+    (process, input, lines) = try Self.launch(pack, conditionFrames: conditionFrames)
     guard let ready = try await lines.next(), ready.hasPrefix("ready") else {
       throw NSError(domain: "ROIRefine", code: 2, userInfo: [
         NSLocalizedDescriptionKey: "ROI refine server did not restart"
@@ -183,6 +192,7 @@ final class ROIRefineSceneEnhancer: @unchecked Sendable {
       "restored": restoredURL.path, "masks": maskURL.path, "frames": frameCount,
       "fps": framesPerSecond, "output": outputURL.path, "aspect": aspect,
       "cropSide": cropSide, "outputSide": outputSide, "maximumWindowSide": maximumWindowSide,
+      "steps": steps,
     ]
     var line = try JSONSerialization.data(withJSONObject: request)
     line.append(0x0A)
@@ -314,5 +324,36 @@ private final class ROIRefineTurn: @unchecked Sendable {
       return waiters.removeFirst()
     }
     next?.resume()
+  }
+}
+
+/// The server's stderr, forwarded line by line without Core AI's "Failed to import MPS module" notice, which it
+/// prints once per DiT group load (12 times per window size) and which says nothing about the export.
+private enum ROIRefineServerLog {
+  static func pipe() -> Pipe {
+    let pipe = Pipe()
+    let lock = NSLock()
+    var pending = Data()
+    pipe.fileHandleForReading.readabilityHandler = { handle in
+      let chunk = handle.availableData
+      let lines: [Data] = lock.withLock {
+        if chunk.isEmpty {   // end of stream: flush what is left
+          defer { pending.removeAll() }
+          return pending.isEmpty ? [] : [pending]
+        }
+        pending.append(chunk)
+        var complete: [Data] = []
+        while let newline = pending.firstIndex(of: 0x0A) {
+          complete.append(pending[pending.startIndex...newline])
+          pending.removeSubrange(pending.startIndex...newline)
+        }
+        return complete
+      }
+      if chunk.isEmpty { handle.readabilityHandler = nil }
+      for line in lines where String(decoding: line, as: UTF8.self).range(of: "Failed to import MPS module") == nil {
+        FileHandle.standardError.write(line)
+      }
+    }
+    return pipe
   }
 }

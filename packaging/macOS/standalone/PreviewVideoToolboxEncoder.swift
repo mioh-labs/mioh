@@ -99,7 +99,8 @@ final class SegmentWriter {
     codec: AVVideoCodecType = .h264,
     averageBitRate: Int? = nil,
     realTime: Bool = true,
-    filePrefix: String = "preview"
+    filePrefix: String = "preview",
+    startingSequence: Int = 0
   ) throws {
     guard width > 0, height > 0 else {
       throw EncoderError.invalidValue("frame dimensions")
@@ -120,6 +121,7 @@ final class SegmentWriter {
     requestedAverageBitRate = averageBitRate
     self.realTime = realTime
     self.filePrefix = filePrefix
+    sequence = max(0, startingSequence)
     segmentNanoseconds = Int64(segmentSeconds * 1_000_000_000)
     frameDurationNanoseconds = Int64(
       Double(1_000_000_000 * fpsDenominator) / Double(fpsNumerator)

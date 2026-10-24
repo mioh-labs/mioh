@@ -139,7 +139,7 @@ Expected outputs:
 
 ```text
 build/macos-standalone-universal/mioh-universal.app
-build/macos-standalone-universal/mioh-universal-0.14.3-020-unsigned.dmg
+build/macos-standalone-universal/mioh-universal-0.14.3-021-unsigned.dmg
 ```
 
 The build is model-free by default. It ad-hoc signs the application, includes
@@ -180,7 +180,7 @@ cmp -s \
 Verify the disk image before publishing:
 
 ```zsh
-DMG=build/macos-standalone-universal/mioh-universal-0.14.3-020-unsigned.dmg
+DMG=build/macos-standalone-universal/mioh-universal-0.14.3-021-unsigned.dmg
 hdiutil verify "$DMG"
 shasum -a 256 "$DMG"
 ```
@@ -236,8 +236,8 @@ rsync -a --delete \
   "$ROOT/build/macos-standalone-universal/mioh-universal.app/" \
   "$PUBLIC/build/macos-standalone-universal/mioh-universal.app/"
 rsync -a \
-  "$ROOT/build/macos-standalone-universal/mioh-universal-0.14.3-020-unsigned.dmg" \
-  "$PUBLIC/build/macos-standalone-universal/mioh-universal-0.14.3-020-unsigned.dmg"
+  "$ROOT/build/macos-standalone-universal/mioh-universal-0.14.3-021-unsigned.dmg" \
+  "$PUBLIC/build/macos-standalone-universal/mioh-universal-0.14.3-021-unsigned.dmg"
 ```
 
 Compare SHA-256 values after every artifact copy.
@@ -259,22 +259,22 @@ git push origin HEAD:main
 ```
 
 The release must not contain a VR detector checkpoint. Publish a new
-`v0.14.3-020` release with the verified 020 DMG, then download it for an
-end-to-end checksum check. Leave the 019 release and its asset untouched:
+`v0.14.3-021` release with the verified 021 DMG, then download it for an
+end-to-end checksum check. Leave the 020 release and its asset untouched:
 
 ```zsh
-gh release create v0.14.3-020 \
-  build/macos-standalone-universal/mioh-universal-0.14.3-020-unsigned.dmg \
-  --target main --title 'mioh Universal 0.14.3-020' \
+gh release create v0.14.3-021 \
+  build/macos-standalone-universal/mioh-universal-0.14.3-021-unsigned.dmg \
+  --target main --title 'mioh Universal 0.14.3-021' \
   --notes 'Align Universal with the current mioh runtime, including ROI enhancement and selectable processing ranges.'
 
 VERIFY_DIR=$(mktemp -d /private/tmp/mioh-release-verify.XXXXXX)
-gh release download v0.14.3-020 \
-  --pattern 'mioh-universal-0.14.3-020-unsigned.dmg' \
+gh release download v0.14.3-021 \
+  --pattern 'mioh-universal-0.14.3-021-unsigned.dmg' \
   --dir "$VERIFY_DIR"
 shasum -a 256 \
-  build/macos-standalone-universal/mioh-universal-0.14.3-020-unsigned.dmg \
-  "$VERIFY_DIR/mioh-universal-0.14.3-020-unsigned.dmg"
+  build/macos-standalone-universal/mioh-universal-0.14.3-021-unsigned.dmg \
+  "$VERIFY_DIR/mioh-universal-0.14.3-021-unsigned.dmg"
 ```
 
 The two hashes must match. Merely seeing a successful upload message is not a

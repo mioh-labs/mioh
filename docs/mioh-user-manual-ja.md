@@ -1,6 +1,6 @@
 # mioh ユーザーマニュアル
 
-バージョン 0.14.3-020
+バージョン 0.14.3-021
 
 対象: mioh-universal for macOS
 改訂日: 2026年10月2日
@@ -23,7 +23,7 @@ miohは、動画内のモザイク領域を検出し、復元モデルで処理�
 
 ## 2. インストールと起動
 
-1. [miohのv0.14.3-020リリース](https://github.com/mioh-labs/mioh/releases/tag/v0.14.3-020)から`mioh-universal-0.14.3-020-unsigned.dmg`を入手します。
+1. [miohのv0.14.3-021リリース](https://github.com/mioh-labs/mioh/releases/tag/v0.14.3-021)から`mioh-universal-0.14.3-021-unsigned.dmg`を入手します。
 2. `mioh-universal.app`を`Applications`へドラッグします。
 3. 次節のモデルダウンロードと変換を完了します。
 4. Applicationsフォルダからmiohを起動します。
@@ -44,7 +44,7 @@ zsh "$TOOLS/convert-mioh-models.zsh" --app "$APP"
 
 ダウンロードした重みと変換後のモデルは、どちらも`mioh-universal.app/Contents/Resources/models`に保存されます。ダウンロードは個々のSHA-256を照合し、失敗した項目を最後に一覧表示します。失敗した場合はネットワーク・空き容量・エラー内容を確認して、同じコマンドを再実行してください。正常な既存ファイルは再ダウンロードされません。
 
-標準ツールはBasicVSR++と公開検出モデルを取得・変換します。ROI Distillの学習済みCore MLモデル、ROI Refineパック、SwiftVRパックはDMGに同梱されません。正規に用意したローカルモデルを、アプリの「復元」→「ROIエンハンサー」のフォルダボタンから選択してください。
+標準ツールはBasicVSR++と公開検出モデルを取得・変換します。ROI Distillの学習済みCore MLモデル、ROI Refineパック、SwiftVRパックはDMGに同梱されません。ROI RefineとSwiftVRは2.2節の追加手順で導入し、ROI Distillは正規に用意したローカルモデルを、アプリの「復元」→「ROIエンハンサー」のフォルダボタンから選択してください。
 
 macOS 26では変換コマンドが自動的にCore MLのみを作成します。macOS 27以降ではCore MLとCore AIの両方を作成します。目的を限定する場合は、変換コマンドに`--coreml-only`または`--coreai-only`を付けられます。Core AIの標準出力は持ち運べる`.aimodel`で、実行前に`.aimodelc`へコンパイルすることは必須ではありません。
 
@@ -82,6 +82,38 @@ zsh "$APP/Contents/Resources/model-tools/install-swiftvr-models.zsh" --app "$APP
 
 完了後、表示されたモデルフォルダをmiohの「復元」→「ROIエンハンサー」→「SwiftVR」のモデル選択で指定します。SwiftVRは書き出し専用で、BasicVSR++の一次復元を行った後に適用されます。モデルの存在確認だけでは画質や長い動画での安定動作は保証できません。最初は短い動画で確認してください。
 
+### ROI Refineを追加する場合
+
+ROI Refineは、BasicVSR++で復元したROIを生成モデル（LTX-2.3派生のSulphur 2に、mioh用のIC-LoRAを適用したもの）で描き直すROIエンハンサーです。macOS 27以降とApple Siliconが必要で、書き出し専用です。モデル一式（パック）はアプリの外に保存されるため、アプリを更新しても残ります。
+
+パックはHugging Faceの`okatti/mioh-roi-refine`で配布しています。このリポジトリは同意制です。
+
+1. ブラウザでリポジトリのページを開き、LTX-2 Community Licenseと利用制限（Attachment A）に同意します。
+2. ターミナルで`hf auth login`を実行し、Hugging Faceのアクセストークンを登録します。環境変数`HF_TOKEN`でも構いません。
+
+導入方法は2通りあります。
+
+```zsh
+APP=/Applications/mioh-universal.app
+# 変換済みパックをダウンロードする（標準、約18 GiB）
+zsh "$APP/Contents/Resources/model-tools/install-roi-refine.zsh" --app "$APP"
+# 公式のSulphur 2チェックポイントから手元で変換する
+zsh "$APP/Contents/Resources/model-tools/install-roi-refine.zsh" --app "$APP" --mode build \
+  --workspace /path/to/fast-disk/ROIRefine
+```
+
+- **ダウンロード**：変換済みのパックを取得するだけで、最も簡単です。空き容量は約20 GiB必要です。
+- **手元で変換**（`--mode build`）：次のものを取得し、アプリ同梱のCore AI変換ツールでパックを作ります。
+  - 公式のSulphur 2 distilledチェックポイント（約43 GiB）
+  - LTX-2のソース
+  - 配布リポジトリのLoRA、プロンプト埋め込み、サーバー
+
+  変換されるのは、DiT 12グループ、VAE、窓ごとの定数です。空き容量は約70 GiB必要です。チェックポイントやLTX-2のソースが手元にある場合は、`--checkpoint`と`--ltx-source`で指定できます。途中で失敗した場合は、同じコマンドを再実行してください。完成した部分は再利用されます。
+
+パックの保存先は、標準では`~/Library/Application Support/mioh/ROIRefine/pack-sulphur-iclora1750-v5`です。`--pack`で変更でき、`--verify-only`で不足ファイルを確認できます。完了後は、表示されたパックフォルダを、miohの「復元」→「ROIエンハンサー」→「ROI Refine」のモデル選択で指定します。
+
+ROI Refineは、元の映像にない細部を推測して描きます。LTX-2のライセンス（Attachment A）により、生成物を共有する場合は機械生成であることを明示する必要があります。未成年が関わる素材への使用や、本人の同意のないなりすましには使用できません。
+
 ### 2.3 ソースからmioh Universalをビルドする
 
 開発者向けの手順です。Apple Silicon Mac、XcodeとCommand Line Tools、`uv`、Python 3.12、十分な空き容量が必要です。macOS 26以降でアプリをビルドでき、Core AI変換・動作確認にはmacOS 27以降と対応するXcodeが必要です。以下はリポジトリのルートで実行します。
@@ -107,13 +139,13 @@ uv run --no-project --python 3.12 --with reportlab \
 zsh packaging/macOS/standalone/build_universal_app.sh
 ```
 
-成果物は`build/macos-standalone-universal/mioh-universal.app`と`build/macos-standalone-universal/mioh-universal-0.14.3-020-unsigned.dmg`です。ビルドはモデルなしの配布物を作成します。モデルを使うMacでは、アプリのインストール後に2.1節のダウンロード・変換を行ってください。ビルド用スクリプトはアプリ本体とCore AIヘルパーを別々のmacOSターゲット向けにコンパイルします。
+成果物は`build/macos-standalone-universal/mioh-universal.app`と`build/macos-standalone-universal/mioh-universal-0.14.3-021-unsigned.dmg`です。ビルドはモデルなしの配布物を作成します。モデルを使うMacでは、アプリのインストール後に2.1節のダウンロード・変換を行ってください。ビルド用スクリプトはアプリ本体とCore AIヘルパーを別々のmacOSターゲット向けにコンパイルします。
 
 ビルド後は次を確認します。`hdiutil verify`の成功に加え、アプリ内のPythonと2本のモデルツールが存在することが重要です。
 
 ```zsh
 APP=build/macos-standalone-universal/mioh-universal.app
-DMG=build/macos-standalone-universal/mioh-universal-0.14.3-020-unsigned.dmg
+DMG=build/macos-standalone-universal/mioh-universal-0.14.3-021-unsigned.dmg
 test -x "$APP/Contents/Resources/runtime/bin/python3.12"
 test -f "$APP/Contents/Resources/model-tools/download-mioh-models.zsh"
 test -f "$APP/Contents/Resources/model-tools/convert-mioh-models.zsh"
@@ -245,7 +277,7 @@ ROIエンハンサーはBasicVSR++の後に追加する細部強化処理です�
 | 方式 `なし` | 追加エンハンサーを無効化します。BasicVSR++による復元自体は実行されます。 |
 | SwiftVR | シーン内の複数フレームを2xまたは4xで処理します。書き出し専用、macOS 27以降。 |
 | ROI Distill | 5フレームのCore MLモデルで、256pxの一次復元を512pxに補強します。専用`.mlmodelc`または`.mlpackage`を選択します。 |
-| ROI Refine | LTX-2.3のIC-LoRAパックで、シーンのROIを512pxまたは1024pxの内部窓で描き直します。書き出し専用です。 |
+| ROI Refine | LTX-2.3のIC-LoRAパックで、シーンのROIを384px・512px（任意で1024px）の内部窓で描き直します。書き出し専用です。パックの導入は2.2節を参照してください。 |
 | モデル | フォルダボタンから各方式のローカルモデルまたはパックを選択します。方式ごとに最後の選択が保持されます。 |
 | 倍率 | SwiftVRは2xまたは4x、ROI DistillとROI Refineは2xです。最終動画全体の解像度を2倍・4倍にする設定ではありません。 |
 | 強度 | 0なら結果へ混ぜません。1ならエンハンサー結果を最大限使用します。 |
@@ -270,6 +302,25 @@ ROIエンハンサーは存在しない細部を推測して追加するため�
 | 揺らぎ低減 | 0-1、初期値1 | Appleの時間方向ノイズ除去を合成後のROI付近に適用し、細かな粒状感のちらつきを抑えます。0で無効です。 |
 
 SwiftVRはBasicVSR++の一次復元を置き換えず、復元後に適用します。4xでも画質が必ず改善するわけではありません。元の細部が失われている場面では形状や質感を推測するため、輪郭の揺れや不自然なディテールが出る場合があります。比較には同じ短い場面でSwiftVRなし・2x・4xを書き出してください。メモリ不足やスワップが増える場合は、まずネイティブ並列数を1にし、2xを試します。
+
+### ROI Refineの操作と注意点
+
+1. 2.2節の手順でROI Refineのパックを導入し、「復元」タブでROIエンハンサーの方式を「ROI Refine」にします。
+2. 「モデル」のフォルダボタンから、導入スクリプトが最後に表示したパックフォルダを選びます。`roi-refine-pack.json`、`blocks`、`constants`が入ったフォルダです。
+3. まず短い範囲を書き出して確認します。ROI Refineはローカルの書き出し専用です。Expert ROIをオフにして使います。
+
+| ROI Refine項目 | 範囲・初期値 | 説明 |
+| --- | --- | --- |
+| 高速モード | オフ | 内部計算を最大384pxにし、窓間の引き継ぎを1フレームにします。詳細設定より優先されます。 |
+| 内部計算の最大サイズ | 384/512/1024px、初期値512px | 描き直す窓の大きさの上限です。小さいROIも384pxで描きます。1024pxは約6倍遅く、細部の差は小さい設定です。 |
+| 窓間の引き継ぎ | 1/9フレーム、初期値9 | 33フレームの窓同士で引き継ぐフレーム数です。1の方が速くなります。 |
+| ステップ数 | 1-8、初期値2 | ノイズ除去の回数です。処理時間はほぼ回数に比例します。2が標準で、3と同等の見た目で約3割速くなります。4以上は強いノイズから描き始めるため、元の形から離れやすくなります。 |
+| 大きいROIにROI Distillを重ねる | オン | 元の切り出しが512pxを超えるROIに、ROI Distillの細部を上乗せします。ROI Distillモデルが導入されている場合だけ有効です。 |
+| 強度・枠のなめらかさ・なじませ範囲・揺らぎ低減 | SwiftVRと同じ | SwiftVRの表と同じ意味です。 |
+
+ROI Refineは、場面ごとに常駐サーバーで処理します。サーバーはメモリを約8〜18 GB使い、並列数に関係なく1レーンで動きます。処理時間はROIの多さで大きく変わります。M5 Proでは、モザイクが続く180フレームの場面1つに、512px・2ステップで約40秒かかります。
+
+設定を変えて書き出し直すと、中断済みセグメントからの再開は使えず、最初から処理します。描き直しの結果はシード値で変わり、元の映像とは異なる細部が出ます。輪郭のちらつきや不自然な形が気になる場合は、強度、枠のなめらかさ、なじませ範囲を調整してください。
 
 ## 8. 検出タブ
 
@@ -513,4 +564,4 @@ ROIエンハンサー強度、テクスチャ、ディテール、シャープ�
 | メモリ | 掃除間隔1、空き4GB、MPS比率0.46 |
 | 再生 | バッファ8秒、通常、SBS左右、左目、視野角60度 |
 
-本マニュアルのインストール・ビルド・モデル導入手順はmioh-universal 0.14.3-020の配布スクリプトを基準にしています。画面項目は配布版や選択したモデルにより異なる場合があります。
+本マニュアルのインストール・ビルド・モデル導入手順はmioh-universal 0.14.3-021の配布スクリプトを基準にしています。画面項目は配布版や選択したモデルにより異なる場合があります。

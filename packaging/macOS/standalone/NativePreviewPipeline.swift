@@ -107,6 +107,10 @@ private struct NativePreviewConfiguration: Decodable {
   let roiRefineDistillMinimumCrop: Int?
   /// Largest internal LTX canvas. Absent defaults to 512; 1024 is an explicit opt-in.
   let roiRefineMaximumWindowSide: Int?
+  /// Clean continuation frames carried between adjacent 33-frame LTX windows.
+  let roiRefineConditionFrames: Int?
+  /// Denoising steps per LTX window, 1...8. Absent defaults to the pack's 2.
+  let roiRefineSteps: Int?
   let detectionEmptyLookahead: Int?
   let detectionMaskReuseSkipFrames: Int?
   let detectFaceMosaics: Bool?
@@ -124,6 +128,8 @@ private struct NativePreviewConfiguration: Decodable {
   let averageBitRate: Int?
   let bitrateMultiplier: Double?
   let mp4FastStart: Bool?
+  /// Continue a stopped export from completed `export-gN-XXXXXX.mp4` files in outputDirectory.
+  let resumeExistingSegments: Bool?
 
   var isExport: Bool { mode == "export" }
   var isWorker: Bool { workerMode ?? false }
@@ -7708,6 +7714,50 @@ private func emit(_ payload: [String: Any]) {
 }
 
 private enum NativeExportSupport {
+  /// Completed, contiguous export segments. `.part` files and everything after the first sequence gap are ignored.
+  static func resumableSegments(
+    in directory: URL,
+    generation: Int,
+    firstStartNanoseconds: Int64,
+    codec: String
+  ) async -> [SegmentEvent] {
+    let prefix = "export-g\(generation)-"
+    let urls = (try? FileManager.default.contentsOfDirectory(
+      at: directory,
+      includingPropertiesForKeys: [.isRegularFileKey],
+      options: [.skipsHiddenFiles]
+    )) ?? []
+    var bySequence: [Int: URL] = [:]
+    for url in urls where url.pathExtension.lowercased() == "mp4" {
+      let stem = url.deletingPathExtension().lastPathComponent
+      guard stem.hasPrefix(prefix),
+        let sequence = Int(stem.dropFirst(prefix.count)),
+        sequence >= 0
+      else { continue }
+      bySequence[sequence] = url
+    }
+    var result: [SegmentEvent] = []
+    var sequence = 0
+    var start = firstStartNanoseconds
+    while let url = bySequence[sequence] {
+      let asset = AVURLAsset(url: url)
+      guard let duration = try? await asset.load(.duration), duration.isNumeric else { break }
+      let seconds = CMTimeGetSeconds(duration)
+      guard seconds.isFinite, seconds > 0 else { break }
+      let span = Int64((seconds * 1_000_000_000).rounded())
+      result.append(SegmentEvent(
+        sequence: sequence,
+        startNs: start,
+        endNs: start + span,
+        path: url.path,
+        codec: codec
+      ))
+      start += span
+      sequence += 1
+    }
+    return result
+  }
+
   static func runProcess(
     executable: URL,
     arguments: [String],
@@ -8205,12 +8255,34 @@ private struct NativePreviewPipeline {
       }
     }
 
+    let resumeBaseStart = config.outputCoreStartNanoseconds ?? config.startNanoseconds
+    let resumedSegments: [SegmentEvent]
+    if config.resumeExistingSegments == true,
+      config.isExport, !config.isWorker,
+      config.exportDetectionMasks != true
+    {
+      resumedSegments = await NativeExportSupport.resumableSegments(
+        in: outputDirectory,
+        generation: config.generation,
+        firstStartNanoseconds: resumeBaseStart,
+        codec: (config.videoCodec?.lowercased() == "h264")
+          ? "h264_videotoolbox" : "hevc_videotoolbox"
+      )
+    } else {
+      resumedSegments = []
+    }
+    let resumeOutputStartNanoseconds = resumedSegments.last?.endNs
+    // Re-decode a short lead-in for detector/restorer temporal context, but do not emit it again.
+    let effectiveDecodeStartNanoseconds = resumeOutputStartNanoseconds.map {
+      max(config.startNanoseconds, $0 - 500_000_000)
+    } ?? config.startNanoseconds
+
     let ring = PixelBufferRing(capacity: config.ringCapacity, diagnostics: diagnostics)
     let decoder = try await ContinuousVideoDecoder(
       input: preparedInput.url,
       expectedRemoteByteCount: config.inputByteCount,
       expectedRemoteSHA256: config.inputSHA256,
-      startNanoseconds: config.startNanoseconds,
+      startNanoseconds: effectiveDecodeStartNanoseconds,
       endNanoseconds: config.decodeEndNanoseconds,
       backend: backend,
       ffmpeg: ffmpegURL,
@@ -8395,7 +8467,9 @@ private struct NativePreviewPipeline {
         framesPerSecond: Double(outputFPSNumerator) / Double(outputFPSDenominator),
         distillModel: config.roiRefineDistillModel.map { URL(fileURLWithPath: $0) },
         distillMinimumCrop: config.roiRefineDistillMinimumCrop ?? 512,
-        maximumWindowSide: config.roiRefineMaximumWindowSide ?? 512
+        maximumWindowSide: config.roiRefineMaximumWindowSide ?? 512,
+        conditionFrames: config.roiRefineConditionFrames ?? 9,
+        steps: config.roiRefineSteps ?? 2
       )
     } else {
       roiRefiner = nil
@@ -8503,7 +8577,8 @@ private struct NativePreviewPipeline {
       codec: codec,
       averageBitRate: config.averageBitRate ?? sourceBasedBitRate,
       realTime: !config.isExport,
-      filePrefix: config.isExport ? "export" : "preview"
+      filePrefix: config.isExport ? "export" : "preview",
+      startingSequence: resumedSegments.count
     )
     let control = PreviewControl(
       bufferLimitSeconds: config.isExport
@@ -8533,6 +8608,9 @@ private struct NativePreviewPipeline {
       "output_buffer_limit": perProcessorOutputLimit
         * nativeParallelWorkers,
       "native_parallel_workers": nativeParallelWorkers,
+      "resumed_segments": resumedSegments.count,
+      "resume_position_seconds": Double(resumeOutputStartNanoseconds ?? resumeBaseStart)
+        / 1_000_000_000,
       "detection_mask_reuse_skip_frames": config.detectionBackend == "celfnet" ? 0 : min(
         max(config.detectionMaskReuseSkipFrames ?? 0, 0),
         8
@@ -8550,13 +8628,17 @@ private struct NativePreviewPipeline {
     var pendingProcessing: [NativePendingProcessingBatch] = []
     pendingProcessing.reserveCapacity(nativeParallelWorkers)
     do {
-      var nextSequence = 0
+      var nextSequence = resumedSegments.count
       var decodedFrames = 0
       var detectedFrames = 0
       var restoredBatches = 0
       var detectionSeconds = 0.0
-      var completedSegments: [SegmentEvent] = []
-      var encodedFrames = 0
+      var completedSegments: [SegmentEvent] = resumedSegments
+      let resumedFrameEstimate = resumedSegments.reduce(0) { count, segment in
+        count + Int((Double(segment.endNs - segment.startNs) / 1_000_000_000
+          * Double(outputFPSNumerator) / Double(outputFPSDenominator)).rounded())
+      }
+      var encodedFrames = resumedFrameEstimate
       var deferredCrossfadeTail: [ProcessedFrame] = []
       var postRestorationFrameRateGate: PTSFrameRateGate? =
         (config.preFPSConversion ?? false)
@@ -8587,6 +8669,11 @@ private struct NativePreviewPipeline {
 
       @inline(__always)
       func belongsToCoreOutput(_ ptsNanoseconds: Int64) -> Bool {
+        if let resumeOutputStartNanoseconds,
+          ptsNanoseconds < resumeOutputStartNanoseconds
+        {
+          return false
+        }
         if let start = config.outputCoreStartNanoseconds,
           ptsNanoseconds < start
         {
@@ -8764,10 +8851,14 @@ private struct NativePreviewPipeline {
               / max(0.001, progressEnd - progressStart) * 100)
           )
           let elapsed = max(0.001, ProcessInfo.processInfo.systemUptime - wallStart)
-          let throughput = Double(encodedFrames) / elapsed
-          let eta = percent > 0
-            ? elapsed * max(0, 100 - percent) / percent
-            : 0
+          // Resumed frames were produced by the earlier run. Do not count
+          // them against this process's elapsed time or both throughput and
+          // ETA become wildly optimistic immediately after a resume.
+          let activeEncodedFrames = max(0, encodedFrames - resumedFrameEstimate)
+          let throughput = Double(activeEncodedFrames) / elapsed
+          let remainingFrames = max(0, progressEnd - position)
+            * Double(outputFPSNumerator) / Double(outputFPSDenominator)
+          let eta = throughput > 0 ? remainingFrames / throughput : 0
           emit([
             "kind": "export_progress",
             "generation": config.generation,
@@ -8775,6 +8866,7 @@ private struct NativePreviewPipeline {
             "position_seconds": position,
             "duration_seconds": video.durationSeconds,
             "encoded_frames": encodedFrames,
+            "processed_encoded_frames": activeEncodedFrames,
             "elapsed_seconds": elapsed,
             "throughput_fps": throughput,
             "eta_seconds": eta,

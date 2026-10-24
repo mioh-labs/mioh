@@ -324,7 +324,8 @@ class MiohRemoteControlTests(unittest.TestCase):
         fields = re.findall(r"^\s*var\s+(\w+):", snapshot_match.group(1), re.M)
         # Expert ROI remains in the persisted schema for backward compatibility,
         # but it is deliberately hidden and forced off when settings are loaded.
-        local_only_fields = {"roiExpertMode"}
+        # per-method model paths stay on the Mac; roiRefineUse1024Window only decodes old settings
+        local_only_fields = {"roiExpertMode", "roiEnhancerModelsByMethod", "roiRefineUse1024Window"}
         self.assertIn("roiExpertMode = false", APP_SOURCE.read_text())
         for field in fields:
             if field in local_only_fields:

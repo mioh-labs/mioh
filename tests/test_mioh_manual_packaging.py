@@ -32,3 +32,16 @@ def test_manual_explains_swiftvr_installation_and_controls() -> None:
         "--verify-only",
     ):
         assert label in manual
+
+
+def test_manual_explains_roi_refine_installation_and_controls() -> None:
+    manual = (ROOT / "docs/mioh-user-manual-ja.md").read_text()
+    for label in (
+        "install-roi-refine.zsh",
+        "okatti/mioh-roi-refine",
+        "--mode build",
+        "ROI Refineの操作と注意点",
+        "ステップ数",
+        "機械生成",
+    ):
+        assert label in manual

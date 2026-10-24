@@ -1221,19 +1221,49 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertNotIn("roiEnhancerPasses", source + pipeline)
         self.assertFalse((ROOT / "packaging/macOS/standalone/MaskedROITextureEnhancer.swift").exists())
 
-    def test_roi_refine_1024_canvas_is_opt_in_and_defaults_to_512(self):
+    def test_roi_refine_fast_preset_and_individual_controls(self):
         source = APP_SOURCE.read_text()
         pipeline = NATIVE_PIPELINE_SOURCE.read_text()
         enhancer = (
             ROOT / "packaging/macOS/standalone/ROIRefineSceneEnhancer.swift"
         ).read_text()
+        remote = (
+            ROOT / "packaging/macOS/standalone/RemoteControlServer.swift"
+        ).read_text()
 
-        self.assertIn("@Published var roiRefineUse1024Window = false", source)
-        self.assertIn("roiRefineUse1024Window ? 1024 : 512", source)
-        self.assertIn('Toggle("1024pxの内部計算窓を使う"', source)
+        self.assertIn("@Published var roiRefineWindowSide = 512", source)
+        self.assertIn("@Published var roiRefineContinuationFrames = 9", source)
+        self.assertIn("@Published var roiRefineFastMode = false", source)
+        self.assertIn("roiRefineFastMode ? 384 : roiRefineWindowSide", source)
+        self.assertIn("roiRefineFastMode ? 1 : roiRefineContinuationFrames", source)
+        self.assertIn('Toggle("高速モード（384px・引き継ぎ1）"', source)
+        self.assertIn('Picker("内部計算の最大サイズ"', source)
+        self.assertIn('Picker("窓間の引き継ぎ"', source)
+        self.assertIn(".disabled(runner.roiRefineFastMode)", source)
+        self.assertIn('roiEnhancer == "roi-refine"\n      ? 1', source)
         self.assertIn("config.roiRefineMaximumWindowSide ?? 512", pipeline)
+        self.assertIn("config.roiRefineConditionFrames ?? 9", pipeline)
+        self.assertNotIn("maximumWindowSide <= 256", enhancer)
+        self.assertIn("maximumWindowSide <= 384 ? 384 : 512", enhancer)
+        self.assertNotIn('Text("256px").tag(256)', source)
+        self.assertIn("savedWindowSide == 256 ? 384", source)
+        self.assertIn("[384, 512, 1024].contains(value.roiRefineWindowSide ?? 512)", remote)
         self.assertIn("maximumWindowSide >= 1024 && cropSide > 512 ? 1024 : 512", enhancer)
         self.assertIn('"maximumWindowSide": maximumWindowSide', enhancer)
+        self.assertIn('"LTX_ROI_CONDITION_FRAMES": String(conditionFrames)', enhancer)
+        self.assertIn("['roiRefineFastMode','高速モード（384px・引き継ぎ1）','bool']", remote)
+        self.assertIn("['roiRefineWindowSide','内部計算の最大サイズ','numberSelect','roiRefineWindowSides']", remote)
+        self.assertIn("['roiRefineContinuationFrames','窓間の引き継ぎ','numberSelect','roiRefineContinuationFrames']", remote)
+        self.assertIn("type==='numberSelect'?Number(control.value):control.value", remote)
+        self.assertIn("['roiRefineWindowSide','roiRefineContinuationFrames'].includes(key)&&s.roiRefineFastMode", remote)
+        self.assertIn("@Published var roiRefineSteps = 2", source)
+        self.assertIn('roiRefineSteps: roiEnhancer == "roi-refine" ? roiRefineSteps : nil', source)
+        self.assertIn('Picker("ステップ数", selection: $runner.roiRefineSteps)', source)
+        self.assertIn("min(max(snapshot.roiRefineSteps ?? 2, 1), 8)", source)
+        self.assertIn("steps: config.roiRefineSteps ?? 2", pipeline)
+        self.assertIn('"steps": steps', enhancer)
+        self.assertIn("['roiRefineSteps','ステップ数','numberSelect','roiRefineSteps']", remote)
+        self.assertIn("(1...8).contains(value.roiRefineSteps ?? 2)", remote)
 
     def test_build_uses_python_only_for_model_generation(self):
         script = BUILD_SCRIPT.read_text()
@@ -1252,7 +1282,7 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn('COREAI_DISTRIBUTION="portable"', script)
         self.assertIn('build/macos-standalone-universal', script)
         self.assertIn('APP_BASENAME="mioh-universal"', script)
-        self.assertIn('DMG_BASENAME="mioh-universal-0.14.3-019-unsigned"', script)
+        self.assertIn('DMG_BASENAME="mioh-universal-0.14.3-021-unsigned"', script)
         self.assertIn('exec "$PACKAGE_DIR/build_app.sh"', script)
 
     def test_universal_bundle_allowlists_conversion_scripts(self):
@@ -1463,10 +1493,9 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertIn(r'ForEach(1...10, id: \.self) { lane in', source)
         self.assertIn('Text("\\(lane)レーン").tag(lane)', source)
         self.assertIn('.pickerStyle(.menu)', source)
-        self.assertIn(
-            "nativeParallelWorkers: min(max(nativeParallelWorkers, 1), 10)",
-            source,
-        )
+        self.assertIn("let effectiveNativeParallelWorkers", source)
+        self.assertIn("nativeParallelWorkers: effectiveNativeParallelWorkers", source)
+        self.assertIn("書き出し時は自動的に1レーンになります", source)
         self.assertIn("max(snapshot.nativeParallelWorkers ?? 1, 1),\n      10", source)
         self.assertIn("nativeParallelWorkers: 1,", source)
         self.assertIn('executor = "process"', source)
@@ -1904,6 +1933,26 @@ class StandaloneAppOptionTests(unittest.TestCase):
         self.assertNotIn("private var reducedPool", pipeline)
         self.assertNotIn('label: "enhancer reduced output"', pipeline)
         self.assertNotIn('guard roiEnhancer == "none"', source)
+
+    def test_native_export_can_resume_completed_contiguous_segments(self):
+        source = APP_SOURCE.read_text()
+        pipeline = NATIVE_PIPELINE_SOURCE.read_text()
+        encoder = (
+            ROOT / "packaging" / "macOS" / "standalone"
+            / "PreviewVideoToolboxEncoder.swift"
+        ).read_text()
+
+        self.assertIn("中断済みセグメントから再開", source)
+        self.assertIn("resumableNativeExport", source)
+        self.assertIn("resumeConfigurationsMatch", source)
+        self.assertIn("resumeExistingSegments", pipeline)
+        self.assertIn("static func resumableSegments(", pipeline)
+        self.assertIn("url.pathExtension.lowercased() == \"mp4\"", pipeline)
+        self.assertIn("while let url = bySequence[sequence]", pipeline)
+        self.assertIn("ptsNanoseconds < resumeOutputStartNanoseconds", pipeline)
+        self.assertIn("startingSequence: resumedSegments.count", pipeline)
+        self.assertIn("encodedFrames - resumedFrameEstimate", pipeline)
+        self.assertIn("startingSequence: Int = 0", encoder)
 
     def test_universal_model_tools_keep_all_recovered_fixes(self):
         tools = ROOT / "packaging" / "macOS" / "standalone" / "model-tools"

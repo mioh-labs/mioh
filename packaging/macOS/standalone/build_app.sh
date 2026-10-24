@@ -268,6 +268,9 @@ if [[ "$COREAI_DISTRIBUTION" == "portable" && -d "$MODEL_TOOLS_SOURCE" ]]; then
     probe_swiftvr_reae_coreml.py
     probe_swiftvr_reae_state_coreml.py
     probe_swiftvr_reae_decoder_state_coreml.py
+    export_ltx23_dit_block_coreai.py
+    export_ltx23_roi_refine_constants.py
+    run_ltx23_roi_refine_coreai.py
   )
   mkdir -p "$RESOURCES/model-tools/scripts/apple"
   for script in "${portable_apple_scripts[@]}"; do
@@ -277,7 +280,8 @@ if [[ "$COREAI_DISTRIBUTION" == "portable" && -d "$MODEL_TOOLS_SOURCE" ]]; then
 chmod +x \
     "$RESOURCES/model-tools/download-mioh-models.zsh" \
     "$RESOURCES/model-tools/convert-mioh-models.zsh" \
-    "$RESOURCES/model-tools/install-swiftvr-models.zsh"
+    "$RESOURCES/model-tools/install-swiftvr-models.zsh" \
+    "$RESOURCES/model-tools/install-roi-refine.zsh"
 fi
 
 if [[ "$MIOH_MODELESS_DISTRIBUTION" != 1 ]]; then
@@ -871,6 +875,10 @@ if [[ "$COREAI_DISTRIBUTION" == "portable" ]]; then
     "$RESOURCES/model-tools/convert-mioh-models.zsh"
     "$RESOURCES/model-tools/download-mioh-models.zsh"
     "$RESOURCES/model-tools/install-swiftvr-models.zsh"
+    "$RESOURCES/model-tools/install-roi-refine.zsh"
+    "$RESOURCES/model-tools/scripts/apple/export_ltx23_dit_block_coreai.py"
+    "$RESOURCES/model-tools/scripts/apple/export_ltx23_roi_refine_constants.py"
+    "$RESOURCES/model-tools/scripts/apple/run_ltx23_roi_refine_coreai.py"
     "$RESOURCES/model-tools/scripts/apple/export_swiftvr_components_coreml.py"
     "$RESOURCES/model-tools/scripts/apple/export_swiftvr_dit_group_coreml.py"
     "$RESOURCES/model-tools/scripts/apple/swiftvr_imports.py"
@@ -942,6 +950,7 @@ if [[ -d "$RESOURCES/model-tools" ]]; then
   ln -s "model-tools/download-mioh-models.zsh" "$DMG_ROOT/download-mioh-models.zsh"
   ln -s "model-tools/convert-mioh-models.zsh" "$DMG_ROOT/convert-mioh-models.zsh"
   ln -s "model-tools/install-swiftvr-models.zsh" "$DMG_ROOT/install-swiftvr-models.zsh"
+  ln -s "model-tools/install-roi-refine.zsh" "$DMG_ROOT/install-roi-refine.zsh"
 fi
 diskutil image create from \
   --volumeName "$APP_BASENAME" \

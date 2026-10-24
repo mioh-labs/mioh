@@ -38,3 +38,22 @@ Useful options:
 models, and Real-ESRGAN x2/x4. Omit it to also download optional ROI enhancer
 models. The VR detection checkpoint is not distributed or downloaded by mioh;
 the converter only accepts an existing local copy if the user provides one.
+
+## ROI Refine pack (macOS 27+)
+
+ROI Refine (Sulphur 2 / LTX-2.3 with the mioh ROI IC-LoRA) uses an external pack. It is
+not stored in the app, so it survives app updates. The Hugging Face repository
+`okatti/mioh-roi-refine` is gated: accept the LTX-2 Community License there first, then
+run `hf auth login` or set `HF_TOKEN`.
+
+```zsh
+./install-roi-refine.zsh --app /Applications/mioh-universal.app                 # download the converted pack (~18 GiB)
+./install-roi-refine.zsh --app /Applications/mioh-universal.app --mode build    # convert locally from the official checkpoint
+./install-roi-refine.zsh --app /Applications/mioh-universal.app --verify-only
+```
+
+The pack is written to `~/Library/Application Support/mioh/ROIRefine/pack-sulphur-iclora1750-v5`
+unless `--pack` is given. Build mode downloads the ~43 GiB Sulphur 2 distilled
+checkpoint and a pinned LTX-2 source checkout. It converts the 12 Core AI DiT groups
+with the packaged `coreai-torch`, and exports the VAE and the window constants. Plan for
+about 70 GiB free. Select the printed folder in 復元 → ROIエンハンサー → ROI Refine.

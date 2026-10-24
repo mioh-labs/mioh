@@ -55,9 +55,9 @@ struct NativeExportConfiguration: Codable, Sendable {
   let input: String
   let inputByteCount: Int64?
   let inputSHA256: String?
-  let outputDirectory: String
-  let ffmpegTemporaryDirectory: String
-  let miohTemporaryDirectory: String
+  var outputDirectory: String
+  var ffmpegTemporaryDirectory: String
+  var miohTemporaryDirectory: String
   let outputFile: String
   let ffmpeg: String
   let detectionModel: String
@@ -120,6 +120,10 @@ struct NativeExportConfiguration: Codable, Sendable {
   var roiRefineDistillMinimumCrop: Int? = nil
   /// ROI Refine: largest internal LTX canvas. Defaults to 512; 1024 is an explicit quality/cost opt-in.
   var roiRefineMaximumWindowSide: Int? = nil
+  /// ROI Refine: temporal continuation frames between 33-frame LTX windows (1 fast, 9 quality).
+  var roiRefineConditionFrames: Int? = nil
+  /// ROI Refine: denoising steps per window, 1...8 (default 2).
+  var roiRefineSteps: Int? = nil
   let detectionEmptyLookahead: Int
   let detectionMaskReuseSkipFrames: Int
   let detectFaceMosaics: Bool
@@ -131,6 +135,8 @@ struct NativeExportConfiguration: Codable, Sendable {
   let averageBitRate: Int?
   let bitrateMultiplier: Double
   let mp4FastStart: Bool
+  /// Reuse the contiguous completed export segments in `outputDirectory` and continue after them.
+  var resumeExistingSegments: Bool? = nil
 
   enum CodingKeys: String, CodingKey {
     case mode
@@ -194,6 +200,8 @@ struct NativeExportConfiguration: Codable, Sendable {
     case roiRefineDistillModel
     case roiRefineDistillMinimumCrop
     case roiRefineMaximumWindowSide
+    case roiRefineConditionFrames
+    case roiRefineSteps
     case detectionEmptyLookahead
     case detectionMaskReuseSkipFrames
     case detectFaceMosaics
@@ -205,6 +213,7 @@ struct NativeExportConfiguration: Codable, Sendable {
     case averageBitRate
     case bitrateMultiplier
     case mp4FastStart
+    case resumeExistingSegments
   }
 }
 
@@ -744,7 +753,15 @@ struct MiohUserDefaultsSnapshot: Codable {
   var swiftVRStabilizationRadius: Int?
   var swiftVRFrameSmoothing: Int?
   var roiRefineDistill: Bool?
+  /// Explicit ROI Refine canvas used when the fast preset is off.
+  var roiRefineWindowSide: Int?
+  /// Explicit LTX continuation length used when the fast preset is off.
+  var roiRefineContinuationFrames: Int?
+  /// ROI Refine denoising steps (1...8).
+  var roiRefineSteps: Int?
+  /// Legacy 1024 toggle, retained so older saved settings still decode.
   var roiRefineUse1024Window: Bool?
+  var roiRefineFastMode: Bool?
 
   var detectionModel: String
   var customDetectionModel: String
@@ -839,7 +856,11 @@ struct MiohUserDefaultsSnapshot: Codable {
       swiftVRStabilizationRadius: 1,
       swiftVRFrameSmoothing: 15,
       roiRefineDistill: true,
+      roiRefineWindowSide: 512,
+      roiRefineContinuationFrames: 9,
+      roiRefineSteps: 2,
       roiRefineUse1024Window: false,
+      roiRefineFastMode: false,
       detectionModel: "v2-coreml",
       customDetectionModel: "",
       detectionEmptyLookahead: 10,
@@ -1046,6 +1067,7 @@ final class RestorationRunner: ObservableObject {
   @Published var mergeEncoder = "copy"
   @Published var deleteSegments = false
   @Published var keepTemp = true
+  @Published var resumeInterruptedExport = true
   @Published var forceSplit = false
 
   @Published var device = "mps"
@@ -1108,8 +1130,14 @@ final class RestorationRunner: ObservableObject {
   @Published var swiftVRFrameSmoothing = 15
   /// ROI Refine: layer ROI Distill on crops over 512 px (refine draws at 512).
   @Published var roiRefineDistill = true
-  /// Permit the expensive 1024px internal LTX canvas. Off caps automatic selection at 512px.
-  @Published var roiRefineUse1024Window = false
+  /// ROI Refine canvas used by the custom settings (384, 512 or 1024; a saved 256 reads as 384).
+  @Published var roiRefineWindowSide = 512
+  /// Clean frames carried into the next 33-frame LTX window (1 or 9).
+  @Published var roiRefineContinuationFrames = 9
+  /// ROI Refine denoising steps per 33-frame window (1...8; 2 is the measured default).
+  @Published var roiRefineSteps = 2
+  /// Cap ROI Refine at 384px and keep one continuation frame between LTX windows.
+  @Published var roiRefineFastMode = false
 
   @Published var detectionModel: String
   @Published var customDetectionModel = ""
@@ -1794,6 +1822,61 @@ final class RestorationRunner: ObservableObject {
     status = "停止中"
   }
 
+  private func resumableNativeExport(
+    in base: URL,
+    input: URL,
+    output: URL
+  ) -> (directory: URL, configuration: NativeExportConfiguration)? {
+    guard resumeInterruptedExport,
+      let directories = try? FileManager.default.contentsOfDirectory(
+        at: base,
+        includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey],
+        options: [.skipsHiddenFiles]
+      )
+    else { return nil }
+    let expectedInput = input.standardizedFileURL.path
+    let expectedOutput = output.standardizedFileURL.path
+    let candidates = directories.filter {
+      $0.lastPathComponent.hasPrefix("mioh-swift-export-")
+    }.sorted {
+      let left = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+      let right = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+      return left > right
+    }
+    for directory in candidates {
+      let configurationURL = directory.appendingPathComponent("configuration.json")
+      guard let data = try? Data(contentsOf: configurationURL),
+        let configuration = try? JSONDecoder().decode(NativeExportConfiguration.self, from: data),
+        URL(fileURLWithPath: configuration.input).standardizedFileURL.path == expectedInput,
+        URL(fileURLWithPath: configuration.outputFile).standardizedFileURL.path == expectedOutput,
+        FileManager.default.fileExists(
+          atPath: directory.appendingPathComponent("export-g\(configuration.generation)-000000.mp4").path
+        )
+      else { continue }
+      return (directory, configuration)
+    }
+    return nil
+  }
+
+  private func resumeConfigurationsMatch(
+    _ previous: NativeExportConfiguration,
+    _ current: NativeExportConfiguration
+  ) -> Bool {
+    func normalized(_ configuration: NativeExportConfiguration) -> NSDictionary? {
+      guard let data = try? JSONEncoder().encode(configuration),
+        let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+      else { return nil }
+      var value = object
+      for key in [
+        "outputDirectory", "ffmpegTemporaryDirectory", "miohTemporaryDirectory",
+        "resumeExistingSegments",
+      ] { value.removeValue(forKey: key) }
+      return value as NSDictionary
+    }
+    guard let left = normalized(previous), let right = normalized(current) else { return false }
+    return left == right
+  }
+
   private func makeNativeExportTask(
     resources: URL,
     input: URL,
@@ -1906,14 +1989,10 @@ final class RestorationRunner: ObservableObject {
       at: generalBase,
       withIntermediateDirectories: true
     )
-    let exportDirectory = generalBase.appendingPathComponent(
-      "mioh-swift-export-\(UUID().uuidString)",
-      isDirectory: true
-    )
-    try FileManager.default.createDirectory(
-      at: exportDirectory,
-      withIntermediateDirectories: true
-    )
+    let resumeCandidate = resumableNativeExport(in: generalBase, input: input, output: output)
+    var exportDirectory = resumeCandidate?.directory ?? generalBase.appendingPathComponent(
+      "mioh-swift-export-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: exportDirectory, withIntermediateDirectories: true)
     let ffmpegBase = ffmpegTempDirectory.isEmpty
       ? exportDirectory
       : URL(fileURLWithPath: ffmpegTempDirectory, isDirectory: true)
@@ -1975,7 +2054,12 @@ final class RestorationRunner: ObservableObject {
     let selectedDecodeStartNanoseconds = selectedCoreStartNanoseconds.map {
       max(0, $0 - 500_000_000)
     } ?? 0
-    let configuration = NativeExportConfiguration(
+    // ROI Refine owns one resident LTX server and serializes every scene on it.
+    // Extra restoration lanes cannot run a second LTX request, but retain another
+    // full batch and compete for Core AI/GPU memory.
+    let effectiveNativeParallelWorkers = roiEnhancer == "roi-refine"
+      ? 1 : min(max(nativeParallelWorkers, 1), 10)
+    var configuration = NativeExportConfiguration(
       input: input.path,
       inputByteCount: nil,
       inputSHA256: nil,
@@ -2009,7 +2093,7 @@ final class RestorationRunner: ObservableObject {
       temporalBatchFrames: clipFrames,
       temporalOverlap: overlap,
       ringCapacity: max(clipFrames + overlap + 8, 32),
-      nativeParallelWorkers: min(max(nativeParallelWorkers, 1), 10),
+      nativeParallelWorkers: effectiveNativeParallelWorkers,
       decoderBackend: decoderBackend,
       detailedDiagnostics: detailedDiagnostics,
       exportDetectionMasks: exportDetectionMasks,
@@ -2037,7 +2121,10 @@ final class RestorationRunner: ObservableObject {
         ? existingPath(resources.appendingPathComponent("models/roi-distill-x2.mlmodelc")) : nil,
       roiRefineDistillMinimumCrop: roiEnhancer == "roi-refine" && roiRefineDistill ? 512 : nil,
       roiRefineMaximumWindowSide: roiEnhancer == "roi-refine"
-        ? (roiRefineUse1024Window ? 1024 : 512) : nil,
+        ? (roiRefineFastMode ? 384 : roiRefineWindowSide) : nil,
+      roiRefineConditionFrames: roiEnhancer == "roi-refine"
+        ? (roiRefineFastMode ? 1 : roiRefineContinuationFrames) : nil,
+      roiRefineSteps: roiEnhancer == "roi-refine" ? roiRefineSteps : nil,
       detectionEmptyLookahead: max(0, detectionEmptyLookahead),
       detectionMaskReuseSkipFrames: min(
         max(detectionMaskReuseSkipFrames, 0),
@@ -2053,6 +2140,29 @@ final class RestorationRunner: ObservableObject {
       bitrateMultiplier: bitrateMultiplier,
       mp4FastStart: mp4FastStart
     )
+    if let resumeCandidate,
+      resumeConfigurationsMatch(resumeCandidate.configuration, configuration)
+    {
+      configuration.resumeExistingSegments = true
+    } else if resumeCandidate != nil {
+      // A prior run for the same paths used different processing settings. Never mix its segments with this run.
+      exportDirectory = generalBase.appendingPathComponent(
+        "mioh-swift-export-\(UUID().uuidString)", isDirectory: true)
+      try FileManager.default.createDirectory(at: exportDirectory, withIntermediateDirectories: true)
+      configuration.outputDirectory = exportDirectory.path
+      nativeExportDirectoryURL = exportDirectory
+      if ffmpegTempDirectory.isEmpty {
+        // The provisional FFmpeg directory was placed under the rejected
+        // resume candidate. Keep every new-run artifact under the new export.
+        try? FileManager.default.removeItem(at: ffmpegWorkDirectory)
+        let freshFFmpegWorkDirectory = exportDirectory.appendingPathComponent(
+          "mioh-ffmpeg-export-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+          at: freshFFmpegWorkDirectory, withIntermediateDirectories: true)
+        configuration.ffmpegTemporaryDirectory = freshFFmpegWorkDirectory.path
+        nativeExportFFmpegDirectoryURL = freshFFmpegWorkDirectory
+      }
+    }
     let configurationURL = exportDirectory.appendingPathComponent(
       "configuration.json"
     )
@@ -2849,6 +2959,7 @@ final class RestorationRunner: ObservableObject {
       復元モデル: \(restorationModel)
       検出モデル: \(detectionModel)
       分割: \(splitDescription)
+      中断再開: \(configuration.resumeExistingSegments == true ? "完成済みセグメントを検査して再利用" : "新規処理")
       復元Clip長: \(configuration.temporalBatchFrames)フレーム
       ネイティブ並列数: \(configuration.nativeParallelWorkers)レーン
       Temporal overlap: \(configuration.temporalOverlap)フレーム
@@ -2859,6 +2970,7 @@ final class RestorationRunner: ObservableObject {
       スムージング: \(String(format: "%.2f", configuration.smoothStrength))
       エフェクト倍率: \(configuration.effectUpscale)x
       ROIエンハンサー: \(configuration.roiEnhancerModel == nil ? "無効" : "有効（\(roiEnhancerModel)、強度 \(String(format: "%.2f", configuration.roiEnhancerStrength))）")
+      ROI Refineモード: \(configuration.roiRefineMaximumWindowSide.map { "最大\($0)px・引き継ぎ\(configuration.roiRefineConditionFrames ?? 9)フレーム・\(configuration.roiRefineSteps ?? 2)ステップ" } ?? "対象外")
       枠のなめらかさ: \(configuration.swiftVRFrameSmoothing ?? 0)フレーム
       大きいROIのDistill重ね: \(configuration.roiRefineDistillModel == nil ? "なし" : "512px超に適用")
       揺らぎ低減: \(String(format: "%.2f", configuration.swiftVRTemporalFilter ?? 0))（Apple時間方向ノイズ補正）
@@ -3307,7 +3419,11 @@ final class RestorationRunner: ObservableObject {
       swiftVRStabilizationRadius: swiftVRStabilizationRadius,
       swiftVRFrameSmoothing: swiftVRFrameSmoothing,
       roiRefineDistill: roiRefineDistill,
-      roiRefineUse1024Window: roiRefineUse1024Window,
+      roiRefineWindowSide: roiRefineWindowSide,
+      roiRefineContinuationFrames: roiRefineContinuationFrames,
+      roiRefineSteps: roiRefineSteps,
+      roiRefineUse1024Window: roiRefineWindowSide == 1024,
+      roiRefineFastMode: roiRefineFastMode,
       detectionModel: detectionModel,
       customDetectionModel: customDetectionModel,
       detectionEmptyLookahead: detectionEmptyLookahead,
@@ -3424,7 +3540,14 @@ final class RestorationRunner: ObservableObject {
     swiftVRStabilizationRadius = min(max(snapshot.swiftVRStabilizationRadius ?? 1, 1), 8)
     swiftVRFrameSmoothing = min(max(snapshot.swiftVRFrameSmoothing ?? 15, 0), 30)
     roiRefineDistill = snapshot.roiRefineDistill ?? true
-    roiRefineUse1024Window = snapshot.roiRefineUse1024Window ?? false
+    let savedWindowSide = snapshot.roiRefineWindowSide
+      ?? ((snapshot.roiRefineUse1024Window ?? false) ? 1024 : 512)
+    roiRefineWindowSide = savedWindowSide == 256 ? 384
+      : ([384, 512, 1024].contains(savedWindowSide) ? savedWindowSide : 512)
+    let savedContinuation = snapshot.roiRefineContinuationFrames ?? 9
+    roiRefineContinuationFrames = savedContinuation <= 1 ? 1 : 9
+    roiRefineSteps = min(max(snapshot.roiRefineSteps ?? 2, 1), 8)
+    roiRefineFastMode = snapshot.roiRefineFastMode ?? false
 
     detectionModel = detectionModels.contains(snapshot.detectionModel) ? snapshot.detectionModel : "v2-coreml"
     customDetectionModel = snapshot.customDetectionModel
@@ -4371,7 +4494,9 @@ struct ContentView: View {
           }
         }
         .pickerStyle(.menu)
-        Text("連続する時間バッチを\(runner.nativeParallelWorkers)レーンで処理します")
+        Text(runner.roiEnhancer == "roi-refine"
+          ? "ROI Refineは1つのLTXサーバーを使うため、書き出し時は自動的に1レーンになります"
+          : "連続する時間バッチを\(runner.nativeParallelWorkers)レーンで処理します")
           .font(.caption)
           .foregroundStyle(.secondary)
         if runner.nativeParallelWorkers >= 4 {
@@ -4399,6 +4524,10 @@ struct ContentView: View {
         }
         Toggle("処理済みセグメントを削除", isOn: $runner.deleteSegments)
         Toggle("一時ファイルを保持", isOn: $runner.keepTemp)
+        Toggle("中断済みセグメントから再開", isOn: $runner.resumeInterruptedExport)
+        Text("同じ入力・出力・設定の完成済みセグメントだけを再利用します。不完全な .part は無視します。")
+          .font(.caption)
+          .foregroundStyle(.secondary)
         Toggle("強制的に再分割", isOn: $runner.forceSplit)
           .disabled(runner.noSplit)
       }
@@ -4509,8 +4638,34 @@ struct ContentView: View {
             .font(.caption)
             .foregroundStyle(.secondary)
           if runner.roiEnhancer == "roi-refine" {
-            Toggle("1024pxの内部計算窓を使う", isOn: $runner.roiRefineUse1024Window)
-            Text("オフではROIに応じて256〜512pxを自動選択します。オンでは512pxを超えるROIを1024pxで描き、1024pxのまま合成します（ROI Distillの重ねは使いません）。実測で約6倍遅く、今のLoRAでは細部の差はほぼありません。")
+            Toggle("高速モード（384px・引き継ぎ1）", isOn: $runner.roiRefineFastMode)
+            Text("内部計算窓を最大384pxにし、33フレーム窓の引き継ぎを9から1フレームへ減らします。ROI Refineは1レーンで実行します。512px高品質モードより約2倍の高速化を狙う設定です。")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+            DisclosureGroup("詳細設定") {
+              Picker("内部計算の最大サイズ", selection: $runner.roiRefineWindowSide) {
+                Text("384px").tag(384)
+                Text("512px").tag(512)
+                Text("1024px").tag(1024)
+              }
+              .pickerStyle(.segmented)
+              Picker("窓間の引き継ぎ", selection: $runner.roiRefineContinuationFrames) {
+                Text("1フレーム").tag(1)
+                Text("9フレーム").tag(9)
+              }
+              .pickerStyle(.segmented)
+            }
+            .disabled(runner.roiRefineFastMode)
+            Text(runner.roiRefineFastMode
+              ? "高速プリセットが詳細設定より優先されます。個別調整する場合は高速モードをオフにしてください。"
+              : "内部サイズと窓間の引き継ぎを個別に指定します。1024pxは実測で約6倍遅く、現在のLoRAでは細部差が小さい設定です。")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+            Picker("ステップ数", selection: $runner.roiRefineSteps) {
+              ForEach(1...8, id: \.self) { Text("\($0)").tag($0) }
+            }
+            .pickerStyle(.segmented)
+            Text("33フレーム窓ごとのノイズ除去の回数。処理時間はほぼ回数に比例します。2が標準（3と同等の見た目で約3割速い）。4以上は強いノイズから描き始めるので、元の形から離れやすくなります。")
               .font(.caption)
               .foregroundStyle(.secondary)
             Toggle("大きいROIにROI Distillを重ねる", isOn: $runner.roiRefineDistill)
